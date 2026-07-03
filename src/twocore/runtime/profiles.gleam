@@ -153,6 +153,38 @@ pub fn safe_spectest() -> Binding {
   Binding(..safe(), host_policy: HostWhitelist(spectest_allow()))
 }
 
+/// The build-fixed allow-set for Porffor's runtime intrinsics (P7-08 §A/§G) — exactly the four
+/// `#("", letter)` pairs Porffor imports from module `""` (`a`=print, `b`=printChar, `c`=time,
+/// `d`=timeOrigin), nothing more. A LITERAL list in this module (D3a — no data-driven
+/// allow-set); every other capability stays denied. Mirrors `spectest_allow/0`; the four names
+/// match `rt_host`'s Porffor handler arms exactly.
+///
+/// Returns the four `#(capability, name)` pairs. Total — never fails.
+pub fn porffor_allow() -> List(#(String, String)) {
+  [#("", "a"), #("", "b"), #("", "c"), #("", "d")]
+}
+
+/// The **Safe** binding that admits Porffor's `""` runtime intrinsics (P7-08 §G) — the
+/// JS-on-BEAM posture. A `HostWhitelist`, NEVER `HostOpen`. Identical to `safe()` except
+/// `host_policy: HostWhitelist(porffor_allow())`; every non-Porffor capability stays denied
+/// (the fail-closed whitelist conjunction), and an unprovided `""` intrinsic (`""."e"`, the PGO
+/// `profileLocalSet`, …) is denied too (§B.4). The four intrinsics are explicit, auditable host
+/// functions with BOUNDED authority (append to a process-local output buffer / read a
+/// deterministic clock — no file/socket/node authority), so this stays a genuinely **Safe**
+/// posture (`mode: Safe`), NOT an Unsafe opt-out — the fail-closed enumeration is unperturbed
+/// (`unsafe()`/`ceiling()` remain the only `mode: Unsafe` constructors). Changes only
+/// `host_policy`, so it composes with `link/1` exactly as `safe()`/`safe_spectest()`. Total.
+pub fn porffor() -> Binding {
+  Binding(..safe(), host_policy: HostWhitelist(porffor_allow()))
+}
+
+/// The JS-on-BEAM posture name — an alias for `porffor()` (the headline "run JS via Porffor"
+/// build). Provided so callers name the *intent* (`profiles.js()`) not the *toolchain*;
+/// identical binding. Total.
+pub fn js() -> Binding {
+  porffor()
+}
+
 /// The named **Unsafe** profile (F4) — the platform's second named mode, the aggressive
 /// posture in one value: the aggressive optimizer, no CPU metering, the open BIF gate,
 /// passthrough stdlib, and the open host, while keeping the **identical**

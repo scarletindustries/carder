@@ -10,8 +10,9 @@
 %% shim; that seam was not present and 04's file is single-owned (D1, must not be edited),
 %% so the seam is provided here instead. It touches no unit-owned source file.
 -module(twocore_cli_ffi).
--export([catch_apply/3, start_instance/1, call_instance/3, stop_instance/1,
-         module_name/1, bench_instance/4]).
+-export([catch_apply/3, start_instance/1, start_instance_with/2,
+         call_instance/3, stop_instance/1, module_name/1, bench_instance/4,
+         porffor_output/1]).
 
 %% Apply Mod:Fun(Args) on the loaded generated module. On a normal return yield
 %% `{ok, V}` (a Gleam `Ok(Int)`) where V is the result rendered as an integer (the raw
@@ -60,10 +61,26 @@ catch_apply(Mod, Fun, Args) ->
 %% record → the `Threaded` loop carrying that record. Any other shape is a
 %% fail-closed error (never assumed Cell).
 start_instance(Module) ->
+    start_common(Module, fun() -> Module:instantiate() end).
+
+%% Like start_instance/1, but for an IMPORT-BEARING module whose generated entry is
+%% `instantiate/1(Imports)` (P7-08 / R4): run `Module:instantiate(Imports)` in the owned
+%% process, where `Imports` is the positional `[Provided ...]` list link:link_imports +
+%% link:link_func_imports returned (handed over opaquely as one argument). Same cell/threaded
+%% self-detection + receive loop as start_instance/1 — the ABI difference is only the arity of
+%% the instantiate call. Used by pipeline:run_porffor for a Porffor module (which imports its
+%% console intrinsics from module "").
+start_instance_with(Module, Imports) ->
+    start_common(Module, fun() -> Module:instantiate(Imports) end).
+
+%% Shared spawn+seed+loop for both the arity-0 and arity-1 instantiate ABIs. `RunInstantiate`
+%% is a 0-arg fun that performs the generated `instantiate/0` or `instantiate/1(Imports)` IN the
+%% spawned process (so it seeds THAT process's cell / builds THAT record).
+start_common(Module, RunInstantiate) ->
     Parent = self(),
     Pid = spawn(fun() ->
         Outcome =
-            try Module:instantiate() of
+            try RunInstantiate() of
                 Ret -> {ok, Ret}
             catch
                 _Class:Reason:Stack -> {error, render_reason(Reason, Stack)}
@@ -82,7 +99,7 @@ start_instance(Module) ->
             {ok, Other} ->
                 Parent ! {started, self(),
                     {error, unicode:characters_to_binary(io_lib:format(
-                        "unexpected instantiate/0 return: ~0p", [Other]))}};
+                        "unexpected instantiate return: ~0p", [Other]))}};
             {error, _} = Err ->
                 Parent ! {started, self(), Err}
         end
@@ -99,6 +116,19 @@ call_instance(Pid, Fun, Args) ->
     Pid ! {invoke, Fun, Args, self(), Ref},
     receive
         {result, Ref, Result} -> Result
+    end.
+
+%% Drain THIS instance's Porffor console output buffer (P7-08, §E/§H.2). The buffer is a
+%% process-DICTIONARY cell in the instance's owned process (rt_host:append_output writes it
+%% during a print/printChar intrinsic call), so it MUST be read IN that process — this routes a
+%% {porffor_output, ...} message into the instance loop, which runs rt_host:porffor_output/0
+%% there and replies with the raw byte stream (a binary). Returns <<>> for a never-printed
+%% instance. Used by pipeline:run_porffor after invoking the entry `m`.
+porffor_output(Pid) ->
+    Ref = make_ref(),
+    Pid ! {porffor_output, self(), Ref},
+    receive
+        {porffor_output_reply, Ref, Bin} -> Bin
     end.
 
 %% Read the module name baked into a .beam binary (needed to load a prebuilt .beam whose
@@ -150,6 +180,13 @@ instance_loop(Module) ->
                     _Class:Reason -> {error, render_reason(Reason)}
                 end,
             From ! {result, Ref, Result},
+            instance_loop(Module);
+        {porffor_output, From, Ref} ->
+            %% Read this instance's Porffor console buffer IN this process (P7-08 §E). The
+            %% rt_host module reference is build-fixed (never a data-derived atom, D3a).
+            Bin = try 'twocore@runtime@rt_host':porffor_output()
+                  catch _:_ -> <<>> end,
+            From ! {porffor_output_reply, Ref, Bin},
             instance_loop(Module);
         stop ->
             ok
@@ -203,6 +240,13 @@ threaded_loop(Module, St) ->
                     From ! {result, Ref, Err},
                     threaded_loop(Module, St)
             end;
+        {porffor_output, From, Ref} ->
+            %% Same Porffor console drain as the Cell loop (P7-08 §E); the buffer is a
+            %% process-local pdict cell independent of the threaded InstanceState record.
+            Bin = try 'twocore@runtime@rt_host':porffor_output()
+                  catch _:_ -> <<>> end,
+            From ! {porffor_output_reply, Ref, Bin},
+            threaded_loop(Module, St);
         stop ->
             ok
     end.

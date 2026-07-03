@@ -61,8 +61,11 @@
 //// a `Threaded`/`atomics` build runs the SAME driver code end-to-end (G7).
 
 import gleam/bit_array
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import twocore/backend/build_beam
 import twocore/backend/core_printer
@@ -76,6 +79,9 @@ import twocore/ir/parser as ir_parser
 import twocore/middle/ir_lower
 import twocore/middle/ir_opt
 import twocore/runtime/instance.{type Binding}
+import twocore/runtime/link
+import twocore/runtime/porffor_abi.{type PorfValue}
+import twocore/runtime/profiles
 
 // ─────────────────────────────── composed error type (D4) ───────────────────────────────
 
@@ -289,6 +295,22 @@ fn ffi_catch_apply(
 @external(erlang, "twocore_cli_ffi", "start_instance")
 fn ffi_start_instance(module: Atom) -> Result(Pid, String)
 
+/// Spawn an IMPORT-BEARING instance's owned process and run `module:instantiate/1(Imports)` in
+/// it (P7-08 / R4). `imports` is the positional `[Provided ...]` list `link.link_imports` +
+/// `link.link_func_imports` returned, handed over opaquely. `Ok(pid)` once seeded; `Error(reason)`
+/// on an instantiation-time trap. See `src/twocore_cli_ffi.erl`.
+@external(erlang, "twocore_cli_ffi", "start_instance_with")
+fn ffi_start_instance_with(
+  module: Atom,
+  imports: Dynamic,
+) -> Result(Pid, String)
+
+/// Identity coercion of any Gleam value to `Dynamic` (identity at runtime) — used to hand the
+/// positional `List(Provided)` import list to the generated `instantiate/1` as one opaque
+/// argument (the same shape ABI the conformance driver uses).
+@external(erlang, "gleam_stdlib", "identity")
+fn to_dynamic(x: a) -> Dynamic
+
 /// Apply `function(args)` inside an instance's owned process. `Ok(v)` / `Error(reason)`.
 @external(erlang, "twocore_cli_ffi", "call_instance")
 fn ffi_call_instance(
@@ -296,6 +318,24 @@ fn ffi_call_instance(
   function: Atom,
   args: List(Int),
 ) -> Result(Int, String)
+
+/// Apply `function(args)` inside an instance's owned process, typed for a **2-value** result
+/// package (P7-08). Bound to the SAME Erlang `call_instance/3` as `ffi_call_instance` (Erlang is
+/// untyped), but typed `Result(#(Int, Int), String)` so a Porffor `m : () -> (f64 i32)` return —
+/// packaged as the 2-tuple `{f64_bits, type_tag}` (emit_core's `r >= 2` packaging, R17) — is
+/// received directly as `Ok(#(f64_bits, type_tag))`. `Error(reason)` on a trap / uncaught throw.
+@external(erlang, "twocore_cli_ffi", "call_instance")
+fn ffi_call_instance_pair(
+  proc: Pid,
+  function: Atom,
+  args: List(Int),
+) -> Result(#(Int, Int), String)
+
+/// Drain an instance's Porffor console output buffer (P7-08 §E/§H.2) — routes into the
+/// instance's owned process and reads `rt_host:porffor_output/0` THERE (the buffer is
+/// process-local). Returns the raw byte stream (`<<>>` if the program never printed).
+@external(erlang, "twocore_cli_ffi", "porffor_output")
+fn ffi_porffor_output(proc: Pid) -> BitArray
 
 /// Ask an instance's owned process to exit (cell GC'd with it).
 @external(erlang, "twocore_cli_ffi", "stop_instance")
@@ -478,5 +518,180 @@ pub fn run_source(
               }
           }
       }
+  }
+}
+
+// ─────────────────────────────── Phase-7: the Porffor JS-on-BEAM run path (P7-08) ───────────────────────────────
+
+/// The outcome of running a Porffor-compiled JS program on the BEAM under `profiles.porffor()`
+/// (P7-08 §C/§E). The **console output is the primary observable** (T12).
+///
+/// - `output`: the captured `console.log` byte stream (§E) — the exact bytes `print`/`printChar`
+///   produced, ANSI escapes in-band; compared byte-for-byte against `porf run` (T13).
+/// - `result`: the decoded completion value of the exported entry (§D) — a scalar
+///   (`PNumber`/`PBool`/`PUndefined`) for the common case; a heap-typed result (string/object)
+///   is `POpaque` here (its memory read is P7-09's FFI, §H.2 — but a `console.log` of a string
+///   still appears in `output`).
+/// - `trapped`: `Some(reason)` if the program trapped (an uncaught throw surfaced as a BEAM
+///   exception, a denied/unprovided intrinsic, an instantiation-time trap, or a WASM trap) —
+///   the rendered BEAM reason; `None` on a clean completion.
+pub type PorfforRun {
+  PorfforRun(output: BitArray, result: PorfValue, trapped: Option(String))
+}
+
+/// A fail-closed `porffor_abi.MemReader` for `run_porffor`: every read is denied, so a
+/// heap-typed (pointer) completion value decodes to `POpaque` (T12 — scalar + console only in
+/// this unit; the routed instance-memory reader that lets pointer results decode is P7-09's,
+/// §H.2). Scalars (number/boolean/undefined) need no memory, so they decode precisely.
+fn no_mem_reader(_addr: Int, _len: Int) -> Result(BitArray, Nil) {
+  Error(Nil)
+}
+
+/// Compile + run a Porffor-emitted `.wasm` on the BEAM under `profiles.porffor()` and collect
+/// its console output + decoded completion value (the JS-on-BEAM run path, P7-08 §C/§E). This
+/// is the headline seam: `source_to_ir` → `ir_to_core(porffor())` → `core_to_beam` →
+/// `instantiate` (owned process) → invoke the entry `main` (multi-value `(f64, i32)` return via
+/// `ffi_call_instance_pair`) → drain the console buffer (`ffi_porffor_output`) → decode the pair
+/// (`porffor_abi.porf_decode`). Conformance-neutral: a non-Porffor module never reaches this
+/// path (the four `""` intrinsics, the buffer, and `porffor()` are inert for it).
+///
+/// - `wasm`: the Porffor-emitted `.wasm` bytes (EH-free subset for this unit; the EH pipeline
+///   P7-03..07 extends it to `try/catch` programs).
+/// - `main`: the entry export name — Porffor's top-level `#main` is always `"m"` (T10).
+/// - Return: `Ok(PorfforRun)` with the captured output + decoded result (+ `trapped`), or a
+///   compile-stage `Error(PipelineError)`. A runtime trap / uncaught throw is a `PorfforRun`
+///   with `trapped: Some(_)` (still `Ok`), so a thrown program is judgeable distinctly from a
+///   clean one. Total — never panics.
+pub fn run_porffor(
+  wasm: BitArray,
+  main: String,
+) -> Result(PorfforRun, PipelineError) {
+  case source_to_ir(wasm) {
+    Error(e) -> Error(e)
+    Ok(m) ->
+      // Resolve the import vector (state + function-import closures) under the porffor()
+      // posture, where the four `""` intrinsics resolve to host closures (the "genuine host
+      // capability" branch of link_func_imports — gated at call time by the HostWhitelist).
+      case link_porffor_imports(m) {
+        Error(reason) ->
+          Ok(PorfforRun(<<>>, porffor_abi.PUndefined, Some("link: " <> reason)))
+        Ok(provided) ->
+          case ir_to_core(m, profiles.porffor()) {
+            Error(e) -> Error(e)
+            Ok(core) ->
+              case core_to_beam(core, m.name) {
+                Error(e) -> Error(e)
+                Ok(beam) ->
+                  case start_porffor_instance(beam, m.name, provided) {
+                    Error(reason) ->
+                      Ok(PorfforRun(<<>>, porffor_abi.PUndefined, Some(reason)))
+                    Ok(proc) -> {
+                      let InstanceProc(pid) = proc
+                      let outcome =
+                        ffi_call_instance_pair(pid, atom.create(main), [])
+                      // Drain AFTER the invoke: print/printChar wrote the instance's
+                      // process-local buffer during the call (any partial output before a trap
+                      // is still captured).
+                      let output = ffi_porffor_output(pid)
+                      let run = case outcome {
+                        Ok(#(f64_bits, type_tag)) ->
+                          PorfforRun(
+                            output,
+                            porffor_abi.porf_decode(
+                              f64_bits,
+                              type_tag,
+                              no_mem_reader,
+                            ),
+                            None,
+                          )
+                        Error(reason) ->
+                          PorfforRun(
+                            output,
+                            porffor_abi.PUndefined,
+                            Some(reason),
+                          )
+                      }
+                      stop_instance(proc)
+                      Ok(run)
+                    }
+                  }
+              }
+          }
+      }
+  }
+}
+
+/// Resolve the full positional import vector for a Porffor module under `profiles.porffor()`:
+/// the STATE imports (`link.link_imports` — empty for a typical Porffor module, which imports
+/// only functions) followed by the function-import dispatch closures (`link.link_func_imports`,
+/// appended in emit_core's order) when the module CALLS an imported function. Porffor's `""`
+/// intrinsics are NOT link-checked (the "genuine host capability" branch); they resolve to host
+/// closures gated at call time by the instance's `HostWhitelist`. Returns `Error(phrase)` on the
+/// first link failure (spec §4.5.4), rendered by `link.import_error_phrase`. Total.
+fn link_porffor_imports(m: ir.Module) -> Result(List(link.Provided), String) {
+  case link.link_imports(m, []) {
+    Error(e) -> Error(link.import_error_phrase(e))
+    Ok(state) ->
+      case module_calls_import(m) {
+        False -> Ok(state)
+        True ->
+          case link.link_func_imports(m, []) {
+            Error(e) -> Error(link.import_error_phrase(e))
+            Ok(funcs) -> Ok(list.append(state, funcs))
+          }
+      }
+  }
+}
+
+/// Load `beam` and start the instance's owned process with the matching instantiate ABI (R4): a
+/// module with NO positional imports keeps `instantiate/0` (`ffi_start_instance`); an
+/// import-bearing one gets `instantiate/1(Imports)` (`ffi_start_instance_with`), where `Imports`
+/// is the positional `Provided` vector. Returns `Ok(InstanceProc)` once seeded, or
+/// `Error(reason)` for a load failure / instantiation-time trap. Total.
+fn start_porffor_instance(
+  beam: BitArray,
+  mod: String,
+  provided: List(link.Provided),
+) -> Result(InstanceProc, String) {
+  case build_beam.load_module(atom.create(mod), "twocore_cli", beam) {
+    Error(reason) -> Error("load failed: " <> reason)
+    Ok(mod_atom) -> {
+      let started = case provided {
+        [] -> ffi_start_instance(mod_atom)
+        _ -> ffi_start_instance_with(mod_atom, to_dynamic(provided))
+      }
+      case started {
+        Ok(pid) -> Ok(InstanceProc(pid))
+        Error(reason) -> Error(reason)
+      }
+    }
+  }
+}
+
+/// `True` iff `m` CALLS an imported function anywhere (its IR contains a `CallImport` node) — the
+/// exact condition `emit_core`'s `needs_func_imports` uses to seed the function-import dispatch
+/// vector at `instantiate`. The run-ABI mirrors it so the woven `Imports` arity matches the
+/// generated `instantiate/1` byte-for-byte. Total.
+fn module_calls_import(m: ir.Module) -> Bool {
+  list.any(m.functions, fn(f) { expr_calls_import(f.body) })
+}
+
+/// `True` iff `expr` (recursively, through the control-flow containers holding sub-`Expr`s)
+/// contains a `CallImport` node. Mirrors `emit_core`'s private `expr_has_call_import`. Total.
+fn expr_calls_import(expr: ir.Expr) -> Bool {
+  case expr {
+    ir.CallImport(..) -> True
+    ir.Let(_, rhs, body) -> expr_calls_import(rhs) || expr_calls_import(body)
+    ir.If(_, _, t, e) -> expr_calls_import(t) || expr_calls_import(e)
+    ir.Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) {
+        let ir.SwitchArm(_, b) = a
+        expr_calls_import(b)
+      })
+      || expr_calls_import(default)
+    ir.Block(_, _, body) -> expr_calls_import(body)
+    ir.Loop(_, _, _, body) -> expr_calls_import(body)
+    ir.Charge(_, body) -> expr_calls_import(body)
+    _ -> False
   }
 }
