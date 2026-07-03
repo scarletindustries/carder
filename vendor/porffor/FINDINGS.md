@@ -126,43 +126,77 @@ it runs in the wasm and the *eager* init throws. These two regexes are `.test()`
 constructs them. (Compiling JS with genuinely non-ASCII identifiers still needs real wide-regex support
 in Porffor's engine — documented future work.)
 
-## 7. The current wall: function `.prototype` is `undefined` past ~7–8k functions ⛔ (HERE)
+## 7. Function `.prototype` is `undefined` at scale — the func lut ⛔→✅ (TWO bugs)
 
-With §6 + §6b fixed, `[run]` now dies during **module init**, not while compiling. Chain of diagnosis:
-- The surfaced error is `RangeError: Invalid typed array length: 1939865600` — but that is a **red
-  herring** from Porffor's *value-conversion* glue (`wrap.js read()`/`porfToJSValue`): the wasm threw
-  an exception and `porffor run` crashes trying to read the thrown Error's corrupted `.message`
-  string. Temporarily clamping absurd lengths in `wrap.js read()` (a diagnostic patch) reveals the
-  real thrown error: **`TypeError` (message itself garbled by the same string-at-scale corruption).**
-- Bracketing every **top-level init statement** with markers (`diagnostics/instrument-init.mjs`)
-  pinned the throw to acorn's **first prototype-method assignment**:
-  `Position.prototype.offset = function offset(n){ … }` — the assignment throws because
-  **`Position.prototype` is `undefined`** (boolean-probed: `Position.prototype === undefined` → `true`,
-  while `typeof Position === "function"`).
-- This is the **first** `X.prototype.method = …` in the whole bundle, so it breaks **every**
-  prototype-based class — i.e. all of acorn.
+With §6 + §6b fixed, `[run]` died during **module init** at acorn's **first prototype-method assignment**
+`Position.prototype.offset = …`, because **`Position.prototype` was `undefined`** (and in fact
+`Position.name`/`.length` were `""`/`0` too, and it happened for a freshly-defined constructor as well →
+a **global** failure, not Position-specific). The surfaced `RangeError: Invalid typed array length` is a
+red herring — `wrap.js read()`/`porfToJSValue` crashing while converting the *real* thrown error (clamp
+absurd lengths in `read()` to unmask it — see `diagnostics/DIAGNOSTICS.md`).
 
-**It is scale-dependent, driven by TOTAL function count (not the constructor's own index):**
-- The exact `Position` pattern, and even 6000 dummy indirect functions + a constructor, **work** in
-  isolation (`diagnostics/scale-test.mjs`).
-- At **≥ 8000** functions the minimal repro reproduces `TypeError: Cannot set property of undefined`.
-  (At ≥ 10000 an *unrelated* limit appears: "local count too large" in the indirect wrapper.)
-- The bundle has **11692 functions / 5588 indirect** (wasm table size) — over the threshold — and
-  `Position` (an early, low-index function) fails anyway → it's a **global** resource keyed to total
-  function count, not the constructor's index.
-- Increasing `--page-size` does **not** help (it trades the throw for `memory access out of bounds`).
+A function's `.name`/`.length`/`.prototype` come from the **func lut** — a per-indirect-function table
+(`__Porffor_funcLut_length/flags/name`, read at `funcIndex * bytesPerFuncLut + off`), and prototype
+creation is gated by `ecma262.IsConstructor` reading the lut's `constr` flag (`_internal_object.ts`).
+**Two independent bugs corrupt the lut:**
 
-**Unresolved:** the exact Porffor constant/region that overflows around 7–8k functions and stops
-function prototypes from being materialized. Candidates to chase next: how a user function's
-`.prototype` object is allocated/looked-up at runtime (search codegen for the funcRef→prototype path
-and `__Porffor_object_setPrototype`); the func-lut sizing (`bytesPerFuncLut = min(⌊pageSize·2 /
-nIndirect⌋, maxNameLen+8)` shrinks with more indirect funcs); and whether prototype resolution reads a
-per-function region sized by total func count. A clean minimal repro exists (`scale8000.js`), so this
-can be bisected in a **fast** loop without the 10 s bundle compile.
+**Bug A — the lut is capped at 2 pages.** `bytesPerFuncLut = min(⌊pageSize·2 / nIndirect⌋, maxNameLen+8)`,
+but a valid entry needs ≥ 7 bytes (2 length + 1 flags + 4 nameLen). Past ~4681 indirect funcs the ⌊⌋
+term drops below 7, so the write stride (7) ≠ read stride (bytesPerFuncLut) and entries corrupt each
+other's `constr` byte. Reproduced with `diagnostics/scale-test.mjs`: 6000 funcs (bytesPerFuncLut=5) work,
+8000 (=4) fail; 8000 *non-indirect* funcs work (only the INDIRECT count matters). **Fix:** grow the func
+lut to **16 pages** (`allocLargePage` + the `pageSize*16` budget in `bytesPerFuncLut`), keeping
+bytesPerFuncLut ≥ 7 for up to ~37k indirect funcs. Data always fits (`nIndirect·bytesPerFuncLut ≤ budget`
+by the `min`).
+
+**Bug B (the self-hosting one) — a page-name / string-literal COLLISION.** The lut is *page*-allocated,
+so its data-segment offset should be `pages.get('#func lut') * pageSize`. But the data emitter resolves
+offsets as `pages.allocs.get(x.page) ?? pages.get(x.page)*pageSize`, and `pages.allocs` is keyed by
+*interned string content*. **The Porffor bundle contains the string literal `'#func lut'`** (it IS the
+Porffor compiler), so `allocBytes` interns it and `pages.allocs['#func lut']` **shadows the page offset**
+→ the lut is written to the string's offset while reads use the page offset → every func-lut read returns
+0. (`--debug-func-lut` + an emit-offset print showed base=16384 but data emitted at 2938067.) **Fix:**
+store an explicit `offset` on the func-lut data segment and honour it in the emitter (and the section
+size pre-count), so a colliding string can't move it. This bug is *invisible* off self-hosting and is a
+clean example of why compiling-Porffor-with-Porffor surfaces bugs nothing else does.
+
+Both fixes live in `scripts/porffor-codegen-fixes.sh` (applied to the vendored compiler by
+`apply-patches.sh` and to the npx tool by `patch-build-tool.sh` — §7b). With them, `Position.prototype`
+works and init advances from statement ~54 to ~470.
+
+## 8. The runtime frontier — missing builtins & Porffor semantics gaps (HERE)
+
+Past §7, init advances through a *sequence* of Porffor limitations (each localized with
+`diagnostics/instrument-init.mjs`; the fixes so far live in `apply-patches.sh` / `codemod.mjs`):
+
+- **`String.prototype.replace` is not implemented** (native `typeof "x".replace` is undefined). acorn's
+  `wordsRegexp` uses `words.replace(/ /g,"|")`. `.split`/`.join` DO work (they resolve as method *calls*
+  even though `typeof x.split` is undefined), so `apply-patches.sh` #8 rewrites it to
+  `words.split(" ").join("|")`. (The other ~20 `.replace` sites are debug/disassembler-path, not hit by
+  the probe — a real `String.prototype.replace` builtin is future work.)
+- **`process` is not defined** — Porffor's Prefs/CLI code reads `process.argv`/`process.stdout` at init.
+  `codemod.mjs` prepends a harmless `process` stub (real `process` under Node).
+- **`globalThis.X = …` does not create a readable bare global `X`** (native: `globalThis.Prefs={}` then
+  bare `Prefs` throws "Prefs is not defined"). Porffor sets globals via `globalThis.X` and reads them
+  bare everywhere (Prefs, precompile, pageSize, …). `codemod.mjs` rewrites `globalThis.X` → bare `X` and
+  declares those as module `var`s — EXCEPT names that are also local `let/const/var` bindings (e.g.
+  `let importFuncs = globalThis.importFuncs = []`, which would become a TDZ self-reference). The proper
+  fix is a Porffor `generateIdent` fallback to `globalThis[name]` for undeclared globals — future work.
+- **⛔ CURRENT: optional call on a nullish base doesn't short-circuit.** Init reaches
+  `types2 = Prefs.parseTypes || Prefs.t || file2?.endsWith(".ts")`; with `file2` undefined,
+  `file2?.endsWith(".ts")` should be `undefined`, but Porffor **calls `endsWith` on undefined** →
+  `TypeError: undefined is not a function` (reproduces natively: `var u; u?.endsWith(".ts")` throws).
+  So Porffor's optional-chain `a?.b(args)` short-circuits the member access but not the CALL. Next:
+  either fix Porffor's optional-call codegen, or codemod `X?.m(a)` → `X == null ? undefined : X.m(a)`.
+  (Also note `String.prototype.endsWith` returned a *wrong* result in one probe — worth verifying.)
+
+This is the long tail CONTINUE.md warned about — a sequence of semantic self-compile bugs and missing
+builtins. Each fix advances `[run]` a bit further; keep going with the `diagnostics/` loop.
 
 **Progress ladder:** won't-validate → **[validate] GREEN** (§4) → memory-trap → **parser runs** (§5) →
-regex-flag = **empty-string null-ptr** (§6, FIXED) → **wide-regex init** (§6b, FIXED) →
-**func-`.prototype`-at-scale** (§7, HERE). Downstream (porffor.beam, `fe_js`, CLI `.js`) gated on `[run]`.
+**empty-string null-ptr** (§6) → **wide-regex init** (§6b) → **func-`.prototype`/func-lut** (§7, 2 bugs)
+→ **missing-builtins + globalThis + optional-call** (§8, HERE, init stmt ~470). Downstream
+(porffor.beam, `fe_js`, CLI `.js`) gated on `[run]` printing `probe_len=`.
 
 ## 7b. The two Porffor copies (important for any codegen fix)
 

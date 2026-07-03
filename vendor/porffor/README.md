@@ -59,20 +59,24 @@ dist/porffor.compiler.js   →   [Porffor]   →   dist/porffor.wasm   →   [2c
   `codegen.js` `generateCall`; `codemod.mjs` fixes it (FINDINGS §3–4).
 - **parser runs** ✅ — the `memory access out of bounds` trap was acorn not being inlined; patch #5
   forces a static acorn import (FINDINGS §5).
-- **`Regex parse: Invalid flag` FIXED** ✅ — it was NOT a flag bug: Porffor's `makeString` returns the
-  **null pointer 0 for empty strings `''`**, which read garbage at address 0 in the 26 MB self-hosted
-  bundle. Fixed by pointing empty strings at a reserved zero slot (`apply-patches.sh` #7 +
-  `scripts/patch-build-tool.sh`). FINDINGS §6.
-- **`TypeError: Invalid regular expression` FIXED** ✅ — acorn's wide-utf16 identifier-class regexes
-  (Porffor's regex engine is bytestring-only) made lazy so ASCII input never builds them
-  (`apply-patches.sh` #6). FINDINGS §6b.
-- **`[run]` RED** ⛔ — now dies in module init: acorn's first `X.prototype.method = …` throws because
-  **function `.prototype` is `undefined` past ~7-8k functions** (the bundle has 11692). A scale-
-  dependent Porffor self-compile bug with a clean fast repro (`diagnostics/scale-test.mjs`); the
-  current frontier (FINDINGS §7). Downstream (porffor.beam, `fe_js`, CLI `.js`) is gated on `[run]` GREEN.
+- **`Regex parse: Invalid flag` FIXED** ✅ — NOT a flag bug: `makeString` returns null ptr 0 for `''`,
+  which reads garbage at address 0 at bundle scale → reserved zero slot. FINDINGS §6.
+- **`Invalid regular expression` FIXED** ✅ — acorn's wide-utf16 identifier regexes made lazy. §6b.
+- **function `.prototype` `undefined` FIXED** ✅ — the **func lut**, two bugs: capped at 2 pages so
+  `bytesPerFuncLut` drops below the 7-byte min entry (grown to 16 pages), AND a self-hosting-only
+  collision where the string literal `'#func lut'` in the bundle shadows the func-lut page offset
+  (pinned to an explicit offset). `scripts/porffor-codegen-fixes.sh`. FINDINGS §7.
+- **missing builtins / Node globals FIXED (partial)** ✅ — `.replace` is absent, so acorn's `wordsRegexp`
+  rewritten to `.split/.join`; `process` stubbed; `globalThis.X` rewritten to bare declared globals
+  (Porffor doesn't link them). FINDINGS §8.
+- **`[run]` RED** ⛔ — init (now at statement ~470 of 733) hits `file2?.endsWith(".ts")`: Porffor's
+  optional-chain `a?.b(args)` **calls the method on a nullish base** instead of short-circuiting →
+  `TypeError: undefined is not a function`. Plus a long tail of missing builtins ahead. Current
+  frontier (FINDINGS §8). Downstream (porffor.beam, `fe_js`, CLI `.js`) gated on `[run]` GREEN.
 - **progress ladder:** won't-validate → **validate GREEN** → memory-trap → **parser runs** →
-  regex-flag(=empty-string, **fixed**) → wide-regex-init(**fixed**) → **func-`.prototype`-at-scale**.
-- **diagnostics:** `diagnostics/` holds the instrumentation that found §6/§7 (init-statement bracketing,
+  empty-string(**fix**) → wide-regex(**fix**) → func-`.prototype`/func-lut(**fix**) →
+  **missing-builtins + globalThis + optional-call**.
+- **diagnostics:** `diagnostics/` holds the instrumentation that found §6–§8 (init-statement bracketing,
   construction-site markers, function-count scaling) — start there for the next `[run]` bug.
 
 ## Updating Porffor — the standard prompt

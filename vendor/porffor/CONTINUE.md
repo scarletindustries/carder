@@ -17,27 +17,31 @@ Porffor project — this is our own out-of-scope experiment.**
 
 ## Current state — the progress ladder
 
-`won't-validate → [validate] GREEN → memory-trap → parser-runs → regex-flag(=empty-string, FIXED) →
-wide-regex-init(FIXED) → **func-.prototype-at-scale (HERE)** → [run] GREEN → integrate`
+`won't-validate → [validate] GREEN → memory-trap → parser-runs → empty-string(FIXED) →
+wide-regex-init(FIXED) → func-.prototype/func-lut(FIXED) → **missing-builtins+globalThis+optional-call (HERE)** → [run] GREEN → integrate`
 
-- ✅ The pure `compileJS(code)→wasmBytes` bundle works in Node.
-- ✅ `[validate]` GREEN: `wasm-tools validate --features=all dist/porffor.wasm` passes.
-- ✅ Parser runs: the `memory access out of bounds` trap was acorn not being inlined; fixed (patch #5).
-- ✅ **`Regex parse: Invalid flag` FIXED** — it was NOT a flag bug. Porffor's `makeString` returns the
-  **null pointer 0 for every empty string `''`**; at bundle scale address 0 holds garbage, so an empty
-  regex-flags `''` read a bogus length. Fixed by pointing empty strings at a reserved zero slot
-  (`apply-patches.sh` patch #7 + `patch-build-tool.sh`). See FINDINGS §6.
-- ✅ **`TypeError: Invalid regular expression` FIXED** — acorn's wide-utf16 identifier-class regexes;
-  Porffor's regex engine is bytestring-only. Made lazy so ASCII input never builds them
-  (`apply-patches.sh` patch #6). See FINDINGS §6b.
-- ⛔ **CURRENT BUG:** `[run]` dies in **module init** at acorn's first `X.prototype.method = …`
-  (`Position.prototype.offset = …`) because **`Position.prototype` is `undefined`**. This breaks every
-  prototype-based class (all of acorn). It is driven by **total function count**: the exact pattern +
-  6000 dummy functions works in isolation, but ≥8000 reproduces it (`diagnostics/scale-test.mjs`); the
-  bundle has 11692 functions. The surfaced `RangeError: Invalid typed array length` is a red herring
-  (Porffor crashing while converting the real thrown `TypeError`). **Unresolved:** the Porffor
-  constant/region that overflows ~7-8k funcs and stops function prototypes materializing. A clean fast
-  repro exists (no bundle rebuild needed). Full detail + where to dig next: **FINDINGS §7.**
+Init now advances from statement ~54 to **~470** (of 733). Fixed since the last handoff:
+
+- ✅ **`Regex parse: Invalid flag`** — NOT a flag bug: `makeString` returns null ptr 0 for `''`, which
+  reads garbage at address 0 at bundle scale. Fixed → reserved zero slot. FINDINGS §6.
+- ✅ **`TypeError: Invalid regular expression`** — acorn's wide-utf16 identifier regexes made lazy
+  (Porffor regex engine is bytestring-only). FINDINGS §6b.
+- ✅ **function `.prototype` is `undefined`** — the **func lut**, two bugs: (A) it's capped at 2 pages so
+  `bytesPerFuncLut` drops below the 7-byte min entry past ~4681 indirect funcs, corrupting the `constr`
+  flag → grown to 16 pages; (B) a self-hosting-only **collision**: the bundle contains the string literal
+  `'#func lut'`, which interns into `pages.allocs` and shadows the func-lut *page* offset → the lut is
+  written to the wrong place and all func-lut reads return 0 → pinned to an explicit page offset. Both in
+  `scripts/porffor-codegen-fixes.sh`. FINDINGS §7.
+- ✅ **`.replace` missing / `process` undefined / `globalThis.X` not readable bare** — `apply-patches.sh`
+  #8 rewrites acorn's `wordsRegexp` `.replace(/ /g,"|")` → `.split(" ").join("|")`; `codemod.mjs`
+  prepends a `process` stub and rewrites `globalThis.X` → bare `X` (+declares vars). FINDINGS §8.
+- ⛔ **CURRENT BUG:** `[run]` dies in init at `types2 = … || file2?.endsWith(".ts")`. With `file2`
+  undefined, `file2?.endsWith(".ts")` should short-circuit to `undefined`, but Porffor **calls
+  `endsWith` on undefined** → `TypeError: undefined is not a function`. Porffor's optional-chain
+  `a?.b(args)` short-circuits the member access but NOT the call (reproduces natively:
+  `var u; u?.endsWith(".ts")`). Next: fix Porffor's optional-call codegen, OR codemod
+  `X?.m(a)` → `X == null ? undefined : X.m(a)`. Then the next semantic bug surfaces — keep going with the
+  `diagnostics/` loop. Full detail: **FINDINGS §8.**
 
 ## Reproduce in 2 commands
 
