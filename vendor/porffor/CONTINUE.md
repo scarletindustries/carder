@@ -32,16 +32,21 @@ Init now advances from statement ~54 to **~470** (of 733). Fixed since the last 
   `'#func lut'`, which interns into `pages.allocs` and shadows the func-lut *page* offset → the lut is
   written to the wrong place and all func-lut reads return 0 → pinned to an explicit page offset. Both in
   `scripts/porffor-codegen-fixes.sh`. FINDINGS §7.
-- ✅ **`.replace` missing / `process` undefined / `globalThis.X` not readable bare** — `apply-patches.sh`
-  #8 rewrites acorn's `wordsRegexp` `.replace(/ /g,"|")` → `.split(" ").join("|")`; `codemod.mjs`
-  prepends a `process` stub and rewrites `globalThis.X` → bare `X` (+declares vars). FINDINGS §8.
-- ⛔ **CURRENT BUG:** `[run]` dies in init at `types2 = … || file2?.endsWith(".ts")`. With `file2`
-  undefined, `file2?.endsWith(".ts")` should short-circuit to `undefined`, but Porffor **calls
-  `endsWith` on undefined** → `TypeError: undefined is not a function`. Porffor's optional-chain
-  `a?.b(args)` short-circuits the member access but NOT the call (reproduces natively:
-  `var u; u?.endsWith(".ts")`). Next: fix Porffor's optional-call codegen, OR codemod
-  `X?.m(a)` → `X == null ? undefined : X.m(a)`. Then the next semantic bug surfaces — keep going with the
-  `diagnostics/` loop. Full detail: **FINDINGS §8.**
+- ✅ **`.replace` missing / `process` undefined / `globalThis.X` not readable bare / optional-call** —
+  `apply-patches.sh` #8 rewrites acorn's `wordsRegexp` `.replace` → `.split/.join`; `codemod.mjs`
+  prepends a `process` stub, rewrites `globalThis.X` → bare declared `X`, and rewrites optional CALLs
+  `X?.m(a)` → a guard (Porffor calls the method on a nullish base instead of short-circuiting). The
+  optional-call fix advanced init from ~470 to ~703. FINDINGS §8.
+- ⛔ **CURRENT BUG — the fundamental wall:** `[run]` dies at init ~703
+  (`inv = (obj, keyMap=x=>x) => …reduce((acc,x2)=>keyMap(…))`) with
+  `ReferenceError: keyMap is not defined`. Root cause: **Porffor 0.61.13 does not support closures that
+  capture enclosing-function locals/parameters** — only closures over module globals work (native
+  repro: `(a)=>{ var g=()=>a+1; return g() }` throws "a is not defined"). The Porffor compiler uses
+  capturing closures everywhere (`.map`/`.reduce`/`.filter` callbacks, nested `scope` helpers), so
+  this is a **major compiler feature**, not a patch. **This is the real reason upstream self-hosting is
+  unsolved.** Options (all large): wait for/port upstream Porffor closure support; implement closure
+  capture in the vendored codegen; or lambda-lift capturing callbacks via codemod. Full detail +
+  the boundary table: **FINDINGS §8b.**
 
 ## Reproduce in 2 commands
 

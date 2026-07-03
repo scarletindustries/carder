@@ -66,16 +66,17 @@ dist/porffor.compiler.js   →   [Porffor]   →   dist/porffor.wasm   →   [2c
   `bytesPerFuncLut` drops below the 7-byte min entry (grown to 16 pages), AND a self-hosting-only
   collision where the string literal `'#func lut'` in the bundle shadows the func-lut page offset
   (pinned to an explicit offset). `scripts/porffor-codegen-fixes.sh`. FINDINGS §7.
-- **missing builtins / Node globals FIXED (partial)** ✅ — `.replace` is absent, so acorn's `wordsRegexp`
-  rewritten to `.split/.join`; `process` stubbed; `globalThis.X` rewritten to bare declared globals
-  (Porffor doesn't link them). FINDINGS §8.
-- **`[run]` RED** ⛔ — init (now at statement ~470 of 733) hits `file2?.endsWith(".ts")`: Porffor's
-  optional-chain `a?.b(args)` **calls the method on a nullish base** instead of short-circuiting →
-  `TypeError: undefined is not a function`. Plus a long tail of missing builtins ahead. Current
-  frontier (FINDINGS §8). Downstream (porffor.beam, `fe_js`, CLI `.js`) gated on `[run]` GREEN.
+- **missing builtins / Node globals / optional-call FIXED** ✅ — `.replace` absent → acorn's
+  `wordsRegexp` uses `.split/.join`; `process` stubbed; `globalThis.X` → bare declared globals; optional
+  CALL `X?.m(a)` on a nullish base guarded (Porffor calls the method instead of short-circuiting). These
+  advanced init from statement ~54 to **~703 of 733**. FINDINGS §8.
+- **`[run]` RED — the fundamental wall** ⛔ — at init ~703, `ReferenceError: keyMap is not defined`:
+  **Porffor 0.61.13 has no closures that capture enclosing-function locals/parameters** (only closures
+  over module globals work). The compiler uses capturing closures pervasively, so this is a **major
+  compiler feature**, not a patch — the real reason upstream self-hosting is unsolved. FINDINGS §8b.
 - **progress ladder:** won't-validate → **validate GREEN** → memory-trap → **parser runs** →
   empty-string(**fix**) → wide-regex(**fix**) → func-`.prototype`/func-lut(**fix**) →
-  **missing-builtins + globalThis + optional-call**.
+  missing-builtins + globalThis + optional-call(**fix**) → **closures-over-locals (fundamental)**.
 - **diagnostics:** `diagnostics/` holds the instrumentation that found §6–§8 (init-statement bracketing,
   construction-site markers, function-count scaling) — start there for the next `[run]` bug.
 

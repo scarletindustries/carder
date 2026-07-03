@@ -182,21 +182,48 @@ Past §7, init advances through a *sequence* of Porffor limitations (each locali
   declares those as module `var`s — EXCEPT names that are also local `let/const/var` bindings (e.g.
   `let importFuncs = globalThis.importFuncs = []`, which would become a TDZ self-reference). The proper
   fix is a Porffor `generateIdent` fallback to `globalThis[name]` for undeclared globals — future work.
-- **⛔ CURRENT: optional call on a nullish base doesn't short-circuit.** Init reaches
-  `types2 = Prefs.parseTypes || Prefs.t || file2?.endsWith(".ts")`; with `file2` undefined,
-  `file2?.endsWith(".ts")` should be `undefined`, but Porffor **calls `endsWith` on undefined** →
-  `TypeError: undefined is not a function` (reproduces natively: `var u; u?.endsWith(".ts")` throws).
-  So Porffor's optional-chain `a?.b(args)` short-circuits the member access but not the CALL. Next:
-  either fix Porffor's optional-call codegen, or codemod `X?.m(a)` → `X == null ? undefined : X.m(a)`.
-  (Also note `String.prototype.endsWith` returned a *wrong* result in one probe — worth verifying.)
+- **optional call on a nullish base doesn't short-circuit** — `file2?.endsWith(".ts")` with `file2`
+  undefined should be `undefined`, but Porffor evaluates `file2?.endsWith` to undefined and then CALLS
+  it → `TypeError: undefined is not a function` (native: `var u; u?.m()` throws). Plain optional MEMBER
+  access works; only optional CALLs are broken. `codemod.mjs` transform #3 rewrites `X?.m(a)` →
+  `((_t)=>_t==null?undefined:_t.m(a))(X)` (single-eval, keeps `this`). **This advanced init from ~470
+  to ~703** (it fixed many sites), which uncovered the fundamental wall below.
 
-This is the long tail CONTINUE.md warned about — a sequence of semantic self-compile bugs and missing
-builtins. Each fix advances `[run]` a bit further; keep going with the `diagnostics/` loop.
+## 8b. THE FUNDAMENTAL WALL: Porffor has no closures over enclosing-function locals ⛔ (HERE)
+
+At init statement ~703 (`var invOpcodes = inv(Opcodes2)` where
+`inv = (obj, keyMap = x=>x) => Object.keys(obj).reduce((acc,x2)=>{ acc[keyMap(obj[x2])]=x2; … })`),
+`[run]` fails `ReferenceError: keyMap is not defined`. Minimal native repros isolate it precisely:
+
+| construct | result |
+|---|---|
+| `var g = () => G+1` capturing a **module global** `G` | **works** (101) |
+| `(a) => { var g = () => a+1; return g() }` capturing an **enclosing param** | ❌ `a is not defined` |
+| `function outer(a){ function inner(){ return a } return inner() }` | ❌ (same) |
+| `(a) => [1,2].reduce((acc,x) => acc+a, 0)` (capture in a builtin callback) | ❌ `a is not defined` |
+
+**Porffor 0.61.13 does not implement closures that capture enclosing-function locals/parameters** —
+only closures over module-level globals work. This is not a codemod-able construct or a missing builtin;
+it is a **major compiler feature**. The Porffor compiler uses capturing closures *pervasively* (every
+`.map`/`.reduce`/`.filter`/`.sort`/`.find` callback that references an outer variable, plus nested
+codegen helpers over `scope`/`func`), so self-hosting cannot get much past here until Porffor gains
+closure support. **This is the real reason upstream Porffor self-hosting is unsolved** — the earlier
+items (§6–§8) were a tractable sequence of bugs/missing-builtins; this is a foundational gap.
+
+Options for the next agent (all large): (a) wait for / port upstream Porffor closure support and
+re-vendor; (b) implement closure capture in the vendored Porffor codegen (heap-allocated environments —
+substantial); (c) a codemod that lambda-lifts capturing callbacks into top-level functions threading the
+captured vars as explicit args (mechanical but must handle every `.map`/`.reduce`/… site and mutation
+semantics — very broad). There is no quick patch.
+
+This is the long tail CONTINUE.md warned about; §6–§8 cleared the tractable part. Each fix advanced
+`[run]` further (init stmt 54 → 703 of 733); the closure wall is where the effort/return changes shape.
 
 **Progress ladder:** won't-validate → **[validate] GREEN** (§4) → memory-trap → **parser runs** (§5) →
 **empty-string null-ptr** (§6) → **wide-regex init** (§6b) → **func-`.prototype`/func-lut** (§7, 2 bugs)
-→ **missing-builtins + globalThis + optional-call** (§8, HERE, init stmt ~470). Downstream
-(porffor.beam, `fe_js`, CLI `.js`) gated on `[run]` printing `probe_len=`.
+→ **missing-builtins + globalThis + optional-call** (§8, all FIXED) → **closures-over-locals**
+(§8b, HERE — fundamental, init stmt ~703/733). Downstream (porffor.beam, `fe_js`, CLI `.js`) gated on
+`[run]` printing `probe_len=`.
 
 ## 7b. The two Porffor copies (important for any codegen fix)
 
