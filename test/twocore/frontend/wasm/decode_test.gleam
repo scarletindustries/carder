@@ -1546,3 +1546,538 @@ pub fn decode_has_no_partial_constructs_test() {
   string.contains(code, "todo")
   |> should.equal(False)
 }
+
+// ═══════════════════ Phase 6: SIMD (the 0xFD family, «WASM-AST4») ═══════════════════
+// Assertions target the WebAssembly SIMD BINARY ENCODING, cited per fixture — never
+// "whatever decode emits":
+//  - the 0xFD sub-opcode table:  binary/instructions.html#vector-instructions
+//                              + appendix/index-instructions.html (authoritative index)
+//  - the single-byte laneidx, 16-byte v128.const, 16-byte shuffle:
+//                                binary/instructions.html#binary-laneidx
+//  - the v128 valtype byte 0x7B: binary/types.html#value-types
+//  - the -5 v128 blocktype:      binary/instructions.html#binary-blocktype
+
+// ───────────────────────────── SIMD helpers ─────────────────────────────
+
+/// Encode `n` as an unsigned LEB128 `u32` (the wire form of a 0xFD sub-opcode). Used so
+/// that a multi-byte sub-opcode such as `i32x4.add = 174` becomes `[0xAE, 0x01]`.
+fn uleb(n: Int) -> List(Int) {
+  case n < 0x80 {
+    True -> [n]
+    False -> [n % 0x80 + 0x80, ..uleb(n / 0x80)]
+  }
+}
+
+/// A minimal module whose single function has signature `functype` (raw functype bytes,
+/// e.g. `[0x60, 0x01, 0x7B, 0x01, 0x7B]` for `(param v128)(result v128)`), the given raw
+/// `locals_bytes` (a full `vec(locals)`, e.g. `[0x00]` for none, `[0x01, 0x01, 0x7B]` for
+/// one `v128` local), and the given `body` (already including its terminating `0x0B`).
+fn module_with_locals_body(
+  functype: List(Int),
+  locals_bytes: List(Int),
+  body: List(Int),
+) -> List(Int) {
+  let type_body = list.append([0x01], functype)
+  let type_section = list.append([0x01, list.length(type_body)], type_body)
+  let function_section = [0x03, 0x02, 0x01, 0x00]
+  let code_entry_body = list.append(locals_bytes, body)
+  let code_entry = list.append([list.length(code_entry_body)], code_entry_body)
+  let code_vec = list.append([0x01], code_entry)
+  let code_section = list.append([0x0A, list.length(code_vec)], code_vec)
+  list.flatten([
+    [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
+    type_section,
+    function_section,
+    code_section,
+  ])
+}
+
+/// `module_with_locals_body` with no declared locals.
+fn module_with_sig_body(functype: List(Int), body: List(Int)) -> List(Int) {
+  module_with_locals_body(functype, [0x00], body)
+}
+
+/// Decode a single `0xFD` instruction (sub-opcode `sub` + raw `imms` immediate bytes)
+/// placed as the whole body of a `() -> ()` function, returning the FIRST decoded
+/// instruction (the SIMD one) or the `DecodeError`. The trailing `End` is appended
+/// automatically. `imms` is the exact wire immediate (a memarg, 16 const bytes, a lane
+/// byte, …); pass `[]` for a pure lane op.
+fn simd_first(sub: Int, imms: List(Int)) -> Result(ast.Instr, ast.DecodeError) {
+  let body = list.flatten([[0xFD], uleb(sub), imms, [0x0B]])
+  case decode.decode(bytes(module_with_body(body))) {
+    Ok(m) ->
+      case m.funcs {
+        [f] ->
+          case f.body {
+            [i, ..] -> Ok(i)
+            _ -> Error(ast.Truncated)
+          }
+        _ -> Error(ast.Truncated)
+      }
+    Error(e) -> Error(e)
+  }
+}
+
+/// `simd_first`, asserting a successful decode. Panics (test failure) if decode errored —
+/// used only for the OK worked-fixtures where the wire is well-formed.
+fn simd_ok(sub: Int, imms: List(Int)) -> ast.Instr {
+  let assert Ok(i) = simd_first(sub, imms)
+  i
+}
+
+// ───────────────── the v128 value type in every valtype position ─────────────────
+
+pub fn decode_v128_param_result_test() {
+  // (func (param v128) (result v128) local.get 0). functype 0x60 01 7B 01 7B.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        module_with_sig_body([0x60, 0x01, 0x7B, 0x01, 0x7B], [0x20, 0x00, 0x0B]),
+      ),
+    )
+  m.types
+  |> should.equal([ast.FuncType([ast.V128], [ast.V128])])
+  let assert [func] = m.funcs
+  func.body
+  |> should.equal([ast.LocalGet(0), ast.End])
+}
+
+pub fn decode_v128_local_test() {
+  // (func) with one (local v128): locals vec = [0x01 group][0x01 count][0x7B v128].
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        module_with_locals_body([0x60, 0x00, 0x00], [0x01, 0x01, 0x7B], [0x0B]),
+      ),
+    )
+  let assert [func] = m.funcs
+  func.locals
+  |> should.equal([ast.V128])
+}
+
+pub fn decode_v128_global_test() {
+  // (global v128 (v128.const i32x4 0 0 0 0)) — v128 valtype + a v128.const const-expr.
+  // global = [0x7B valtype][0x00 const][0xFD 0x0C <16 bytes>][0x0B end].
+  let global_bytes =
+    list.flatten([[0x7B, 0x00, 0xFD, 0x0C], list.repeat(0x00, 16), [0x0B]])
+  let seg = list.append([0x01], global_bytes)
+  let section = list.append([0x06, list.length(seg)], seg)
+  let assert Ok(m) = decode.decode(bytes(module_with_section(section)))
+  m.globals
+  |> should.equal([
+    ast.Global(ty: ast.V128, mutable: False, init: [
+      ast.V128Const(bytes(list.repeat(0x00, 16))),
+    ]),
+  ])
+}
+
+pub fn decode_v128_select_t_test() {
+  // select (result v128): typed-select 0x1C, a vec(valtype) of one v128 (0x7B).
+  let assert Ok(m) =
+    decode.decode(bytes(module_with_body([0x1C, 0x01, 0x7B, 0x0B])))
+  let assert [func] = m.funcs
+  func.body
+  |> should.equal([ast.SelectT([ast.V128]), ast.End])
+}
+
+pub fn decode_v128_blocktype_test() {
+  // (block (result v128) …): 0x02 blocktype-byte 0x7B (s33 = -5) → BlockVal(V128).
+  let assert Ok(m) =
+    decode.decode(bytes(module_with_body([0x02, 0x7B, 0x0B, 0x0B])))
+  let assert [func] = m.funcs
+  func.body
+  |> should.equal([ast.Block(ast.BlockVal(ast.V128)), ast.End, ast.End])
+}
+
+pub fn decode_v128_reftype_still_bad_test() {
+  // v128 (0x7B) is NOT a reftype: ref.null with heaptype 0x7B → BadHeapType (a
+  // reftype-only position), while `bad_heap_type_table_test` covers the tabletype
+  // position. Contrast: a (param v128) — a valtype position — is ACCEPTED (above).
+  decode.decode(bytes(module_with_body([0xD0, 0x7B, 0x0B])))
+  |> should.equal(Error(ast.BadHeapType))
+}
+
+// ───────────────── v128.const + i8x16.shuffle immediates (anti-swap) ─────────────────
+
+pub fn decode_v128_const_anti_swap_test() {
+  // v128.const (sub 12) reads 16 RAW little-endian bytes verbatim. Bytes 00 01 … 0F must
+  // decode to exactly <<0,1,…,15>> — proving byte order is preserved (not reversed).
+  simd_ok(12, int_range(0, 15))
+  |> should.equal(ast.V128Const(bytes(int_range(0, 15))))
+}
+
+pub fn decode_shuffle_anti_swap_test() {
+  // i8x16.shuffle (sub 13) reads 16 lane bytes; lanes 0..15 → [0,…,15] (lanes[0] is
+  // result lane 0 — not reversed).
+  simd_ok(13, int_range(0, 15))
+  |> should.equal(ast.I8x16Shuffle(int_range(0, 15)))
+}
+
+pub fn decode_shuffle_permutation_test() {
+  // A distinct permutation proves each byte lands at its result-lane position and the
+  // a/b halves are not swapped: [16,0,17,1,18,2,…,23,7].
+  let lanes = [16, 0, 17, 1, 18, 2, 19, 3, 20, 4, 21, 5, 22, 6, 23, 7]
+  simd_ok(13, lanes)
+  |> should.equal(ast.I8x16Shuffle(lanes))
+}
+
+// ───────────────── splat / swizzle / extract-replace lane ─────────────────
+
+pub fn decode_swizzle_and_splat_test() {
+  // i8x16.swizzle (14) → SSwizzle; i32x4.splat (17) → SSplat(I32x4);
+  // f64x2.splat (20) → SSplat(F64x2).
+  simd_ok(14, [])
+  |> should.equal(ast.Simd(ast.SSwizzle))
+  simd_ok(17, [])
+  |> should.equal(ast.Simd(ast.SSplat(ast.I32x4)))
+  simd_ok(20, [])
+  |> should.equal(ast.Simd(ast.SSplat(ast.F64x2)))
+}
+
+pub fn decode_extract_replace_lane_test() {
+  // i8x16.extract_lane_s 3 (21) → SExtractLaneS(I8x16, 3);
+  // i32x4.replace_lane 2 (28) → SReplaceLane(I32x4, 2);
+  // f64x2.extract_lane 1 (33) → SExtractLane(F64x2, 1). The lane byte is the immediate.
+  simd_ok(21, [3])
+  |> should.equal(ast.Simd(ast.SExtractLaneS(ast.I8x16, 3)))
+  simd_ok(28, [2])
+  |> should.equal(ast.Simd(ast.SReplaceLane(ast.I32x4, 2)))
+  simd_ok(33, [1])
+  |> should.equal(ast.Simd(ast.SExtractLane(ast.F64x2, 1)))
+}
+
+// ───────────────── per-shape arithmetic (multi-byte LEB disambiguation) ─────────────────
+
+pub fn decode_simd_arith_disambiguation_test() {
+  // i8x16.add (110, one-byte sub) → SAdd(I8x16);
+  // i32x4.add (174, TWO-byte LEB 0xAE 0x01) → SAdd(I32x4);
+  // i64x2.mul (213, 0xD5 0x01) → SMul(I64x2). Proves multi-byte sub-opcode + shape.
+  simd_ok(110, [])
+  |> should.equal(ast.Simd(ast.SAdd(ast.I8x16)))
+  simd_ok(174, [])
+  |> should.equal(ast.Simd(ast.SAdd(ast.I32x4)))
+  simd_ok(213, [])
+  |> should.equal(ast.Simd(ast.SMul(ast.I64x2)))
+  // sanity: the multi-byte sub-opcode really is [0xAE, 0x01] for 174.
+  uleb(174)
+  |> should.equal([0xAE, 0x01])
+}
+
+pub fn decode_simd_float_lanes_test() {
+  // f32x4.mul (230) → FMul(F32x4); f64x2.pmin (246) → FPMin(F64x2);
+  // f32x4.sqrt (227) → FSqrt(F32x4).
+  simd_ok(230, [])
+  |> should.equal(ast.Simd(ast.FMul(ast.F32x4)))
+  simd_ok(246, [])
+  |> should.equal(ast.Simd(ast.FPMin(ast.F64x2)))
+  simd_ok(227, [])
+  |> should.equal(ast.Simd(ast.FSqrt(ast.F32x4)))
+}
+
+pub fn decode_simd_comparison_order_test() {
+  // i32x4.eq (55) → SEq(I32x4); f64x2.gt (74) → FGt(F64x2) [asserting gt is 74, NOT le];
+  // i64x2.lt_s (216) → SLtS(I64x2) [the i64x2 compares live at 214..219, not 35..76].
+  simd_ok(55, [])
+  |> should.equal(ast.Simd(ast.SEq(ast.I32x4)))
+  simd_ok(74, [])
+  |> should.equal(ast.Simd(ast.FGt(ast.F64x2)))
+  simd_ok(216, [])
+  |> should.equal(ast.Simd(ast.SLtS(ast.I64x2)))
+}
+
+pub fn decode_simd_bitwise_order_test() {
+  // v128.andnot (79) → VAndNot [asserting 79 is andnot, NOT or]; v128.bitselect (82) →
+  // VBitselect; v128.any_true (83) → VAnyTrue.
+  simd_ok(79, [])
+  |> should.equal(ast.Simd(ast.VAndNot))
+  simd_ok(82, [])
+  |> should.equal(ast.Simd(ast.VBitselect))
+  simd_ok(83, [])
+  |> should.equal(ast.Simd(ast.VAnyTrue))
+}
+
+pub fn decode_simd_narrow_widen_dot_extmul_test() {
+  // One representative of each non-uniform family:
+  //  i8x16.narrow_i16x8_s (101) → SNarrow(I16x8, True)
+  //  i16x8.extend_low_i8x16_u (137) → SExtend(I8x16, Low, False)
+  //  i32x4.dot_i16x8_s (186) → SDotI16x8S
+  //  i64x2.extmul_high_i32x4_u (223) → SExtMul(I32x4, High, False)
+  //  i32x4.extadd_pairwise_i16x8_s (126) → SExtAddPairwise(I16x8, True)
+  //  i16x8.q15mulr_sat_s (130) → SQ15MulrSatS ; i8x16.popcnt (98) → SPopcnt(I8x16)
+  simd_ok(101, [])
+  |> should.equal(ast.Simd(ast.SNarrow(ast.I16x8, True)))
+  simd_ok(137, [])
+  |> should.equal(ast.Simd(ast.SExtend(ast.I8x16, ast.Low, False)))
+  simd_ok(186, [])
+  |> should.equal(ast.Simd(ast.SDotI16x8S))
+  simd_ok(223, [])
+  |> should.equal(ast.Simd(ast.SExtMul(ast.I32x4, ast.High, False)))
+  simd_ok(126, [])
+  |> should.equal(ast.Simd(ast.SExtAddPairwise(ast.I16x8, True)))
+  simd_ok(130, [])
+  |> should.equal(ast.Simd(ast.SQ15MulrSatS))
+  simd_ok(98, [])
+  |> should.equal(ast.Simd(ast.SPopcnt(ast.I8x16)))
+}
+
+pub fn decode_simd_saturating_add_sub_test() {
+  // The saturating add/sub family (RECONCILIATION S3): i8x16.add_sat_s (111),
+  // i8x16.add_sat_u (112), i16x8.sub_sat_s (146), i16x8.sub_sat_u (147).
+  simd_ok(111, [])
+  |> should.equal(ast.Simd(ast.SAddSatS(ast.I8x16)))
+  simd_ok(112, [])
+  |> should.equal(ast.Simd(ast.SAddSatU(ast.I8x16)))
+  simd_ok(146, [])
+  |> should.equal(ast.Simd(ast.SSubSatS(ast.I16x8)))
+  simd_ok(147, [])
+  |> should.equal(ast.Simd(ast.SSubSatU(ast.I16x8)))
+}
+
+pub fn decode_simd_conversions_test() {
+  // i32x4.trunc_sat_f32x4_s (248) → STruncSatF32x4S; f64x2.promote_low_f32x4 (95) →
+  // SPromoteLowF32x4; f32x4.demote_f64x2_zero (94) → SDemoteF64x2Zero;
+  // f32x4.convert_i32x4_s (250) → SConvertF32x4I32x4S.
+  simd_ok(248, [])
+  |> should.equal(ast.Simd(ast.STruncSatF32x4S))
+  simd_ok(95, [])
+  |> should.equal(ast.Simd(ast.SPromoteLowF32x4))
+  simd_ok(94, [])
+  |> should.equal(ast.Simd(ast.SDemoteF64x2Zero))
+  simd_ok(250, [])
+  |> should.equal(ast.Simd(ast.SConvertF32x4I32x4S))
+}
+
+// ───────────────── v128 memory (load / store / splat / extend / zero) ─────────────────
+
+pub fn decode_simd_memory_loads_test() {
+  // v128.load (0) align=4 offset=0 → SimdLoad(LoadV128, MemArg(4,0,0));
+  // v128.load8_splat (7) → SimdLoad(LoadSplat(8), …);
+  // v128.load32x2_u (6) → SimdLoad(LoadExtend(32, False), …);
+  // v128.load64_zero (93) → SimdLoad(LoadZero(64), …). memarg = [align, offset].
+  simd_ok(0, [0x04, 0x00])
+  |> should.equal(ast.SimdLoad(ast.LoadV128, ast.MemArg(4, 0, 0)))
+  simd_ok(7, [0x00, 0x00])
+  |> should.equal(ast.SimdLoad(ast.LoadSplat(8), ast.MemArg(0, 0, 0)))
+  simd_ok(6, [0x03, 0x00])
+  |> should.equal(ast.SimdLoad(ast.LoadExtend(32, False), ast.MemArg(3, 0, 0)))
+  simd_ok(93, [0x03, 0x00])
+  |> should.equal(ast.SimdLoad(ast.LoadZero(64), ast.MemArg(3, 0, 0)))
+}
+
+pub fn decode_simd_store_and_memidx_test() {
+  // v128.store (11) → SimdStore(MemArg); a (memory 1) form sets MemArg.mem == 1 (the
+  // bit-6 memidx flag: align byte 0x44 = 4 | 0x40, then memidx 0x01, then offset 0x00).
+  simd_ok(11, [0x04, 0x00])
+  |> should.equal(ast.SimdStore(ast.MemArg(4, 0, 0)))
+  simd_ok(0, [0x44, 0x01, 0x00])
+  |> should.equal(ast.SimdLoad(ast.LoadV128, ast.MemArg(4, 0, 1)))
+}
+
+pub fn decode_simd_load_store_lane_anti_swap_test() {
+  // load/store-lane read a memarg THEN a lane byte (§E.4). v128.load8_lane (84) with
+  // align=0 offset=4 lane=3 → SimdLoadLane(8, MemArg(0,4,0), 3): a swap would read
+  // align=4 and take 0 as the lane. v128.store64_lane (91) → the store form.
+  simd_ok(84, [0x00, 0x04, 0x03])
+  |> should.equal(ast.SimdLoadLane(8, ast.MemArg(0, 4, 0), 3))
+  simd_ok(91, [0x00, 0x04, 0x03])
+  |> should.equal(ast.SimdStoreLane(64, ast.MemArg(0, 4, 0), 3))
+  // (memory 1) lane form: memidx-then-offset-then-lane all exercised.
+  simd_ok(85, [0x40, 0x01, 0x00, 0x02])
+  |> should.equal(ast.SimdLoadLane(16, ast.MemArg(0, 0, 1), 2))
+}
+
+// ───────────────── memory64 decode is unchanged after AST4 (§F regression) ─────────────────
+
+pub fn decode_memory64_still_idx64_test() {
+  // (memory i64 1): limits flag 0x04 (Idx64, no max), min 1 → MemType(Limits(1,None), Idx64).
+  let mem64 = [0x05, 0x03, 0x01, 0x04, 0x01]
+  let assert Ok(m) = decode.decode(bytes(module_with_section(mem64)))
+  m.memories
+  |> should.equal([ast.MemType(ast.Limits(1, None), ast.Idx64)])
+  // (memory 1): flag 0x00 → Idx32 (unchanged).
+  let mem32 = [0x05, 0x03, 0x01, 0x00, 0x01]
+  let assert Ok(m2) = decode.decode(bytes(module_with_section(mem32)))
+  m2.memories
+  |> should.equal([ast.MemType(ast.Limits(1, None), ast.Idx32)])
+}
+
+// ───────────────── neutrality: a non-SIMD module is unchanged ─────────────────
+
+pub fn decode_simd_neutrality_test() {
+  // The `add` fixture (no 0xFD, no v128) decodes to the SAME AST as before the SIMD
+  // additions — no `Simd*`/`V128Const` node, no `V128` valtype appears.
+  let assert Ok(m) = decode.decode(bytes(add_fixture))
+  m.types
+  |> should.equal([ast.FuncType([ast.I32, ast.I32], [ast.I32])])
+  let assert [func] = m.funcs
+  func.body
+  |> should.equal([ast.LocalGet(0), ast.LocalGet(1), ast.I32Add, ast.End])
+}
+
+// ───────────────── fail-closed: reserved gaps + relaxed-SIMD ─────────────────
+
+pub fn decode_simd_reserved_gaps_test() {
+  // The reserved gaps in 0..255 are UnknownSimdOpcode — sample one from each block:
+  // 154 (i16x8), 162 (i32x4), 226 (f32x4), 238 (f64x2).
+  [154, 162, 226, 238]
+  |> list.each(fn(sub) {
+    simd_first(sub, [])
+    |> should.equal(Error(ast.UnknownSimdOpcode(sub)))
+  })
+}
+
+pub fn decode_simd_relaxed_out_of_scope_test() {
+  // Relaxed-SIMD sub-opcodes (>= 256) are deferred → UnknownSimdOpcode. 256 encodes as
+  // [0x80, 0x02], 300 as [0xAC, 0x02].
+  simd_first(256, [])
+  |> should.equal(Error(ast.UnknownSimdOpcode(256)))
+  simd_first(300, [])
+  |> should.equal(Error(ast.UnknownSimdOpcode(300)))
+}
+
+// ───────────────── fail-closed: truncated immediates ─────────────────
+
+pub fn decode_simd_truncated_const_test() {
+  // v128.const (12) with only 10 immediate bytes (needs 16) → Truncated.
+  simd_first(12, list.repeat(0x00, 10))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn decode_simd_truncated_shuffle_test() {
+  // i8x16.shuffle (13) with only 8 lane bytes (needs 16) → Truncated.
+  simd_first(13, list.repeat(0x00, 8))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn decode_simd_truncated_lane_byte_test() {
+  // i8x16.extract_lane_s (21) with the lane byte absent (EOF) → Truncated. Building the
+  // body directly (no auto-appended End) so nothing supplies the missing byte.
+  decode.decode(bytes(module_with_body([0xFD, 0x15])))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn decode_simd_truncated_load_lane_test() {
+  // v128.load8_lane (84) with the memarg present but the lane byte at EOF → Truncated.
+  // Body [0xFD, 84, align=0, offset=0] and then EOF (no lane byte, no End).
+  decode.decode(bytes(module_with_body([0xFD, 84, 0x00, 0x00])))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn decode_simd_truncated_memidx_test() {
+  // v128.load (0) whose memarg sets the bit-6 memidx flag (0x40) but whose memidx LEB is
+  // truncated (a lone continuation byte 0x80 at EOF) → Truncated.
+  decode.decode(bytes(module_with_body([0xFD, 0x00, 0x40, 0x80])))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn decode_simd_truncated_subopcode_test() {
+  // A 0xFD whose sub-opcode LEB is a lone continuation byte at EOF → Truncated.
+  decode.decode(bytes(module_with_body([0xFD, 0x80])))
+  |> should.equal(Error(ast.Truncated))
+  // An over-wide sub-opcode LEB (five continuation bytes exceed the u32 width) →
+  // LebTooLong (a fail-closed LEB rejection, never a silent wrap).
+  decode.decode(bytes(module_with_body([0xFD, 0x80, 0x80, 0x80, 0x80, 0x80])))
+  |> should.equal(Error(ast.LebTooLong))
+}
+
+// ───────────────── totality: fuzz over a SIMD fixture ─────────────────
+
+/// A packed SIMD fixture (all sizes computed by `module_with_body`): v128.const,
+/// i8x16.shuffle, i32x4.add, v128.load, v128.load8_lane. Built by function rather than a
+/// hand-sized `const` so the code-section length fields are always correct.
+fn simd_fixture() -> List(Int) {
+  module_with_body(
+    list.flatten([
+      [0xFD, 0x0C],
+      int_range(0, 15),
+      // v128.const 00..0F
+      [0xFD, 0x0D],
+      int_range(0, 15),
+      // i8x16.shuffle 00..0F
+      [0xFD, 0xAE, 0x01],
+      // i32x4.add
+      [0xFD, 0x00, 0x04, 0x00],
+      // v128.load align=4 offset=0
+      [0xFD, 0x54, 0x00, 0x04, 0x03],
+      // v128.load8_lane align=0 offset=4 lane=3
+      [0x0B],
+    ]),
+  )
+}
+
+pub fn decode_simd_fixture_decodes_test() {
+  // The packed SIMD fixture decodes cleanly to the five expected instructions — proving
+  // the byte layout is well-formed (so the fuzz/truncation sweeps are meaningful).
+  let assert Ok(m) = decode.decode(bytes(simd_fixture()))
+  let assert [func] = m.funcs
+  func.body
+  |> should.equal([
+    ast.V128Const(bytes(int_range(0, 15))),
+    ast.I8x16Shuffle(int_range(0, 15)),
+    ast.Simd(ast.SAdd(ast.I32x4)),
+    ast.SimdLoad(ast.LoadV128, ast.MemArg(4, 0, 0)),
+    ast.SimdLoadLane(8, ast.MemArg(0, 4, 0), 3),
+    ast.End,
+  ])
+}
+
+pub fn fuzz_simd_fixture_mutations_test() {
+  // Every single-byte mutation of the SIMD fixture stays TOTAL (a Result, never a
+  // panic/crash) — the fail-closed property over the whole 0xFD surface (D4/H6).
+  sweep_single_byte_mutations(simd_fixture())
+  |> should.equal(True)
+}
+
+pub fn fuzz_simd_fixture_truncation_test() {
+  // Every prefix of the SIMD fixture decodes to a Result; the full fixture is Ok and
+  // every shorter prefix is an Error (never a crash).
+  let fixture = simd_fixture()
+  let full = decode.decode(bytes(fixture))
+  let len = list.length(fixture)
+  list.all(int_range(0, len), fn(n) {
+    let r = decode.decode(bytes(list.take(fixture, n)))
+    case n == len {
+      True -> r == full
+      False -> is_total(r) && r != full
+    }
+  })
+  |> should.equal(True)
+}
+
+// ───────────────── the opcode-map audit (spec-exhaustive over 0..255) ─────────────────
+
+pub fn decode_simd_opcode_map_audit_test() {
+  // Derived from the spec's 0xFD opcode table, NOT the implementation: sweep every
+  // sub-opcode 0..255 (each wrapped as a 0xFD instruction with a generous zero-immediate
+  // pad) and assert EXACTLY the 236 assigned sub-opcodes decode Ok and EXACTLY the 20
+  // reserved gaps decode UnknownSimdOpcode(sub). A mis-transcribed opcode fails this.
+  let gaps = [
+    154, 162, 165, 166, 175, 176, 178, 179, 180, 187, 194, 197, 198, 207, 208,
+    210, 211, 212, 226, 238,
+  ]
+  // Sanity: the spec's audit says 236 assigned + 20 gaps = 256.
+  list.length(gaps)
+  |> should.equal(20)
+  let pad = list.repeat(0x00, 20)
+  let misbehaving =
+    list.filter(int_range(0, 255), fn(sub) {
+      let body = list.flatten([[0xFD], uleb(sub), pad, [0x0B]])
+      let result = decode.decode(bytes(module_with_body(body)))
+      case list.contains(gaps, sub) {
+        // a gap must report UnknownSimdOpcode(sub)
+        True -> result != Error(ast.UnknownSimdOpcode(sub))
+        // an assigned sub must decode Ok
+        False ->
+          case result {
+            Ok(_) -> False
+            Error(_) -> True
+          }
+      }
+    })
+  // No sub misbehaves (the list names any offender for a legible failure).
+  misbehaving
+  |> should.equal([])
+  // And exactly 236 subs are assigned (non-gap).
+  list.length(int_range(0, 255)) - list.length(gaps)
+  |> should.equal(236)
+}

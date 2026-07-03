@@ -36,20 +36,26 @@
 
 import gleam/option.{type Option}
 
-/// A WebAssembly value type — the four number types plus the two MVP reference
-/// types (Phase 5, `«WASM-AST3»`).
+/// A WebAssembly value type — the four number types, the 128-bit SIMD vector type
+/// (Phase 6, `«WASM-AST4»`), and the two MVP reference types (Phase 5, `«WASM-AST3»`).
 ///
 /// In the binary format each is a single byte: `i32 = 0x7F`, `i64 = 0x7E`,
-/// `f32 = 0x7D`, `f64 = 0x7C`, `funcref = 0x70`, `externref = 0x6F`
-/// (spec binary/types.html#reference-types). There is **no separate `RefType`** in
-/// the AST — a reftype is exactly the `FuncRef`/`ExternRef` subset of `ValType`,
-/// validated positionally by `decode_reftype` (so one `decode_valtype` serves every
-/// valtype site). No `v128` (SIMD, Phase 6) and no GC-proposal reftypes.
+/// `f32 = 0x7D`, `f64 = 0x7C`, `v128 = 0x7B`, `funcref = 0x70`, `externref = 0x6F`
+/// (spec binary/types.html#value-types). `V128` is the low-level 128-bit fixed-width
+/// SIMD value (`«WASM-AST4»`) — it is **NOT** a reference type: `decode_reftype`
+/// (reftype-only positions) still rejects `0x7B` with `BadHeapType`; only
+/// `decode_valtype` accepts it. There is **no separate `RefType`** in the AST — a
+/// reftype is exactly the `FuncRef`/`ExternRef` subset of `ValType`, validated
+/// positionally by `decode_reftype` (so one `decode_valtype` serves every valtype
+/// site). No GC-proposal reftypes. A non-SIMD module never carries `V128`, so every
+/// existing exhaustive match over `ValType` gains one unreachable-in-practice arm and
+/// stays byte-identical (lower maps `V128 → ir.TV128`, 1:1 like `FuncRef`/`TFuncRef`).
 pub type ValType {
   I32
   I64
   F32
   F64
+  V128
   FuncRef
   ExternRef
 }
@@ -323,6 +329,165 @@ pub type Module {
     data_count: Option(Int),
     exports: List(Export),
   )
+}
+
+// ===================== Phase 6 SIMD types («WASM-AST4») =====================
+
+/// The six standardized SIMD lane shapes (spec §2.3.2 — the fixed-width SIMD value
+/// interpretations). A shape tags the shape-uniform `SimdOp` constructors the way an
+/// integer width tags a numeric op. Integer shapes (`I8x16`/`I16x8`/`I32x4`/`I64x2`)
+/// tag the integer lane ops; float shapes (`F32x4`/`F64x2`) tag the float lane ops. A
+/// shape's lane bit-width is `128 / lane_count`: `I8x16`→8, `I16x8`→16, `I32x4`→32,
+/// `I64x2`→64, `F32x4`→32, `F64x2`→64.
+///
+/// AST-PRIVATE — the IR has its own `SimdShape`; this spelling mirrors it 1:1 so
+/// lower's (P6-05) relabel is mechanical. A `(shape, op)` pair with no standardized
+/// opcode (e.g. `SMul(I8x16)`, `SLtU(I64x2)`) is simply never produced by decode; the
+/// enum admits it, the wire does not.
+pub type SimdShape {
+  I8x16
+  I16x8
+  I32x4
+  I64x2
+  F32x4
+  F64x2
+}
+
+/// Which half of a source vector a widening/extending op (`SExtend`/`SExtMul`) consumes.
+/// `Low` selects source lanes `0 .. n/2-1`, `High` selects `n/2 .. n-1`, each promoted to
+/// the double-width result shape. Mirrors `ir.SimdHalf` 1:1 (lower relabels).
+pub type SimdHalf {
+  Low
+  High
+}
+
+/// A single lane-wise SIMD operation, carried by the `Simd(op)` `Instr` (the immediate-
+/// bearing SIMD ops get dedicated `Instr`s instead — see `Instr`). AST-PRIVATE; it
+/// deliberately mirrors `ir.SimdOp` constructor-for-constructor so lower (P6-05) relabels
+/// near-1:1 — the sole spelling difference is the float ops, which are `F`-prefixed here
+/// (`FAdd`, …) because this module has no `NumOp` to collide with, whereas the IR must use
+/// `SF`-prefixed names (`SFAdd`, …). Every constructor corresponds to one or more `0xFD`
+/// sub-opcodes (decode.gleam §D).
+///
+/// The design (matching `NumOp`): **shape-tag the uniform ops** (one constructor for all
+/// applicable lane shapes, like `SAdd(shape)`); **parametrise the widen/narrow/extend/
+/// extmul/pairwise families** (`from` = the SOURCE shape, plus `half` and `signed`);
+/// **name the genuinely-singular conversions / dot / q15 / swizzle**. Lane indices for
+/// extract/replace ride as `lane` fields.
+///
+/// The enum is **permissive** — the shape-tag admits illegal combinations (e.g.
+/// `SMul(I8x16)` — there is no `i8x16.mul`; `i64x2` has no min/max or unsigned compare;
+/// `SAvgrU`/`SAddSat*`/`SSubSat*` are `i8x16`/`i16x8` only; `SPopcnt` is `i8x16` only).
+/// Decode never emits an illegal combo, and **validate (P6-04) rejects them fail-closed**
+/// — exactly the latitude `NumOp` already has.
+pub type SimdOp {
+  // ── lane-uniform integer arithmetic (integer shapes) ──
+  SAdd(SimdShape)
+  SSub(SimdShape)
+  SMul(SimdShape)
+  SNeg(SimdShape)
+  SAbs(SimdShape)
+  SAddSatS(SimdShape)
+  SAddSatU(SimdShape)
+  SSubSatS(SimdShape)
+  SSubSatU(SimdShape)
+  SMinS(SimdShape)
+  SMinU(SimdShape)
+  SMaxS(SimdShape)
+  SMaxU(SimdShape)
+  SAvgrU(SimdShape)
+  SShl(SimdShape)
+  SShrS(SimdShape)
+  SShrU(SimdShape)
+  SPopcnt(SimdShape)
+  // ── lane-uniform comparisons → a v128 mask (all-ones / all-zeros per lane) ──
+  SEq(SimdShape)
+  SNe(SimdShape)
+  SLtS(SimdShape)
+  SLtU(SimdShape)
+  SLeS(SimdShape)
+  SLeU(SimdShape)
+  SGtS(SimdShape)
+  SGtU(SimdShape)
+  SGeS(SimdShape)
+  SGeU(SimdShape)
+  // ── v128 bitwise (shape-agnostic) + boolean reductions ──
+  VNot
+  VAnd
+  VOr
+  VXor
+  VAndNot
+  VBitselect
+  VAnyTrue
+  SAllTrue(SimdShape)
+  SBitmask(SimdShape)
+  // ── lane access / build (lane index rides in the constructor) ──
+  SSplat(SimdShape)
+  SExtractLane(shape: SimdShape, lane: Int)
+  SExtractLaneS(shape: SimdShape, lane: Int)
+  SExtractLaneU(shape: SimdShape, lane: Int)
+  SReplaceLane(shape: SimdShape, lane: Int)
+  // ── float-lane ops (F32x4 / F64x2) ──
+  FAdd(SimdShape)
+  FSub(SimdShape)
+  FMul(SimdShape)
+  FDiv(SimdShape)
+  FNeg(SimdShape)
+  FAbs(SimdShape)
+  FSqrt(SimdShape)
+  FMin(SimdShape)
+  FMax(SimdShape)
+  FPMin(SimdShape)
+  FPMax(SimdShape)
+  FCeil(SimdShape)
+  FFloor(SimdShape)
+  FTrunc(SimdShape)
+  FNearest(SimdShape)
+  FEq(SimdShape)
+  FNe(SimdShape)
+  FLt(SimdShape)
+  FLe(SimdShape)
+  FGt(SimdShape)
+  FGe(SimdShape)
+  // ── widen / narrow / extended-multiply / pairwise (parametric — `from` = SOURCE shape) ──
+  SNarrow(from: SimdShape, signed: Bool)
+  SExtend(from: SimdShape, half: SimdHalf, signed: Bool)
+  SExtMul(from: SimdShape, half: SimdHalf, signed: Bool)
+  SExtAddPairwise(from: SimdShape, signed: Bool)
+  // ── conversions (genuinely singular — named like `ConvOp`) ──
+  STruncSatF32x4S
+  STruncSatF32x4U
+  STruncSatF64x2SZero
+  STruncSatF64x2UZero
+  SConvertF32x4I32x4S
+  SConvertF32x4I32x4U
+  SConvertF64x2LowI32x4S
+  SConvertF64x2LowI32x4U
+  SDemoteF64x2Zero
+  SPromoteLowF32x4
+  // ── dot / q15 (singular) ──
+  SDotI16x8S
+  SQ15MulrSatS
+  // ── byte swizzle (dynamic; shuffle is a dedicated `Instr`) ──
+  SSwizzle
+}
+
+/// The v128 memory-LOAD variant carried by a `SimdLoad` (`Instr`). **All bit-widths are
+/// in BITS, never bytes (RECONCILIATION S2).** Mirrors `ir.SimdLoadKind`.
+///
+/// - `LoadV128`: `v128.load` (sub 0) — a plain 16-byte load (the 16 bytes ARE the v128).
+/// - `LoadSplat(lane_bits)`: `v128.load{8,16,32,64}_splat` (sub 7..10) — load `lane_bits`
+///   ∈ {8,16,32,64} and broadcast to every lane.
+/// - `LoadExtend(source_bits, signed)`: `v128.load{8x8,16x4,32x2}_{s,u}` (sub 1..6) — load
+///   8 bytes as `source_bits` ∈ {8,16,32}-wide source lanes (8/4/2 of them) and sign-/
+///   zero-extend each to double width (`signed` picks the sign).
+/// - `LoadZero(lane_bits)`: `v128.load{32,64}_zero` (sub 92,93) — load `lane_bits` ∈
+///   {32,64} into the low lane, zero the rest.
+pub type SimdLoadKind {
+  LoadV128
+  LoadSplat(lane_bits: Int)
+  LoadExtend(source_bits: Int, signed: Bool)
+  LoadZero(lane_bits: Int)
 }
 
 /// A single decoded instruction (one constructor per Phase-1 opcode).
@@ -727,7 +892,46 @@ pub type Instr {
   TableSize(table: Int)
   // 0xFC 16 — <tableidx>
   TableFill(table: Int)
+
   // 0xFC 17 — <tableidx>
+  // ===================== Phase 6 («WASM-AST4», the 0xFD SIMD family) =====================
+  // The ~236 fixed-width SIMD instructions collapse to SEVEN `Instr` constructors (I2): a
+  // single `Simd(op)` for the pure lane ops, plus six dedicated nodes for the immediate-
+  // bearing / memory ops (a raw 16-byte immediate, 16 shuffle bytes, or a `memarg` are
+  // structurally unlike a bare op). Immediate order is WIRE order throughout (decode.gleam
+  // §E). `V128` is opaque at the AST — no SIMD instruction grants memory authority except
+  // the `SimdLoad`/`SimdStore`/`SimdLoadLane`/`SimdStoreLane` family, which carry only a
+  // `memarg` routed downstream (06/07) through the bounds-checked `rt_mem` seam (I6).
+  /// `v128.const` (0xFD 12) — the 16-byte immediate, stored RAW little-endian (D5: the
+  /// bits, never a decoded lane structure, so NaN payloads / `-0.0` survive). `bytes` is
+  /// always exactly 16 bytes; a shorter input is `Truncated`.
+  V128Const(bytes: BitArray)
+  /// A pure lane-wise SIMD op with no wire immediate beyond its identity (arithmetic,
+  /// comparisons, bitwise, splat, swizzle, extract/replace-lane — the lane index rides
+  /// inside `op` —, conversions, narrow/widen/extend/dot/extmul/extadd/reductions).
+  /// Operands come from the operand stack, as for every AST instruction. PURE downstream.
+  Simd(op: SimdOp)
+  /// `i8x16.shuffle` (0xFD 13) — 16 immediate lane indices (each a raw byte 0..255 on the
+  /// wire; validate requires 0..31), selecting bytes from the two v128 operands `a ++ b`
+  /// (indices 0..15 pick from `a`, 16..31 from `b`). `lanes` is always length 16; a shorter
+  /// input is `Truncated`. Kept a dedicated node: its 16-element immediate does not fit the
+  /// uniform `SimdOp` shape.
+  I8x16Shuffle(lanes: List(Int))
+  /// A v128 memory LOAD (0xFD 0..10, 92, 93): `v128.load`, the `loadN_splat`, the extending
+  /// `loadMxK_{s,u}`, and `loadN_zero`. `kind` (a `SimdLoadKind`) selects which; `arg` is
+  /// the standard `memarg` (multi-memory bit-6 memidx + `u64` offset already handled — the
+  /// same decoder as scalar loads). Routes through the bounds-checked `rt_mem` seam
+  /// downstream (06/07) — never a raw term op.
+  SimdLoad(kind: SimdLoadKind, arg: MemArg)
+  /// `v128.store` (0xFD 11): stores a full 16-byte v128 to memory. `arg` is a `memarg`.
+  SimdStore(arg: MemArg)
+  /// `v128.loadN_lane` (0xFD 84..87): load `width` BITS (∈ {8,16,32,64} — S2) from memory
+  /// into lane `lane` of the v128 operand (the other lanes preserved). `arg` is a `memarg`
+  /// decoded FIRST, then the trailing lane byte (§E.4). Validate checks `lane < 128/width`.
+  SimdLoadLane(width: Int, arg: MemArg, lane: Int)
+  /// `v128.storeN_lane` (0xFD 88..91): store the `width`-BIT (∈ {8,16,32,64} — S2) lane
+  /// `lane` of the v128 operand to memory. Fields as `SimdLoadLane` (memarg THEN lane byte).
+  SimdStoreLane(width: Int, arg: MemArg, lane: Int)
 }
 
 /// Every reason the decoder rejects a binary. UNTRUSTED input maps to EXACTLY
@@ -761,6 +965,10 @@ pub type Instr {
 ///   offending byte).
 /// - `UnknownSatOpcode(Int)`: a `0xFC`-prefixed sub-opcode is outside `0..7`
 ///   (carries the offending sub-opcode).
+/// - `UnknownSimdOpcode(Int)`: a `0xFD`-prefixed sub-opcode outside the 236 standardized
+///   fixed-width SIMD instructions — one of the 20 reserved gaps in `0..255`
+///   (decode.gleam §D.7), or a relaxed-SIMD sub-opcode (`>= 256`, deferred). Carries the
+///   offending sub-opcode. The SIMD analogue of `UnknownSatOpcode`.
 /// - `FuncCodeCountMismatch`: the function section and code section declared
 ///   different numbers of functions, so their entries cannot be paired. (Spec:
 ///   the binary module decoding requires the two vectors to have equal length.)
@@ -798,6 +1006,7 @@ pub type DecodeError {
   BadBlockType
   UnknownOpcode(Int)
   UnknownSatOpcode(Int)
+  UnknownSimdOpcode(Int)
   FuncCodeCountMismatch
   BadHeapType
   BadLimitsFlag

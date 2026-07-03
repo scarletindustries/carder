@@ -1811,15 +1811,20 @@ fn blocktype_io(
   }
 }
 
-/// Map a WASM value type to the IR value type. The two MVP reference types map to
-/// the IR's reference value types (`FuncRef → TFuncRef`, `ExternRef → TExternRef`);
-/// the ref/table op lowering that consumes them is P5-05's.
+/// Map a WASM value type to the IR value type. The 128-bit SIMD vector type maps to
+/// `ir.TV128` (`«WASM-AST4»` ↔ `«IR4»`, 1:1 like `FuncRef`/`TFuncRef`); the two MVP
+/// reference types map to the IR's reference value types (`FuncRef → TFuncRef`,
+/// `ExternRef → TExternRef`). The v128 SIMD *instructions* that produce/consume a `V128`
+/// remain unsupported until P6-05 (they fail closed via `Error(Unsupported(_))` in
+/// `lower_numeric`); this mapping only carries the value type through function
+/// signatures / locals / globals so the tree compiles green.
 fn to_ir_vt(t: ast.ValType) -> ir.ValType {
   case t {
     ast.I32 -> ir.TI32
     ast.I64 -> ir.TI64
     ast.F32 -> ir.TF32
     ast.F64 -> ir.TF64
+    ast.V128 -> ir.TV128
     ast.FuncRef -> ir.TFuncRef
     ast.ExternRef -> ir.TExternRef
   }

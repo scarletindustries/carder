@@ -1100,6 +1100,23 @@ fn validate_instr(
       Ok(push_val(st2, at))
     }
 
+    // SIMD («WASM-AST4», the 0xFD family) — FAIL-CLOSED (S1). SIMD typing is P6-04's
+    // job; until it lands, every SIMD `Instr` constructor is intercepted HERE, BEFORE the
+    // `validate_numeric` catch-all, so none can reach `numeric_sig`'s fail-OPEN `_ ->
+    // #([], [])` fallthrough (which would silently accept a SIMD op as a typed no-op).
+    // Rejecting with `Unsupported` keeps the module security boundary closed.
+    ast.V128Const(_) -> Error(Unsupported("simd: v128.const (typing is P6-04)"))
+    ast.Simd(_) -> Error(Unsupported("simd: lane op (typing is P6-04)"))
+    ast.I8x16Shuffle(_) ->
+      Error(Unsupported("simd: i8x16.shuffle (typing is P6-04)"))
+    ast.SimdLoad(_, _) ->
+      Error(Unsupported("simd: v128 load (typing is P6-04)"))
+    ast.SimdStore(_) -> Error(Unsupported("simd: v128.store (typing is P6-04)"))
+    ast.SimdLoadLane(_, _, _) ->
+      Error(Unsupported("simd: v128.loadN_lane (typing is P6-04)"))
+    ast.SimdStoreLane(_, _, _) ->
+      Error(Unsupported("simd: v128.storeN_lane (typing is P6-04)"))
+
     // numeric / comparison / conversion / float leaves --------------------------
     _ -> validate_numeric(st, instr)
   }

@@ -515,11 +515,13 @@ fn decode_vec_n(
   }
 }
 
-/// Decode one value type byte: `0x7F→I32 0x7E→I64 0x7D→F32 0x7C→F64`, plus the two
-/// MVP reference types `0x70→FuncRef 0x6F→ExternRef` (Phase 5). Any other byte
-/// (`v128 = 0x7B`, a GC heaptype, …) is `Error(ast.BadValType)`; empty input is
-/// `Error(ast.Truncated)`. Used at every valtype site (params/results, locals,
-/// globals, typed `select` vectors).
+/// Decode one value type byte: `0x7F→I32 0x7E→I64 0x7D→F32 0x7C→F64`, the SIMD vector
+/// type `0x7B→V128` (Phase 6, `«WASM-AST4»`), plus the two MVP reference types
+/// `0x70→FuncRef 0x6F→ExternRef` (Phase 5). Any other byte (a GC heaptype, …) is
+/// `Error(ast.BadValType)`; empty input is `Error(ast.Truncated)`. Used at every valtype
+/// site (params/results, locals, globals, typed `select` vectors). `v128` is NOT a
+/// reftype — `decode_reftype` still rejects `0x7B` (a reftype-only position never accepts
+/// v128).
 fn decode_valtype(
   bytes: BitArray,
 ) -> Result(#(ValType, BitArray), ast.DecodeError) {
@@ -530,6 +532,7 @@ fn decode_valtype(
         0x7E -> Ok(#(ast.I64, rest))
         0x7D -> Ok(#(ast.F32, rest))
         0x7C -> Ok(#(ast.F64, rest))
+        0x7B -> Ok(#(ast.V128, rest))
         0x70 -> Ok(#(ast.FuncRef, rest))
         0x6F -> Ok(#(ast.ExternRef, rest))
         _ -> Error(ast.BadValType)
@@ -1033,9 +1036,9 @@ fn decode_locals_groups(
 
 /// Decode a structured-control blocktype: one signed-LEB(33). A non-negative
 /// value is a `BlockTypeIdx`; `-64` is `BlockEmpty`; the negative valtype encodings
-/// are the four number types `-1`..`-4` and the two reference types funcref (`0x70`
-/// as s33 = `-16`) / externref (`0x6F` = `-17`); any other negative value is
-/// `Error(ast.BadBlockType)`.
+/// are the four number types `-1`..`-4`, the SIMD vector type `v128` (`0x7B` as
+/// s33 = `-5`, Phase 6), and the two reference types funcref (`0x70` as s33 = `-16`)
+/// / externref (`0x6F` = `-17`); any other negative value is `Error(ast.BadBlockType)`.
 fn decode_blocktype(
   bytes: BitArray,
 ) -> Result(#(BlockType, BitArray), ast.DecodeError) {
@@ -1047,6 +1050,7 @@ fn decode_blocktype(
     _ if v == -2 -> Ok(#(ast.BlockVal(ast.I64), rest))
     _ if v == -3 -> Ok(#(ast.BlockVal(ast.F32), rest))
     _ if v == -4 -> Ok(#(ast.BlockVal(ast.F64), rest))
+    _ if v == -5 -> Ok(#(ast.BlockVal(ast.V128), rest))
     _ if v == -16 -> Ok(#(ast.BlockVal(ast.FuncRef), rest))
     _ if v == -17 -> Ok(#(ast.BlockVal(ast.ExternRef), rest))
     _ -> Error(ast.BadBlockType)
@@ -1215,6 +1219,12 @@ fn decode_instr(
                     Ok(instr) -> Ok(#(instr, r))
                     Error(Nil) -> decode_bulk(sub, r)
                   }
+                }
+                // 0xFD prefix family (SIMD): read a u32 sub-opcode and dispatch to
+                // `decode_simd` (all 236 fixed-width sub-opcodes + their immediates).
+                0xFD -> {
+                  use #(sub, r) <- result.try(decode_u_n(rest, 32))
+                  decode_simd(sub, r)
                 }
                 _ -> Error(ast.UnknownOpcode(op))
               }
@@ -1485,6 +1495,412 @@ fn sat_instr(sub: Int) -> Result(Instr, Nil) {
     5 -> Ok(ast.I64TruncSatF32U)
     6 -> Ok(ast.I64TruncSatF64S)
     7 -> Ok(ast.I64TruncSatF64U)
+    _ -> Error(Nil)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SIMD: the 0xFD prefix family («WASM-AST4») — all 236 fixed-width sub-opcodes
+// ---------------------------------------------------------------------------
+
+/// Decode a `0xFD`-prefixed SIMD instruction given its `sub`-opcode (a `u32` already
+/// read after the prefix) and the bytes after it (spec binary/instructions
+/// §vector-instructions; the appendix instruction index is authoritative for the exact
+/// opcodes). The six immediate-bearing ranges (memory loads/store, `v128.const`,
+/// `i8x16.shuffle`, extract/replace lane, load/store-lane) are handled explicitly; every
+/// other sub-opcode is a pure lane op looked up by `simd_pure_op`. A sub-opcode with no
+/// standardized fixed-width instruction — one of the 20 reserved gaps in `0..255`, or a
+/// relaxed-SIMD sub-opcode (`>= 256`, deferred) — is `Error(ast.UnknownSimdOpcode(sub))`.
+/// Immediate order is WIRE order throughout (§E), and every read is fail-closed
+/// (`Truncated` on any shortfall — never an over-read).
+fn decode_simd(
+  sub: Int,
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case sub {
+    // v128 memory loads / store — each takes a `memarg` (widths in BITS, S2)
+    0 -> simd_load(ast.LoadV128, bytes)
+    1 -> simd_load(ast.LoadExtend(8, True), bytes)
+    2 -> simd_load(ast.LoadExtend(8, False), bytes)
+    3 -> simd_load(ast.LoadExtend(16, True), bytes)
+    4 -> simd_load(ast.LoadExtend(16, False), bytes)
+    5 -> simd_load(ast.LoadExtend(32, True), bytes)
+    6 -> simd_load(ast.LoadExtend(32, False), bytes)
+    7 -> simd_load(ast.LoadSplat(8), bytes)
+    8 -> simd_load(ast.LoadSplat(16), bytes)
+    9 -> simd_load(ast.LoadSplat(32), bytes)
+    10 -> simd_load(ast.LoadSplat(64), bytes)
+    11 -> {
+      use #(a, r) <- result.try(decode_memarg(bytes))
+      Ok(#(ast.SimdStore(a), r))
+    }
+    92 -> simd_load(ast.LoadZero(32), bytes)
+    93 -> simd_load(ast.LoadZero(64), bytes)
+    // v128.const (16 raw bytes) / i8x16.shuffle (16 lane bytes)
+    12 -> decode_v128_const(bytes)
+    13 -> decode_shuffle(bytes)
+    // extract / replace lane — one trailing lane byte, folded into the `SimdOp`
+    21 -> lane_op(bytes, ast.SExtractLaneS(ast.I8x16, _))
+    22 -> lane_op(bytes, ast.SExtractLaneU(ast.I8x16, _))
+    23 -> lane_op(bytes, ast.SReplaceLane(ast.I8x16, _))
+    24 -> lane_op(bytes, ast.SExtractLaneS(ast.I16x8, _))
+    25 -> lane_op(bytes, ast.SExtractLaneU(ast.I16x8, _))
+    26 -> lane_op(bytes, ast.SReplaceLane(ast.I16x8, _))
+    27 -> lane_op(bytes, ast.SExtractLane(ast.I32x4, _))
+    28 -> lane_op(bytes, ast.SReplaceLane(ast.I32x4, _))
+    29 -> lane_op(bytes, ast.SExtractLane(ast.I64x2, _))
+    30 -> lane_op(bytes, ast.SReplaceLane(ast.I64x2, _))
+    31 -> lane_op(bytes, ast.SExtractLane(ast.F32x4, _))
+    32 -> lane_op(bytes, ast.SReplaceLane(ast.F32x4, _))
+    33 -> lane_op(bytes, ast.SExtractLane(ast.F64x2, _))
+    34 -> lane_op(bytes, ast.SReplaceLane(ast.F64x2, _))
+    // load / store lane — a `memarg` THEN a single lane byte (§E.4)
+    84 -> simd_load_lane(8, bytes)
+    85 -> simd_load_lane(16, bytes)
+    86 -> simd_load_lane(32, bytes)
+    87 -> simd_load_lane(64, bytes)
+    88 -> simd_store_lane(8, bytes)
+    89 -> simd_store_lane(16, bytes)
+    90 -> simd_store_lane(32, bytes)
+    91 -> simd_store_lane(64, bytes)
+    // everything else: a pure lane op (no immediate) or a reserved/out-of-range gap
+    _ ->
+      case simd_pure_op(sub) {
+        Ok(op) -> Ok(#(ast.Simd(op), bytes))
+        Error(Nil) -> Error(ast.UnknownSimdOpcode(sub))
+      }
+  }
+}
+
+/// Decode a v128 memory-load op's `memarg` and wrap it as `SimdLoad(kind, arg)`. The
+/// `memarg` is the same one scalar loads use (`decode_memarg`: multi-memory bit-6 memidx
+/// + `u64` offset). LEB/`Truncated` errors propagate.
+fn simd_load(
+  kind: ast.SimdLoadKind,
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  use #(arg, r) <- result.try(decode_memarg(bytes))
+  Ok(#(ast.SimdLoad(kind, arg), r))
+}
+
+/// Decode `v128.loadN_lane`: a `memarg` THEN one lane byte (`width` in BITS, S2). Order is
+/// load-bearing — NOT lane-then-memarg (swapping them would read the lane byte as the
+/// align flags and mis-decode the whole instruction). A missing lane byte is `Truncated`.
+fn simd_load_lane(
+  width: Int,
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  use #(arg, r1) <- result.try(decode_memarg(bytes))
+  case r1 {
+    <<l:8, r2:bytes>> -> Ok(#(ast.SimdLoadLane(width, arg, l), r2))
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode `v128.storeN_lane`: a `memarg` THEN one lane byte (`width` in BITS, S2), exactly
+/// like `simd_load_lane` but building `SimdStoreLane`. A missing lane byte is `Truncated`.
+fn simd_store_lane(
+  width: Int,
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  use #(arg, r1) <- result.try(decode_memarg(bytes))
+  case r1 {
+    <<l:8, r2:bytes>> -> Ok(#(ast.SimdStoreLane(width, arg, l), r2))
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode `v128.const`'s 16-byte immediate (spec: an `i128` literal, little-endian).
+/// Stored RAW (D5) as a 16-byte `BitArray` — never a decoded lane structure, so NaN
+/// payloads / `-0.0` / exact lane bits survive. The shape annotation in WAT text
+/// (`v128.const i32x4 …` vs `i8x16 …`) is a text nicety with no wire presence: on the wire
+/// both are just these 16 bytes, taken verbatim. Fewer than 16 bytes ⇒ `Truncated`.
+fn decode_v128_const(
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case bytes {
+    <<imm:size(16)-bytes, r:bytes>> -> Ok(#(ast.V128Const(imm), r))
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode `i8x16.shuffle`'s 16 lane-index bytes. Each is a RAW byte 0..255 (a `laneidx`
+/// is a single byte, NOT LEB128; validate requires 0..31). `lanes[i]` selects the byte for
+/// RESULT lane `i`, from the concatenation `a ++ b` of the two v128 operands (0..15 → `a`,
+/// 16..31 → `b`). Order is load-bearing: `lanes[0]` is result lane 0. Fewer than 16 bytes
+/// ⇒ `Truncated`.
+fn decode_shuffle(
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case bytes {
+    <<
+      l0:8,
+      l1:8,
+      l2:8,
+      l3:8,
+      l4:8,
+      l5:8,
+      l6:8,
+      l7:8,
+      l8:8,
+      l9:8,
+      l10:8,
+      l11:8,
+      l12:8,
+      l13:8,
+      l14:8,
+      l15:8,
+      r:bytes,
+    >> ->
+      Ok(#(
+        ast.I8x16Shuffle([
+          l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15,
+        ]),
+        r,
+      ))
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Read one lane-index byte and build a lane-carrying `Simd` instruction via `make`
+/// (extract/replace lane, sub 21..34). The lane is stored RAW (0..255); validate checks
+/// `lane < lane-count`. An absent lane byte is `Truncated`.
+fn lane_op(
+  bytes: BitArray,
+  make: fn(Int) -> ast.SimdOp,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case bytes {
+    <<l:8, r:bytes>> -> Ok(#(ast.Simd(make(l)), r))
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Map a pure (immediate-free) `0xFD` sub-opcode to its `SimdOp`. This is the SIMD
+/// analogue of `leaf_instr`/`sat_instr`: a total `case` over the sub-opcode covering the
+/// splat/swizzle (14..20), comparison (35..76), bitwise/`any_true` (77..83), and lane-wise
+/// arithmetic/rounding/narrow/widen/extend/dot/extmul/extadd/convert (94..255) blocks.
+/// `Error(Nil)` for any sub-opcode NOT in this table — a reserved gap (154; 162,165,166,
+/// 175,176,178,179,180,187; 194,197,198,207,208,210,211,212; 226; 238) or an out-of-range
+/// sub — and the caller reports `UnknownSimdOpcode`. The opcode numbers ARE the spec (the
+/// appendix instruction index); every arm cites its instruction mnemonic.
+fn simd_pure_op(sub: Int) -> Result(ast.SimdOp, Nil) {
+  case sub {
+    // splat / swizzle (14..20)
+    14 -> Ok(ast.SSwizzle)
+    15 -> Ok(ast.SSplat(ast.I8x16))
+    16 -> Ok(ast.SSplat(ast.I16x8))
+    17 -> Ok(ast.SSplat(ast.I32x4))
+    18 -> Ok(ast.SSplat(ast.I64x2))
+    19 -> Ok(ast.SSplat(ast.F32x4))
+    20 -> Ok(ast.SSplat(ast.F64x2))
+    // i8x16 comparisons (35..44): eq ne lt_s lt_u gt_s gt_u le_s le_u ge_s ge_u
+    35 -> Ok(ast.SEq(ast.I8x16))
+    36 -> Ok(ast.SNe(ast.I8x16))
+    37 -> Ok(ast.SLtS(ast.I8x16))
+    38 -> Ok(ast.SLtU(ast.I8x16))
+    39 -> Ok(ast.SGtS(ast.I8x16))
+    40 -> Ok(ast.SGtU(ast.I8x16))
+    41 -> Ok(ast.SLeS(ast.I8x16))
+    42 -> Ok(ast.SLeU(ast.I8x16))
+    43 -> Ok(ast.SGeS(ast.I8x16))
+    44 -> Ok(ast.SGeU(ast.I8x16))
+    // i16x8 comparisons (45..54)
+    45 -> Ok(ast.SEq(ast.I16x8))
+    46 -> Ok(ast.SNe(ast.I16x8))
+    47 -> Ok(ast.SLtS(ast.I16x8))
+    48 -> Ok(ast.SLtU(ast.I16x8))
+    49 -> Ok(ast.SGtS(ast.I16x8))
+    50 -> Ok(ast.SGtU(ast.I16x8))
+    51 -> Ok(ast.SLeS(ast.I16x8))
+    52 -> Ok(ast.SLeU(ast.I16x8))
+    53 -> Ok(ast.SGeS(ast.I16x8))
+    54 -> Ok(ast.SGeU(ast.I16x8))
+    // i32x4 comparisons (55..64)
+    55 -> Ok(ast.SEq(ast.I32x4))
+    56 -> Ok(ast.SNe(ast.I32x4))
+    57 -> Ok(ast.SLtS(ast.I32x4))
+    58 -> Ok(ast.SLtU(ast.I32x4))
+    59 -> Ok(ast.SGtS(ast.I32x4))
+    60 -> Ok(ast.SGtU(ast.I32x4))
+    61 -> Ok(ast.SLeS(ast.I32x4))
+    62 -> Ok(ast.SLeU(ast.I32x4))
+    63 -> Ok(ast.SGeS(ast.I32x4))
+    64 -> Ok(ast.SGeU(ast.I32x4))
+    // f32x4 comparisons (65..70): eq ne lt gt le ge (note gt BEFORE le)
+    65 -> Ok(ast.FEq(ast.F32x4))
+    66 -> Ok(ast.FNe(ast.F32x4))
+    67 -> Ok(ast.FLt(ast.F32x4))
+    68 -> Ok(ast.FGt(ast.F32x4))
+    69 -> Ok(ast.FLe(ast.F32x4))
+    70 -> Ok(ast.FGe(ast.F32x4))
+    // f64x2 comparisons (71..76)
+    71 -> Ok(ast.FEq(ast.F64x2))
+    72 -> Ok(ast.FNe(ast.F64x2))
+    73 -> Ok(ast.FLt(ast.F64x2))
+    74 -> Ok(ast.FGt(ast.F64x2))
+    75 -> Ok(ast.FLe(ast.F64x2))
+    76 -> Ok(ast.FGe(ast.F64x2))
+    // v128 bitwise + any_true (77..83): not and andnot or xor bitselect any_true
+    77 -> Ok(ast.VNot)
+    78 -> Ok(ast.VAnd)
+    79 -> Ok(ast.VAndNot)
+    80 -> Ok(ast.VOr)
+    81 -> Ok(ast.VXor)
+    82 -> Ok(ast.VBitselect)
+    83 -> Ok(ast.VAnyTrue)
+    // demote / promote (94, 95)
+    94 -> Ok(ast.SDemoteF64x2Zero)
+    95 -> Ok(ast.SPromoteLowF32x4)
+    // i8x16 block + interleaved f32x4/f64x2 rounding (96..127, no gaps)
+    96 -> Ok(ast.SAbs(ast.I8x16))
+    97 -> Ok(ast.SNeg(ast.I8x16))
+    98 -> Ok(ast.SPopcnt(ast.I8x16))
+    99 -> Ok(ast.SAllTrue(ast.I8x16))
+    100 -> Ok(ast.SBitmask(ast.I8x16))
+    101 -> Ok(ast.SNarrow(ast.I16x8, True))
+    102 -> Ok(ast.SNarrow(ast.I16x8, False))
+    103 -> Ok(ast.FCeil(ast.F32x4))
+    104 -> Ok(ast.FFloor(ast.F32x4))
+    105 -> Ok(ast.FTrunc(ast.F32x4))
+    106 -> Ok(ast.FNearest(ast.F32x4))
+    107 -> Ok(ast.SShl(ast.I8x16))
+    108 -> Ok(ast.SShrS(ast.I8x16))
+    109 -> Ok(ast.SShrU(ast.I8x16))
+    110 -> Ok(ast.SAdd(ast.I8x16))
+    111 -> Ok(ast.SAddSatS(ast.I8x16))
+    112 -> Ok(ast.SAddSatU(ast.I8x16))
+    113 -> Ok(ast.SSub(ast.I8x16))
+    114 -> Ok(ast.SSubSatS(ast.I8x16))
+    115 -> Ok(ast.SSubSatU(ast.I8x16))
+    116 -> Ok(ast.FCeil(ast.F64x2))
+    117 -> Ok(ast.FFloor(ast.F64x2))
+    118 -> Ok(ast.SMinS(ast.I8x16))
+    119 -> Ok(ast.SMinU(ast.I8x16))
+    120 -> Ok(ast.SMaxS(ast.I8x16))
+    121 -> Ok(ast.SMaxU(ast.I8x16))
+    122 -> Ok(ast.FTrunc(ast.F64x2))
+    123 -> Ok(ast.SAvgrU(ast.I8x16))
+    124 -> Ok(ast.SExtAddPairwise(ast.I8x16, True))
+    125 -> Ok(ast.SExtAddPairwise(ast.I8x16, False))
+    126 -> Ok(ast.SExtAddPairwise(ast.I16x8, True))
+    127 -> Ok(ast.SExtAddPairwise(ast.I16x8, False))
+    // i16x8 block (+ f64x2.nearest at 148), gap at 154 (128..159)
+    128 -> Ok(ast.SAbs(ast.I16x8))
+    129 -> Ok(ast.SNeg(ast.I16x8))
+    130 -> Ok(ast.SQ15MulrSatS)
+    131 -> Ok(ast.SAllTrue(ast.I16x8))
+    132 -> Ok(ast.SBitmask(ast.I16x8))
+    133 -> Ok(ast.SNarrow(ast.I32x4, True))
+    134 -> Ok(ast.SNarrow(ast.I32x4, False))
+    135 -> Ok(ast.SExtend(ast.I8x16, ast.Low, True))
+    136 -> Ok(ast.SExtend(ast.I8x16, ast.High, True))
+    137 -> Ok(ast.SExtend(ast.I8x16, ast.Low, False))
+    138 -> Ok(ast.SExtend(ast.I8x16, ast.High, False))
+    139 -> Ok(ast.SShl(ast.I16x8))
+    140 -> Ok(ast.SShrS(ast.I16x8))
+    141 -> Ok(ast.SShrU(ast.I16x8))
+    142 -> Ok(ast.SAdd(ast.I16x8))
+    143 -> Ok(ast.SAddSatS(ast.I16x8))
+    144 -> Ok(ast.SAddSatU(ast.I16x8))
+    145 -> Ok(ast.SSub(ast.I16x8))
+    146 -> Ok(ast.SSubSatS(ast.I16x8))
+    147 -> Ok(ast.SSubSatU(ast.I16x8))
+    148 -> Ok(ast.FNearest(ast.F64x2))
+    149 -> Ok(ast.SMul(ast.I16x8))
+    150 -> Ok(ast.SMinS(ast.I16x8))
+    151 -> Ok(ast.SMinU(ast.I16x8))
+    152 -> Ok(ast.SMaxS(ast.I16x8))
+    153 -> Ok(ast.SMaxU(ast.I16x8))
+    155 -> Ok(ast.SAvgrU(ast.I16x8))
+    156 -> Ok(ast.SExtMul(ast.I8x16, ast.Low, True))
+    157 -> Ok(ast.SExtMul(ast.I8x16, ast.High, True))
+    158 -> Ok(ast.SExtMul(ast.I8x16, ast.Low, False))
+    159 -> Ok(ast.SExtMul(ast.I8x16, ast.High, False))
+    // i32x4 block, gaps at 162,165,166,175,176,178,179,180,187 (160..191)
+    160 -> Ok(ast.SAbs(ast.I32x4))
+    161 -> Ok(ast.SNeg(ast.I32x4))
+    163 -> Ok(ast.SAllTrue(ast.I32x4))
+    164 -> Ok(ast.SBitmask(ast.I32x4))
+    167 -> Ok(ast.SExtend(ast.I16x8, ast.Low, True))
+    168 -> Ok(ast.SExtend(ast.I16x8, ast.High, True))
+    169 -> Ok(ast.SExtend(ast.I16x8, ast.Low, False))
+    170 -> Ok(ast.SExtend(ast.I16x8, ast.High, False))
+    171 -> Ok(ast.SShl(ast.I32x4))
+    172 -> Ok(ast.SShrS(ast.I32x4))
+    173 -> Ok(ast.SShrU(ast.I32x4))
+    174 -> Ok(ast.SAdd(ast.I32x4))
+    177 -> Ok(ast.SSub(ast.I32x4))
+    181 -> Ok(ast.SMul(ast.I32x4))
+    182 -> Ok(ast.SMinS(ast.I32x4))
+    183 -> Ok(ast.SMinU(ast.I32x4))
+    184 -> Ok(ast.SMaxS(ast.I32x4))
+    185 -> Ok(ast.SMaxU(ast.I32x4))
+    186 -> Ok(ast.SDotI16x8S)
+    188 -> Ok(ast.SExtMul(ast.I16x8, ast.Low, True))
+    189 -> Ok(ast.SExtMul(ast.I16x8, ast.High, True))
+    190 -> Ok(ast.SExtMul(ast.I16x8, ast.Low, False))
+    191 -> Ok(ast.SExtMul(ast.I16x8, ast.High, False))
+    // i64x2 block (+ i64x2 signed comparisons 214..219),
+    // gaps at 194,197,198,207,208,210,211,212 (192..223)
+    192 -> Ok(ast.SAbs(ast.I64x2))
+    193 -> Ok(ast.SNeg(ast.I64x2))
+    195 -> Ok(ast.SAllTrue(ast.I64x2))
+    196 -> Ok(ast.SBitmask(ast.I64x2))
+    199 -> Ok(ast.SExtend(ast.I32x4, ast.Low, True))
+    200 -> Ok(ast.SExtend(ast.I32x4, ast.High, True))
+    201 -> Ok(ast.SExtend(ast.I32x4, ast.Low, False))
+    202 -> Ok(ast.SExtend(ast.I32x4, ast.High, False))
+    203 -> Ok(ast.SShl(ast.I64x2))
+    204 -> Ok(ast.SShrS(ast.I64x2))
+    205 -> Ok(ast.SShrU(ast.I64x2))
+    206 -> Ok(ast.SAdd(ast.I64x2))
+    209 -> Ok(ast.SSub(ast.I64x2))
+    213 -> Ok(ast.SMul(ast.I64x2))
+    214 -> Ok(ast.SEq(ast.I64x2))
+    215 -> Ok(ast.SNe(ast.I64x2))
+    216 -> Ok(ast.SLtS(ast.I64x2))
+    217 -> Ok(ast.SGtS(ast.I64x2))
+    218 -> Ok(ast.SLeS(ast.I64x2))
+    219 -> Ok(ast.SGeS(ast.I64x2))
+    220 -> Ok(ast.SExtMul(ast.I32x4, ast.Low, True))
+    221 -> Ok(ast.SExtMul(ast.I32x4, ast.High, True))
+    222 -> Ok(ast.SExtMul(ast.I32x4, ast.Low, False))
+    223 -> Ok(ast.SExtMul(ast.I32x4, ast.High, False))
+    // f32x4 block, gap at 226 (224..235)
+    224 -> Ok(ast.FAbs(ast.F32x4))
+    225 -> Ok(ast.FNeg(ast.F32x4))
+    227 -> Ok(ast.FSqrt(ast.F32x4))
+    228 -> Ok(ast.FAdd(ast.F32x4))
+    229 -> Ok(ast.FSub(ast.F32x4))
+    230 -> Ok(ast.FMul(ast.F32x4))
+    231 -> Ok(ast.FDiv(ast.F32x4))
+    232 -> Ok(ast.FMin(ast.F32x4))
+    233 -> Ok(ast.FMax(ast.F32x4))
+    234 -> Ok(ast.FPMin(ast.F32x4))
+    235 -> Ok(ast.FPMax(ast.F32x4))
+    // f64x2 block, gap at 238 (236..247)
+    236 -> Ok(ast.FAbs(ast.F64x2))
+    237 -> Ok(ast.FNeg(ast.F64x2))
+    239 -> Ok(ast.FSqrt(ast.F64x2))
+    240 -> Ok(ast.FAdd(ast.F64x2))
+    241 -> Ok(ast.FSub(ast.F64x2))
+    242 -> Ok(ast.FMul(ast.F64x2))
+    243 -> Ok(ast.FDiv(ast.F64x2))
+    244 -> Ok(ast.FMin(ast.F64x2))
+    245 -> Ok(ast.FMax(ast.F64x2))
+    246 -> Ok(ast.FPMin(ast.F64x2))
+    247 -> Ok(ast.FPMax(ast.F64x2))
+    // float ⇄ int conversions (248..255, no gaps)
+    248 -> Ok(ast.STruncSatF32x4S)
+    249 -> Ok(ast.STruncSatF32x4U)
+    250 -> Ok(ast.SConvertF32x4I32x4S)
+    251 -> Ok(ast.SConvertF32x4I32x4U)
+    252 -> Ok(ast.STruncSatF64x2SZero)
+    253 -> Ok(ast.STruncSatF64x2UZero)
+    254 -> Ok(ast.SConvertF64x2LowI32x4S)
+    255 -> Ok(ast.SConvertF64x2LowI32x4U)
+    // reserved gaps in 0..255, and any sub not enumerated above → the caller reports
+    // `UnknownSimdOpcode`. (sub >= 256 is relaxed-SIMD, deferred; also caught here.)
     _ -> Error(Nil)
   }
 }
