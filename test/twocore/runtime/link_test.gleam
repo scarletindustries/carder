@@ -60,6 +60,7 @@ fn module_with_imports(imports: List(ir.ImportDecl)) -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 

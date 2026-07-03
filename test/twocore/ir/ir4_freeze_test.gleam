@@ -187,6 +187,7 @@ pub fn ir4_surface_is_expressible_test() {
       tables: [],
       elements: [],
       start: None,
+      tags: [],
     )
 
   // The value compiled ⇒ the surface is expressible. Assert the frozen shapes are as declared.
@@ -287,6 +288,7 @@ pub fn legacy_module_is_conformance_neutral_test() {
       tables: [],
       elements: [],
       start: None,
+      tags: [],
     )
 
   // D7 round-trip: parse(print(m)) == m (the new arms never fire on a legacy module).

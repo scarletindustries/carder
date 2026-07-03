@@ -50,6 +50,7 @@ fn module_with(f: ir.Function) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -905,6 +906,7 @@ fn full_module() -> ir.Module {
       ),
     ],
     start: option.Some("init"),
+    tags: [],
   )
 }
 
@@ -1050,6 +1052,7 @@ pub fn export_alias_wrapper_test() {
       tables: [],
       elements: [],
       start: option.None,
+      tags: [],
     )
   let assert Ok(cm) = emit_core.emit_module(m, binding())
   // The external name/arity is exported …
@@ -1108,6 +1111,7 @@ fn st_module(f: ir.Function) -> ir.Module {
     tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -1405,6 +1409,7 @@ pub fn threaded_tail_call_to_state_reaching_stays_tail_test() {
       tables: [],
       elements: [],
       start: option.None,
+      tags: [],
     )
   let assert FunDef(FName("f", 2), CFun([st, "x"], body)) = threaded_def(m, "f")
   // the whole body IS the tail apply — {Package, St'} passed straight through.
@@ -1528,6 +1533,7 @@ pub fn threaded_export_alias_forwards_at_plus_one_test() {
       tables: [],
       elements: [],
       start: option.None,
+      tags: [],
     )
   let assert Ok(cm) = emit_core.emit_module(m, threaded_binding())
   assert list.contains(cm.exports, FName("main", 2))
@@ -1669,6 +1675,7 @@ fn p5_module(body: ir.Expr, result: List(ir.ValType)) -> ir.Module {
     tables: [ir.TableDecl("t0", ir.FuncRef, 4, option.None)],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -2211,6 +2218,7 @@ pub fn mem64_fresh64_in_instantiate_test() {
       tables: [],
       elements: [],
       start: option.None,
+      tags: [],
     )
   }
   let inst = fn(idx) {
@@ -2254,6 +2262,7 @@ pub fn mem64_op_sites_byte_identical_test() {
       tables: [],
       elements: [],
       start: option.None,
+      tags: [],
     )
   }
   assert body_of_b(mk(ir.Idx32), "f", b) == body_of_b(mk(ir.Idx64), "f", b)
@@ -2372,6 +2381,7 @@ pub fn v128_global_routes_boxed_test() {
       tables: [],
       elements: [],
       start: option.None,
+      tags: [],
     )
   }
   // get → ref_global_get, NOT global_get
@@ -2404,5 +2414,6 @@ fn module_with_import(f: ir.Function, imp: ir.ImportDecl) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }

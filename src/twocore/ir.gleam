@@ -98,7 +98,32 @@ pub type Module {
     tables: List(TableDecl),
     elements: List(ElementSegment),
     start: Option(String),
+    /// The module's own **exception tags** (J2/T2). Each `TagDecl` names an exception class
+    /// and its operand signature. `[]` (the default) means the module declares no tags — the
+    /// conformance-neutral case, byte-identical to Phase-6. The list position **is** the
+    /// tag-index space (as `memories`'s position is the memory-index space), so a `Throw`/`Try`
+    /// catch referencing a same-module tag resolves by name (D6 — never a numeric index in the
+    /// IR core). Imported tags are declared in `imports` (`ImportTag`), NOT here; `tags` holds
+    /// module-DEFINED tags only, exactly as `globals` holds module-defined globals and
+    /// `ImportGlobal` the imports.
+    tags: List(TagDecl),
   )
+}
+
+/// An exception-tag declaration (J2/T2). A tag is a build-controlled exception CLASS carrying a
+/// typed payload — the operand `ValType`s the exception transports (spec: a tag's type is a
+/// `FuncType` whose results MUST be empty; only `params` are meaningful for an exception tag, so
+/// this decl stores JUST the params, NOT a `FuncType` — T2). NEUTRAL: a generic named exception
+/// class, not a WASM opcode (D6).
+///
+/// - `name`: the tag's unique name within the module (referenced by `Throw` and
+///   `CatchTag.OnTag`, and by `ExportTag`). Frontend-conventional (`tag0 … tag{n-1}`), like
+///   `p0`/global names.
+/// - `params`: the operand value types the exception carries. Measured for Porffor:
+///   `[TF64, TI32]` (the `(f64, i32)` typed JS value). May be `[]` (a payload-less tag) or any
+///   `ValType` list.
+pub type TagDecl {
+  TagDecl(name: String, params: List(ValType))
 }
 
 /// A reference table declaration. Generalizes the Phase-2 funcref-only table with a
@@ -208,6 +233,14 @@ pub type ImportDecl {
     max_pages: Option(Int),
     idx_type: IdxType,
   )
+  /// An imported exception tag (J2/T2 — the P5 import/export-state pattern). Provided state,
+  /// not a capability: its RUNTIME IDENTITY is the exporter's (an exception thrown with the
+  /// exporter's tag is caught by a `catch` on this import — spec §4.5.4 tag matching). `params`
+  /// is the declared operand signature, link-matched against the provider fail-closed (spec
+  /// §3.2). No Phase-1..6 module has one; Porffor (single-module) never imports a tag. The
+  /// link-time identity resolution (`ProvidedTag`) is DEFERRED (P7-05/link) — the keystone
+  /// freezes the decl shape only.
+  ImportTag(module: String, name: String, params: List(ValType))
 }
 
 /// Names an externally callable / observable entry point (H4). Functions plus exported
@@ -223,6 +256,11 @@ pub type ExportDecl {
   ExportGlobal(export_name: String, global_name: String)
   ExportTable(export_name: String, table_name: String)
   ExportMemory(export_name: String, mem_index: Int)
+  /// Exports the module-defined tag named `tag_name` (J2/T2). Measured: Porffor emits
+  /// `(export "0" (tag 0))`, so this arm IS exercised by real output — but the export is
+  /// **inert for single-module execution** (nothing imports it), so `emit_core` emits no state
+  /// for it (§J).
+  ExportTag(export_name: String, tag_name: String)
 }
 
 /// A linear-memory data segment (H2). GENERALIZES the Phase-2 `DataSegment(offset, bytes)`.
@@ -296,6 +334,17 @@ pub type ValType {
   /// Spec anchor: `v128` is the sole vector type; `vectype = v128 ⊆ valtype`
   /// ([spec §2.3.2 vector types](https://webassembly.github.io/spec/core/syntax/types.html)).
   TV128
+  /// An `exnref` (`(ref null exn)`, J2/T9) — a caught-exception handle. A REFERENCE value
+  /// (term-layer, like funcref/externref — never the raw-bit numeric path): it flows as a
+  /// `Dynamic`, is nullable, and is OPAQUE in Safe mode (holdable/passable/storable/
+  /// null-testable/re-throwable, but its underlying BEAM exception is NOT inspectable — H6/J5).
+  /// Placed AFTER `TV128` so it falls to the reference/`_` arm of every `ValType` match with a
+  /// catch-all; the exhaustive matches gain an explicit `TExnRef` arm. `is_reference_type(TExnRef)
+  /// == True`. Maps 1:1 onto `RefType.ExnRef` via `reftype_to_valtype`/`valtype_to_reftype`.
+  ///
+  /// Spec anchor: `exnref = (ref null exn)`; `exn` is a heap type
+  /// ([EH proposal](https://github.com/WebAssembly/exception-handling)).
+  TExnRef
 }
 
 /// The subset of `ValType` that is a reference type (H1). Used wherever the spec's `reftype`
@@ -306,9 +355,15 @@ pub type ValType {
 pub type RefType {
   FuncRef
   ExternRef
+  /// The `exn` heap type's reference (`exnref`, J2/T9). `ConstNull(ExnRef)` is `ref.null exn`;
+  /// an exnref table/element/select carries it. Maps 1:1 onto `TExnRef` via
+  /// `reftype_to_valtype`. Its runtime box `{ref_exn, Reason}` (T9) is owned by `rt_exn`, reusing
+  /// `rt_ref`'s shared null sentinel — the forge-proof reference model.
+  ExnRef
 }
 
-/// Widen a `RefType` to its `ValType` — `FuncRef → TFuncRef`, `ExternRef → TExternRef`.
+/// Widen a `RefType` to its `ValType` — `FuncRef → TFuncRef`, `ExternRef → TExternRef`,
+/// `ExnRef → TExnRef`.
 ///
 /// - `r`: the reference type.
 /// - Returns the corresponding `ValType` reference constructor. Total — never fails.
@@ -316,18 +371,21 @@ pub fn reftype_to_valtype(r: RefType) -> ValType {
   case r {
     FuncRef -> TFuncRef
     ExternRef -> TExternRef
+    ExnRef -> TExnRef
   }
 }
 
 /// Narrow a `ValType` to a `RefType` iff it is a reference type.
 ///
 /// - `t`: the value type to narrow.
-/// - Returns `Ok(FuncRef)`/`Ok(ExternRef)` for `TFuncRef`/`TExternRef`; `Error(Nil)` for a
-///   non-reference type (`TI32`/`TI64`/`TF32`/`TF64`/`TTerm`). Total — never panics.
+/// - Returns `Ok(FuncRef)`/`Ok(ExternRef)`/`Ok(ExnRef)` for `TFuncRef`/`TExternRef`/`TExnRef`;
+///   `Error(Nil)` for a non-reference type (`TI32`/`TI64`/`TF32`/`TF64`/`TTerm`/`TV128`). Total —
+///   never panics.
 pub fn valtype_to_reftype(t: ValType) -> Result(RefType, Nil) {
   case t {
     TFuncRef -> Ok(FuncRef)
     TExternRef -> Ok(ExternRef)
+    TExnRef -> Ok(ExnRef)
     _ -> Error(Nil)
   }
 }
@@ -662,6 +720,79 @@ pub type Expr {
   /// CAPABILITY, never an ambient `apply` of a data-named `module:atom` (D3a). Effectful (it is a
   /// call — §effect). No Phase-1..5 module produces this node; P6-05 lowers imported calls to it.
   CallImport(slot: Int, ty: FuncType, args: List(Value))
+  // ── Phase-7 exception handling (J1/J2, INLINE-HANDLER shaped — T1) — three effectful barriers.
+  // A generic structured-exception model (throw a value / guard-and-catch by class / re-raise a
+  // handle), NOT WASM opcodes (D6). The IR is binary-encoding-neutral: the LEGACY `try/catch`
+  // (Porffor) maps 1:1, the MODERN `try_table` maps via a transfer inside each handler
+  // (Break/Continue/Return to the target frame), and both lower onto Core Erlang's own
+  // inline-handler `try…catch` 1:1 (P7-06). ──
+  /// `throw <tag> (args…)` — raise exception `tag` (a same-module `TagDecl` NAME — T4) carrying
+  /// `args` as its payload. **Does not return** — bottom, exactly like `Return`/`Trap` (spec
+  /// §4.4.9: `throw` transfers control, the rest of the block is unreachable). `args` arity +
+  /// types match the tag's `params`. Lowers to `rt_exn.throw_exn(tag_id, payload)` (P7-06/07).
+  /// Effectful (a non-local transfer — §effect).
+  Throw(tag: String, args: List(Value))
+  /// `try result body handlers` — the INLINE-HANDLER exception region (T1). Evaluate `body`; on
+  /// a thrown exception, each `CatchHandler` is tried in order: a matching handler runs its
+  /// inline `handler` expression (with the tag's payload bound to `payload` names, plus an
+  /// `exnref` name if captured); an unmatched exception **propagates** (re-raised). `body`
+  /// falling through yields `result`. Lowers to a Core Erlang `try … of <Vs> -> <Vs> catch
+  /// C:R:S -> <handler dispatch>` 1:1 (P7-06). Effectful (establishes a handler + alters control
+  /// flow — a barrier). Both the legacy `try…catch…end` (Porffor, DIRECT — the handler is the
+  /// inline legacy handler) and the modern `try_table` (each clause's `handler` is a
+  /// `Break`/`Continue`/`Return` transfer to the resolved target frame) structure into this one
+  /// node in lower (P7-05). `result` is the block type the try region produces on normal
+  /// completion.
+  Try(result: List(ValType), body: Expr, handlers: List(CatchHandler))
+  /// `throw_ref <exnref>` — re-raise the exception referenced by the `exnref` value `exnref`
+  /// (produced by a `capture_exnref` handler). **Does not return** — bottom (spec §4.4.9). A
+  /// null `exnref` traps (`ref.null exn` re-thrown → a trap — validate/emit uphold). Lowers to
+  /// `rt_exn.throw_ref(exnref)` (P7-06/07). Effectful (a non-local transfer — §effect).
+  /// Porffor-INERT (Porffor never emits it — spec-conformance surface only, T9).
+  ThrowRef(exnref: Value)
+}
+
+/// One catch handler of a `Try` region (J2/T1 — the INLINE-HANDLER shape). `on` selects which
+/// exceptions this handler catches; when it matches, `handler` (a full `Expr`) is evaluated with
+/// the tag's payload bound to the `payload` names (in operand order), plus the captured exnref
+/// bound to `exnref`'s name if present.
+///
+/// The two encodings map onto this ONE shape:
+/// - **Legacy `try bt B catch x H end`** (Porffor) → `Try(bt, lower(B), [CatchHandler(OnTag(x),
+///   names, None, lower(H))])` — DIRECT; the handler `H` is the inline legacy handler, the tag's
+///   operands bound to fresh `names` the handler references. No restructuring / branch
+///   renumbering.
+/// - **Modern `try_table` clause → label** → `CatchHandler(on, names, exnref?, handler)` where
+///   `handler` is the transfer to the target frame: `Break(label, names ++ exnref)` for a block,
+///   `Continue(label, …)` for a loop, `Return(…)` for the function frame (P7-05 picks the
+///   transfer from the resolved frame kind — this is why `handler` is a full `Expr`, resolving
+///   the modern label-clause's target-frame kind without a scope limitation).
+///
+/// - `on`: the `CatchTag` this handler matches (`OnTag(tag)` or `OnAll`).
+/// - `payload`: names the tag's operand values are bound to inside `handler` (empty for `OnAll`,
+///   which carries no operand types).
+/// - `exnref`: `Some(name)` for the ref-capturing forms (`catch_ref`/`catch_all_ref`) — binds
+///   the caught exception as an `exnref` handle inside `handler`; `None` otherwise.
+/// - `handler`: the expression evaluated when this handler matches (the inline legacy handler,
+///   or the modern transfer to the target frame).
+pub type CatchHandler {
+  CatchHandler(
+    on: CatchTag,
+    payload: List(String),
+    exnref: Option(String),
+    handler: Expr,
+  )
+}
+
+/// What a `CatchHandler` catches (J2/T4 — tag by NAME, never a numeric index in the IR core).
+/// - `OnTag(tag)`: catch exceptions thrown with the same-module tag named `tag` (spec
+///   tag-identity match); the tag's payload is bound to the handler's `payload` names.
+/// - `OnAll`: catch ANY exception (`catch_all`) — but per spec, **exceptions only, NOT traps** (a
+///   trap is re-raised untouched; the emitted handler enforces this via `rt_exn.is_wasm_exn`,
+///   P7-06/07). No payload is bound (an all-catch carries no operand types).
+pub type CatchTag {
+  OnTag(tag: String)
+  OnAll
 }
 
 // ───────────────────────────── SIMD (Phase-6, I1/I2) ─────────────────────────────
@@ -1079,6 +1210,15 @@ pub type MemAccess {
 /// Confirmed against the SIMD + memory64 + linking suites: `"out of bounds memory access"`
 /// covers every SIMD/memory64 OOB. If a pinned `.wast` `assert_trap` empirically distinguishes a
 /// message this set cannot produce (expected: none), add exactly one variant consciously (10/11).
+///
+/// ## Phase 7 adds ZERO variants (T8 — a WASM exception is NOT a trap)
+///
+/// The EH surface (`Throw`/`Try`/`ThrowRef` + `TagDecl` + `exnref`) raises a DISTINCT term class
+/// `{wasm_exn, TagId, Payload}` (owned by `rt_exn`), never `{wasm_trap, Kind}`. An **uncaught**
+/// exception is a distinct run-ABI outcome (`pipeline.RunResult.UncaughtException` — owned by
+/// P7-06), NOT a trap: the spec separates them (`assert_exception ≠ assert_trap`). So the
+/// exhaustive `spec_trap_message`/`trap_reason_atom` matches stay untouched. (A null-`throw_ref`
+/// trap reuses an EXISTING reason — no new variant.)
 pub type TrapReason {
   IntDivByZero
   IntOverflow

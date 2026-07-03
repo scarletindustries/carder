@@ -108,7 +108,7 @@ pub fn parse_module(source: String) -> Result(Module, ParseError) {
   use rest <- result.try(expect(rest, TLBrace, "{"))
   use #(acc, rest) <- result.try(parse_module_items(
     rest,
-    ModuleAcc(False, [], [], [], [], [], [], [], [], None),
+    ModuleAcc(False, [], [], [], [], [], [], [], [], None, []),
   ))
   use rest <- result.try(expect(rest, TRBrace, "}"))
   case rest {
@@ -551,6 +551,8 @@ type ModuleAcc {
     tables: List(TableDecl),
     elements: List(ElementSegment),
     start: Option(String),
+    // Phase-7 module-defined exception tags (J2/T2). `[]` for a tag-free module.
+    tags: List(ir.TagDecl),
   )
 }
 
@@ -568,6 +570,7 @@ fn build_module(name: String, acc: ModuleAcc) -> Module {
     tables: list.reverse(acc.tables),
     elements: list.reverse(acc.elements),
     start: acc.start,
+    tags: list.reverse(acc.tags),
   )
 }
 
@@ -604,6 +607,10 @@ fn parse_module_items(
         "global" -> {
           use #(g, r) <- result.try(parse_global(rest))
           parse_module_items(r, ModuleAcc(..acc, globals: [g, ..acc.globals]))
+        }
+        "tag" -> {
+          use #(t, r) <- result.try(parse_tag(rest))
+          parse_module_items(r, ModuleAcc(..acc, tags: [t, ..acc.tags]))
         }
         "import" -> {
           use #(i, r) <- result.try(parse_import(rest))
@@ -729,6 +736,17 @@ fn parse_global(
   Ok(#(GlobalDecl(name, ty, mutable, init), rest))
 }
 
+/// Parses one module-defined exception tag (J2/T2): `tag @name (params)`. The leading `tag`
+/// keyword has already been consumed. `params` is the parenthesised operand-type list. Returns a
+/// typed `ParseError` (never a panic) on a missing `@name`/list. Round-trips `print_tag`.
+fn parse_tag(
+  toks: List(PToken),
+) -> Result(#(ir.TagDecl, List(PToken)), ParseError) {
+  use #(name, rest) <- result.try(parse_at_name(toks))
+  use #(params, rest) <- result.try(parse_paren_list(rest, parse_valtype))
+  Ok(#(ir.TagDecl(name, params), rest))
+}
+
 /// Parses one import (H4, §A.2.3): `import "<a>" "<b>" <kind-clause>`.
 ///
 /// The two leading strings are the `(module, name)` link key (for `ImportFn` the first is the
@@ -772,11 +790,16 @@ fn parse_import(
         r,
       ))
     }
+    // Phase-7 imported exception tag (J2/T2): `import "mod" "name" tag (params)`.
+    [PToken(TWord("tag"), _, _), ..r] -> {
+      use #(params, r) <- result.try(parse_paren_list(r, parse_valtype))
+      Ok(#(ir.ImportTag(a, b, params), r))
+    }
     [PToken(t, l, c), ..] ->
       Error(UnexpectedToken(
         l,
         c,
-        "import kind (: / global / table / memory)",
+        "import kind (: / global / table / memory / tag)",
         describe(t),
       ))
     [] -> Error(UnexpectedEnd("import kind"))
@@ -822,11 +845,16 @@ fn parse_export(
       use #(i, r) <- result.try(expect_number(r))
       Ok(#(ir.ExportMemory(ename, i), r))
     }
+    // Phase-7 exported exception tag (J2/T2): `export "name" = tag @tagname`.
+    [PToken(TWord("tag"), _, _), ..r] -> {
+      use #(t, r) <- result.try(parse_at_name(r))
+      Ok(#(ir.ExportTag(ename, t), r))
+    }
     [PToken(t, l, c), ..] ->
       Error(UnexpectedToken(
         l,
         c,
-        "export target (@fn / global / table / memory)",
+        "export target (@fn / global / table / memory / tag)",
         describe(t),
       ))
     [] -> Error(UnexpectedEnd("export target"))
@@ -890,6 +918,8 @@ fn parse_reftype(
   case toks {
     [PToken(TWord("funcref"), _, _), ..rest] -> Ok(#(ir.FuncRef, rest))
     [PToken(TWord("externref"), _, _), ..rest] -> Ok(#(ir.ExternRef, rest))
+    // Phase-7 exnref (J2/T9). Conformance-neutral; P7-02 owns the full round-trip.
+    [PToken(TWord("exnref"), _, _), ..rest] -> Ok(#(ir.ExnRef, rest))
     [PToken(t, l, c), ..] ->
       Error(UnexpectedToken(l, c, "reftype", describe(t)))
     [] -> Error(UnexpectedEnd("reftype"))
@@ -1116,6 +1146,8 @@ fn parse_valtype(
         "externref" -> Ok(#(ir.TExternRef, rest))
         // Phase-6 SIMD value type (I1). Conformance-neutral; P6-02 owns the full round-trip.
         "v128" -> Ok(#(ir.TV128, rest))
+        // Phase-7 exnref value type (J2/T9). Conformance-neutral; P7-02 owns the full round-trip.
+        "exnref" -> Ok(#(ir.TExnRef, rest))
         _ -> Error(UnexpectedToken(l, c, "valtype", w))
       }
     [PToken(t, l, c), ..] ->
@@ -1158,9 +1190,11 @@ fn parse_value(
           use #(n, rest) <- result.try(expect_number(rest))
           Ok(#(ConstF64(n), rest))
         }
-        // The null-reference literal, tagged by reftype (R1c): `null.funcref` / `null.externref`.
+        // The null-reference literal, tagged by reftype (R1c): `null.funcref` / `null.externref`
+        // / `null.exnref` (Phase-7, T9).
         "null.funcref" -> Ok(#(ir.ConstNull(ir.FuncRef), rest))
         "null.externref" -> Ok(#(ir.ConstNull(ir.ExternRef), rest))
+        "null.exnref" -> Ok(#(ir.ConstNull(ir.ExnRef), rest))
         // The `v128.const` literal — the 16 raw little-endian bytes as `0x` + 32 hex digits
         // (I1/D5), byte-exact so NaN-payload / `-0.0` / `±Inf` lanes survive. Reuses the
         // data-segment hex path (`parse_hexbytes` → `hex_to_bytes`, which already rejects
@@ -1362,6 +1396,18 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           use #(cost, rest) <- result.try(expect_number(rest))
           use #(body, rest) <- result.try(parse_expr(rest))
           Ok(#(Charge(cost, body), rest))
+        }
+        // ── Phase-7 EH expressions (J2/T1). `throw`/`throw_ref` round-trip their printer
+        // spelling here; the `try` region's brace-delimited body + catch-handler list is P7-02's
+        // full round-trip (the printer emits it, this keystone does not re-read it). ──
+        "throw" -> {
+          use #(tag, rest) <- result.try(parse_at_name(rest))
+          use #(args, rest) <- result.try(parse_value_list(rest))
+          Ok(#(ir.Throw(tag, args), rest))
+        }
+        "throw_ref" -> {
+          use #(exnref, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.ThrowRef(exnref), rest))
         }
         _ -> Error(UnexpectedToken(l, c, "expression", kw))
       }

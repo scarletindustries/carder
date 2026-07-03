@@ -39,6 +39,7 @@ fn mod_of(funcs: List(ir.Function), exports: List(ir.ExportDecl)) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

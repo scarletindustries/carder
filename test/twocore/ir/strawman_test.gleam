@@ -45,6 +45,7 @@ fn add_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -116,6 +117,7 @@ fn sum_to_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -188,6 +190,7 @@ fn fib_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

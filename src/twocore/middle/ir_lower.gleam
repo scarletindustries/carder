@@ -214,7 +214,11 @@ fn lower_expr(
     | ir.SimdStore(_, _, _, _)
     | ir.SimdLoadLane(_, _, _, _, _, _)
     | ir.SimdStoreLane(_, _, _, _, _, _)
-    | ir.CallImport(_, _, _) -> Ok(expr)
+    | ir.CallImport(_, _, _)
+    | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`, no `CallHost`, no
+      // `Loop`), so this CallHost-gate + Loop-meter pass leaves them unchanged.
+      ir.Throw(_, _)
+    | ir.ThrowRef(_) -> Ok(expr)
 
     // THE capability boundary — gate it; the node is left unchanged for `emit_core` to route
     ir.CallHost(cap, name, args) ->
@@ -286,6 +290,27 @@ fn lower_expr(
       case lower_expr(body, binding, imports) {
         Error(e) -> Error(e)
         Ok(body2) -> Ok(ir.Charge(cost, body2))
+      }
+
+    // Phase-7 `Try` region (T1): recurse into its `body` and each handler's inline `handler`
+    // expression so a `CallHost` / `Loop` inside an EH region is gated / metered like any other
+    // structured-control interior. Byte-neutral (no Phase-1..6 module has this node); P7-05/06
+    // own the real EH lowering + emit.
+    ir.Try(result, body, handlers) ->
+      case lower_expr(body, binding, imports) {
+        Error(e) -> Error(e)
+        Ok(body2) ->
+          case
+            list.try_map(handlers, fn(h) {
+              case lower_expr(h.handler, binding, imports) {
+                Error(e) -> Error(e)
+                Ok(h2) -> Ok(ir.CatchHandler(..h, handler: h2))
+              }
+            })
+          {
+            Error(e) -> Error(e)
+            Ok(handlers2) -> Ok(ir.Try(result, body2, handlers2))
+          }
       }
   }
 }
@@ -384,10 +409,13 @@ fn import_set(module: Module) -> Set(#(String, String)) {
   list.fold(module.imports, set.new(), fn(acc, imp) {
     case imp {
       ir.ImportFn(capability, name, _ty) -> set.insert(acc, #(capability, name))
-      // Non-function imports (H4) are PROVIDED STATE, not capabilities — they are wired into
-      // the instance by the instantiation contract (unit 09), never reached via `CallHost`, so
-      // they contribute nothing to the host-capability set.
-      ir.ImportGlobal(..) | ir.ImportTable(..) | ir.ImportMemory(..) -> acc
+      // Non-function imports (H4) + a Phase-7 imported TAG (T2) are PROVIDED STATE, not
+      // capabilities — they are wired into the instance by the instantiation contract (unit 09),
+      // never reached via `CallHost`, so they contribute nothing to the host-capability set.
+      ir.ImportGlobal(..)
+      | ir.ImportTable(..)
+      | ir.ImportMemory(..)
+      | ir.ImportTag(..) -> acc
     }
   })
 }

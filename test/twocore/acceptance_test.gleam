@@ -273,6 +273,9 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
     // A `v128` result is 16 raw little-endian bytes (S14); the numeric acceptance corpus never
     // produces one, so this arm is unreachable — an i32 fallback keeps the function total.
     ir.TV128 -> I32Val(raw)
+    // An `exnref` (Phase-7) is a reference; the acceptance corpus never returns one — an i32
+    // fallback keeps the function total.
+    ir.TExnRef -> I32Val(raw)
   }
 }
 
@@ -294,6 +297,7 @@ fn numeric_module(name: String, fns: List(ir.Function)) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -376,7 +380,10 @@ fn export_types(m: ir.Module) -> Dict(String, List(ir.ValType)) {
           Ok(results) -> dict.insert(acc, export_name, results)
           Error(_) -> acc
         }
-      ir.ExportGlobal(..) | ir.ExportTable(..) | ir.ExportMemory(..) -> acc
+      ir.ExportGlobal(..)
+      | ir.ExportTable(..)
+      | ir.ExportMemory(..)
+      | ir.ExportTag(..) -> acc
     }
   })
 }

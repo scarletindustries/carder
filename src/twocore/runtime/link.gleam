@@ -46,8 +46,8 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import twocore/ir.{
   type FuncType, type IdxType, type Module, type RefType, type ValType, FuncRef,
-  Idx32, ImportFn, ImportGlobal, ImportMemory, ImportTable, TF32, TF64, TI32,
-  TI64,
+  Idx32, ImportFn, ImportGlobal, ImportMemory, ImportTable, ImportTag, TF32,
+  TF64, TI32, TI64,
 }
 import twocore/runtime/rt_host
 import twocore/runtime/rt_mem
@@ -465,6 +465,12 @@ fn resolve_one(
         _ -> Error(IncompatibleImportType(module, name, "expected a memory"))
       }
     }
+    // Phase-7 imported exception TAG (T2): its link-time identity resolution (a P5-style
+    // `Provided.ProvidedTag`) is DEFERRED (§H.4) — cross-module EH linking is out of the
+    // single-module Porffor scope. The keystone contributes NO positional value for it (`Ok(None)`,
+    // like a checked function import). Byte-neutral (no Phase-1..6 module imports a tag); P7-05/link
+    // owns the real `ProvidedTag` identity if pursued.
+    ImportTag(_module, _name, _params) -> Ok(None)
   }
 }
 

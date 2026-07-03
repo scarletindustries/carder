@@ -84,6 +84,10 @@ pub fn print_module(module: Module) -> String {
     ms -> list.map(ms, print_memory_decl)
   }
   let globals = list.map(module.globals, print_global)
+  // One `tag` line per module-defined exception tag (J2/T2), in list order (= tag-index space).
+  // The empty list (the conformance-neutral default) renders NOTHING, so a tag-free module's
+  // `.ir` text is byte-identical to Phase-6.
+  let tags = list.map(module.tags, print_tag)
   let tables = list.map(module.tables, print_table)
   let imports = list.map(module.imports, print_import)
   let exports = list.map(module.exports, print_export)
@@ -100,6 +104,7 @@ pub fn print_module(module: Module) -> String {
       header,
       memories,
       globals,
+      tags,
       tables,
       imports,
       exports,
@@ -154,6 +159,14 @@ fn print_global(g: ir.GlobalDecl) -> String {
   <> " = "
   <> print_expr(2, g.init)
   <> "\n"
+}
+
+/// Renders one module-defined exception tag (J2/T2): `  tag @name (params)`, mirroring the
+/// `global`/`table` module-declaration spellings. `params` is the operand signature the exception
+/// carries (`()` for a payload-less tag). Conformance-neutral (no legacy module declares a tag);
+/// P7-02 owns the full round-trip. Total.
+fn print_tag(t: ir.TagDecl) -> String {
+  "  tag @" <> t.name <> " " <> valtype_list(t.params) <> "\n"
 }
 
 /// Renders one import (H4, §A.2.3).
@@ -211,6 +224,17 @@ fn print_import(i: ir.ImportDecl) -> String {
       <> int.to_string(min)
       <> max_clause(max)
       <> ")\n"
+    // Phase-7 imported exception tag (J2/T2) — `import "mod" "name" tag (params)`, mirroring the
+    // imported-global/table/memory spellings. Conformance-neutral (no legacy module imports a
+    // tag); P7-02 owns the full round-trip.
+    ir.ImportTag(module, name, params) ->
+      "  import \""
+      <> escape(module)
+      <> "\" \""
+      <> escape(name)
+      <> "\" tag "
+      <> valtype_list(params)
+      <> "\n"
   }
 }
 
@@ -253,6 +277,11 @@ fn print_export(e: ir.ExportDecl) -> String {
       <> "\" = memory "
       <> int.to_string(mem_index)
       <> "\n"
+    // Phase-7 exported exception tag (J2/T2) — `export "name" = tag @tagname`, mirroring the
+    // global/table export spellings. Measured: Porffor emits `(export "0" (tag 0))`. Inert for
+    // single-module execution; P7-02 owns the full round-trip.
+    ir.ExportTag(export_name, tag_name) ->
+      "  export \"" <> escape(export_name) <> "\" = tag @" <> tag_name <> "\n"
   }
 }
 
@@ -281,6 +310,9 @@ fn print_reftype(r: ir.RefType) -> String {
   case r {
     ir.FuncRef -> "funcref"
     ir.ExternRef -> "externref"
+    // Phase-7 exnref (J2/T9). Conformance-neutral — no legacy module has it; P7-02 owns the
+    // full round-trip.
+    ir.ExnRef -> "exnref"
   }
 }
 
@@ -328,6 +360,9 @@ fn print_table(t: ir.TableDecl) -> String {
   let ref_ty = case t.ref_ty {
     ir.FuncRef -> ""
     ir.ExternRef -> " externref"
+    // Phase-7 exnref-typed table (spec-conformance surface only; validate rejects it for
+    // Porffor). Total match — no legacy module has it.
+    ir.ExnRef -> " exnref"
   }
   "  table @"
   <> t.name
@@ -442,6 +477,8 @@ fn print_valtype(t: ValType) -> String {
     ir.TExternRef -> "externref"
     // Phase-6 SIMD value type (I1). Conformance-neutral — no legacy module has it.
     ir.TV128 -> "v128"
+    // Phase-7 exnref value type (J2/T9). Conformance-neutral; P7-02 owns the full round-trip.
+    ir.TExnRef -> "exnref"
   }
 }
 
@@ -770,7 +807,49 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_functype(ty)
       <> " "
       <> value_list(args)
+    // ── Phase-7 EH nodes (J2/T1). No Phase-1..6 module contains these, so any spelling is
+    // conformance-neutral by construction; P7-02 makes it the round-trip spelling. ──
+    ir.Throw(tag, args) -> "throw @" <> tag <> " " <> value_list(args)
+    ir.ThrowRef(exnref) -> "throw_ref " <> print_value(exnref)
+    ir.Try(result, body, handlers) ->
+      "try "
+      <> valtype_list(result)
+      <> " {\n"
+      <> stmt(indent + 2, body)
+      <> "\n"
+      <> spaces(indent)
+      <> "}"
+      <> string.concat(
+        list.map(handlers, fn(h) { print_catch_handler(indent, h) }),
+      )
   }
+}
+
+/// Renders one `CatchHandler` of a `Try` region (J2/T1) at the try's `indent`. Spells the
+/// `CatchTag` (`catch @tag` / `catch_all`), the payload names in `(%a, %b)`, an optional ` ref %e`
+/// exnref-capture clause, then the inline handler body. Conformance-neutral spelling; P7-02 owns
+/// the round-trip. Total.
+fn print_catch_handler(indent: Int, h: ir.CatchHandler) -> String {
+  let tag = case h.on {
+    ir.OnTag(t) -> "catch @" <> t
+    ir.OnAll -> "catch_all"
+  }
+  let payload =
+    "(" <> string.join(list.map(h.payload, fn(n) { "%" <> n }), ", ") <> ")"
+  let exnref = case h.exnref {
+    Some(name) -> " ref %" <> name
+    None -> ""
+  }
+  " "
+  <> tag
+  <> " "
+  <> payload
+  <> exnref
+  <> " {\n"
+  <> stmt(indent + 2, h.handler)
+  <> "\n"
+  <> spaces(indent)
+  <> "}"
 }
 
 /// Renders a SIMD lane shape token (`i8x16`/`i16x8`/`i32x4`/`i64x2`/`f32x4`/`f64x2`). Shared by

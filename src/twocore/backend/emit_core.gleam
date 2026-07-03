@@ -456,6 +456,11 @@ fn emit_exports(
           ])
         Ok(add_state_export(export_name, cell, threaded, names, wrappers, ctx))
       }
+      // An exported exception TAG (Phase-7, T2) is INERT for single-module execution (nothing
+      // imports it), and a tag seeds no runtime state under the static-`TagId` model (§H.1) — so
+      // it adds NO export name / wrapper. Byte-neutral (no Phase-1..6 module has one). P7-05/link
+      // owns the cross-module `ProvidedTag` identity if pursued.
+      ir.ExportTag(_export_name, _tag_name) -> Ok(#(names, wrappers))
     }
   })
   |> result.map(fn(acc) {
@@ -677,7 +682,10 @@ fn reference_global_names(module: Module) -> Set(String) {
 /// globals that route through `rt_state`'s parallel `ref_globals` map (R8).
 fn is_reference_type(ty: ValType) -> Bool {
   case ty {
-    ir.TFuncRef | ir.TExternRef -> True
+    // `TExnRef` (Phase-7, T9) is a reference type — a semantic MUST-ADD (not a hard compile
+    // break): an exnref-typed global must route through `rt_state`'s boxed `ref_globals` map, not
+    // the numeric raw-bit path. Leaving it at the `_ -> False` default would mis-box it.
+    ir.TFuncRef | ir.TExternRef | ir.TExnRef -> True
     _ -> False
   }
 }
@@ -969,6 +977,13 @@ fn emit(
     // an ambient `apply` of a data-named `module:atom` — D3a). ──
     ir.CallImport(slot, ty, args) ->
       emit_call_import(slot, ty, args, cont, sc, state, ctx)
+    // ── Phase-7 EH nodes (§J/T5): the keystone lands these as a typed `UnsupportedNode` — no
+    // module carries a tag until P7-05 lowers them, so these arms are UNREACHED and the tree
+    // stays byte-identical. P7-06 replaces them with the real `try…catch` / `rt_exn` codegen
+    // (adding the `CTry` Core Erlang construct — the keystone does NOT add `CTry`, T5). ──
+    ir.Throw(_, _) -> Error(UnsupportedNode("throw"))
+    ir.Try(_, _, _) -> Error(UnsupportedNode("try"))
+    ir.ThrowRef(_) -> Error(UnsupportedNode("throw_ref"))
     // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
     // boxing `Convert`s remain unlowered (still a later-phase deferral).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
@@ -1651,6 +1666,9 @@ fn result_width(t: ValType) -> Int {
     // A `v128` is a 16-byte value — 128 bits. Never a scalar numeric-load result (validate
     // rejects it; SIMD loads route through the dedicated `SimdLoad*` nodes, P6-06). §J.
     ir.TV128 -> 128
+    // An `exnref` is a reference, never a numeric load result (validate rejects it); defaulted
+    // to 32 like the other references (Phase-7, T9). §J.
+    ir.TExnRef -> 32
   }
 }
 
@@ -3657,6 +3675,8 @@ fn valtype_atom(t: ValType) -> CExpr {
     ir.TExternRef -> "externref"
     // Phase-6 SIMD value type (§J). Self-consistent inside `func_type_term`.
     ir.TV128 -> "v128"
+    // Phase-7 exnref value type (§J/T9). Self-consistent inside `func_type_term`.
+    ir.TExnRef -> "exnref"
   })
 }
 
@@ -4083,6 +4103,10 @@ fn imported_slots(
       let #(mems, tables, nums, refs, p, gidx) = acc
       case imp {
         ir.ImportFn(..) -> Ok(#(mems, tables, nums, refs, p, gidx))
+        // An imported exception TAG (Phase-7, T2) contributes NO positional state slot here (like
+        // a function import) — its link identity (`ProvidedTag`) is DEFERRED (§H.4). Byte-neutral
+        // (no Phase-1..6 module imports a tag; Porffor is single-module).
+        ir.ImportTag(..) -> Ok(#(mems, tables, nums, refs, p, gidx))
         ir.ImportGlobal(_, _, ty, _) -> {
           use v <- result.map(import_var(imp_vars, p))
           let name = core_binary_string("g" <> int.to_string(gidx))
@@ -5281,6 +5305,22 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     ir.SimdStoreLane(_, _, addr, _, _, vec) ->
       collect_value(vec, collect_value(addr, acc))
     ir.CallImport(_, _, args) -> collect_values(args, acc)
+    // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions so gensym
+    // avoids them (over-approximating is safe). `Try` recurses into its body + each handler's
+    // inline handler expression and includes the handler's `payload`/`exnref` binder names. ──
+    ir.Throw(_, args) -> collect_values(args, acc)
+    ir.ThrowRef(exnref) -> collect_value(exnref, acc)
+    ir.Try(_, body, handlers) -> {
+      let acc = collect_expr(body, acc)
+      list.fold(handlers, acc, fn(a, h) {
+        let a = list.fold(h.payload, a, set.insert)
+        let a = case h.exnref {
+          Some(name) -> set.insert(a, name)
+          None -> a
+        }
+        collect_expr(h.handler, a)
+      })
+    }
   }
 }
 

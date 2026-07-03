@@ -380,7 +380,7 @@ fn export_types(m: ir.Module) -> Dict(String, List(ir.ValType)) {
           Ok(ty) -> dict.insert(acc, export_name, [ty])
           Error(_) -> acc
         }
-      ir.ExportTable(..) | ir.ExportMemory(..) -> acc
+      ir.ExportTable(..) | ir.ExportMemory(..) | ir.ExportTag(..) -> acc
     }
   })
 }
@@ -536,6 +536,8 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
     // A `v128` result forces the term ABI (`use_term_abi`), so the integer path never tags one.
     // Defensive fallback keeps this total.
     ir.TV128 -> I32Val(raw)
+    // An `exnref` (Phase-7) is a reference; the integer path never tags one. Defensive fallback.
+    ir.TExnRef -> I32Val(raw)
   }
 }
 
@@ -564,6 +566,9 @@ fn tag_term(ty: ir.ValType, term: Dynamic) -> SpecValue {
           LaneI8,
         ),
       )
+    // An `exnref` (Phase-7, T9) is a caught-exception handle; the conformance corpus never returns
+    // one as a scalar. Classify it via a defensive reference tag (its identity is not compared).
+    ir.TExnRef -> tag_ref(term, ExternRefTag)
   }
 }
 

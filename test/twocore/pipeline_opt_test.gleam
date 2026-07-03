@@ -54,6 +54,7 @@ fn add_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -80,6 +81,7 @@ fn single_fn_module(body: ir.Expr) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

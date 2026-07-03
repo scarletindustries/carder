@@ -601,6 +601,23 @@ fn apply_rename_subst(
       )
     ir.CallImport(slot, ty, cargs) ->
       ir.CallImport(slot, ty, rs_values(cargs, rename, subst))
+    // ── Phase-7 EH nodes: rewrite their `Value` operands (the tag NAME is static). `Try`
+    // recurses into its body + each handler's inline handler expression (the handler's own
+    // `payload`/`exnref` binders are left untouched — a static-name introduction). Conservative:
+    // no Phase-1..6 module has these nodes, so this is byte-neutral. ──
+    ir.Throw(tag, args) -> ir.Throw(tag, rs_values(args, rename, subst))
+    ir.ThrowRef(exnref) -> ir.ThrowRef(rs_value(exnref, rename, subst))
+    ir.Try(result, body, handlers) ->
+      ir.Try(
+        result,
+        apply_rename_subst(body, rename, subst),
+        list.map(handlers, fn(h) {
+          ir.CatchHandler(
+            ..h,
+            handler: apply_rename_subst(h.handler, rename, subst),
+          )
+        }),
+      )
   }
 }
 
@@ -822,8 +839,12 @@ fn protected_names(module: ir.Module) -> Set(String) {
     list.filter_map(module.exports, fn(x) {
       case x {
         ir.ExportFn(_, fn_name) -> Ok(fn_name)
-        ir.ExportGlobal(..) | ir.ExportTable(..) | ir.ExportMemory(..) ->
-          Error(Nil)
+        // Exported state (global/table/memory) + a Phase-7 exported TAG name no function (H4/T2),
+        // so none protects a function from orphan deletion.
+        ir.ExportGlobal(..)
+        | ir.ExportTable(..)
+        | ir.ExportMemory(..)
+        | ir.ExportTag(..) -> Error(Nil)
       }
     })
   let started = case module.start {

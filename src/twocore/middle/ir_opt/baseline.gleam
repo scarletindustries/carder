@@ -947,6 +947,19 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
       )
     ir.CallImport(slot, ty, cargs) ->
       ir.CallImport(slot, ty, subst_values(cargs, subs))
+    // ── Phase-7 EH nodes: substitute their `Value` operands (the tag NAME is static); `Try`
+    // recurses into its body + each handler's inline handler expression. Byte-neutral (no
+    // Phase-1..6 module has these nodes). ──
+    ir.Throw(tag, args) -> ir.Throw(tag, subst_values(args, subs))
+    ir.ThrowRef(exnref) -> ir.ThrowRef(subst_value(exnref, subs))
+    ir.Try(result, body, handlers) ->
+      ir.Try(
+        result,
+        subst_expr(body, subs),
+        list.map(handlers, fn(h) {
+          ir.CatchHandler(..h, handler: subst_expr(h.handler, subs))
+        }),
+      )
   }
 }
 
@@ -1066,6 +1079,16 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.SimdStoreLane(_, _, addr, _, _, vec) ->
       list.append(value_name(addr), value_name(vec))
     ir.CallImport(_, _, args) -> values_names(args)
+    // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions (the tag
+    // NAME is static). Over-approximating (including handler binders) is safe for liveness —
+    // names are function-unique. Byte-neutral (no Phase-1..6 module has these nodes). ──
+    ir.Throw(_, args) -> values_names(args)
+    ir.ThrowRef(exnref) -> value_name(exnref)
+    ir.Try(_, body, handlers) ->
+      list.append(
+        expr_vars(body),
+        list.flat_map(handlers, fn(h) { expr_vars(h.handler) }),
+      )
   }
 }
 

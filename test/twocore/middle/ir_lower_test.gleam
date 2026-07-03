@@ -34,6 +34,7 @@ fn module_with(
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

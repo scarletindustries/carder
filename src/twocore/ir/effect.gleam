@@ -61,7 +61,8 @@ import twocore/ir.{
   MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize, MemStore, Num, RefFunc,
   RefIsNull, Return, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
   SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
-  TableSet, TableSize, TermOp, Trap, TruncS, TruncU, Values,
+  TableSet, TableSize, TermOp, Throw, ThrowRef, Trap, TruncS, TruncU, Try,
+  Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -136,7 +137,17 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     | SimdStoreLane(_, _, _, _, _, _)
     | // Phase-6 imported-function CALL (S5/S7): a call is a barrier (it may read/write any
       // state and trap) — classified like `CallDirect`/`CallHost`.
-      CallImport(_, _, _) -> True
+      CallImport(_, _, _)
+    | // ── Phase-7 exception handling (J5/T1): ALL THREE EH nodes are barriers. `Throw`/`ThrowRef`
+      // are non-local control transfers that RAISE (like `Trap`/`Return`) — never reorder, hoist,
+      // duplicate, or eliminate (they add/remove an exception, an F2 observable). `Try` establishes
+      // an exception handler and alters control flow (catching turns a throwing body into a normal
+      // result — observable), and its `body`/handlers may be effectful; conservatively a barrier.
+      // Since the `case` is exhaustive, OMITTING any EH node fails to compile (fail-closed, D4) —
+      // an unclassified EH node can never be silently optimized. ──
+      Throw(_, _)
+    | Try(_, _, _)
+    | ThrowRef(_) -> True
     Num(op, _) -> trapping_numop(op)
     Convert(op, _) -> trapping_convop(op)
     // ── Phase-6 PURE lane-wise SIMD (S7): `Simd`/`SimdShuffle` are TOTAL and DETERMINISTIC —

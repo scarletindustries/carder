@@ -144,8 +144,21 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | ir.SimdStore(..)
     | ir.SimdLoadLane(..)
     | ir.SimdStoreLane(..)
-    | ir.CallImport(..) -> e
+    | ir.CallImport(..)
+    | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`), so like the leaves
+      // they return unchanged. They are barriers (`ir/effect`), so no pass hoists across them.
+      ir.Throw(..)
+    | ir.ThrowRef(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
+    // Phase-7 `Try` recurses into its `body` and each handler's inline `handler` expression
+    // (both are sub-`Expr`s), so a traversal reaches an EH region's interior. The node itself is
+    // a barrier (`ir/effect`), so no pass hoists across it.
+    ir.Try(result, body, handlers) ->
+      ir.Try(
+        result,
+        map_expr(body, rewrite),
+        map_catch_handlers(handlers, rewrite),
+      )
     ir.Let(names, rhs, body) ->
       ir.Let(names, map_expr(rhs, rewrite), map_expr(body, rewrite))
     ir.Block(label, result, body) ->
@@ -195,6 +208,17 @@ fn map_switch_arms(
 ) -> List(ir.SwitchArm) {
   list.map(arms, fn(arm) {
     ir.SwitchArm(..arm, body: map_expr(arm.body, rewrite))
+  })
+}
+
+/// Map `map_expr(_, rewrite)` over each `CatchHandler.handler` of a `Try` region, preserving the
+/// handler order, its `on` tag, `payload` names, and `exnref` capture (Phase-7, T1).
+fn map_catch_handlers(
+  handlers: List(ir.CatchHandler),
+  rewrite: fn(Expr) -> Expr,
+) -> List(ir.CatchHandler) {
+  list.map(handlers, fn(h) {
+    ir.CatchHandler(..h, handler: map_expr(h.handler, rewrite))
   })
 }
 

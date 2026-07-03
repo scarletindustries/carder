@@ -97,6 +97,7 @@ fn state_module(name: String) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

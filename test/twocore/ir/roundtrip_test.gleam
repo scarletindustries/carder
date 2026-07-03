@@ -77,6 +77,7 @@ fn add_module() -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -127,6 +128,7 @@ fn sum_to_module() -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -181,6 +183,7 @@ fn fib_module() -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -218,6 +221,7 @@ fn expr_module(name: String, body: ir.Expr) -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -509,6 +513,7 @@ fn kitchen_sink_module() -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -567,6 +572,7 @@ fn mem_table_module() -> ir.Module {
       ),
     ],
     start: Some("setup"),
+    tags: [],
   )
 }
 
@@ -776,6 +782,7 @@ fn refs_bulk_module() -> ir.Module {
       ]),
     ],
     start: Some("setup"),
+    tags: [],
   )
 }
 
@@ -853,6 +860,7 @@ pub fn empty_module_roundtrip_test() {
       tables: [],
       elements: [],
       start: None,
+      tags: [],
     )
   check_roundtrip(m)
 }
@@ -1054,6 +1062,7 @@ fn reftype_valtype_module() -> ir.Module {
     tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -1238,6 +1247,7 @@ pub fn legacy_module_byte_identical_test() {
       tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
       elements: [],
       start: None,
+      tags: [],
     )
   let expected =
     "module @leg {\n"
@@ -1255,19 +1265,9 @@ pub fn legacy_module_byte_identical_test() {
     <> "}\n"
   assert printer.print_module(m) == expected
   // And the empty (numerics-only) module still prints the legacy `memory none` line.
-  assert printer.print_module(ir.Module(
-      "e",
-      False,
-      [],
-      [],
-      [],
-      [],
-      [],
-      [],
-      [],
-      [],
-      None,
-    ))
+  assert printer.print_module(
+      ir.Module("e", False, [], [], [], [], [], [], [], [], None, tags: []),
+    )
     == "module @e {\n  numerics false\n  memory none\n}\n"
 }
 
@@ -1819,6 +1819,7 @@ fn v128_valtype_module() -> ir.Module {
     tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 
@@ -1899,6 +1900,7 @@ pub fn cross_module_import_and_callimport_roundtrip_test() {
       tables: [],
       elements: [],
       start: None,
+      tags: [],
     )
   // Byte-identity of the import DECL spelling (the A.7 invariant).
   assert printer.print_module(m)
@@ -2051,6 +2053,7 @@ fn simd_module() -> ir.Module {
     tables: [],
     elements: [],
     start: None,
+    tags: [],
   )
 }
 

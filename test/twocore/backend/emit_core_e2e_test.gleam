@@ -72,6 +72,7 @@ fn module(name: String, functions: List(ir.Function)) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -425,6 +426,7 @@ fn full(
     tables: tables,
     elements: elements,
     start: start,
+    tags: [],
   )
 }
 
@@ -1230,6 +1232,7 @@ fn reftype_module(name: String) -> ir.Module {
       ),
     ],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -1344,6 +1347,7 @@ fn bulk_module(name: String) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -1455,6 +1459,7 @@ fn multimem_module(name: String) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -1521,6 +1526,7 @@ fn import_module(name: String) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -1724,6 +1730,7 @@ pub fn ref_func_declarative_and_global_init_elem_e2e_test() {
         ),
       ],
       start: option.None,
+      tags: [],
     )
   // The module EMITS (no `UnsupportedNode`) and instantiates, and the global-initialised slot is
   // the funcref of `$f`: `call0(21) == 42` (`f(x) = x*2`).
@@ -2301,27 +2308,30 @@ pub fn cross_module_call_import_e2e_test() {
   let provided = link.provided_func(ty, closure)
   // Module B: `caller(x) = CallImport(0, ty, [x])` — imports and CALLS A's `add1`.
   let mod_b =
-    load(ir.Module(
-      name: "twocore@e2e@modB",
-      uses_numerics: True,
-      memories: [],
-      globals: [],
-      imports: [ir.ImportFn("modA", "add1", ty)],
-      functions: [
-        ir.Function(
-          name: "caller",
-          params: [ir.Local("x", ir.TI32)],
-          result: [ir.TI32],
-          locals: [],
-          body: ir.CallImport(0, ty, [ir.Var("x")]),
-        ),
-      ],
-      exports: [ir.ExportFn("caller", "caller")],
-      data_segments: [],
-      tables: [],
-      elements: [],
-      start: option.None,
-    ))
+    load(
+      ir.Module(
+        name: "twocore@e2e@modB",
+        uses_numerics: True,
+        memories: [],
+        globals: [],
+        imports: [ir.ImportFn("modA", "add1", ty)],
+        functions: [
+          ir.Function(
+            name: "caller",
+            params: [ir.Local("x", ir.TI32)],
+            result: [ir.TI32],
+            locals: [],
+            body: ir.CallImport(0, ty, [ir.Var("x")]),
+          ),
+        ],
+        exports: [ir.ExportFn("caller", "caller")],
+        data_segments: [],
+        tables: [],
+        elements: [],
+        start: option.None,
+        tags: [],
+      ),
+    )
   // Instantiate B with the positional func-import vector `[provided]` (S5), then invoke.
   let assert Ok(_) =
     catch_apply_dyn(mod_b, atom.create("instantiate"), [to_dynamic([provided])])

@@ -150,6 +150,7 @@ pub fn ir3_surface_is_expressible_test() {
         ]),
       ],
       start: None,
+      tags: [],
     )
 
   // The value compiled ⇒ the surface is expressible. Assert the frozen shapes are as declared.
@@ -239,6 +240,7 @@ pub fn legacy_module_is_byte_identical_test() {
         ]),
       ],
       start: None,
+      tags: [],
     )
 
   let text = printer.print_module(module)

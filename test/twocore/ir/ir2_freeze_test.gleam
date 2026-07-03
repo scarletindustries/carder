@@ -43,6 +43,7 @@ fn ir2_module() -> ir.Module {
       ),
     ],
     start: Some("init"),
+    tags: [],
   )
 }
 

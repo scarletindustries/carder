@@ -83,6 +83,7 @@ fn sample_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option_none(),
+    tags: [],
   )
 }
 

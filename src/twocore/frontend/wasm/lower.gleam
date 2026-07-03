@@ -270,6 +270,9 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
     tables: lower_tables(module, typed.imported_table_count),
     elements: elements,
     start: lower_start(module),
+    // Phase-7 exception tags (J2/T2). Empty until P7-05 lowers the WASM tag section →
+    // `Module.tags`; a tag-free module is byte-identical to Phase-6.
+    tags: [],
   ))
 }
 
@@ -2271,6 +2274,9 @@ fn zero_value(t: ir.ValType) -> ir.Value {
     // A `v128` slot's zero value is the all-zero 16-byte vector (I1). Never arises from the
     // Phase-1..5 WASM surface; P6-05 exercises real v128 locals.
     ir.TV128 -> ir.ConstV128(<<0:128>>)
+    // An `exnref` slot's zero value is the null reference (J2/T9) — `ref.null exn`. Never arises
+    // from the Phase-1..6 WASM surface; P7-05 exercises real exnref locals.
+    ir.TExnRef -> ir.ConstNull(ir.ExnRef)
   }
 }
 

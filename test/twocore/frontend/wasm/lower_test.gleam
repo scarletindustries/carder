@@ -131,7 +131,10 @@ pub fn export_preserved_test() {
   list.any(irm.exports, fn(e) {
     case e {
       ir.ExportFn(export_name, _) -> export_name == "add"
-      ir.ExportGlobal(..) | ir.ExportTable(..) | ir.ExportMemory(..) -> False
+      ir.ExportGlobal(..)
+      | ir.ExportTable(..)
+      | ir.ExportMemory(..)
+      | ir.ExportTag(..) -> False
     }
   })
   |> should.equal(True)

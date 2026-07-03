@@ -161,6 +161,7 @@ fn mixed_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -253,6 +254,7 @@ fn stateful_module() -> ir.Module {
       ),
     ],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -564,6 +566,7 @@ fn phase5_module() -> ir.Module {
       ir.ElementSegment(ir.ElemPassive, ir.FuncRef, [ir.RefFunc("target")]),
     ],
     start: option.None,
+    tags: [],
   )
 }
 
@@ -711,6 +714,7 @@ fn p6_module() -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

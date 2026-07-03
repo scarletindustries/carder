@@ -378,6 +378,7 @@ fn numeric_module(name: String, fns: List(ir.Function)) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 

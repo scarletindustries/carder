@@ -34,6 +34,7 @@ fn mod_with_body(body: ir.Expr) -> ir.Module {
     tables: [],
     elements: [],
     start: option.None,
+    tags: [],
   )
 }
 
