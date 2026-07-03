@@ -1,5 +1,9 @@
 # `vendor/porffor` — self-hosting Porffor for an in-BEAM JS frontend
 
+> 🚧 **Work in progress. If you are continuing this effort, read [`CONTINUE.md`](CONTINUE.md) FIRST**
+> — it is a full, self-contained kickstart (current state, the reproduce loop, every fix so far, the
+> gotchas, the current bug + how to attack it, and the end-game integration plan).
+
 **Goal.** Turn [Porffor](https://github.com/CanadaHonk/porffor) (a JS→Wasm compiler *written in JS*)
 into a **pure, Node-free `compileJS(code) → wasmBytes` function**, compile *that* with Porffor to
 `porffor.wasm`, and run it on 2core's Wasm engine → `porffor.beam`. Result: `2core compile foo.js`
