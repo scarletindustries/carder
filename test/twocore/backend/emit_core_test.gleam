@@ -1880,3 +1880,529 @@ pub fn reference_only_stays_pure_under_threaded_test() {
   let assert FunDef(FName("f", 2), _) =
     p5_fdef(ir.TableSize("t0"), [ir.TI32], threaded())
 }
+
+// ══════════════════════ Phase-6 SIMD + memory64 + cross-module (P6-06) ══════════════════════
+//
+// Structural goldens for the new IR4 nodes, asserted against the fixed-width-SIMD spec (§5.4.9) /
+// the memory64 proposal (S9) / spec §4.5.4 + S5 — NOT change-detectors: the `rt_simd` names ARE the
+// spec instruction mnemonics; the compose shapes ARE the S4 table; the closure dispatch IS the D3a
+// capability form. Each pattern-matches the emitted `core_erlang` AST.
+
+/// Emit `module` under `b` and return function `name`'s Core body.
+fn body_of_b(module: ir.Module, name: String, b: instance.Binding) -> CExpr {
+  let assert Ok(m) = emit_core.emit_module(module, b)
+  let assert Ok(FunDef(_, CFun(_, body))) =
+    list.find(m.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == name
+    })
+  body
+}
+
+/// The FunDef of function `name` in `module` emitted under `b` (to inspect its arity).
+fn fdef_of(
+  module: ir.Module,
+  name: String,
+  b: instance.Binding,
+) -> core_erlang.FunDef {
+  let assert Ok(m) = emit_core.emit_module(module, b)
+  let assert Ok(def) =
+    list.find(m.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == name
+    })
+  def
+}
+
+/// True iff `e` (recursively) contains a `call '<mod>':'<fun>'(...)`.
+fn has_call(e: CExpr, mod: String, fun: String) -> Bool {
+  case e {
+    CCall(CAtom(m), CAtom(f), args) ->
+      { m == mod && f == fun } || list.any(args, has_call(_, mod, fun))
+    CCall(m, f, args) ->
+      has_call(m, mod, fun)
+      || has_call(f, mod, fun)
+      || list.any(args, has_call(_, mod, fun))
+    CLet(_, arg, body) -> has_call(arg, mod, fun) || has_call(body, mod, fun)
+    CLetrec(defs, body) ->
+      list.any(defs, fn(d) {
+        let FunDef(_, v) = d
+        has_call(v, mod, fun)
+      })
+      || has_call(body, mod, fun)
+    CCase(arg, clauses) ->
+      has_call(arg, mod, fun)
+      || list.any(clauses, fn(c) {
+        let CClause(_, g, b) = c
+        has_call(g, mod, fun) || has_call(b, mod, fun)
+      })
+    CApply(_, args) -> list.any(args, has_call(_, mod, fun))
+    CFun(_, b) -> has_call(b, mod, fun)
+    CCons(h, t) -> has_call(h, mod, fun) || has_call(t, mod, fun)
+    CTuple(xs) -> list.any(xs, has_call(_, mod, fun))
+    CValues(xs) -> list.any(xs, has_call(_, mod, fun))
+    _ -> False
+  }
+}
+
+const rt_simd_atom = "twocore@runtime@rt_simd"
+
+/// A single 2-v128-param SIMD binary function `f(a, b) = Simd(op, [a, b])`.
+fn simd_binop_module(op: ir.SimdOp) -> ir.Module {
+  module_with(ir.Function(
+    name: "f",
+    params: [ir.Local("a", ir.TV128), ir.Local("b", ir.TV128)],
+    result: [ir.TV128],
+    locals: [],
+    body: ir.Simd(op, [ir.Var("a"), ir.Var("b")]),
+  ))
+}
+
+/// The `SimdOp → rt_simd` chokepoint names EXPORTED `rt_simd` heads (the fixed-width-SIMD spec
+/// mnemonics, §5.4.9) — a representative spread across every family. A name/family drift makes the
+/// export vanish and fails here (ties the table to the real artefact, like `num_op_name`).
+pub fn simd_op_name_matches_rt_simd_test() {
+  // Force `rt_simd` loaded.
+  assert rt_simd_reachable()
+  let m = atom.create(rt_simd_atom)
+  let cases = [
+    #(ir.SAdd(ir.I32x4), 2),
+    #(ir.SSub(ir.I8x16), 2),
+    #(ir.SMul(ir.I16x8), 2),
+    #(ir.SNeg(ir.I64x2), 1),
+    #(ir.SAddSatS(ir.I8x16), 2),
+    #(ir.SSubSatU(ir.I16x8), 2),
+    #(ir.SMinS(ir.I32x4), 2),
+    #(ir.SMaxU(ir.I8x16), 2),
+    #(ir.SAvgrU(ir.I16x8), 2),
+    #(ir.SShl(ir.I32x4), 2),
+    #(ir.SShrS(ir.I64x2), 2),
+    #(ir.SPopcnt(ir.I8x16), 1),
+    #(ir.SEq(ir.I32x4), 2),
+    #(ir.SLtS(ir.I16x8), 2),
+    #(ir.SGeU(ir.I8x16), 2),
+    #(ir.VNot, 1),
+    #(ir.VBitselect, 3),
+    #(ir.VAnyTrue, 1),
+    #(ir.SAllTrue(ir.I32x4), 1),
+    #(ir.SBitmask(ir.I8x16), 1),
+    #(ir.SSplat(ir.F64x2), 1),
+    #(ir.SExtractLane(ir.I32x4, 0), 2),
+    #(ir.SExtractLaneS(ir.I8x16, 0), 2),
+    #(ir.SReplaceLane(ir.I16x8, 0), 3),
+    #(ir.SFAdd(ir.F32x4), 2),
+    #(ir.SFMul(ir.F64x2), 2),
+    #(ir.SFPMin(ir.F32x4), 2),
+    #(ir.SFSqrt(ir.F64x2), 1),
+    #(ir.SFEq(ir.F32x4), 2),
+    #(ir.SNarrow(ir.I16x8, True), 2),
+    #(ir.SExtend(ir.I8x16, ir.Low, True), 1),
+    #(ir.SExtend(ir.I32x4, ir.High, False), 1),
+    #(ir.SExtMul(ir.I16x8, ir.Low, False), 2),
+    #(ir.SExtAddPairwise(ir.I8x16, True), 1),
+    #(ir.STruncSatF32x4S, 1),
+    #(ir.STruncSatF64x2UZero, 1),
+    #(ir.SConvertF32x4I32x4U, 1),
+    #(ir.SConvertF64x2LowI32x4S, 1),
+    #(ir.SDemoteF64x2Zero, 1),
+    #(ir.SPromoteLowF32x4, 1),
+    #(ir.SDotI16x8S, 2),
+    #(ir.SQ15MulrSatS, 2),
+    #(ir.SSwizzle, 2),
+  ]
+  list.each(cases, fn(c) {
+    let #(op, arity) = c
+    assert function_exported(m, atom.create(emit_core.simd_op_name(op)), arity)
+      == True
+  })
+}
+
+/// Force `rt_simd` module-loaded (any call does it); returns True.
+fn rt_simd_reachable() -> Bool {
+  function_exported(atom.create(rt_simd_atom), atom.create("i32x4_add"), 2)
+}
+
+/// A pure SIMD op → a BARE `call '<rt_simd>':'<name>'(args…)` (no `case`, no `raise` — I3 total),
+/// and BYTE-IDENTICAL under Cell vs Threaded (a v128 op is state-neutral, §A.3). Cite §5.4.
+pub fn simd_pure_op_is_bare_call_test() {
+  let cell = body_of_b(simd_binop_module(ir.SAdd(ir.I32x4)), "f", binding())
+  let assert CCall(CAtom(m), CAtom("i32x4_add"), [CVar("a"), CVar("b")]) = cell
+  assert m == rt_simd_atom
+  // State-neutral: identical body under Threaded.
+  let threaded =
+    body_of_b(simd_binop_module(ir.SAdd(ir.I32x4)), "f", threaded())
+  assert cell == threaded
+}
+
+/// A SIMD-arithmetic-only function stays PURE `'f'/n` under Threaded (NOT `'f'/(n+1)`) — `Simd` is
+/// not a state-reaching seed (the I7-neutral classification, §A.3). A memory op WOULD widen it.
+pub fn simd_arith_is_state_neutral_test() {
+  let assert FunDef(FName("f", 2), _) =
+    fdef_of(simd_binop_module(ir.SAdd(ir.I32x4)), "f", threaded())
+}
+
+/// `SimdShuffle(lanes, a, b)` → `call '<rt_simd>':'i8x16_shuffle'(A, B, [l0,…,l15])` — the 16
+/// immediates as a proper Core list AFTER the two operands (spec `i8x16.shuffle`).
+pub fn simd_shuffle_golden_test() {
+  let lanes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  let m =
+    module_with(ir.Function(
+      name: "f",
+      params: [ir.Local("a", ir.TV128), ir.Local("b", ir.TV128)],
+      result: [ir.TV128],
+      locals: [],
+      body: ir.SimdShuffle(lanes, ir.Var("a"), ir.Var("b")),
+    ))
+  let assert CCall(
+    CAtom(mod),
+    CAtom("i8x16_shuffle"),
+    [CVar("a"), CVar("b"), lane_list],
+  ) = body_of_b(m, "f", binding())
+  assert mod == rt_simd_atom
+  // The lane list has exactly 16 CInt elements.
+  assert core_list_ints(lane_list) == lanes
+}
+
+/// Extract the `Int`s from a Core proper list of `CInt`s (for the shuffle-immediate assertion).
+fn core_list_ints(e: CExpr) -> List(Int) {
+  case e {
+    CNil -> []
+    CCons(CInt(n), t) -> [n, ..core_list_ints(t)]
+    _ -> panic as "not a list of CInt"
+  }
+}
+
+/// The lane immediate rides where the FROZEN `rt_simd` head expects: `extract_lane(vec, lane)` (last)
+/// vs `replace_lane(vec, lane, x)` (MIDDLE — the actual rt_simd signature, superseding the stale doc).
+pub fn simd_lane_immediate_placement_test() {
+  // extract: [vec, lane]
+  let ext =
+    module_with(ir.Function(
+      name: "f",
+      params: [ir.Local("v", ir.TV128)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.Simd(ir.SExtractLane(ir.I32x4, 2), [ir.Var("v")]),
+    ))
+  let assert CCall(CAtom(_), CAtom("i32x4_extract_lane"), [CVar("v"), CInt(2)]) =
+    body_of_b(ext, "f", binding())
+  // replace: [vec, lane, x]
+  let rep =
+    module_with(ir.Function(
+      name: "f",
+      params: [ir.Local("v", ir.TV128), ir.Local("x", ir.TI32)],
+      result: [ir.TV128],
+      locals: [],
+      body: ir.Simd(ir.SReplaceLane(ir.I8x16, 3), [ir.Var("v"), ir.Var("x")]),
+    ))
+  let assert CCall(
+    CAtom(_),
+    CAtom("i8x16_replace_lane"),
+    [CVar("v"), CInt(3), CVar("x")],
+  ) = body_of_b(rep, "f", binding())
+}
+
+/// `v128.const` → a pure 16-byte binary literal (the raw LE bytes, D5) — NOT a `call` (const-
+/// foldable, D3a-trivially-clean, like `ConstF32`).
+pub fn const_v128_is_binary_literal_test() {
+  let m =
+    module_with(ir.Function(
+      name: "f",
+      params: [],
+      result: [ir.TV128],
+      locals: [],
+      body: ir.Return([
+        ir.ConstV128(<<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16>>),
+      ]),
+    ))
+  let assert CBinary(segs) = body_of_b(m, "f", binding())
+  assert list.length(segs) == 16
+}
+
+/// `SimdStore` (`v128.store`) → an EAGER trapping `store_bytes(Addr, V, Off)` zero-effect (the 16
+/// bytes ARE the run; no partial write, H6). Cell: `{ok,_}`→discard, `{error,E}`→raise, sequenced.
+pub fn simd_store_is_trapping_effect_test() {
+  let b = binding()
+  let m =
+    op_module(
+      "f",
+      [ir.Local("a", ir.TI32), ir.Local("v", ir.TV128)],
+      [],
+      ir.Let([], ir.SimdStore(0, ir.Var("a"), ir.Var("v"), 0), ir.Values([])),
+    )
+  let body = body_of_b(m, "f", b)
+  assert has_call(body, b.mem_module, "store_bytes")
+  // No lane assembly on a plain store (the v128 is the bytes).
+  assert has_call(body, rt_simd_atom, "i8x16_shuffle") == False
+}
+
+/// `SimdLoad(V128)` (`v128.load`) → a trapping `load_bytes(Addr, Off, 16)` value (the slice IS the
+/// v128) — the `{ok, B}`/`{error, E}`-`case`-and-`raise`, read-only.
+pub fn simd_load_v128_is_trapping_value_test() {
+  let b = binding()
+  let m =
+    op_module(
+      "f",
+      [ir.Local("a", ir.TI32)],
+      [ir.TV128],
+      ir.SimdLoad(0, ir.LoadV128, ir.Var("a"), 0),
+    )
+  let assert CLet([_r], CCase(load_call, _clauses), _rest) =
+    body_of_b(m, "f", b)
+  let assert CCall(
+    CAtom(mem),
+    CAtom("load_bytes"),
+    [CVar("a"), CInt(0), CInt(16)],
+  ) = load_call
+  assert mem == b.mem_module
+}
+
+/// `SimdLoad(Splat(32))` composes the bounds-checked scalar `rt_mem.load(4, …)` with the pure
+/// `rt_simd:i32x4_splat` (S4) — the splat is on the `{ok,_}` path (unreachable if the load faults).
+pub fn simd_load_splat_composes_test() {
+  let b = binding()
+  let m =
+    op_module(
+      "f",
+      [ir.Local("a", ir.TI32)],
+      [ir.TV128],
+      ir.SimdLoad(0, ir.LoadSplat(32), ir.Var("a"), 0),
+    )
+  let body = body_of_b(m, "f", b)
+  assert has_call(body, b.mem_module, "load")
+  assert has_call(body, rt_simd_atom, "i32x4_splat")
+}
+
+/// `SimdStoreLane(8)` runs the PURE `rt_simd:v128_extract_lane_bits(v, lane, 8)` FIRST, then the
+/// trapping scalar `rt_mem.store(1, …)` (S4) — the extract is pure, so ordering it before the
+/// bounds-checked store is sound (no observable effect precedes the trap, H6).
+pub fn simd_store_lane_extract_then_store_test() {
+  let b = binding()
+  let m =
+    op_module(
+      "f",
+      [ir.Local("a", ir.TI32), ir.Local("v", ir.TV128)],
+      [],
+      ir.Let(
+        [],
+        ir.SimdStoreLane(0, 8, ir.Var("a"), 0, 2, ir.Var("v")),
+        ir.Values([]),
+      ),
+    )
+  let body = body_of_b(m, "f", b)
+  assert has_call(body, rt_simd_atom, "v128_extract_lane_bits")
+  assert has_call(body, b.mem_module, "store")
+}
+
+/// An `Idx64` memory seeds `fresh64(Min, Max, Mem64Cap)` at `instantiate` (§D/S9); an `Idx32` memory
+/// seeds the BYTE-IDENTICAL Phase-5 `fresh(Min, Max, SafeCap)`. The op sites are unchanged either way.
+pub fn mem64_fresh64_in_instantiate_test() {
+  let b = binding()
+  let mk = fn(idx) {
+    ir.Module(
+      name: "twocore@test@m",
+      uses_numerics: True,
+      memories: [ir.MemoryDecl(1, option.None, idx)],
+      globals: [],
+      imports: [],
+      functions: [],
+      exports: [],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
+    )
+  }
+  let inst = fn(idx) {
+    let assert Ok(m) = emit_core.emit_module(mk(idx), b)
+    let assert Ok(FunDef(_, CFun(_, body))) =
+      list.find(m.defs, fn(d) {
+        let FunDef(FName(n, _), _) = d
+        n == "instantiate"
+      })
+    body
+  }
+  // Idx64 → fresh64 with the mem64 cap; NO plain `fresh` for the 64-bit memory.
+  assert has_call(inst(ir.Idx64), b.mem_module, "fresh64")
+  // Idx32 → the byte-identical `fresh`; NO fresh64.
+  assert has_call(inst(ir.Idx32), b.mem_module, "fresh")
+  assert has_call(inst(ir.Idx32), b.mem_module, "fresh64") == False
+}
+
+/// memory64 is transparent at the op sites (§D): a `MemLoad` on an `Idx64` memory emits the SAME
+/// Core as on an `Idx32` memory (the width lives in the handle, not an op argument).
+pub fn mem64_op_sites_byte_identical_test() {
+  let b = binding()
+  let mk = fn(idx) {
+    ir.Module(
+      name: "twocore@test@m",
+      uses_numerics: True,
+      memories: [ir.MemoryDecl(1, option.None, idx)],
+      globals: [],
+      imports: [],
+      functions: [
+        ir.Function(
+          name: "f",
+          params: [ir.Local("a", ir.TI64)],
+          result: [ir.TI32],
+          locals: [],
+          body: ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("a"), 0, ir.TI32),
+        ),
+      ],
+      exports: [],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
+    )
+  }
+  assert body_of_b(mk(ir.Idx32), "f", b) == body_of_b(mk(ir.Idx64), "f", b)
+}
+
+/// `CallImport(slot, ty, args)` → read the closure from `rt_state:func_import_at(slot)`, then
+/// dispatch via `link:call_import(Closure, [Args…])` (S5/D3a) — a HANDED-IN capability, and NO
+/// `erlang:apply` anywhere on the path. The result LIST is unpacked to `len(ty.results)` values.
+pub fn call_import_closure_dispatch_test() {
+  let b = binding()
+  let ty = ir.FuncType([ir.TI32], [ir.TI32])
+  let m =
+    module_with_import(
+      ir.Function(
+        name: "f",
+        params: [ir.Local("x", ir.TI32)],
+        result: [ir.TI32],
+        locals: [],
+        body: ir.CallImport(0, ty, [ir.Var("x")]),
+      ),
+      ir.ImportFn("modA", "g", ty),
+    )
+  let body = body_of_b(m, "f", b)
+  // The closure is read from the state seam, and dispatched through `link.call_import`.
+  assert has_call(body, b.state_module, "func_import_at")
+  assert has_call(body, "twocore@runtime@link", "call_import")
+  // NEVER an `erlang:apply` (the S5 arity-safe seam, not the forbidden 2-/3-arg apply).
+  assert has_call(body, "erlang", "apply") == False
+}
+
+/// A cross-module-function-import module seeds its func-import vector at `instantiate`:
+/// `rt_state:seed_func_imports([link:provided_func_call(Imp0)])` (S5), and the `instantiate` entry
+/// is arity 1 (the positional `Imports` list carries the closure).
+pub fn call_import_seeds_func_import_vector_test() {
+  let b = binding()
+  let ty = ir.FuncType([ir.TI32], [ir.TI32])
+  let m =
+    module_with_import(
+      ir.Function(
+        name: "f",
+        params: [ir.Local("x", ir.TI32)],
+        result: [ir.TI32],
+        locals: [],
+        body: ir.CallImport(0, ty, [ir.Var("x")]),
+      ),
+      ir.ImportFn("modA", "g", ty),
+    )
+  let assert Ok(cm) = emit_core.emit_module(m, b)
+  let assert Ok(FunDef(FName("instantiate", 1), CFun(_, inst_body))) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == "instantiate"
+    })
+  assert has_call(inst_body, b.state_module, "seed_func_imports")
+  assert has_call(inst_body, "twocore@runtime@link", "provided_func_call")
+}
+
+/// A module importing a function it NEVER calls stays byte-neutral (no `CallImport` ⇒ no
+/// func-import vector, `instantiate/0`) — the I7 neutrality that keeps the whole Phase-1..5 corpus
+/// unchanged through the func-import surface.
+pub fn import_without_call_is_byte_neutral_test() {
+  let b = binding()
+  let ty = ir.FuncType([ir.TI32], [ir.TI32])
+  let m =
+    module_with_import(
+      ir.Function(
+        name: "f",
+        params: [ir.Local("x", ir.TI32)],
+        result: [ir.TI32],
+        locals: [],
+        body: ir.Return([ir.Var("x")]),
+      ),
+      ir.ImportFn("modA", "g", ty),
+    )
+  let assert Ok(cm) = emit_core.emit_module(m, b)
+  // No CallImport ⇒ `instantiate/0` (not /1) and no func-import seed.
+  let assert Ok(FunDef(FName("instantiate", 0), CFun(_, inst_body))) =
+    list.find(cm.defs, fn(d) {
+      let FunDef(FName(n, _), _) = d
+      n == "instantiate"
+    })
+  assert has_call(inst_body, b.state_module, "seed_func_imports") == False
+}
+
+/// A `v128` global routes `global.get`/`global.set` through the BOXED `ref_global_get`/`set`
+/// accessor (S6), NOT the numeric raw-bit `global_get`/`set` (which stays byte-identical for D5).
+pub fn v128_global_routes_boxed_test() {
+  let b = binding()
+  let g =
+    ir.GlobalDecl(
+      "gv",
+      ir.TV128,
+      True,
+      ir.Values([
+        ir.ConstV128(<<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>),
+      ]),
+    )
+  let mk = fn(body, result, params) {
+    ir.Module(
+      name: "twocore@test@gv",
+      uses_numerics: True,
+      memories: [],
+      globals: [g],
+      imports: [],
+      functions: [
+        ir.Function(
+          name: "f",
+          params: params,
+          result: result,
+          locals: [],
+          body: body,
+        ),
+      ],
+      exports: [],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: option.None,
+    )
+  }
+  // get → ref_global_get, NOT global_get
+  let get_body = body_of_b(mk(ir.GlobalGet("gv"), [ir.TV128], []), "f", b)
+  assert has_call(get_body, b.state_module, "ref_global_get")
+  assert has_call(get_body, b.state_module, "global_get") == False
+  // set → ref_global_set
+  let set_body =
+    body_of_b(
+      mk(ir.Let([], ir.GlobalSet("gv", ir.Var("v")), ir.Values([])), [], [
+        ir.Local("v", ir.TV128),
+      ]),
+      "f",
+      b,
+    )
+  assert has_call(set_body, b.state_module, "ref_global_set")
+}
+
+/// A single-function module importing `imp`, exporting `f` — for the `CallImport` goldens.
+fn module_with_import(f: ir.Function, imp: ir.ImportDecl) -> ir.Module {
+  ir.Module(
+    name: "twocore@test@" <> f.name,
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [imp],
+    functions: [f],
+    exports: [ir.ExportFn(f.name, f.name)],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+  )
+}

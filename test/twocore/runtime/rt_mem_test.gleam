@@ -1079,6 +1079,7 @@ fn two_mem_state() -> InstanceState {
     dropped_data: set.new(),
     dropped_elem: set.new(),
     ref_globals: dict.new(),
+    func_imports: [],
   )
 }
 

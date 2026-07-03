@@ -126,6 +126,16 @@ const ref_module = "twocore@runtime@rt_ref"
 /// slot. A fixed build-controlled atom (D3a); never a `Binding` field.
 const link_module = "twocore@runtime@link"
 
+/// The SIMD lane-op runtime module (`runtime/rt_simd` → `twocore@runtime@rt_simd`, I1/I2). The
+/// SIMD binding chokepoint — every `Simd`/`SimdShuffle`/SIMD-memory-assembly seam call targets it
+/// (`simd_op_name` maps each neutral `SimdOp` to a concrete `rt_simd` fn here, exactly as
+/// `num_op_name → rt_num`). A fixed build-controlled atom (D3a); like `rt_ref`/`link` the keystone
+/// did not add a `binding.simd_module` field, so this literal is its home and it is admitted by the
+/// security walk's allow-set exactly like a `binding.*_module`. (A future tier-N real-SIMD NIF
+/// would swap this one atom — the whole `emit_core` SIMD surface routes through it and nothing
+/// else, I3/I8.)
+const simd_module = "twocore@runtime@rt_simd"
+
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
 /// This stage's own error type (D4 — there is no shared `StageError`). `emit_module`
@@ -349,9 +359,10 @@ pub fn emit_module(
   // the active element/data segments + start in WASM spec order. Always emitted and
   // exported so the harness (unit 11) can call `instantiate/0` in the instance process.
   use inst_def <- result.try(emit_instantiate(module, ctx))
-  // The generated entry is `instantiate/1(Imports)` for an import-bearing module (R4) and
-  // `instantiate/0` for an import-free one (byte-identical, H7).
-  let inst_arity = case count_state_imports(module) > 0 {
+  // The generated entry is `instantiate/1(Imports)` for an import-bearing module (R4/S5) and
+  // `instantiate/0` for an import-free one (byte-identical, H7). `Imports` carries the state imports
+  // AND — when the module calls an imported function — the function-import dispatch closures.
+  let inst_arity = case count_import_slots(module) > 0 {
     True -> 1
     False -> 0
   }
@@ -636,17 +647,18 @@ fn build_table_index(module: Module) -> Dict(String, Int) {
   dict.from_list(list.append(list.reverse(imported), defined))
 }
 
-/// The set of REFERENCE-typed global NAMES (funcref/externref, R8) — the union of imported
-/// reference globals (named `g<idx>` in imports-first order) and defined reference globals
-/// (`GlobalDecl.name`). Used so `ExportGlobal` routes a reference global through the
-/// `ref_globals` map (`ref_global_get`), not the numeric raw-bit `globals` path.
+/// The set of BOXED global NAMES — reference (funcref/externref, R8) AND `v128` (S6) — the union of
+/// imported boxed globals (named `g<idx>` in imports-first order) and defined boxed globals
+/// (`GlobalDecl.name`). Used so `ExportGlobal` and the op-site `global.get`/`global.set` route a
+/// boxed global through the `ref_globals` map (`ref_global_get`/`set`), not the numeric raw-bit
+/// `globals` path (which stays byte-identical for D5).
 fn reference_global_names(module: Module) -> Set(String) {
   let #(imported, _gidx) =
     list.fold(module.imports, #(set.new(), 0), fn(acc, imp) {
       let #(names, k) = acc
       case imp {
         ir.ImportGlobal(_, _, ty, _) ->
-          case is_reference_type(ty) {
+          case is_boxed_global_type(ty) {
             True -> #(set.insert(names, "g" <> int.to_string(k)), k + 1)
             False -> #(names, k + 1)
           }
@@ -654,7 +666,7 @@ fn reference_global_names(module: Module) -> Set(String) {
       }
     })
   list.fold(module.globals, imported, fn(names, g) {
-    case is_reference_type(g.ty) {
+    case is_boxed_global_type(g.ty) {
       True -> set.insert(names, g.name)
       False -> names
     }
@@ -774,7 +786,18 @@ fn expr_touches_state(expr: Expr) -> Bool {
     | ir.MemFill(..)
     | ir.MemCopy(..)
     | ir.MemInit(..)
-    | ir.DataDrop(..) -> True
+    | ir.DataDrop(..)
+    | // Phase-6 (§A.3): the four SIMD-MEMORY nodes read/write linear memory (like `MemLoad`/
+      // `MemStore`), and `CallImport` reads the closure capability from the instance's `func_imports`
+      // vector — so a function containing one is state-reaching under `Threaded`. The PURE lane ops
+      // (`Simd`/`SimdShuffle`) reach no record (produced from operand values + a compile-time op tag,
+      // like `Num`/`RefFunc`), so they are NOT seeds — the I7-neutral rule keeping a
+      // SIMD-arithmetic-only body at its Phase-1 pure arity.
+      ir.SimdLoad(..)
+    | ir.SimdStore(..)
+    | ir.SimdLoadLane(..)
+    | ir.SimdStoreLane(..)
+    | ir.CallImport(..) -> True
     Let(_, rhs, body) -> expr_touches_state(rhs) || expr_touches_state(body)
     If(_, _, t, e) -> expr_touches_state(t) || expr_touches_state(e)
     Switch(_, _, arms, default) ->
@@ -905,18 +928,47 @@ fn emit(
     ir.MemInit(mem, seg, dst, src, count) ->
       emit_mem_init(mem, seg, dst, src, count, cont, sc, state, ctx)
     ir.DataDrop(seg) -> emit_data_drop(seg, cont, sc, state, ctx)
-    // ── Phase-6 SIMD + cross-module call (§J). NO Phase-1..5 module produces these nodes (P6-05
-    // lowers them), so a typed `UnsupportedNode` arm keeps the corpus + suite byte-identical and
-    // is genuinely unreachable now. P6-06 replaces each with the real lowering: `Simd`/`SimdShuffle`
-    // → the `rt_simd` seam; `SimdLoad*`/`SimdStore*` → the `rt_mem`-compose-`rt_simd` seam;
-    // `CallImport` → `link.call_import(closure, args)` over the positional import-slot vector. ──
-    ir.Simd(..) -> Error(UnsupportedNode("simd_lane"))
-    ir.SimdShuffle(..) -> Error(UnsupportedNode("simd_shuffle"))
-    ir.SimdLoad(..) -> Error(UnsupportedNode("simd_load"))
-    ir.SimdStore(..) -> Error(UnsupportedNode("simd_store"))
-    ir.SimdLoadLane(..) -> Error(UnsupportedNode("simd_load_lane"))
-    ir.SimdStoreLane(..) -> Error(UnsupportedNode("simd_store_lane"))
-    ir.CallImport(..) -> Error(UnsupportedNode("call_import"))
+    // ── Phase-6 SIMD (§B/§C) — PURE lane ops are state-neutral, non-trapping; the SIMD-memory
+    // family composes the bounds-checked `rt_mem` byte-slice seam with pure `rt_simd` lane
+    // assembly (S4). ──
+    ir.Simd(op, args) -> emit_simd(op, args, cont, sc, state, ctx)
+    ir.SimdShuffle(lanes, a, b) ->
+      emit_simd_shuffle(lanes, a, b, cont, sc, state, ctx)
+    ir.SimdLoad(mem, kind, addr, offset) ->
+      emit_simd_load(mem, kind, addr, offset, cont, sc, state, ctx)
+    ir.SimdStore(mem, addr, value, offset) ->
+      emit_simd_store(mem, addr, value, offset, cont, sc, state, ctx)
+    ir.SimdLoadLane(mem, width, addr, offset, lane, vec) ->
+      emit_simd_load_lane(
+        mem,
+        width,
+        addr,
+        offset,
+        lane,
+        vec,
+        cont,
+        sc,
+        state,
+        ctx,
+      )
+    ir.SimdStoreLane(mem, width, addr, offset, lane, vec) ->
+      emit_simd_store_lane(
+        mem,
+        width,
+        addr,
+        offset,
+        lane,
+        vec,
+        cont,
+        sc,
+        state,
+        ctx,
+      )
+    // ── Phase-6 cross-module dispatch (§E/S5) — read the handed-in closure from the instance's
+    // positional func-import slot, then `link.call_import(closure, args_list)` (a capability, never
+    // an ambient `apply` of a data-named `module:atom` — D3a). ──
+    ir.CallImport(slot, ty, args) ->
+      emit_call_import(slot, ty, args, cont, sc, state, ctx)
     // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
     // boxing `Convert`s remain unlowered (still a later-phase deferral).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
@@ -1092,9 +1144,11 @@ fn emit_mem_store(
   }
 }
 
-/// `global.get` (read-only). `NoState`: `call '<state>':'global_get'(NameBin)`.
-/// `Threading(cur)`: `call '<state>':'t_global_get'(St, NameBin)` — the record is threaded on
-/// unchanged.
+/// `global.get` (read-only). Routes by global TYPE (via `ctx.ref_global_names`, which holds the
+/// BOXED — reference + `v128` — global names, S6): a NUMERIC global reads the raw-bit `global_get`
+/// (byte-identical, D5); a BOXED global (funcref/externref, R8, or a `v128`, S6) reads the parallel
+/// `ref_global_get` (the opaque-`Dynamic` map). `NoState` reads the pdict cell; `Threading(cur)`
+/// reads the live record via the `t_*` twin (`cur` threaded on unchanged).
 fn emit_global_get(
   name: String,
   cont: Cont,
@@ -1102,12 +1156,17 @@ fn emit_global_get(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  let boxed = set.contains(ctx.ref_global_names, name)
+  let #(cell_fn, threaded_fn) = case boxed {
+    True -> #("ref_global_get", "t_ref_global_get")
+    False -> #("global_get", "t_global_get")
+  }
   case sc {
     NoState ->
       apply_cont(
         cont,
         [
-          seam_call(ctx.binding.state_module, "global_get", [
+          seam_call(ctx.binding.state_module, cell_fn, [
             core_binary_string(name),
           ]),
         ],
@@ -1119,7 +1178,7 @@ fn emit_global_get(
       apply_cont(
         cont,
         [
-          seam_call(ctx.binding.state_module, "t_global_get", [
+          seam_call(ctx.binding.state_module, threaded_fn, [
             CVar(cur),
             core_binary_string(name),
           ]),
@@ -1131,10 +1190,11 @@ fn emit_global_get(
   }
 }
 
-/// `global.set` (ZERO-RESULT ordered effect). `NoState`: the pure cell effect
-/// `call '<state>':'global_set'(NameBin, Val)` sequenced with a `let`-discard.
-/// `Threading(cur)`: `St2 = call '<state>':'t_global_set'(St, NameBin, Val)` — NON-trapping,
-/// returns the record directly; REBIND `cur := St2` and continue disposing zero values.
+/// `global.set` (ZERO-RESULT ordered effect). Routes by global TYPE like `emit_global_get`: a
+/// NUMERIC global writes the raw-bit `global_set` (byte-identical); a BOXED (reference/`v128`, S6)
+/// global writes the parallel `ref_global_set`. `NoState`: the pure cell effect sequenced with a
+/// `let`-discard. `Threading(cur)`: rebind `cur := <t_*>_set(St, Name, Val)` (NON-trapping, returns
+/// the record) and continue disposing zero values.
 fn emit_global_set(
   name: String,
   value: Value,
@@ -1143,10 +1203,15 @@ fn emit_global_set(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  let boxed = set.contains(ctx.ref_global_names, name)
+  let #(cell_fn, threaded_fn) = case boxed {
+    True -> #("ref_global_set", "t_ref_global_set")
+    False -> #("global_set", "t_global_set")
+  }
   case sc {
     NoState -> {
       let effect =
-        seam_call(ctx.binding.state_module, "global_set", [
+        seam_call(ctx.binding.state_module, cell_fn, [
           core_binary_string(name),
           emit_value(value),
         ])
@@ -1154,7 +1219,7 @@ fn emit_global_set(
     }
     Threading(cur) -> {
       let call =
-        seam_call(ctx.binding.state_module, "t_global_set", [
+        seam_call(ctx.binding.state_module, threaded_fn, [
           CVar(cur),
           core_binary_string(name),
           emit_value(value),
@@ -1621,6 +1686,612 @@ fn raise_trap(ctx: Ctx, reason_expr: CExpr) -> CExpr {
   CCall(CAtom(ctx.binding.trap_module), CAtom("raise"), [reason_expr])
 }
 
+// ─────────────────────────── SIMD lane ops (the chokepoint, §B) ───────────────────────────
+
+/// Lower a pure lane-wise `Simd(op, args)` through the SIMD chokepoint (`simd_module`).
+///
+/// PURE, state-neutral, NON-trapping (I3/I6): a bare `call '<rt_simd>':'<simd_op_name(op)>'(args…)`
+/// whose single result (a v128 binary, or an i32/i64/f-bits scalar for extract-lane / `VAnyTrue` /
+/// `SAllTrue` / `SBitmask`) is passed to `cont`. Emitted identically under `Cell` and `Threaded`
+/// (`cur` flows through UNCHANGED — a v128 op reaches no state), so a SIMD-arithmetic-only body is
+/// byte-identical across strategies and keeps its Phase-1 pure arity (§A.3, the I7-neutral shape).
+/// The lane immediate of `SExtractLane*`/`SReplaceLane` is spliced by `simd_call_args` at the exact
+/// position the FROZEN `rt_simd` head expects (extract: `(vec, lane)`; replace: `(vec, lane, x)`).
+fn emit_simd(
+  op: ir.SimdOp,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call = seam_call(simd_module, simd_op_name(op), simd_call_args(op, args))
+  apply_cont(cont, [call], sc, state, ctx)
+}
+
+/// Build the concrete Core argument list for a `Simd(op, args)`, splicing any static lane
+/// immediate at the position the frozen `rt_simd` head expects.
+///
+/// - `SExtractLane(_, l)`/`SExtractLaneS`/`SExtractLaneU` — the head is `<shape>_extract_lane[_s|_u]
+///   (a, lane)`; `args == [vec]`, so append `CInt(l)`: `[vec, l]`.
+/// - `SReplaceLane(_, l)` — the head is `<shape>_replace_lane(a, lane, x)` (lane is the MIDDLE arg,
+///   per the frozen rt_simd signature — NOT last as the stale unit doc §B.1 sketched); `args ==
+///   [vec, x]`, so splice: `[vec, l, x]`.
+/// - every other op — its operands only (`list.map(args, emit_value)`).
+fn simd_call_args(op: ir.SimdOp, args: List(Value)) -> List(CExpr) {
+  case op {
+    ir.SExtractLane(_, lane)
+    | ir.SExtractLaneS(_, lane)
+    | ir.SExtractLaneU(_, lane) ->
+      list.append(list.map(args, emit_value), [CInt(lane)])
+    ir.SReplaceLane(_, lane) ->
+      case args {
+        [vec, x] -> [emit_value(vec), CInt(lane), emit_value(x)]
+        // Validation guarantees replace-lane has exactly [vec, scalar]; any other shape is an
+        // internal invariant, defaulted to the operands verbatim (never reached).
+        _ -> list.map(args, emit_value)
+      }
+    _ -> list.map(args, emit_value)
+  }
+}
+
+/// Lower `SimdShuffle(lanes, a, b)` (`i8x16.shuffle`) — PURE, state-neutral. The 16 immediate lane
+/// indices (each 0..31, validated by P6-04) ride as a proper Core list AFTER the two v128 operands:
+/// `call '<rt_simd>':'i8x16_shuffle'(A, B, [l0,…,l15])`. `rt_simd` selects byte `lanes[i]` from
+/// `A ++ B` (spec `i8x16.shuffle`).
+fn emit_simd_shuffle(
+  lanes: List(Int),
+  a: Value,
+  b: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call =
+    seam_call(simd_module, "i8x16_shuffle", [
+      emit_value(a),
+      emit_value(b),
+      core_list(list.map(lanes, CInt)),
+    ])
+  apply_cont(cont, [call], sc, state, ctx)
+}
+
+/// The `SimdOp → rt_simd` name table — the SIMD binding chokepoint (I2), the analogue of
+/// `num_op_name`. Total; every constructor maps to the EXACT frozen `rt_simd` public head
+/// (`<shape>_<op>` for shape-uniform ops, `v128_<op>` for the shape-agnostic bitwise/reductions, a
+/// fully-spelled name for each conversion/widen/narrow). 07 bound its ~217 heads to precisely
+/// these names; the names ARE the fixed-width-SIMD instruction mnemonics (spec §5.4.9 / the
+/// `simd/*.wast` oracle), so a golden asserting them is spec-cited, not a change-detector.
+///
+/// Legality (which `(op, shape)` combos are valid) is enforced UPSTREAM by validate/lower; this map
+/// names whatever constructor+shape it is handed (a nonsensical combo has no `rt_simd` head, exactly
+/// as `num_op_name` names an out-of-range width).
+pub fn simd_op_name(op: ir.SimdOp) -> String {
+  case op {
+    // ── lane-uniform integer arithmetic ──
+    ir.SAdd(s) -> simd_shape_name(s) <> "_add"
+    ir.SSub(s) -> simd_shape_name(s) <> "_sub"
+    ir.SMul(s) -> simd_shape_name(s) <> "_mul"
+    ir.SNeg(s) -> simd_shape_name(s) <> "_neg"
+    ir.SAbs(s) -> simd_shape_name(s) <> "_abs"
+    ir.SAddSatS(s) -> simd_shape_name(s) <> "_add_sat_s"
+    ir.SAddSatU(s) -> simd_shape_name(s) <> "_add_sat_u"
+    ir.SSubSatS(s) -> simd_shape_name(s) <> "_sub_sat_s"
+    ir.SSubSatU(s) -> simd_shape_name(s) <> "_sub_sat_u"
+    ir.SMinS(s) -> simd_shape_name(s) <> "_min_s"
+    ir.SMinU(s) -> simd_shape_name(s) <> "_min_u"
+    ir.SMaxS(s) -> simd_shape_name(s) <> "_max_s"
+    ir.SMaxU(s) -> simd_shape_name(s) <> "_max_u"
+    ir.SAvgrU(s) -> simd_shape_name(s) <> "_avgr_u"
+    ir.SShl(s) -> simd_shape_name(s) <> "_shl"
+    ir.SShrS(s) -> simd_shape_name(s) <> "_shr_s"
+    ir.SShrU(s) -> simd_shape_name(s) <> "_shr_u"
+    ir.SPopcnt(s) -> simd_shape_name(s) <> "_popcnt"
+    // ── lane-uniform comparisons → v128 mask ──
+    ir.SEq(s) -> simd_shape_name(s) <> "_eq"
+    ir.SNe(s) -> simd_shape_name(s) <> "_ne"
+    ir.SLtS(s) -> simd_shape_name(s) <> "_lt_s"
+    ir.SLtU(s) -> simd_shape_name(s) <> "_lt_u"
+    ir.SLeS(s) -> simd_shape_name(s) <> "_le_s"
+    ir.SLeU(s) -> simd_shape_name(s) <> "_le_u"
+    ir.SGtS(s) -> simd_shape_name(s) <> "_gt_s"
+    ir.SGtU(s) -> simd_shape_name(s) <> "_gt_u"
+    ir.SGeS(s) -> simd_shape_name(s) <> "_ge_s"
+    ir.SGeU(s) -> simd_shape_name(s) <> "_ge_u"
+    // ── v128 bitwise (shape-agnostic) ──
+    ir.VNot -> "v128_not"
+    ir.VAnd -> "v128_and"
+    ir.VOr -> "v128_or"
+    ir.VXor -> "v128_xor"
+    ir.VAndNot -> "v128_andnot"
+    ir.VBitselect -> "v128_bitselect"
+    // ── boolean reductions / mask ──
+    ir.VAnyTrue -> "v128_any_true"
+    ir.SAllTrue(s) -> simd_shape_name(s) <> "_all_true"
+    ir.SBitmask(s) -> simd_shape_name(s) <> "_bitmask"
+    // ── lane access / build ──
+    ir.SSplat(s) -> simd_shape_name(s) <> "_splat"
+    ir.SExtractLane(s, _) -> simd_shape_name(s) <> "_extract_lane"
+    ir.SExtractLaneS(s, _) -> simd_shape_name(s) <> "_extract_lane_s"
+    ir.SExtractLaneU(s, _) -> simd_shape_name(s) <> "_extract_lane_u"
+    ir.SReplaceLane(s, _) -> simd_shape_name(s) <> "_replace_lane"
+    // ── float-lane ops (SF-prefixed constructors → the plain `<fshape>_<op>` head) ──
+    ir.SFAdd(s) -> simd_shape_name(s) <> "_add"
+    ir.SFSub(s) -> simd_shape_name(s) <> "_sub"
+    ir.SFMul(s) -> simd_shape_name(s) <> "_mul"
+    ir.SFDiv(s) -> simd_shape_name(s) <> "_div"
+    ir.SFNeg(s) -> simd_shape_name(s) <> "_neg"
+    ir.SFAbs(s) -> simd_shape_name(s) <> "_abs"
+    ir.SFSqrt(s) -> simd_shape_name(s) <> "_sqrt"
+    ir.SFMin(s) -> simd_shape_name(s) <> "_min"
+    ir.SFMax(s) -> simd_shape_name(s) <> "_max"
+    ir.SFPMin(s) -> simd_shape_name(s) <> "_pmin"
+    ir.SFPMax(s) -> simd_shape_name(s) <> "_pmax"
+    ir.SFCeil(s) -> simd_shape_name(s) <> "_ceil"
+    ir.SFFloor(s) -> simd_shape_name(s) <> "_floor"
+    ir.SFTrunc(s) -> simd_shape_name(s) <> "_trunc"
+    ir.SFNearest(s) -> simd_shape_name(s) <> "_nearest"
+    ir.SFEq(s) -> simd_shape_name(s) <> "_eq"
+    ir.SFNe(s) -> simd_shape_name(s) <> "_ne"
+    ir.SFLt(s) -> simd_shape_name(s) <> "_lt"
+    ir.SFLe(s) -> simd_shape_name(s) <> "_le"
+    ir.SFGt(s) -> simd_shape_name(s) <> "_gt"
+    ir.SFGe(s) -> simd_shape_name(s) <> "_ge"
+    // ── widen / narrow / extended-multiply / pairwise (parametric — S3) ──
+    ir.SNarrow(from, signed) ->
+      simd_narrow_shape_name(from)
+      <> "_narrow_"
+      <> simd_shape_name(from)
+      <> "_"
+      <> sign_suffix(signed)
+    ir.SExtend(from, half, signed) ->
+      simd_double_shape_name(from)
+      <> "_extend_"
+      <> simd_half_name(half)
+      <> "_"
+      <> simd_shape_name(from)
+      <> "_"
+      <> sign_suffix(signed)
+    ir.SExtMul(from, half, signed) ->
+      simd_double_shape_name(from)
+      <> "_extmul_"
+      <> simd_half_name(half)
+      <> "_"
+      <> simd_shape_name(from)
+      <> "_"
+      <> sign_suffix(signed)
+    ir.SExtAddPairwise(from, signed) ->
+      simd_double_shape_name(from)
+      <> "_extadd_pairwise_"
+      <> simd_shape_name(from)
+      <> "_"
+      <> sign_suffix(signed)
+    // ── conversions (genuinely singular) ──
+    ir.STruncSatF32x4S -> "i32x4_trunc_sat_f32x4_s"
+    ir.STruncSatF32x4U -> "i32x4_trunc_sat_f32x4_u"
+    ir.STruncSatF64x2SZero -> "i32x4_trunc_sat_f64x2_s_zero"
+    ir.STruncSatF64x2UZero -> "i32x4_trunc_sat_f64x2_u_zero"
+    ir.SConvertF32x4I32x4S -> "f32x4_convert_i32x4_s"
+    ir.SConvertF32x4I32x4U -> "f32x4_convert_i32x4_u"
+    ir.SConvertF64x2LowI32x4S -> "f64x2_convert_low_i32x4_s"
+    ir.SConvertF64x2LowI32x4U -> "f64x2_convert_low_i32x4_u"
+    ir.SDemoteF64x2Zero -> "f32x4_demote_f64x2_zero"
+    ir.SPromoteLowF32x4 -> "f64x2_promote_low_f32x4"
+    // ── dot / q15 / swizzle (singular) ──
+    ir.SDotI16x8S -> "i32x4_dot_i16x8_s"
+    ir.SQ15MulrSatS -> "i16x8_q15mulr_sat_s"
+    ir.SSwizzle -> "i8x16_swizzle"
+  }
+}
+
+/// The canonical lane-shape prefix for a `SimdShape` — the analogue of `iw`/`fw` for `NumOp`. Total.
+fn simd_shape_name(s: ir.SimdShape) -> String {
+  case s {
+    ir.I8x16 -> "i8x16"
+    ir.I16x8 -> "i16x8"
+    ir.I32x4 -> "i32x4"
+    ir.I64x2 -> "i64x2"
+    ir.F32x4 -> "f32x4"
+    ir.F64x2 -> "f64x2"
+  }
+}
+
+/// The DOUBLE-width result shape name of a widening/extending source shape (extend/extmul/pairwise):
+/// I8x16→i16x8, I16x8→i32x4, I32x4→i64x2. Float / i64x2 sources are documented-unreachable (validate
+/// rejects them); defaulted for totality.
+fn simd_double_shape_name(from: ir.SimdShape) -> String {
+  case from {
+    ir.I8x16 -> "i16x8"
+    ir.I16x8 -> "i32x4"
+    ir.I32x4 -> "i64x2"
+    _ -> "i64x2"
+  }
+}
+
+/// The HALF-width result shape name of a narrowing source shape: I16x8→i8x16, I32x4→i16x8. Other
+/// sources are documented-unreachable (validate rejects them); defaulted for totality.
+fn simd_narrow_shape_name(from: ir.SimdShape) -> String {
+  case from {
+    ir.I16x8 -> "i8x16"
+    ir.I32x4 -> "i16x8"
+    _ -> "i8x16"
+  }
+}
+
+/// `"low"`/`"high"` for a `SimdHalf` (extend/extmul name component). Total.
+fn simd_half_name(h: ir.SimdHalf) -> String {
+  case h {
+    ir.Low -> "low"
+    ir.High -> "high"
+  }
+}
+
+/// `"s"`/`"u"` — the signed/unsigned suffix of a parametric widen/narrow/extmul/pairwise head. Total.
+fn sign_suffix(signed: Bool) -> String {
+  case signed {
+    True -> "s"
+    False -> "u"
+  }
+}
+
+// ─────────────────── SIMD memory (rt_mem bounds-check ∘ rt_simd assembly, §C/S4) ───────────────────
+
+/// Lower a `SimdLoad(mem, kind, addr, offset)` — the S4 compose: the bounds check + byte move are
+/// `rt_mem`'s (the trap owner, `MemoryOutOfBounds` before any partial read — H6), the pure lane
+/// assembly is `rt_simd`'s. The trapping load is reduced to a bound value FIRST; the `rt_simd`
+/// assembly runs ONLY on the `{ok, _}` path (unreachable if the load faults). Read-only w.r.t. the
+/// record (`cur` unchanged under `Threaded`, like `MemLoad`).
+///
+/// - `LoadV128`  → `load_bytes(16)`; the 16 bytes ARE the v128 (identity assembly).
+/// - `LoadSplat(w)` → scalar `rt_mem.load(w/8)` then `iNxM_splat` (the existing lane splat, S4).
+/// - `LoadExtend(src, signed)` → `load_bytes(8)` then `rt_simd:v128_load_extend(_, src, signed)`.
+/// - `LoadZero(w)` → `load_bytes(w/8)` then `rt_simd:v128_load_zero(_, w)`.
+fn emit_simd_load(
+  mem: Int,
+  kind: ir.SimdLoadKind,
+  addr: Value,
+  offset: Int,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case kind {
+    ir.LoadV128 -> {
+      let call = simd_load_bytes_call(mem, addr, offset, 16, sc, ctx)
+      emit_simd_trapping_value(call, fn(x) { x }, cont, sc, state, ctx)
+    }
+    ir.LoadSplat(bits) -> {
+      let call =
+        simd_scalar_load_call(
+          mem,
+          bits / 8,
+          False,
+          scalar_result_width(bits),
+          addr,
+          offset,
+          sc,
+          ctx,
+        )
+      emit_simd_trapping_value(
+        call,
+        fn(x) { seam_call(simd_module, simd_splat_head(bits), [x]) },
+        cont,
+        sc,
+        state,
+        ctx,
+      )
+    }
+    ir.LoadExtend(source_bits, signed) -> {
+      let call = simd_load_bytes_call(mem, addr, offset, 8, sc, ctx)
+      emit_simd_trapping_value(
+        call,
+        fn(x) {
+          seam_call(simd_module, "v128_load_extend", [
+            x,
+            CInt(source_bits),
+            bool_atom(signed),
+          ])
+        },
+        cont,
+        sc,
+        state,
+        ctx,
+      )
+    }
+    ir.LoadZero(bits) -> {
+      let call = simd_load_bytes_call(mem, addr, offset, bits / 8, sc, ctx)
+      emit_simd_trapping_value(
+        call,
+        fn(x) { seam_call(simd_module, "v128_load_zero", [x, CInt(bits)]) },
+        cont,
+        sc,
+        state,
+        ctx,
+      )
+    }
+  }
+}
+
+/// Lower a `SimdStore(mem, addr, value, offset)` (`v128.store`) — the 16-byte `value` IS the run
+/// `store_bytes` writes (no lane assembly). Trapping ZERO-effect: `Cell` reduces `{ok,_}`/`{error,E}`
+/// to a discardable `'ok'`/`raise` and sequences (`emit_zero_effect`); `Threaded` rebinds `cur` to
+/// the record `t_store_bytes` returns (`emit_threaded_record_effect`). Trap-before-write (H6), like
+/// `MemStore`.
+fn emit_simd_store(
+  mem: Int,
+  addr: Value,
+  value: Value,
+  offset: Int,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call =
+    simd_store_bytes_call(mem, addr, emit_value(value), offset, sc, ctx)
+  case sc {
+    NoState -> {
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(_) -> emit_threaded_record_effect(call, cont, state, ctx)
+  }
+}
+
+/// Lower a `SimdLoadLane(mem, width, addr, offset, lane, vec)` (`v128.loadN_lane`) — scalar
+/// `rt_mem.load(width/8)` (bounds-checked) then `rt_simd:v128_replace_lane_bits(vec, lane, width, _)`
+/// writes the loaded bits into lane `lane` of `vec` (S4). Read-only; the replace runs only on the
+/// `{ok,_}` path.
+fn emit_simd_load_lane(
+  mem: Int,
+  width: Int,
+  addr: Value,
+  offset: Int,
+  lane: Int,
+  vec: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call =
+    simd_scalar_load_call(
+      mem,
+      width / 8,
+      False,
+      scalar_result_width(width),
+      addr,
+      offset,
+      sc,
+      ctx,
+    )
+  emit_simd_trapping_value(
+    call,
+    fn(x) {
+      seam_call(simd_module, "v128_replace_lane_bits", [
+        emit_value(vec),
+        CInt(lane),
+        CInt(width),
+        x,
+      ])
+    },
+    cont,
+    sc,
+    state,
+    ctx,
+  )
+}
+
+/// Lower a `SimdStoreLane(mem, width, addr, offset, lane, vec)` (`v128.storeN_lane`) — the PURE
+/// `rt_simd:v128_extract_lane_bits(vec, lane, width)` runs FIRST (no memory touched), then the
+/// trapping scalar `rt_mem.store(width/8)` writes it. Ordering the pure extract before the
+/// bounds-checked store is sound (no observable effect precedes the trap — H6). Trapping ZERO-effect
+/// (`Cell`: discard; `Threaded`: rebind `cur`), like `MemStore`.
+fn emit_simd_store_lane(
+  mem: Int,
+  width: Int,
+  addr: Value,
+  offset: Int,
+  lane: Int,
+  vec: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let extracted =
+    seam_call(simd_module, "v128_extract_lane_bits", [
+      emit_value(vec),
+      CInt(lane),
+      CInt(width),
+    ])
+  let call =
+    simd_scalar_store_call(mem, width / 8, addr, extracted, offset, sc, ctx)
+  case sc {
+    NoState -> {
+      let #(effect, state2) = trapping_effect(call, ctx, state)
+      emit_zero_effect(effect, cont, sc, state2, ctx)
+    }
+    Threading(_) -> emit_threaded_record_effect(call, cont, state, ctx)
+  }
+}
+
+/// Reduce a trapping `Result(X, TrapReason)` SIMD-memory producer to its `{ok, X}` payload, then
+/// feed `make_value(X)` (the pure `rt_simd` lane assembly, or identity for `v128.load`) to `cont`.
+/// The `{error, E}` arm raises via `rt_trap` — so the assembly is on the `{ok,_}` path only (H6:
+/// never reached if the load faults). Mirrors `emit_trapping_result`, but post-processes the bound
+/// value before disposing it.
+fn emit_simd_trapping_value(
+  produced: CExpr,
+  make_value: fn(CExpr) -> CExpr,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(xvar, state2) = fresh_var(state)
+  let #(evar, state3) = fresh_var(state2)
+  let #(rvar, state4) = fresh_var(state3)
+  let result_case =
+    CCase(produced, [
+      CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), CVar(xvar)),
+      CClause(
+        [PTuple([PAtom("error"), PVar(evar)])],
+        CAtom("true"),
+        raise_trap(ctx, CVar(evar)),
+      ),
+    ])
+  use #(rest, state5) <- result.try(apply_cont(
+    cont,
+    [make_value(CVar(rvar))],
+    sc,
+    state4,
+    ctx,
+  ))
+  Ok(#(CLet([rvar], result_case, rest), state5))
+}
+
+/// The `rt_mem` v128-slice LOAD seam call (`Result(BitArray, _)`), routed by memory index +
+/// state channel: index 0 → the un-indexed `load_bytes`/`t_load_bytes`; index ≥1 → the `_at` head
+/// with a leading memidx. `n` is the byte count (16/8/4). memory64 is transparent — `addr` is the
+/// raw bignum address, `offset` a bignum `CInt`; `rt_mem` reads the width from the handle (§D).
+fn simd_load_bytes_call(
+  mem: Int,
+  addr: Value,
+  offset: Int,
+  n: Int,
+  sc: StateChan,
+  ctx: Ctx,
+) -> CExpr {
+  let tail = [emit_value(addr), CInt(offset), CInt(n)]
+  case mem, sc {
+    0, NoState -> seam_call(ctx.binding.mem_module, "load_bytes", tail)
+    0, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load_bytes", [CVar(cur), ..tail])
+    _, NoState ->
+      seam_call(ctx.binding.mem_module, "load_bytes_at", [CInt(mem), ..tail])
+    _, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load_bytes_at", [
+        CVar(cur),
+        CInt(mem),
+        ..tail
+      ])
+  }
+}
+
+/// The `rt_mem` v128-slice STORE seam call (`Result(Nil, _)` cell / `Result(InstanceState, _)`
+/// threaded) for a 16-byte `v128.store`. Arg order matches the frozen head: `store_bytes(Addr,
+/// Bytes, Off)`. Index 0 → the un-indexed head; ≥1 → the `_at` head with a leading memidx.
+fn simd_store_bytes_call(
+  mem: Int,
+  addr: Value,
+  bytes: CExpr,
+  offset: Int,
+  sc: StateChan,
+  ctx: Ctx,
+) -> CExpr {
+  let tail = [emit_value(addr), bytes, CInt(offset)]
+  case mem, sc {
+    0, NoState -> seam_call(ctx.binding.mem_module, "store_bytes", tail)
+    0, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_store_bytes", [CVar(cur), ..tail])
+    _, NoState ->
+      seam_call(ctx.binding.mem_module, "store_bytes_at", [CInt(mem), ..tail])
+    _, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_store_bytes_at", [
+        CVar(cur),
+        CInt(mem),
+        ..tail
+      ])
+  }
+}
+
+/// The SCALAR `rt_mem` LOAD seam call (`Result(Int, _)`) for a `load{N}_splat`/`load{N}_lane` — the
+/// existing numeric load head (`load(Bytes, Signed, W, Addr, Off)`), memidx/state routed. Splat and
+/// load-lane load the raw bytes UNSIGNED; the lane assembly masks to the lane width.
+fn simd_scalar_load_call(
+  mem: Int,
+  bytes: Int,
+  signed: Bool,
+  result_bits: Int,
+  addr: Value,
+  offset: Int,
+  sc: StateChan,
+  ctx: Ctx,
+) -> CExpr {
+  let tail = [
+    CInt(bytes),
+    bool_atom(signed),
+    CInt(result_bits),
+    emit_value(addr),
+    CInt(offset),
+  ]
+  case mem, sc {
+    0, NoState -> seam_call(ctx.binding.mem_module, "load", tail)
+    0, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load", [CVar(cur), ..tail])
+    _, NoState ->
+      seam_call(ctx.binding.mem_module, "load_at", [CInt(mem), ..tail])
+    _, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_load_at", [
+        CVar(cur),
+        CInt(mem),
+        ..tail
+      ])
+  }
+}
+
+/// The SCALAR `rt_mem` STORE seam call (`store(Bytes, Addr, Value, Off)`) for a `store{N}_lane` —
+/// `value_expr` is the pure `v128_extract_lane_bits(vec, lane, width)` result, inlined as the store
+/// value (evaluated before the store's bounds check — sound, the extract is pure). memidx/state
+/// routed.
+fn simd_scalar_store_call(
+  mem: Int,
+  bytes: Int,
+  addr: Value,
+  value_expr: CExpr,
+  offset: Int,
+  sc: StateChan,
+  ctx: Ctx,
+) -> CExpr {
+  let tail = [CInt(bytes), emit_value(addr), value_expr, CInt(offset)]
+  case mem, sc {
+    0, NoState -> seam_call(ctx.binding.mem_module, "store", tail)
+    0, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_store", [CVar(cur), ..tail])
+    _, NoState ->
+      seam_call(ctx.binding.mem_module, "store_at", [CInt(mem), ..tail])
+    _, Threading(cur) ->
+      seam_call(ctx.binding.mem_module, "t_store_at", [
+        CVar(cur),
+        CInt(mem),
+        ..tail
+      ])
+  }
+}
+
+/// The `iNxM_splat` head for a `load{N}_splat` scalar of `bits` (8→i8x16, 16→i16x8, 32→i32x4,
+/// 64→i64x2). Total; defaulted for an out-of-range width (validate rejects it).
+fn simd_splat_head(bits: Int) -> String {
+  case bits {
+    8 -> "i8x16_splat"
+    16 -> "i16x8_splat"
+    32 -> "i32x4_splat"
+    _ -> "i64x2_splat"
+  }
+}
+
+/// The scalar-load result width in bits for a splat/lane access of `bits`: 64 for a 64-bit lane,
+/// else 32 (an i32-carried sub-word, matching the numeric `MemLoad` result-width convention).
+fn scalar_result_width(bits: Int) -> Int {
+  case bits {
+    64 -> 64
+    _ -> 32
+  }
+}
+
 // ─────────────────────────────── calls ───────────────────────────────
 
 /// Lower a `CallDirect` to `apply 'fn'/arity(args…)` against a same-module function
@@ -1929,6 +2600,58 @@ fn unpack_result_list(
       Ok(#(CCase(CVar(lvar), [clause]), state3))
     }
   }
+}
+
+/// Lower `CallImport(slot, ty, args)` — a call to an IMPORTED function over the linker-built closure
+/// capability (I5/S5/D3a). Read the closure from the instance's positional func-import `slot`
+/// (`rt_state:func_import_at(slot)` / `t_func_import_at(St, slot)`), then dispatch it through the
+/// frozen `link.call_import(closure, ArgsList)` seam — a plain 1-ary application of a HANDED-IN
+/// closure VALUE, returning the callee's result value LIST. This is NEVER `erlang:apply(Mod, Fun,
+/// Args)` of a data-named `module:atom`, and NEVER the 2-arg `erlang:apply(Closure, ArgsList)` that
+/// would SPREAD the list into an N-ary fun's params (the arity bug S5 fixes) — the closure is a
+/// capability supplied at link time, exactly like `externref`/`call_host` (D3a).
+///
+/// State-reaching (it READS the closure from `func_imports`), but record-READ-ONLY: reading the
+/// closure does not mutate our record, and the callee threads its OWN state inside the closure — so
+/// `cur` is UNCHANGED under `Threaded`. The returned value list is unpacked to `len(ty.results)`
+/// values (`unpack_result_list`, the same machinery `CallIndirect` uses) and disposed through
+/// `cont`. A callee trap PROPAGATES by the closure raising (`call_import` neither catches nor
+/// synthesizes).
+fn emit_call_import(
+  slot: Int,
+  ty: FuncType,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let r = list.length(ty.results)
+  let closure = case sc {
+    NoState ->
+      seam_call(ctx.binding.state_module, "func_import_at", [CInt(slot)])
+    Threading(cur) ->
+      seam_call(ctx.binding.state_module, "t_func_import_at", [
+        CVar(cur),
+        CInt(slot),
+      ])
+  }
+  let #(cvar, state2) = fresh_var(state)
+  let applied =
+    seam_call(link_module, "call_import", [
+      CVar(cvar),
+      core_list(list.map(args, emit_value)),
+    ])
+  let #(lvar, state3) = fresh_var(state2)
+  use #(rest, state4) <- result.try(unpack_result_list(
+    lvar,
+    r,
+    cont,
+    sc,
+    state3,
+    ctx,
+  ))
+  Ok(#(CLet([cvar], closure, CLet([lvar], applied, rest)), state4))
 }
 
 // ─────────────────────────── Phase-5 reference layer (§B) ───────────────────────────
@@ -3027,7 +3750,50 @@ fn needs_full_decl(module: Module) -> Bool {
   count_state_imports(module) > 0
   || list.length(module.memories) >= 2
   || list.length(module.tables) >= 2
-  || list.any(module.globals, fn(g) { is_reference_type(g.ty) })
+  // A boxed (reference OR v128, S6) defined global needs the `FullDecl.ref_globals` slot — the
+  // `StateDecl` path has only the numeric raw-bit `globals`.
+  || list.any(module.globals, fn(g) { is_boxed_global_type(g.ty) })
+  // An `Idx64` memory needs the `mem_fresh_term` `fresh64` branch (§D) — the `StateDecl` path inlines
+  // the byte-identical Phase-5 `fresh` (Idx32-only).
+  || list.any(module.memories, fn(m) { m.idx_type == ir.Idx64 })
+  // A module that CALLS an imported function needs its `func_imports` vector seeded at instantiate
+  // (S5) — the `FullDecl` path carries the positional func-import slots.
+  || needs_func_imports(module)
+}
+
+/// `True` iff `module` calls an IMPORTED function anywhere (contains a `CallImport` node) — the
+/// condition that forces the func-import dispatch vector to be seeded at `instantiate` (S5). A
+/// module that merely IMPORTS a function without calling it produces no `CallImport`, so this is
+/// `False` and the module stays byte-neutral through the func-import surface (I7).
+fn needs_func_imports(module: Module) -> Bool {
+  list.any(module.functions, fn(f) { expr_has_call_import(f.body) })
+}
+
+/// `True` iff `expr` (recursively) contains a `CallImport` node.
+fn expr_has_call_import(expr: Expr) -> Bool {
+  case expr {
+    ir.CallImport(..) -> True
+    Let(_, rhs, body) -> expr_has_call_import(rhs) || expr_has_call_import(body)
+    If(_, _, t, e) -> expr_has_call_import(t) || expr_has_call_import(e)
+    Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) {
+        let SwitchArm(_, b) = a
+        expr_has_call_import(b)
+      })
+      || expr_has_call_import(default)
+    Block(_, _, body) -> expr_has_call_import(body)
+    Loop(_, _, _, body) -> expr_has_call_import(body)
+    Charge(_, body) -> expr_has_call_import(body)
+    _ -> False
+  }
+}
+
+/// `True` iff `ty` is a BOXED (opaque-`Dynamic`) global type — a reference (funcref/externref, R8)
+/// OR a `v128` (a 16-byte `BitArray`, S6). Boxed globals live in `rt_state`'s parallel `ref_globals`
+/// map (`ref_global_get`/`set`), NOT the numeric raw-bit `globals` map (which stays byte-identical
+/// for D5). `emit_core` routes both through the same boxed accessor.
+fn is_boxed_global_type(ty: ValType) -> Bool {
+  is_reference_type(ty) || ty == ir.TV128
 }
 
 /// The number of STATE imports (imported globals/tables/memories) — the length of the positional
@@ -3040,6 +3806,37 @@ fn count_state_imports(module: Module) -> Int {
       _ -> n + 1
     }
   })
+}
+
+/// The number of FUNCTION imports (`ir.ImportFn`) — one dispatch-closure slot each, in
+/// function-import declaration order, indexed by `CallImport.slot`.
+fn count_function_imports(module: Module) -> Int {
+  list.fold(module.imports, 0, fn(n, imp) {
+    case imp {
+      ir.ImportFn(..) -> n + 1
+      _ -> n
+    }
+  })
+}
+
+/// The total number of positional `Imports` slots the generated `instantiate` destructures (S5):
+/// the state imports (`count_state_imports`, first) PLUS — only when the module CALLS an imported
+/// function (`needs_func_imports`) — every function import's dispatch-closure slot (last). A module
+/// that imports functions but never calls one contributes NO function slot, so its arity is
+/// byte-identical to Phase-5 (I7). The harness passes `link_imports(m) ++ link_func_imports(m)` in
+/// exactly this order.
+fn count_import_slots(module: Module) -> Int {
+  count_state_imports(module) + count_func_import_positions(module)
+}
+
+/// The number of positional FUNCTION-import slots (`count_function_imports` when the module calls an
+/// imported function, else 0). Seeding ALL function imports (not just the called ones) keeps
+/// `CallImport.slot` — the function-import index — a direct index into the seeded vector.
+fn count_func_import_positions(module: Module) -> Int {
+  case needs_func_imports(module) {
+    True -> count_function_imports(module)
+    False -> 0
+  }
 }
 
 /// Emit the general `instantiate` entry (R4/R5): `instantiate/1(Imports)` for an import-bearing
@@ -3060,9 +3857,10 @@ fn emit_instantiate_full(
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
     )
-  let n_imports = count_state_imports(module)
+  let n_imports = count_import_slots(module)
   // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
-  // state import (`Imp<p>`). Gensym'd, so they never collide with each other or the seeds.
+  // import SLOT (`Imp<p>`) — state imports first, then the function-import dispatch closures (S5).
+  // Gensym'd, so they never collide with each other or the seeds.
   let #(imports_param, state1) = fresh_var(state0)
   let #(imp_vars, state2) = fresh_n_vars(state1, n_imports)
   use #(decl_term, state3) <- result.try(full_decl_term(
@@ -3071,9 +3869,12 @@ fn emit_instantiate_full(
     imp_vars,
     state2,
   ))
+  // The function-import dispatch closures occupy the positional slots AFTER the state imports (S5);
+  // pull their `Imp<p>` vars for the `seed_func_imports`/`set_func_imports` seed.
+  let func_import_vars = list.drop(imp_vars, count_state_imports(module))
   use body <- result.try(case is_threaded(ctx) {
-    False -> full_cell_body(module, ctx, decl_term, state3)
-    True -> full_threaded_body(module, ctx, decl_term, state3)
+    False -> full_cell_body(module, ctx, decl_term, func_import_vars, state3)
+    True -> full_threaded_body(module, ctx, decl_term, func_import_vars, state3)
   })
   Ok(wrap_instantiate(n_imports, imports_param, imp_vars, body))
 }
@@ -3108,6 +3909,7 @@ fn full_cell_body(
   module: Module,
   ctx: Ctx,
   decl_term: CExpr,
+  func_import_vars: List(String),
   state: EmitState,
 ) -> Result(CExpr, EmitError) {
   let seed_effect =
@@ -3128,12 +3930,37 @@ fn full_cell_body(
       seed_fuel_effect(ctx),
       seed_policy_effect(ctx),
       [seed_effect],
+      seed_func_imports_effect(func_import_vars, ctx),
       elem_fx,
       data_fx,
       start_fx,
     ])
   let #(body, _state4) = chain_effects(effects, state3)
   Ok(body)
+}
+
+/// The `Cell` `seed_func_imports` effect (S5), or `[]` when the module calls no imported function.
+/// Pulls each positional func-import closure out of its `Imp<p>` var via `link:provided_func_call`
+/// (a fixed `link` module call, the slot chosen statically — D3a) and installs the whole vector into
+/// the just-seeded cell via `rt_state:seed_func_imports([Closures…])`. Runs right after
+/// `seed_full`, before any element/data segment, so any `start` function that calls an import finds
+/// the vector present.
+fn seed_func_imports_effect(
+  func_import_vars: List(String),
+  ctx: Ctx,
+) -> List(CExpr) {
+  case func_import_vars {
+    [] -> []
+    _ -> [
+      seam_call(ctx.binding.state_module, "seed_func_imports", [
+        core_list(
+          list.map(func_import_vars, fn(v) {
+            seam_call(link_module, "provided_func_call", [CVar(v)])
+          }),
+        ),
+      ]),
+    ]
+  }
 }
 
 /// The `Threaded` general-instantiate body: `St0 = fresh_full(Decl)` then the record-threading
@@ -3143,6 +3970,7 @@ fn full_threaded_body(
   module: Module,
   ctx: Ctx,
   decl_term: CExpr,
+  func_import_vars: List(String),
   state: EmitState,
 ) -> Result(CExpr, EmitError) {
   let seed_effects =
@@ -3156,10 +3984,34 @@ fn full_threaded_body(
       rest,
     )
   }
+  // Seed the func-import dispatch vector on the fresh record (S5): `St0b = set_func_imports(St0,
+  // [Closures…])`, threaded forward from here — or, with no imported-function call, thread `St0`
+  // straight through (byte-neutral).
+  let #(cur_seeded, fi_wraps, state3b) = case func_import_vars {
+    [] -> #(st0, [], state3)
+    _ -> {
+      let #(st0b, s) = fresh_var(state3)
+      let wrap = fn(rest) {
+        CLet(
+          [st0b],
+          seam_call(ctx.binding.state_module, "set_func_imports", [
+            CVar(st0),
+            core_list(
+              list.map(func_import_vars, fn(v) {
+                seam_call(link_module, "provided_func_call", [CVar(v)])
+              }),
+            ),
+          ]),
+          rest,
+        )
+      }
+      #(st0b, [wrap], s)
+    }
+  }
   use #(elem_wraps, cur1, state4) <- result.try(threaded_elem_wrappers(
     module.elements,
-    st0,
-    state3,
+    cur_seeded,
+    state3b,
     ctx,
   ))
   use #(data_wraps, cur2, state5) <- result.try(threaded_data_wrappers(
@@ -3175,7 +4027,14 @@ fn full_threaded_body(
     ctx,
   ))
   let all_wraps =
-    list.flatten([seed_wraps, [fresh_wrap], elem_wraps, data_wraps, start_wraps])
+    list.flatten([
+      seed_wraps,
+      [fresh_wrap],
+      fi_wraps,
+      elem_wraps,
+      data_wraps,
+      start_wraps,
+    ])
   Ok(list.fold_right(all_wraps, CVar(cur3), fn(rest, wrap) { wrap(rest) }))
 }
 
@@ -3227,7 +4086,7 @@ fn imported_slots(
         ir.ImportGlobal(_, _, ty, _) -> {
           use v <- result.map(import_var(imp_vars, p))
           let name = core_binary_string("g" <> int.to_string(gidx))
-          case is_reference_type(ty) {
+          case is_boxed_global_type(ty) {
             True -> #(
               mems,
               tables,
@@ -3296,14 +4155,29 @@ fn import_var(imp_vars: List(String), p: Int) -> Result(String, EmitError) {
   |> result.replace_error(UnsupportedNode("import_positional"))
 }
 
-/// The `rt_mem:fresh(MinPages, MaxOpt, SafeCap)` term for a DEFINED memory (the same head the
-/// byte-identical `StateDecl` path uses).
+/// The `rt_mem` handle-seed term for a DEFINED memory (§D/I4).
+///
+/// - `Idx32` → the BYTE-IDENTICAL Phase-5 `fresh(Min, MaxOpt, SafeCap)` head — a 32-bit memory's
+///   seed is bit-for-bit unchanged (I7). This is also the exact term the `StateDecl` path inlines.
+/// - `Idx64` → the memory64 `fresh64(Min, MaxOpt, Mem64Cap)` head (P6-08): a 64-bit-addressed memory
+///   bounded by the documented, spec-aligned page cap `binding.mem64_max_pages` (2³² pages, S9). The
+///   `paged` backend grows on demand, so the cap is a TRAP BOUNDARY, not a reservation. A module
+///   with an `Idx64` memory routes through `FullDecl` (`needs_full_decl`), so this branch is reached.
 fn mem_fresh_term(m: ir.MemoryDecl, ctx: Ctx) -> CExpr {
-  seam_call(ctx.binding.mem_module, "fresh", [
-    CInt(m.min_pages),
-    option_int_term(m.max_pages),
-    CInt(ctx.binding.safe_max_pages),
-  ])
+  case m.idx_type {
+    ir.Idx32 ->
+      seam_call(ctx.binding.mem_module, "fresh", [
+        CInt(m.min_pages),
+        option_int_term(m.max_pages),
+        CInt(ctx.binding.safe_max_pages),
+      ])
+    ir.Idx64 ->
+      seam_call(ctx.binding.mem_module, "fresh64", [
+        CInt(m.min_pages),
+        option_int_term(m.max_pages),
+        CInt(ctx.binding.mem64_max_pages),
+      ])
+  }
 }
 
 /// The `rt_table:new(Min, MaxOpt)` term for a DEFINED table.
@@ -3326,7 +4200,7 @@ fn defined_globals(
   list.try_fold(globals, #([], [], state), fn(acc, g) {
     let #(nums, refs, st) = acc
     let name = core_binary_string(g.name)
-    case is_reference_type(g.ty) {
+    case is_boxed_global_type(g.ty) {
       True -> {
         use #(refval, st2) <- result.try(render_ref_global_init(g.init, ctx, st))
         Ok(#(nums, list.append(refs, [CTuple([name, refval])]), st2))
@@ -3339,10 +4213,12 @@ fn defined_globals(
   })
 }
 
-/// Render a DEFINED reference-typed global's constant init to a Core reference value (R8):
-/// `ref.null` (`Values([ConstNull(_)])`) → the null sentinel; `ref.func` (`RefFunc`) → the
-/// `{TypeTag, Closure}` funcref entry (build-strategy ABI). `Error(NonConstInit)` for any other
-/// init (e.g. `global.get` — imported-global-init resolution is 09's).
+/// Render a DEFINED boxed global's constant init to a Core boxed value for the `ref_globals` slot:
+/// `ref.null` (`Values([ConstNull(_)])`) → the null sentinel (R8); `ref.func` (`RefFunc`) → the
+/// `{TypeTag, Closure}` funcref entry (build-strategy ABI, R8); `v128.const`
+/// (`Values([ConstV128(bytes)])`) → the raw 16-byte little-endian binary literal (S6/D5 — the
+/// EXACT bytes, so lane values / NaN payloads / `-0.0` survive). `Error(NonConstInit)` for any
+/// other init (e.g. an imported-global `global.get` — 09's resolution).
 fn render_ref_global_init(
   init: Expr,
   ctx: Ctx,
@@ -3351,6 +4227,7 @@ fn render_ref_global_init(
   case init {
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
     ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
+    Values([ir.ConstV128(bytes)]) -> Ok(#(core_binary_bytes(bytes), state))
     _ -> Error(NonConstInit("non-constant reference global init"))
   }
 }

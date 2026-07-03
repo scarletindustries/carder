@@ -122,6 +122,15 @@ type StateKey {
 ///   routes a `v128`-typed `global.get`/`global.set`/const-init to the SAME boxed accessor
 ///   (`ref_global_get`/`ref_global_set`) it uses for reftype globals; `rt_state` does not
 ///   distinguish the two (both are opaque `Dynamic`s), so no per-global type tag is needed.
+/// - `func_imports`: the per-instance **function-import dispatch vector** (S5, completed by unit
+///   06). One opaque closure per IMPORTED function, in function-import declaration order — each a
+///   `fn(List(Dynamic)) -> List(Dynamic)` capability the linker built (`link.link_func_imports`):
+///   a host/`spectest` import wraps `rt_host.call_host`, a cross-module import routes into the
+///   exporting instance. `emit_core` reads slot `CallImport.slot` via `func_import_at`/
+///   `t_func_import_at` and applies it through `link.call_import` — a HANDED-IN capability, never an
+///   ambient `apply` of a data-named `module:atom` (D3a). Seeded by `seed_func_imports` (cell) /
+///   `set_func_imports` (threaded) at `instantiate`; empty (`[]`) for a module with no
+///   imported-function CALLS (so the field is inert + byte-neutral for the whole Phase-1..5 corpus).
 pub type InstanceState {
   InstanceState(
     mems: List(Dynamic),
@@ -130,6 +139,7 @@ pub type InstanceState {
     dropped_data: Set(Int),
     dropped_elem: Set(Int),
     ref_globals: Dict(String, Dynamic),
+    func_imports: List(Dynamic),
   )
 }
 
@@ -385,6 +395,40 @@ pub fn ref_global_set(name: String, value: Dynamic) -> Nil {
   )
 }
 
+// ── function-import dispatch vector (cell family; S5, completed by unit 06) ────────────
+//
+// The per-instance vector of imported-function closures (one per imported function, in
+// function-import order). `emit_core`'s generated `instantiate` seeds it once (right after the
+// fresh cell is installed) from the linker-built `link.link_func_imports` result; a `CallImport`
+// site reads slot `n` and applies it through `link.call_import`. A handed-in capability (D3a) —
+// `rt_state` stores the closures opaquely and never names a callee.
+
+/// Seed this process's cell with the function-import dispatch vector `closures` (S5) — one opaque
+/// `fn(List(Dynamic)) -> List(Dynamic)` per imported function, in function-import order. Called
+/// once by the generated `instantiate` (unit 06) immediately after `seed`/`seed_full`, only when
+/// the module calls an imported function.
+/// - `closures`: the linker-built dispatch closures (from `link.link_func_imports`).
+/// - Returns `Nil`. Fail-closed: `panic`s on an un-seeded cell. Only `func_imports` changes; other
+///   fields are preserved by reference.
+pub fn seed_func_imports(closures: List(Dynamic)) -> Nil {
+  let st = require_cell()
+  put_cell(InstanceState(..st, func_imports: closures))
+}
+
+/// Read the imported-function dispatch closure at `slot` from this process's cell (S5) — the
+/// capability a `CallImport(slot, …)` applies via `link.call_import`.
+/// - `slot`: the positional function-import index (0-based over imported functions, declaration
+///   order). Out of range / un-seeded cell `panic`s fail-closed (an internal codegen invariant —
+///   `emit_core` seeds exactly one closure per imported function; never a WASM trap).
+/// - Returns the boxed closure as an opaque `Dynamic`.
+pub fn func_import_at(slot: Int) -> Dynamic {
+  nth_or_panic(
+    require_cell().func_imports,
+    slot,
+    "rt_state.func_import_at: function-import slot out of range (internal invariant violation)",
+  )
+}
+
 /// Read mutable global `name`'s current raw bit pattern from this process's cell.
 ///
 /// - `name`: the global's name.
@@ -613,6 +657,30 @@ pub fn t_ref_global_set(
   InstanceState(..st, ref_globals: dict.insert(st.ref_globals, name, value))
 }
 
+// ── function-import dispatch vector (threaded twins; S5) ──────────────────────
+
+/// Seed the function-import dispatch vector on the threaded record, RETURNING it (S5) — the
+/// `Threaded` twin of `seed_func_imports` (no pdict write). Called once by the threaded
+/// `instantiate` (unit 06) immediately after `fresh_full`, only when the module calls an imported
+/// function. Only `func_imports` changes; other fields shared by reference.
+pub fn set_func_imports(
+  st: InstanceState,
+  closures: List(Dynamic),
+) -> InstanceState {
+  InstanceState(..st, func_imports: closures)
+}
+
+/// Read the imported-function dispatch closure at `slot` from the threaded record (S5) — the
+/// capability a threaded `CallImport(slot, …)` applies via `link.call_import`. READ-ONLY.
+/// Out of range `panic`s fail-closed (an internal codegen invariant, never a WASM trap).
+pub fn t_func_import_at(st: InstanceState, slot: Int) -> Dynamic {
+  nth_or_panic(
+    st.func_imports,
+    slot,
+    "rt_state.t_func_import_at: function-import slot out of range (internal invariant violation)",
+  )
+}
+
 // ── internal helpers ──────────────────────────────────────────────────────────
 
 /// Materialise the single-memory / single-table / import-free `StateDecl` (the byte-identical
@@ -648,6 +716,11 @@ fn build_full(decl: FullDecl) -> InstanceState {
     dropped_data: set.new(),
     dropped_elem: set.new(),
     ref_globals: dict.from_list(decl.ref_globals),
+    // The function-import dispatch vector starts EMPTY (S5); `emit_core`'s `instantiate` seeds it
+    // via `seed_func_imports`/`set_func_imports` immediately after the fresh record is built, and
+    // only when the module actually calls an imported function — so a no-imported-call module keeps
+    // an empty vector and the whole Phase-1..5 corpus is byte-neutral through this field.
+    func_imports: [],
   )
 }
 

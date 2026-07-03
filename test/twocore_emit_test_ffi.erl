@@ -6,7 +6,15 @@
 %% OTP 29 has no generic exception-rescue in this dependency set). It does not touch
 %% any unit-owned source file.
 -module(twocore_emit_test_ffi).
--export([catch_apply/3]).
+-export([catch_apply/3, apply3/3]).
+
+%% Raw `erlang:apply(M, F, Args)` with NO trap capture — the value is returned
+%% directly and any raise/exit/throw PROPAGATES. Used by the P6-06 cross-module
+%% end-to-end test to build a linker-style dispatch closure that routes a
+%% `CallImport` into another 2core-compiled module's exported function (a genuine
+%% WASM→WASM call across two loaded modules; a callee trap must propagate, not be
+%% swallowed).
+apply3(M, F, Args) -> erlang:apply(M, F, Args).
 
 %% Apply M:F(Args). On a normal return yield `{ok, V}` (a Gleam `Ok`); if the call
 %% raises/exits/throws, yield `{error, Reason}` (a Gleam `Error`) with `Reason`

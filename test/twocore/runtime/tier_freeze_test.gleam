@@ -100,6 +100,7 @@ pub fn threaded_box_round_trips_test() {
       dropped_data: set.new(),
       dropped_elem: set.new(),
       ref_globals: dict.new(),
+      func_imports: [],
     )
   // The index-0 aliases project the default memory/table (byte-identical to Phase-4).
   assert rt_state.mem(st) == mem

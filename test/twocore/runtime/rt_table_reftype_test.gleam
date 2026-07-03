@@ -388,6 +388,7 @@ pub fn multiple_tables_route_by_index_test() {
       dropped_data: set.new(),
       dropped_elem: set.new(),
       ref_globals: dict.new(),
+      func_imports: [],
     )
   rt_table.t_size(st, 0) |> should.equal(3)
   rt_table.t_size(st, 1) |> should.equal(2)

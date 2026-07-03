@@ -47,6 +47,12 @@ fn runtime_modules(b: instance.Binding) -> Set(String) {
     b.state_module,
     "twocore@runtime@rt_ref",
     "twocore@runtime@link",
+    // Phase-6 (P6-06): the SIMD lane-op chokepoint — a fixed build-controlled atom `emit_core`
+    // reaches WITHOUT a `Binding` field (like `rt_ref`/`link`), admitted here exactly like a
+    // `binding.*_module` (D3a). The cross-module closure dispatch adds NO new module: it routes
+    // through the already-admitted `link.call_import` (S5 — a homogeneous twocore-only allow-set;
+    // there is deliberately NO `erlang` entry, since no `erlang:apply` is emitted).
+    "twocore@runtime@rt_simd",
   ])
 }
 
@@ -622,5 +628,158 @@ fn has_call(m: CModule, module: String, fun: String) -> Bool {
       let #(mod, f) = pair
       mod == CAtom(module) && f == CAtom(fun)
     })
+  })
+}
+
+/// A Phase-6 module exercising the WHOLE new authority surface (P6-06 §Verification test 7):
+/// pure SIMD arithmetic + a shuffle, every SIMD-memory node (`v128.store`/`load`/`storeN_lane`), a
+/// SECOND memory that is 64-bit (`Idx64` → `fresh64` + the mem64 cap), a `v128` global
+/// (`ref_globals` routing), and a cross-module `CallImport` (the linker-built closure capability).
+fn p6_module() -> ir.Module {
+  let ty = ir.FuncType([ir.TI32], [ir.TI32])
+  // Pure lane arithmetic (state-neutral).
+  let simd_arith =
+    ir.Function(
+      name: "simd_arith",
+      params: [ir.Local("a", ir.TV128), ir.Local("b", ir.TV128)],
+      result: [ir.TV128],
+      locals: [],
+      body: ir.Simd(ir.SAdd(ir.I32x4), [ir.Var("a"), ir.Var("b")]),
+    )
+  // A busy function: SIMD memory (store/load/store-lane) + shuffle + a v128 global get/set + a
+  // cross-module CallImport.
+  let busy =
+    ir.Function(
+      name: "busy",
+      params: [
+        ir.Local("addr", ir.TI32),
+        ir.Local("v", ir.TV128),
+        ir.Local("x", ir.TI32),
+      ],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.Let(
+        [],
+        ir.SimdStore(0, ir.Var("addr"), ir.Var("v"), 0),
+        ir.Let(
+          ["loaded"],
+          ir.SimdLoad(0, ir.LoadV128, ir.Var("addr"), 0),
+          ir.Let(
+            [],
+            ir.SimdStoreLane(0, 8, ir.Var("addr"), 0, 2, ir.Var("loaded")),
+            ir.Let(
+              ["shuf"],
+              ir.SimdShuffle(
+                [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23],
+                ir.Var("v"),
+                ir.Var("loaded"),
+              ),
+              ir.Let(
+                [],
+                ir.GlobalSet("gv", ir.Var("shuf")),
+                ir.CallImport(0, ty, [ir.Var("x")]),
+              ),
+            ),
+          ),
+        ),
+      ),
+    )
+  ir.Module(
+    name: "twocore@test@p6",
+    uses_numerics: True,
+    memories: [
+      ir.MemoryDecl(1, option.None, ir.Idx32),
+      ir.MemoryDecl(1, option.None, ir.Idx64),
+    ],
+    globals: [
+      ir.GlobalDecl(
+        "gv",
+        ir.TV128,
+        True,
+        ir.Values([
+          ir.ConstV128(<<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>),
+        ]),
+      ),
+    ],
+    imports: [ir.ImportFn("modA", "g", ty)],
+    functions: [simd_arith, busy],
+    exports: [
+      ir.ExportFn("busy", "busy"),
+      ir.ExportFn("simd_arith", "simd_arith"),
+    ],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+  )
+}
+
+/// EXTENDED D3a security invariant for the Phase-6 surface (P6-06): SIMD arithmetic + SIMD memory +
+/// an `Idx64` memory + a `v128` global + a cross-module `CallImport`, under Cell, Threaded, AND the
+/// Unsafe posture — all still ambient-free. (a) every `call` targets a fixed `Binding`/allow-set
+/// runtime atom with a literal function; (b) every `apply` is a static local `FName`; (c) the
+/// SURGICAL closure-dispatch proof: the ONLY `erlang:*` call is NONE (no `erlang:apply` anywhere —
+/// the dispatch is `link:call_import` over a closure read from `rt_state:func_import_at`); (d) the
+/// new seams are delegated to the runtime.
+pub fn phase6_ops_have_no_ambient_authority_test() {
+  let cell = instance.safe_default()
+  let threaded =
+    instance.Binding(
+      ..instance.safe_default(),
+      state_strategy: instance.Threaded,
+    )
+  let unsafe = profiles.unsafe()
+  list.each([cell, threaded, unsafe], fn(binding) {
+    let assert Ok(m) = emit_core.emit_module(p6_module(), binding)
+    // (a) every call → a fixed runtime/allow-set module + literal function atom (the allow-set now
+    // includes `rt_simd`; the closure dispatch uses the already-admitted `link`).
+    assert_calls_are_runtime(m, binding)
+    // (b) every apply → a static local FName, never a runtime-module atom.
+    let allowed = runtime_modules(binding)
+    let applies =
+      list.flat_map(m.defs, fn(d) {
+        let core_erlang.FunDef(_, v) = d
+        applies_in(v)
+      })
+    list.each(applies, fn(name) {
+      let core_erlang.FName(n, _arity) = name
+      assert set.contains(allowed, n) == False
+    })
+    // (c) THE surgical closure-dispatch assertion: NO `erlang:apply` (nor any `erlang:*`) is emitted
+    // anywhere — the S5 model dispatches via `link:call_import` over a HANDED-IN closure read from
+    // the instance's positional func-import slot, never an ambient `apply` of a data-named target.
+    assert has_call(m, "erlang", "apply") == False
+    assert erlang_calls(m) == []
+    assert has_call(m, "twocore@runtime@link", "call_import")
+    assert has_call(m, binding.state_module, "func_import_at")
+      || has_call(m, binding.state_module, "t_func_import_at")
+    // (d) the new seams are delegated to the runtime: the SIMD chokepoint, the bounds-checked
+    // byte-slice seam, the mem64 fresh64 handle, the func-import vector seed, and — on a SIMD-memory
+    // fault — `rt_trap:raise`.
+    assert has_call(m, "twocore@runtime@rt_simd", "i32x4_add")
+    assert has_call(m, "twocore@runtime@rt_simd", "i8x16_shuffle")
+    assert has_op(m, binding.mem_module, "store_bytes")
+    assert has_op(m, binding.mem_module, "load_bytes")
+    assert has_call(m, binding.mem_module, "fresh64")
+    // The func-import vector is seeded via `seed_func_imports` (cell) / `set_func_imports` (threaded).
+    assert has_call(m, binding.state_module, "seed_func_imports")
+      || has_call(m, binding.state_module, "set_func_imports")
+    assert has_call(m, "twocore@runtime@link", "provided_func_call")
+    // the v128 global routes to the BOXED accessor, not the numeric one.
+    assert has_op(m, binding.state_module, "ref_global_set")
+    assert has_call(m, binding.trap_module, "raise")
+  })
+}
+
+/// Every `#(module, fun)` `CCall` whose module position is the literal atom `'erlang'` — the D3a
+/// forbidden ambient-authority surface. Must be EMPTY: the Phase-6 dispatch names no `erlang:*`.
+fn erlang_calls(m: CModule) -> List(#(CExpr, CExpr)) {
+  list.flat_map(m.defs, fn(d) {
+    let FunDef(_, v) = d
+    calls_in(v)
+  })
+  |> list.filter(fn(pair) {
+    let #(mod, _f) = pair
+    mod == CAtom("erlang")
   })
 }
