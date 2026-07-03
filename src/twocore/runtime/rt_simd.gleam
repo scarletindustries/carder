@@ -41,330 +41,505 @@
 //// masking mod lane width, f32 single-rounding, NaN canonicalisation, saturating narrow,
 //// pmin/pmax pseudo-form, `dot_i16x8_s` wrapping, `avgr_u` rounding, swizzle OOB → 0).
 
+import gleam/bit_array
+import gleam/int
+import gleam/list
+import twocore/runtime/rt_num
+
+// ─────────────────────────── the shared lane codec + integer width-core (07a) ───────────────────────────
+//
+// PRIVATE infrastructure established by pass 07a and REUSED by 07b/07c/07d.
+//
+// A `v128` is 16 bytes; a "shape" slices it into `128 / w` lanes of `w ∈ {8,16,32,64}` bits,
+// little-endian, lane 0 lowest-addressed (D5). `decode_lanes`/`encode_lanes` are the ONE codec
+// every lane op funnels through. `mask_low`/`signed_of`/`shift_count`/`all_ones` are the
+// width-parametric integer core for the 8-/16-bit widths `rt_num` does not implement (§A.3) —
+// each mirrors a `rt_num` PRIVATE worker at an arbitrary lane width. The subtle scalar numerics
+// (the two's-complement wrap, popcount) are CONSUMED from `rt_num`, which is NEVER edited (D1).
+
+/// `2^n` as a BEAM bignum — the modulus bounding an `n`-bit lane.
+fn pow2(n: Int) -> Int {
+  int.bitwise_shift_left(1, n)
+}
+
+/// The all-ones bit pattern of a `w`-bit lane (`2^w - 1`): the width mask (and, in 07b, the
+/// "relation holds" comparison-mask value).
+fn all_ones(w: Int) -> Int {
+  pow2(w) - 1
+}
+
+/// Reduce `x` to its `w`-bit unsigned bit pattern `x mod 2^w` in `[0, 2^w)`. `x` may be
+/// negative: `band` treats a BEAM integer as an infinite two's-complement string, so this
+/// re-encodes a signed lane result to its unsigned pattern (`band(-128, 0xFF) = 128`). Mirrors
+/// `rt_num`'s private `norm` at an arbitrary lane width.
+fn mask_low(x: Int, w: Int) -> Int {
+  int.bitwise_and(x, all_ones(w))
+}
+
+/// Interpret the `w`-bit unsigned pattern `u ∈ [0, 2^w)` as a two's-complement SIGNED integer
+/// in `[-2^(w-1), 2^(w-1))`. Mirrors `rt_num`'s private `signed` at a lane width (the
+/// sanctioned local `lane_signed`, §A.3).
+fn signed_of(u: Int, w: Int) -> Int {
+  case u >= pow2(w - 1) {
+    True -> u - pow2(w)
+    False -> u
+  }
+}
+
+/// The shift amount `count` reduced mod the lane width `w` (a power of two): `count band
+/// (w - 1)`, so a shift by `w` is the identity and by `w + 1` equals by `1` (spec vector
+/// shift-count masking). Mirrors `rt_num`'s private `shift_count`.
+fn shift_count(count: Int, w: Int) -> Int {
+  int.bitwise_and(count, w - 1)
+}
+
+/// Decode the 16-byte little-endian v128 `v` into its lanes, each `w` bits wide
+/// (`w ∈ {8,16,32,64}` → 16/8/4/2 lanes), lane 0 first, as raw NON-NEGATIVE bit patterns in
+/// `[0, 2^w)`. THE shared decode 07b/07c/07d reuse — a float lane is simply its raw 32/64-bit
+/// pattern (decode with `w = 32/64`; the IEEE interpretation is `rt_num`'s job, not the
+/// codec's). A `v` whose length is not a whole multiple of `w / 8` bytes is an
+/// internal-invariant crash (P6-04 validation guarantees a well-typed 16-byte v128), never a
+/// WASM trap.
+fn decode_lanes(v: BitArray, w: Int) -> List(Int) {
+  case v {
+    <<>> -> []
+    <<lane:size(w)-little-unsigned, rest:bits>> -> [
+      lane,
+      ..decode_lanes(rest, w)
+    ]
+    _ ->
+      panic as "rt_simd.decode_lanes — v128 length not a multiple of the lane width"
+  }
+}
+
+/// Re-encode a lane list (lane 0 first) of `w`-bit lanes into the little-endian byte string
+/// (`length(lanes) * w` MUST be 128 for a v128 result). Each lane is taken mod `2^w` by the
+/// `size(w)` segment; callers pass already-normalised non-negative lanes. THE shared encode
+/// 07b/07c/07d reuse (the exact inverse of `decode_lanes`).
+fn encode_lanes(lanes: List(Int), w: Int) -> BitArray {
+  bit_array.concat(list.map(lanes, fn(lane) { <<lane:size(w)-little>> }))
+}
+
+/// Decode both operands into `w`-bit lanes, apply `f` to each corresponding lane pair, and
+/// re-encode — the driver every shape-preserving binary head funnels through.
+fn map2_lanes(
+  a: BitArray,
+  b: BitArray,
+  w: Int,
+  f: fn(Int, Int) -> Int,
+) -> BitArray {
+  encode_lanes(list.map2(decode_lanes(a, w), decode_lanes(b, w), f), w)
+}
+
+/// Decode into `w`-bit lanes, apply the unary `f` per lane, and re-encode.
+fn map1_lanes(a: BitArray, w: Int, f: fn(Int) -> Int) -> BitArray {
+  encode_lanes(list.map(decode_lanes(a, w), f), w)
+}
+
+// ── per-lane integer workers (reuse `rt_num` for the scalar wrap / popcount; §A.3) ──
+
+/// Lane-wise wrapping add of two `w`-bit patterns: `rt_num`'s audited wrap (`i32`/`i64_add`)
+/// masked to the lane width. Widen-and-mask is exact because `2^8 | 2^16 | 2^32` (so
+/// `((a+b) mod 2^32) mod 2^w = (a+b) mod 2^w`), and for `w = 32/64` the `rt_num` wrap already
+/// IS the lane wrap.
+fn add_lane(a: Int, b: Int, w: Int) -> Int {
+  case w {
+    64 -> rt_num.i64_add(a, b)
+    _ -> mask_low(rt_num.i32_add(a, b), w)
+  }
+}
+
+/// Lane-wise wrapping subtract (`rt_num.i{32,64}_sub` then mask).
+fn sub_lane(a: Int, b: Int, w: Int) -> Int {
+  case w {
+    64 -> rt_num.i64_sub(a, b)
+    _ -> mask_low(rt_num.i32_sub(a, b), w)
+  }
+}
+
+/// Lane-wise wrapping multiply (`rt_num.i{32,64}_mul` then mask).
+fn mul_lane(a: Int, b: Int, w: Int) -> Int {
+  case w {
+    64 -> rt_num.i64_mul(a, b)
+    _ -> mask_low(rt_num.i32_mul(a, b), w)
+  }
+}
+
+/// Lane-wise two's-complement negation `(0 - a) mod 2^w` (spec `ineg`; `neg(INT_MIN) = INT_MIN`).
+fn neg_lane(a: Int, w: Int) -> Int {
+  sub_lane(0, a, w)
+}
+
+/// Lane-wise two's-complement absolute value: `|signed(a)|` re-encoded mod `2^w` (spec `iabs`;
+/// wraps — `abs(INT_MIN) = INT_MIN`).
+fn abs_lane(a: Int, w: Int) -> Int {
+  mask_low(int.absolute_value(signed_of(a, w)), w)
+}
+
+/// The `w`-bit signed range endpoints (`INT_MIN` / `INT_MAX`).
+fn int_min_s(w: Int) -> Int {
+  0 - pow2(w - 1)
+}
+
+fn int_max_s(w: Int) -> Int {
+  pow2(w - 1) - 1
+}
+
+/// Clamp signed `x` to `[-2^(w-1), 2^(w-1)-1]`, then re-encode to the unsigned lane pattern.
+fn sat_s(x: Int, w: Int) -> Int {
+  mask_low(int.clamp(x, int_min_s(w), int_max_s(w)), w)
+}
+
+/// Clamp `x` to the unsigned range `[0, 2^w-1]` (the clamped result is already a lane pattern).
+fn sat_u(x: Int, w: Int) -> Int {
+  int.clamp(x, 0, all_ones(w))
+}
+
+/// Signed saturating add: the EXACT (bignum) signed sum, clamped to the `w`-bit signed range.
+fn add_sat_s_lane(a: Int, b: Int, w: Int) -> Int {
+  sat_s(signed_of(a, w) + signed_of(b, w), w)
+}
+
+/// Unsigned saturating add: the exact sum clamped to `[0, 2^w-1]`.
+fn add_sat_u_lane(a: Int, b: Int, w: Int) -> Int {
+  sat_u(a + b, w)
+}
+
+/// Signed saturating subtract: the exact signed difference clamped to the `w`-bit signed range.
+fn sub_sat_s_lane(a: Int, b: Int, w: Int) -> Int {
+  sat_s(signed_of(a, w) - signed_of(b, w), w)
+}
+
+/// Unsigned saturating subtract: the exact difference clamped to `[0, 2^w-1]`.
+fn sub_sat_u_lane(a: Int, b: Int, w: Int) -> Int {
+  sat_u(a - b, w)
+}
+
+/// Lane-wise signed minimum: select the operand bits of the numerically smaller SIGNED value.
+fn min_s_lane(a: Int, b: Int, w: Int) -> Int {
+  case signed_of(a, w) < signed_of(b, w) {
+    True -> a
+    False -> b
+  }
+}
+
+/// Lane-wise signed maximum.
+fn max_s_lane(a: Int, b: Int, w: Int) -> Int {
+  case signed_of(a, w) < signed_of(b, w) {
+    True -> b
+    False -> a
+  }
+}
+
+/// Lane-wise unsigned minimum (raw compare of the non-negative lane patterns).
+fn min_u_lane(a: Int, b: Int) -> Int {
+  case a < b {
+    True -> a
+    False -> b
+  }
+}
+
+/// Lane-wise unsigned maximum.
+fn max_u_lane(a: Int, b: Int) -> Int {
+  case a < b {
+    True -> b
+    False -> a
+  }
+}
+
+/// Rounding unsigned average `(a + b + 1) >> 1` in full precision (never overflows; the result
+/// is `≤ 2^w - 1`, so no mask is needed). Spec `iavgr_u`.
+fn avgr_u_lane(a: Int, b: Int) -> Int {
+  { a + b + 1 } / 2
+}
+
+/// Lane-wise left shift by `count` masked mod `w`: `(a << k) mod 2^w`.
+fn shl_lane(a: Int, count: Int, w: Int) -> Int {
+  mask_low(int.bitwise_shift_left(a, shift_count(count, w)), w)
+}
+
+/// Lane-wise logical right shift by `count` masked mod `w` (`a` is the non-negative pattern, so
+/// an Erlang `bsr` is a zero-filling shift; the result stays `< 2^w`).
+fn shr_u_lane(a: Int, count: Int, w: Int) -> Int {
+  int.bitwise_shift_right(a, shift_count(count, w))
+}
+
+/// Lane-wise arithmetic right shift by `count` masked mod `w`: sign-extend the lane, `bsr`
+/// (Erlang `bsr` floors on a negative operand = a sign-filling shift), and re-encode mod `2^w`.
+fn shr_s_lane(a: Int, count: Int, w: Int) -> Int {
+  mask_low(int.bitwise_shift_right(signed_of(a, w), shift_count(count, w)), w)
+}
+
 // ── integer arithmetic: lane-wise, two's-complement at the LANE width (I3) ─────────────────────────────────────────────
 
 /// `i8x16.add` — lane-wise addition, wrapping at the lane width.
 pub fn i8x16_add(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_add — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { add_lane(x, y, 8) })
 }
 
 /// `i16x8.add` — lane-wise addition, wrapping at the lane width.
 pub fn i16x8_add(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_add — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { add_lane(x, y, 16) })
 }
 
 /// `i32x4.add` — lane-wise addition, wrapping at the lane width.
 pub fn i32x4_add(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_add — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { add_lane(x, y, 32) })
 }
 
 /// `i64x2.add` — lane-wise addition, wrapping at the lane width.
 pub fn i64x2_add(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_add — implemented in P6-07"
+  map2_lanes(a, b, 64, fn(x, y) { add_lane(x, y, 64) })
 }
 
 /// `i8x16.sub` — lane-wise subtraction, wrapping at the lane width.
 pub fn i8x16_sub(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_sub — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { sub_lane(x, y, 8) })
 }
 
 /// `i16x8.sub` — lane-wise subtraction, wrapping at the lane width.
 pub fn i16x8_sub(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_sub — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { sub_lane(x, y, 16) })
 }
 
 /// `i32x4.sub` — lane-wise subtraction, wrapping at the lane width.
 pub fn i32x4_sub(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_sub — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { sub_lane(x, y, 32) })
 }
 
 /// `i64x2.sub` — lane-wise subtraction, wrapping at the lane width.
 pub fn i64x2_sub(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_sub — implemented in P6-07"
+  map2_lanes(a, b, 64, fn(x, y) { sub_lane(x, y, 64) })
 }
 
 /// `i16x8.mul` — lane-wise multiplication, wrapping (no `i8x16.mul`).
 pub fn i16x8_mul(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_mul — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { mul_lane(x, y, 16) })
 }
 
 /// `i32x4.mul` — lane-wise multiplication, wrapping (no `i8x16.mul`).
 pub fn i32x4_mul(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_mul — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { mul_lane(x, y, 32) })
 }
 
 /// `i64x2.mul` — lane-wise multiplication, wrapping (no `i8x16.mul`).
 pub fn i64x2_mul(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_mul — implemented in P6-07"
+  map2_lanes(a, b, 64, fn(x, y) { mul_lane(x, y, 64) })
 }
 
 /// `i8x16.neg` — lane-wise negation (two's-complement).
 pub fn i8x16_neg(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i8x16_neg — implemented in P6-07"
+  map1_lanes(a, 8, fn(x) { neg_lane(x, 8) })
 }
 
 /// `i16x8.neg` — lane-wise negation (two's-complement).
 pub fn i16x8_neg(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_neg — implemented in P6-07"
+  map1_lanes(a, 16, fn(x) { neg_lane(x, 16) })
 }
 
 /// `i32x4.neg` — lane-wise negation (two's-complement).
 pub fn i32x4_neg(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_neg — implemented in P6-07"
+  map1_lanes(a, 32, fn(x) { neg_lane(x, 32) })
 }
 
 /// `i64x2.neg` — lane-wise negation (two's-complement).
 pub fn i64x2_neg(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i64x2_neg — implemented in P6-07"
+  map1_lanes(a, 64, fn(x) { neg_lane(x, 64) })
 }
 
 /// `i8x16.abs` — lane-wise absolute value (two's-complement).
 pub fn i8x16_abs(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i8x16_abs — implemented in P6-07"
+  map1_lanes(a, 8, fn(x) { abs_lane(x, 8) })
 }
 
 /// `i16x8.abs` — lane-wise absolute value (two's-complement).
 pub fn i16x8_abs(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_abs — implemented in P6-07"
+  map1_lanes(a, 16, fn(x) { abs_lane(x, 16) })
 }
 
 /// `i32x4.abs` — lane-wise absolute value (two's-complement).
 pub fn i32x4_abs(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_abs — implemented in P6-07"
+  map1_lanes(a, 32, fn(x) { abs_lane(x, 32) })
 }
 
 /// `i64x2.abs` — lane-wise absolute value (two's-complement).
 pub fn i64x2_abs(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i64x2_abs — implemented in P6-07"
+  map1_lanes(a, 64, fn(x) { abs_lane(x, 64) })
 }
 
 /// `i8x16.add_sat_s` — signed saturating add (never traps).
 pub fn i8x16_add_sat_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_add_sat_s — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { add_sat_s_lane(x, y, 8) })
 }
 
 /// `i16x8.add_sat_s` — signed saturating add (never traps).
 pub fn i16x8_add_sat_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_add_sat_s — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { add_sat_s_lane(x, y, 16) })
 }
 
 /// `i8x16.add_sat_u` — unsigned saturating add.
 pub fn i8x16_add_sat_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_add_sat_u — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { add_sat_u_lane(x, y, 8) })
 }
 
 /// `i16x8.add_sat_u` — unsigned saturating add.
 pub fn i16x8_add_sat_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_add_sat_u — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { add_sat_u_lane(x, y, 16) })
 }
 
 /// `i8x16.sub_sat_s` — signed saturating subtract.
 pub fn i8x16_sub_sat_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_sub_sat_s — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { sub_sat_s_lane(x, y, 8) })
 }
 
 /// `i16x8.sub_sat_s` — signed saturating subtract.
 pub fn i16x8_sub_sat_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_sub_sat_s — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { sub_sat_s_lane(x, y, 16) })
 }
 
 /// `i8x16.sub_sat_u` — unsigned saturating subtract.
 pub fn i8x16_sub_sat_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_sub_sat_u — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { sub_sat_u_lane(x, y, 8) })
 }
 
 /// `i16x8.sub_sat_u` — unsigned saturating subtract.
 pub fn i16x8_sub_sat_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_sub_sat_u — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { sub_sat_u_lane(x, y, 16) })
 }
 
 /// `i8x16.min_s` — lane-wise signed minimum.
 pub fn i8x16_min_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_min_s — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { min_s_lane(x, y, 8) })
 }
 
 /// `i16x8.min_s` — lane-wise signed minimum.
 pub fn i16x8_min_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_min_s — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { min_s_lane(x, y, 16) })
 }
 
 /// `i32x4.min_s` — lane-wise signed minimum.
 pub fn i32x4_min_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_min_s — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { min_s_lane(x, y, 32) })
 }
 
 /// `i8x16.min_u` — lane-wise unsigned minimum.
 pub fn i8x16_min_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_min_u — implemented in P6-07"
+  map2_lanes(a, b, 8, min_u_lane)
 }
 
 /// `i16x8.min_u` — lane-wise unsigned minimum.
 pub fn i16x8_min_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_min_u — implemented in P6-07"
+  map2_lanes(a, b, 16, min_u_lane)
 }
 
 /// `i32x4.min_u` — lane-wise unsigned minimum.
 pub fn i32x4_min_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_min_u — implemented in P6-07"
+  map2_lanes(a, b, 32, min_u_lane)
 }
 
 /// `i8x16.max_s` — lane-wise signed maximum.
 pub fn i8x16_max_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_max_s — implemented in P6-07"
+  map2_lanes(a, b, 8, fn(x, y) { max_s_lane(x, y, 8) })
 }
 
 /// `i16x8.max_s` — lane-wise signed maximum.
 pub fn i16x8_max_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_max_s — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) { max_s_lane(x, y, 16) })
 }
 
 /// `i32x4.max_s` — lane-wise signed maximum.
 pub fn i32x4_max_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_max_s — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { max_s_lane(x, y, 32) })
 }
 
 /// `i8x16.max_u` — lane-wise unsigned maximum.
 pub fn i8x16_max_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_max_u — implemented in P6-07"
+  map2_lanes(a, b, 8, max_u_lane)
 }
 
 /// `i16x8.max_u` — lane-wise unsigned maximum.
 pub fn i16x8_max_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_max_u — implemented in P6-07"
+  map2_lanes(a, b, 16, max_u_lane)
 }
 
 /// `i32x4.max_u` — lane-wise unsigned maximum.
 pub fn i32x4_max_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_max_u — implemented in P6-07"
+  map2_lanes(a, b, 32, max_u_lane)
 }
 
 /// `i8x16.avgr_u` — rounding unsigned average `(a+b+1)>>1`.
 pub fn i8x16_avgr_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_avgr_u — implemented in P6-07"
+  map2_lanes(a, b, 8, avgr_u_lane)
 }
 
 /// `i16x8.avgr_u` — rounding unsigned average `(a+b+1)>>1`.
 pub fn i16x8_avgr_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_avgr_u — implemented in P6-07"
+  map2_lanes(a, b, 16, avgr_u_lane)
 }
 
 /// `i8x16.popcnt` — per-lane population count.
 pub fn i8x16_popcnt(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i8x16_popcnt — implemented in P6-07"
+  map1_lanes(a, 8, rt_num.i32_popcnt)
 }
 
 /// `i8x16.shl` — shift each lane left by `count` masked mod the lane width.
 pub fn i8x16_shl(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i8x16_shl — implemented in P6-07"
+  map1_lanes(a, 8, fn(x) { shl_lane(x, count, 8) })
 }
 
 /// `i16x8.shl` — shift each lane left by `count` masked mod the lane width.
 pub fn i16x8_shl(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i16x8_shl — implemented in P6-07"
+  map1_lanes(a, 16, fn(x) { shl_lane(x, count, 16) })
 }
 
 /// `i32x4.shl` — shift each lane left by `count` masked mod the lane width.
 pub fn i32x4_shl(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i32x4_shl — implemented in P6-07"
+  map1_lanes(a, 32, fn(x) { shl_lane(x, count, 32) })
 }
 
 /// `i64x2.shl` — shift each lane left by `count` masked mod the lane width.
 pub fn i64x2_shl(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i64x2_shl — implemented in P6-07"
+  map1_lanes(a, 64, fn(x) { shl_lane(x, count, 64) })
 }
 
 /// `i8x16.shr_s` — arithmetic right shift, `count` masked mod the lane width.
 pub fn i8x16_shr_s(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i8x16_shr_s — implemented in P6-07"
+  map1_lanes(a, 8, fn(x) { shr_s_lane(x, count, 8) })
 }
 
 /// `i16x8.shr_s` — arithmetic right shift, `count` masked mod the lane width.
 pub fn i16x8_shr_s(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i16x8_shr_s — implemented in P6-07"
+  map1_lanes(a, 16, fn(x) { shr_s_lane(x, count, 16) })
 }
 
 /// `i32x4.shr_s` — arithmetic right shift, `count` masked mod the lane width.
 pub fn i32x4_shr_s(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i32x4_shr_s — implemented in P6-07"
+  map1_lanes(a, 32, fn(x) { shr_s_lane(x, count, 32) })
 }
 
 /// `i64x2.shr_s` — arithmetic right shift, `count` masked mod the lane width.
 pub fn i64x2_shr_s(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i64x2_shr_s — implemented in P6-07"
+  map1_lanes(a, 64, fn(x) { shr_s_lane(x, count, 64) })
 }
 
 /// `i8x16.shr_u` — logical right shift, `count` masked mod the lane width.
 pub fn i8x16_shr_u(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i8x16_shr_u — implemented in P6-07"
+  map1_lanes(a, 8, fn(x) { shr_u_lane(x, count, 8) })
 }
 
 /// `i16x8.shr_u` — logical right shift, `count` masked mod the lane width.
 pub fn i16x8_shr_u(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i16x8_shr_u — implemented in P6-07"
+  map1_lanes(a, 16, fn(x) { shr_u_lane(x, count, 16) })
 }
 
 /// `i32x4.shr_u` — logical right shift, `count` masked mod the lane width.
 pub fn i32x4_shr_u(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i32x4_shr_u — implemented in P6-07"
+  map1_lanes(a, 32, fn(x) { shr_u_lane(x, count, 32) })
 }
 
 /// `i64x2.shr_u` — logical right shift, `count` masked mod the lane width.
 pub fn i64x2_shr_u(a: BitArray, count: Int) -> BitArray {
-  let _ = #(a, count)
-  panic as "rt_simd.i64x2_shr_u — implemented in P6-07"
+  map1_lanes(a, 64, fn(x) { shr_u_lane(x, count, 64) })
 }
 
 /// `i16x8.q15mulr_sat_s` — Q15 fixed-point rounding multiply, saturating.
