@@ -542,16 +542,32 @@ pub fn i64x2_shr_u(a: BitArray, count: Int) -> BitArray {
   map1_lanes(a, 64, fn(x) { shr_u_lane(x, count, 64) })
 }
 
-/// `i16x8.q15mulr_sat_s` — Q15 fixed-point rounding multiply, saturating.
+/// `i16x8.q15mulr_sat_s` — lane-wise Q15 fixed-point rounding multiply, saturating (spec
+/// `q15mulr_sat_s`): `sat_s16((a·b + 0x4000) >> 15)` with SIGNED i16 inputs. The `+ 0x4000`
+/// (= 2^14) is the round-to-nearest bias; the `>> 15` is an arithmetic (sign-filling) shift; the
+/// result is clamped to `[-2^15, 2^15-1]`. The only lane that actually saturates is
+/// `(-32768)·(-32768)` → `0x7FFF`. Never traps.
 pub fn i16x8_q15mulr_sat_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_q15mulr_sat_s — implemented in P6-07"
+  map2_lanes(a, b, 16, fn(x, y) {
+    sat_s(
+      int.bitwise_shift_right(signed_of(x, 16) * signed_of(y, 16) + 0x4000, 15),
+      16,
+    )
+  })
 }
 
-/// `i32x4.dot_i16x8_s` — pairwise i16x8 multiply-add → i32x4 (WRAPS at i32).
+/// `i32x4.dot_i16x8_s` — signed pairwise dot product (spec `idot`): for each i32 output lane `j`,
+/// `(a[2j]·b[2j]) + (a[2j+1]·b[2j+1])` with SIGNED i16 inputs. Each product is exact in i32
+/// (`|i16·i16| ≤ 2^30`); the sum of two adjacent products **WRAPS** at i32 (all lanes `-32768` →
+/// `2^30 + 2^30 = 2^31` wraps to `0x80000000` = INT_MIN — verified vs wasmtime). Never traps.
 pub fn i32x4_dot_i16x8_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_dot_i16x8_s — implemented in P6-07"
+  let products =
+    list.map2(
+      list.map(decode_lanes(a, 16), fn(x) { signed_of(x, 16) }),
+      list.map(decode_lanes(b, 16), fn(y) { signed_of(y, 16) }),
+      fn(x, y) { x * y },
+    )
+  encode_lanes(pairwise(products, fn(x, y) { mask_low(x + y, 32) }), 32)
 }
 
 // ─────────────────────────── pass 07b private helpers (compare / bitwise / reductions / lane access) ───────────────────────────
@@ -1366,245 +1382,392 @@ pub fn f64x2_promote_low_f32x4(a: BitArray) -> BitArray {
   convert_low2(a, 32, 64, rt_num.f64_promote_f32)
 }
 
-// ── narrow (saturating), extend, extmul, extadd_pairwise ─────────────────────────────────────────────
+// ── narrow (saturating), extend, extmul, extadd_pairwise (07d) ─────────────────────────────────────────────
+//
+// PRIVATE infrastructure for the shape-CHANGING integer families. All funnel through the 07a
+// codec (`decode_lanes`/`encode_lanes`/`signed_of`/`mask_low`/`sat_s`/`sat_u`). Three plumbing
+// primitives are shared: `half` (select the low/high N/2 source lanes), `extend_lanes` (sign/zero-
+// widen a lane list to the target width), and `pairwise` (fold adjacent lane pairs). The
+// dispatchers `narrow`/`extend`/`extmul`/`extadd_pairwise` are each parametric over
+// from-width/to-width/half/sign, so every head is a one-line application.
 
-/// `i8x16.narrow_i16x8_s` — signed saturating narrow of a++b.
+/// The low (`high = False`) or high (`high = True`) half of a decoded `from_w`-bit lane list — the
+/// first / last `N/2` of the `N = 128 / from_w` source lanes, i.e. the operand half the low/high
+/// shape-changing ops read.
+fn half(lanes: List(Int), from_w: Int, high: Bool) -> List(Int) {
+  let count = 128 / from_w / 2
+  case high {
+    True -> list.drop(lanes, count)
+    False -> list.take(lanes, count)
+  }
+}
+
+/// Sign- (`signed = True`) or zero-extend each `from_w`-bit lane pattern to its `to_w`-bit pattern
+/// (`to_w > from_w`). Signed: interpret two's-complement then re-encode mod `2^to_w` (`0xFF`@8 →
+/// `0xFFFF`@16 = −1). Unsigned: the raw non-negative pattern already IS the zero-extension, so the
+/// lanes pass through unchanged.
+fn extend_lanes(
+  lanes: List(Int),
+  from_w: Int,
+  to_w: Int,
+  signed: Bool,
+) -> List(Int) {
+  case signed {
+    True -> list.map(lanes, fn(x) { mask_low(signed_of(x, from_w), to_w) })
+    False -> lanes
+  }
+}
+
+/// Fold a lane list into its adjacent-pair combinations `[combine(l0,l1), combine(l2,l3), …]` —
+/// the shared worker behind `extadd_pairwise` (combine = widening add) and `dot` (combine = the
+/// wrapping sum of two products). An odd tail element is dropped (never occurs: v128 lane counts
+/// are even).
+fn pairwise(lanes: List(Int), combine: fn(Int, Int) -> Int) -> List(Int) {
+  case lanes {
+    [x, y, ..rest] -> [combine(x, y), ..pairwise(rest, combine)]
+    _ -> []
+  }
+}
+
+/// Saturating narrow of two source vectors into the half-width shape: sign-interpret each `from_w`
+/// lane of `a` (then `b`), saturate to the `to_w` range via `sat` (`sat_s` → signed range, `sat_u`
+/// → unsigned range so a negative source → 0), and concat the `a`-lanes (low half of the result)
+/// then the `b`-lanes. Shared worker behind the 4 `narrow_*` heads.
+fn narrow(
+  a: BitArray,
+  b: BitArray,
+  from_w: Int,
+  to_w: Int,
+  sat: fn(Int, Int) -> Int,
+) -> BitArray {
+  let f = fn(lane) { sat(signed_of(lane, from_w), to_w) }
+  encode_lanes(
+    list.append(
+      list.map(decode_lanes(a, from_w), f),
+      list.map(decode_lanes(b, from_w), f),
+    ),
+    to_w,
+  )
+}
+
+/// Extend (sign/zero) one half of a source vector into the double-width shape: decode `a` into
+/// `from_w` lanes, take the low or high half, widen each to `to_w`, re-encode. The shared worker
+/// behind the 12 `extend_low/high_*_s/u` heads AND the extending v128 memory loads (§E).
+fn extend(
+  a: BitArray,
+  from_w: Int,
+  to_w: Int,
+  high: Bool,
+  signed: Bool,
+) -> BitArray {
+  encode_lanes(
+    extend_lanes(
+      half(decode_lanes(a, from_w), from_w, high),
+      from_w,
+      to_w,
+      signed,
+    ),
+    to_w,
+  )
+}
+
+/// Interpret a `from_w`-bit lane pattern as SIGNED (two's complement) or UNSIGNED (raw) per
+/// `signed` — the per-lane numeric interpretation `extmul`/`extadd_pairwise` widen from.
+fn interp_lane(x: Int, from_w: Int, signed: Bool) -> Int {
+  case signed {
+    True -> signed_of(x, from_w)
+    False -> x
+  }
+}
+
+/// Extended multiply of one half: interpret (s/u) the low or high half of both operands, multiply
+/// pairwise into the double-width lane. The product of two half-width lanes fits EXACTLY in the
+/// double width (`|i8·i8| < 2^15`, `|i16·i16| < 2^31`, `|i32·i32| < 2^63`), so the `mask_low`
+/// only re-encodes a negative product to its unsigned pattern — no value is lost. Shared worker
+/// behind the 12 `extmul_low/high_*_s/u` heads.
+fn extmul(
+  a: BitArray,
+  b: BitArray,
+  from_w: Int,
+  to_w: Int,
+  high: Bool,
+  signed: Bool,
+) -> BitArray {
+  let ha =
+    list.map(half(decode_lanes(a, from_w), from_w, high), fn(x) {
+      interp_lane(x, from_w, signed)
+    })
+  let hb =
+    list.map(half(decode_lanes(b, from_w), from_w, high), fn(y) {
+      interp_lane(y, from_w, signed)
+    })
+  encode_lanes(list.map2(ha, hb, fn(x, y) { mask_low(x * y, to_w) }), to_w)
+}
+
+/// Extended pairwise add: interpret (s/u) every source lane, then sum ADJACENT pairs into the
+/// double-width output lane (`out[j] = ext(a[2j]) + ext(a[2j+1])`). The sum of two half-width
+/// values fits in the double width, so `mask_low` only re-encodes the sign. Shared worker behind
+/// the 4 `extadd_pairwise_*` heads.
+fn extadd_pairwise(
+  a: BitArray,
+  from_w: Int,
+  to_w: Int,
+  signed: Bool,
+) -> BitArray {
+  let lanes =
+    list.map(decode_lanes(a, from_w), fn(x) { interp_lane(x, from_w, signed) })
+  encode_lanes(pairwise(lanes, fn(x, y) { mask_low(x + y, to_w) }), to_w)
+}
+
+/// `i8x16.narrow_i16x8_s` — take the 8 SIGNED i16 lanes of `a` then of `b`, saturate each to the
+/// signed i8 range `[-128, 127]`, giving an i8x16 (`a`-lanes low, `b`-lanes high).
 pub fn i8x16_narrow_i16x8_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_narrow_i16x8_s — implemented in P6-07"
+  narrow(a, b, 16, 8, sat_s)
 }
 
-/// `i8x16.narrow_i16x8_u` — unsigned saturating narrow.
+/// `i8x16.narrow_i16x8_u` — saturate each SIGNED i16 lane to the UNSIGNED u8 range `[0, 255]` (a
+/// negative i16 → `0`, `> 255` → `255`), giving an i8x16 (`a`-lanes low, `b`-lanes high).
 pub fn i8x16_narrow_i16x8_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_narrow_i16x8_u — implemented in P6-07"
+  narrow(a, b, 16, 8, sat_u)
 }
 
-/// `i16x8.narrow_i32x4_s` — signed saturating narrow.
+/// `i16x8.narrow_i32x4_s` — signed saturating narrow of i32 lanes to signed i16 `[-32768, 32767]`.
 pub fn i16x8_narrow_i32x4_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_narrow_i32x4_s — implemented in P6-07"
+  narrow(a, b, 32, 16, sat_s)
 }
 
-/// `i16x8.narrow_i32x4_u` — unsigned saturating narrow.
+/// `i16x8.narrow_i32x4_u` — saturate each SIGNED i32 lane to unsigned u16 `[0, 65535]`.
 pub fn i16x8_narrow_i32x4_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_narrow_i32x4_u — implemented in P6-07"
+  narrow(a, b, 32, 16, sat_u)
 }
 
-/// `i16x8.extend_low_i8x16_s` — extend the low half of i8x16.
+/// `i16x8.extend_low_i8x16_s` — sign-extend the LOW 8 i8 lanes to i16.
 pub fn i16x8_extend_low_i8x16_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_extend_low_i8x16_s — implemented in P6-07"
+  extend(a, 8, 16, False, True)
 }
 
-/// `i16x8.extend_low_i8x16_u` — extend the low half of i8x16.
+/// `i16x8.extend_low_i8x16_u` — zero-extend the LOW 8 i8 lanes to i16.
 pub fn i16x8_extend_low_i8x16_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_extend_low_i8x16_u — implemented in P6-07"
+  extend(a, 8, 16, False, False)
 }
 
-/// `i16x8.extend_high_i8x16_s` — extend the high half of i8x16.
+/// `i16x8.extend_high_i8x16_s` — sign-extend the HIGH 8 i8 lanes (bytes 8..15) to i16.
 pub fn i16x8_extend_high_i8x16_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_extend_high_i8x16_s — implemented in P6-07"
+  extend(a, 8, 16, True, True)
 }
 
-/// `i16x8.extend_high_i8x16_u` — extend the high half of i8x16.
+/// `i16x8.extend_high_i8x16_u` — zero-extend the HIGH 8 i8 lanes (bytes 8..15) to i16.
 pub fn i16x8_extend_high_i8x16_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_extend_high_i8x16_u — implemented in P6-07"
+  extend(a, 8, 16, True, False)
 }
 
-/// `i32x4.extend_low_i16x8_s` — extend the low half of i16x8.
+/// `i32x4.extend_low_i16x8_s` — sign-extend the LOW 4 i16 lanes to i32.
 pub fn i32x4_extend_low_i16x8_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_extend_low_i16x8_s — implemented in P6-07"
+  extend(a, 16, 32, False, True)
 }
 
-/// `i32x4.extend_low_i16x8_u` — extend the low half of i16x8.
+/// `i32x4.extend_low_i16x8_u` — zero-extend the LOW 4 i16 lanes to i32.
 pub fn i32x4_extend_low_i16x8_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_extend_low_i16x8_u — implemented in P6-07"
+  extend(a, 16, 32, False, False)
 }
 
-/// `i32x4.extend_high_i16x8_s` — extend the high half of i16x8.
+/// `i32x4.extend_high_i16x8_s` — sign-extend the HIGH 4 i16 lanes to i32.
 pub fn i32x4_extend_high_i16x8_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_extend_high_i16x8_s — implemented in P6-07"
+  extend(a, 16, 32, True, True)
 }
 
-/// `i32x4.extend_high_i16x8_u` — extend the high half of i16x8.
+/// `i32x4.extend_high_i16x8_u` — zero-extend the HIGH 4 i16 lanes to i32.
 pub fn i32x4_extend_high_i16x8_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_extend_high_i16x8_u — implemented in P6-07"
+  extend(a, 16, 32, True, False)
 }
 
-/// `i64x2.extend_low_i32x4_s` — extend the low half of i32x4.
+/// `i64x2.extend_low_i32x4_s` — sign-extend the LOW 2 i32 lanes to i64.
 pub fn i64x2_extend_low_i32x4_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i64x2_extend_low_i32x4_s — implemented in P6-07"
+  extend(a, 32, 64, False, True)
 }
 
-/// `i64x2.extend_low_i32x4_u` — extend the low half of i32x4.
+/// `i64x2.extend_low_i32x4_u` — zero-extend the LOW 2 i32 lanes to i64.
 pub fn i64x2_extend_low_i32x4_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i64x2_extend_low_i32x4_u — implemented in P6-07"
+  extend(a, 32, 64, False, False)
 }
 
-/// `i64x2.extend_high_i32x4_s` — extend the high half of i32x4.
+/// `i64x2.extend_high_i32x4_s` — sign-extend the HIGH 2 i32 lanes to i64.
 pub fn i64x2_extend_high_i32x4_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i64x2_extend_high_i32x4_s — implemented in P6-07"
+  extend(a, 32, 64, True, True)
 }
 
-/// `i64x2.extend_high_i32x4_u` — extend the high half of i32x4.
+/// `i64x2.extend_high_i32x4_u` — zero-extend the HIGH 2 i32 lanes to i64.
 pub fn i64x2_extend_high_i32x4_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i64x2_extend_high_i32x4_u — implemented in P6-07"
+  extend(a, 32, 64, True, False)
 }
 
-/// `i16x8.extmul_low_i8x16_s` — extended multiply of the low half.
+/// `i16x8.extmul_low_i8x16_s` — signed extended multiply of the low 8 i8 lane pairs → i16.
 pub fn i16x8_extmul_low_i8x16_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_extmul_low_i8x16_s — implemented in P6-07"
+  extmul(a, b, 8, 16, False, True)
 }
 
-/// `i16x8.extmul_low_i8x16_u` — extended multiply of the low half.
+/// `i16x8.extmul_low_i8x16_u` — unsigned extended multiply of the low 8 i8 lane pairs → i16.
 pub fn i16x8_extmul_low_i8x16_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_extmul_low_i8x16_u — implemented in P6-07"
+  extmul(a, b, 8, 16, False, False)
 }
 
-/// `i16x8.extmul_high_i8x16_s` — extended multiply of the high half.
+/// `i16x8.extmul_high_i8x16_s` — signed extended multiply of the high 8 i8 lane pairs → i16.
 pub fn i16x8_extmul_high_i8x16_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_extmul_high_i8x16_s — implemented in P6-07"
+  extmul(a, b, 8, 16, True, True)
 }
 
-/// `i16x8.extmul_high_i8x16_u` — extended multiply of the high half.
+/// `i16x8.extmul_high_i8x16_u` — unsigned extended multiply of the high 8 i8 lane pairs → i16.
 pub fn i16x8_extmul_high_i8x16_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_extmul_high_i8x16_u — implemented in P6-07"
+  extmul(a, b, 8, 16, True, False)
 }
 
-/// `i32x4.extmul_low_i16x8_s` — extended multiply of the low half.
+/// `i32x4.extmul_low_i16x8_s` — signed extended multiply of the low 4 i16 lane pairs → i32.
 pub fn i32x4_extmul_low_i16x8_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_extmul_low_i16x8_s — implemented in P6-07"
+  extmul(a, b, 16, 32, False, True)
 }
 
-/// `i32x4.extmul_low_i16x8_u` — extended multiply of the low half.
+/// `i32x4.extmul_low_i16x8_u` — unsigned extended multiply of the low 4 i16 lane pairs → i32.
 pub fn i32x4_extmul_low_i16x8_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_extmul_low_i16x8_u — implemented in P6-07"
+  extmul(a, b, 16, 32, False, False)
 }
 
-/// `i32x4.extmul_high_i16x8_s` — extended multiply of the high half.
+/// `i32x4.extmul_high_i16x8_s` — signed extended multiply of the high 4 i16 lane pairs → i32.
 pub fn i32x4_extmul_high_i16x8_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_extmul_high_i16x8_s — implemented in P6-07"
+  extmul(a, b, 16, 32, True, True)
 }
 
-/// `i32x4.extmul_high_i16x8_u` — extended multiply of the high half.
+/// `i32x4.extmul_high_i16x8_u` — unsigned extended multiply of the high 4 i16 lane pairs → i32.
 pub fn i32x4_extmul_high_i16x8_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_extmul_high_i16x8_u — implemented in P6-07"
+  extmul(a, b, 16, 32, True, False)
 }
 
-/// `i64x2.extmul_low_i32x4_s` — extended multiply of the low half.
+/// `i64x2.extmul_low_i32x4_s` — signed extended multiply of the low 2 i32 lane pairs → i64.
 pub fn i64x2_extmul_low_i32x4_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_extmul_low_i32x4_s — implemented in P6-07"
+  extmul(a, b, 32, 64, False, True)
 }
 
-/// `i64x2.extmul_low_i32x4_u` — extended multiply of the low half.
+/// `i64x2.extmul_low_i32x4_u` — unsigned extended multiply of the low 2 i32 lane pairs → i64.
 pub fn i64x2_extmul_low_i32x4_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_extmul_low_i32x4_u — implemented in P6-07"
+  extmul(a, b, 32, 64, False, False)
 }
 
-/// `i64x2.extmul_high_i32x4_s` — extended multiply of the high half.
+/// `i64x2.extmul_high_i32x4_s` — signed extended multiply of the high 2 i32 lane pairs → i64.
 pub fn i64x2_extmul_high_i32x4_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_extmul_high_i32x4_s — implemented in P6-07"
+  extmul(a, b, 32, 64, True, True)
 }
 
-/// `i64x2.extmul_high_i32x4_u` — extended multiply of the high half.
+/// `i64x2.extmul_high_i32x4_u` — unsigned extended multiply of the high 2 i32 lane pairs → i64.
 pub fn i64x2_extmul_high_i32x4_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_extmul_high_i32x4_u — implemented in P6-07"
+  extmul(a, b, 32, 64, True, False)
 }
 
-/// `i16x8.extadd_pairwise_i8x16_s` — pairwise widening add.
+/// `i16x8.extadd_pairwise_i8x16_s` — sum adjacent SIGNED i8 lane pairs → 8 i16 lanes.
 pub fn i16x8_extadd_pairwise_i8x16_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_extadd_pairwise_i8x16_s — implemented in P6-07"
+  extadd_pairwise(a, 8, 16, True)
 }
 
-/// `i16x8.extadd_pairwise_i8x16_u` — pairwise widening add.
+/// `i16x8.extadd_pairwise_i8x16_u` — sum adjacent UNSIGNED i8 lane pairs → 8 i16 lanes.
 pub fn i16x8_extadd_pairwise_i8x16_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i16x8_extadd_pairwise_i8x16_u — implemented in P6-07"
+  extadd_pairwise(a, 8, 16, False)
 }
 
-/// `i32x4.extadd_pairwise_i16x8_s` — pairwise widening add.
+/// `i32x4.extadd_pairwise_i16x8_s` — sum adjacent SIGNED i16 lane pairs → 4 i32 lanes.
 pub fn i32x4_extadd_pairwise_i16x8_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_extadd_pairwise_i16x8_s — implemented in P6-07"
+  extadd_pairwise(a, 16, 32, True)
 }
 
-/// `i32x4.extadd_pairwise_i16x8_u` — pairwise widening add.
+/// `i32x4.extadd_pairwise_i16x8_u` — sum adjacent UNSIGNED i16 lane pairs → 4 i32 lanes.
 pub fn i32x4_extadd_pairwise_i16x8_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_extadd_pairwise_i16x8_u — implemented in P6-07"
+  extadd_pairwise(a, 16, 32, False)
 }
 
 // ── shuffle / swizzle ─────────────────────────────────────────────
 
-/// `i8x16.shuffle` — 16 immediate lane indices (0..31) select bytes from a ++ b.
-pub fn i8x16_shuffle(a: BitArray, b: BitArray, lanes: List(Int)) -> BitArray {
-  let _ = #(a, b, lanes)
-  panic as "rt_simd.i8x16_shuffle — implemented in P6-07"
+/// The byte at index `i` of a decoded byte list (`i8x16.swizzle`'s 16-element source, or
+/// `i8x16.shuffle`'s 32-element `a ++ b`). `i` is guaranteed in range by the caller (shuffle
+/// immediates validated `< 32`; swizzle indices filtered `< 16` before this is called), so the
+/// `list.drop` head always exists; an out-of-range `i` would crash node-safe (never a WASM trap).
+fn byte_at(bytes: List(Int), i: Int) -> Int {
+  let assert [x, ..] = list.drop(bytes, i)
+  x
 }
 
-/// `i8x16.swizzle` — dynamic byte select; index ≥ 16 → 0 (param `idx`, S15).
+/// `i8x16.shuffle` — 16 IMMEDIATE lane indices (each `0..31`, validated by P6-04) select bytes
+/// from the 32-byte concatenation `a ++ b` (spec `shuffle`): output byte `i` = `(a ++ b)[lanes[i]]`.
+/// Pure byte gather — no lane arithmetic. `[0,…,15]` yields `a`; `[16,…,31]` yields `b`.
+pub fn i8x16_shuffle(a: BitArray, b: BitArray, lanes: List(Int)) -> BitArray {
+  let concat = list.append(decode_lanes(a, 8), decode_lanes(b, 8))
+  encode_lanes(list.map(lanes, fn(i) { byte_at(concat, i) }), 8)
+}
+
+/// `i8x16.swizzle` — dynamic byte select (spec `swizzle`): output byte `i` = `a[idx_i]` if the
+/// UNSIGNED index byte `idx_i < 16`, else **`0`** (the load-bearing OOB → 0 corner — an index of
+/// 16..255 produces a zero byte, never a trap). `idx` is a v128 of 16 byte indices (param `idx`, S15).
 pub fn i8x16_swizzle(a: BitArray, idx: BitArray) -> BitArray {
-  let _ = #(a, idx)
-  panic as "rt_simd.i8x16_swizzle — implemented in P6-07"
+  let bytes = decode_lanes(a, 8)
+  encode_lanes(
+    list.map(decode_lanes(idx, 8), fn(i) {
+      case i < 16 {
+        True -> byte_at(bytes, i)
+        False -> 0
+      }
+    }),
+    8,
+  )
 }
 
 // ── v128 memory lane-assembly helpers (PURE; rt_mem owns the bounds check — S4) ─────────────────────────────────────────────
+//
+// The four PUBLIC helpers `emit_core` (P6-06) composes with the bounds-checked `rt_mem` byte-slice
+// seam (which owns the OOB trap). `rt_simd` supplies only the pure value assembly — it never
+// touches memory, bounds, or the trap. `pad_low` is the one genuinely-new private worker (S4);
+// everything else reuses the codec / `extend` / `set_lane` / `lane_at` already proven above.
 
-/// Build a v128 by extending each of 8/4/2 `source_bits`-wide lanes of the 8-byte slice to double width (`v128.load8x8`/`load16x4`/`load32x2`).
+/// Zero-extend a ≤16-byte little-endian slice into a full 16-byte v128: the loaded bytes occupy the
+/// LOW positions, every higher byte is `0` (the natural little-endian placement — the low value is
+/// preserved, the top is zeroed). The private worker behind the extending v128 memory loads (S4 —
+/// not public; `emit_core` reaches it only through `v128_load_extend`).
+fn pad_low(bytes: BitArray) -> BitArray {
+  let pad_bits = { 16 - bit_array.byte_size(bytes) } * 8
+  <<bytes:bits, 0:size(pad_bits)>>
+}
+
+/// Assemble the `v128.load{8x8,16x4,32x2}_{s,u}` result: `bytes8` is the 8-byte memory slice
+/// `rt_mem` supplied; interpret it as 8/4/2 lanes of `source_bits` (`8`/`16`/`32`) and sign- or
+/// zero-extend (`signed`) each to the double width, filling the v128 (i16x8/i32x4/i64x2). Padding
+/// the slice to 16 bytes then extending its LOW half reuses the `extend` driver verbatim. Pure —
+/// the bounds check + trap were `rt_mem`'s, before this is ever reached.
 pub fn v128_load_extend(
   bytes8: BitArray,
   source_bits: Int,
   signed: Bool,
 ) -> BitArray {
-  let _ = #(bytes8, source_bits, signed)
-  panic as "rt_simd.v128_load_extend — implemented in P6-07"
+  extend(pad_low(bytes8), source_bits, source_bits * 2, False, signed)
 }
 
-/// Build a v128 with the loaded `lane_bits` (32/64) in the low lane, upper bits zero (`v128.load32_zero`/`load64_zero`).
+/// Assemble the `v128.load{32,64}_zero` result: place the low `lane_bits` (`32`/`64`) little-endian
+/// value from `bytes` into lane 0, zero every higher bit (spec `load_zero` — the high 96/64 bits are
+/// `0`). Pure — `rt_mem` supplied `bytes` after its bounds check.
 pub fn v128_load_zero(bytes: BitArray, lane_bits: Int) -> BitArray {
-  let _ = #(bytes, lane_bits)
-  panic as "rt_simd.v128_load_zero — implemented in P6-07"
+  let assert <<low:size(lane_bits)-little-unsigned, _:bits>> = bytes
+  encode_lanes([low, ..list.repeat(0, 128 / lane_bits - 1)], lane_bits)
 }
 
-/// Insert `bits` (`width` = 8/16/32/64) into lane `lane` of `vec` (`v128.loadN_lane` assembly).
+/// Assemble the `v128.load{8,16,32,64}_lane` result: return a copy of `vec` with lane `lane` (of
+/// `width` = 8/16/32/64 BITS) overwritten by the raw `bits` (`bits mod 2^width`) that `rt_mem`
+/// loaded. A thin alias of the lane replace over an explicit bit-width (S4).
 pub fn v128_replace_lane_bits(
   vec: BitArray,
   lane: Int,
   width: Int,
   bits: Int,
 ) -> BitArray {
-  let _ = #(vec, lane, width, bits)
-  panic as "rt_simd.v128_replace_lane_bits — implemented in P6-07"
+  set_lane(vec, width, lane, bits)
 }
 
-/// Extract lane `lane` (`width` bits) of `vec` as raw bits (`v128.storeN_lane` extraction).
+/// Extract lane `lane` of `vec` as its raw `width`-bit (8/16/32/64) pattern — the scalar
+/// `emit_core` then hands to `rt_mem.store` for `v128.store{8,16,32,64}_lane` (S4). A thin alias of
+/// the lane read over an explicit bit-width.
 pub fn v128_extract_lane_bits(vec: BitArray, lane: Int, width: Int) -> Int {
-  let _ = #(vec, lane, width)
-  panic as "rt_simd.v128_extract_lane_bits — implemented in P6-07"
+  lane_at(vec, width, lane)
 }
