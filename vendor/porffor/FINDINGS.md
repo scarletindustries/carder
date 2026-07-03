@@ -212,9 +212,26 @@ items (§6–§8) were a tractable sequence of bugs/missing-builtins; this is a 
 
 Options for the next agent (all large): (a) wait for / port upstream Porffor closure support and
 re-vendor; (b) implement closure capture in the vendored Porffor codegen (heap-allocated environments —
-substantial); (c) a codemod that lambda-lifts capturing callbacks into top-level functions threading the
-captured vars as explicit args (mechanical but must handle every `.map`/`.reduce`/… site and mutation
-semantics — very broad). There is no quick patch.
+substantial); (c) a codemod that lambda-lifts capturing callbacks (see below). There is no quick patch.
+
+### 8b.1 Lambda-lift experiment (`lambda-lift/`) — advances the frontier, but has a hard ceiling
+
+Option (c) was prototyped in `vendor/porffor/lambda-lift/` (kept OUT of the main build; opt-in). Instead
+of classic lambda-lifting (blocked — Porffor's `.bind` is broken, so no partial application), it
+**globalizes captured variables**: Porffor closures over *module globals* work, so for each function it
+promotes params/locals that nested closures read into fresh module globals, with save/restore at
+entry/exits (recursion-safe; plain assignments, since Porffor's `try/finally`+closure is broken). Verified
+correct on `inv` and via a Node correctness oracle.
+
+Result: globalizing `inv` clears the init `keyMap` wall and lets `compileJS` run into **actual
+compilation** — real progress. **But the ceiling is fundamental:** globalization is only sound for
+NON-ESCAPING closures (run synchronously within the function — array-method callbacks). The compiler has
+many **escaping** closures that outlive their function and thus can't be lifted — e.g. `comptime`'s
+`Object.defineProperty(..., { set(x){ x.comptime = comptime2 } })` setter. On the bundle ~6 captures are
+safely globalized and **~66 escape** and are skipped; the next blocker after `inv` is a `this`-capture
+(esbuild's `this$1`), then the escaping ones. No codemod can eliminate escaping closures — they need real
+closure support. So lambda-lifting **extends reach but is not a complete path to `[run]` GREEN**. See
+`lambda-lift/README.md` for the mechanism, the ceiling, and how to run/wire it in.
 
 This is the long tail CONTINUE.md warned about; §6–§8 cleared the tractable part. Each fix advanced
 `[run]` further (init stmt 54 → 703 of 733); the closure wall is where the effort/return changes shape.
