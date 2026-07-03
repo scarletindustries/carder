@@ -48,16 +48,25 @@ fn ffi_is_null(x: Dynamic) -> Bool
 @external(erlang, "twocore_rt_ref_ffi", "is_extern")
 fn ffi_is_extern(x: Dynamic) -> Bool
 
+/// Structural exnref test — `X` matches `{ref_exn, _}` (the Phase-7 EH caught-exception box,
+/// owned by `rt_exn`, T9). Delegated to `rt_exn`'s FFI shim so the `{ref_exn, _}` shape stays in
+/// one place (D3b); `rt_ref` only needs the boolean to route `classify_ref` (below).
+@external(erlang, "twocore_rt_exn_ffi", "is_exnref")
+fn ffi_is_exnref(x: Dynamic) -> Bool
+
 /// The three reference kinds a runtime reference value can be (the result of `classify_ref`).
 /// Used by the conformance harness to JUDGE a returned reference (R18) and by defensive
 /// runtime checks.
 ///
 /// - `NullRef`: the null sentinel `{ref_null}` (either reftype).
 /// - `ExternRef`: a wrapped host reference `{ref_extern, _}`.
+/// - `ExnRef`: a Phase-7 caught-exception handle `{ref_exn, _}` (owned by `rt_exn`, T9). Tested
+///   BEFORE the funcref by-elimination arm so a `{ref_exn, _}` is never misclassified as a funcref.
 /// - `FuncRef`: a function reference `{FuncType, Closure}` (a Phase-2 table entry shape).
 pub type RefKind {
   NullRef
   ExternRef
+  ExnRef
   FuncRef
 }
 
@@ -103,17 +112,23 @@ pub fn is_null(x: Dynamic) -> Bool {
 /// defensive runtime checks.
 ///
 /// - `x`: any reference `Dynamic`.
-/// - Returns `NullRef` for the sentinel, `ExternRef` for a `{ref_extern, _}` box, else
-///   `FuncRef` (a `{FuncType, Closure}` entry — the only remaining shape a well-typed
-///   reference can hold). Total; never panics. The order (null, then extern, then funcref by
-///   elimination) is forge-proof because the null and extern tests are structural.
+/// - Returns `NullRef` for the sentinel, `ExternRef` for a `{ref_extern, _}` box, `ExnRef` for a
+///   `{ref_exn, _}` caught-exception box (Phase-7 EH — owned by `rt_exn`, T9), else `FuncRef` (a
+///   `{FuncType, Closure}` entry — the only remaining shape a well-typed reference can hold). Total;
+///   never panics. The order (null, then extern, then exn, then funcref by elimination) is
+///   forge-proof because the null/extern/exn tests are all structural — the exn arm precedes the
+///   by-elimination funcref arm so a `{ref_exn, _}` is never misclassified.
 pub fn classify_ref(x: Dynamic) -> RefKind {
   case ffi_is_null(x) {
     True -> NullRef
     False ->
       case ffi_is_extern(x) {
         True -> ExternRef
-        False -> FuncRef
+        False ->
+          case ffi_is_exnref(x) {
+            True -> ExnRef
+            False -> FuncRef
+          }
       }
   }
 }

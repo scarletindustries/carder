@@ -587,6 +587,11 @@ fn tag_ref(term: Dynamic, t: fixture.RefTypeTag) -> SpecValue {
   case rt_ref.classify_ref(term) {
     rt_ref.NullRef -> NullRef(t)
     rt_ref.ExternRef -> ExternRefVal(term_to_int(ffi.extern_payload(term)))
+    // A Phase-7 caught-exception handle `{ref_exn, _}` (T9). Opaque like a funcref at the value
+    // layer; the harness has no distinct exnref `SpecValue` yet (P7-09 refines this if a `.wast`
+    // ever RETURNS an exnref — Porffor never does, so this arm is unreached in the current corpus,
+    // keeping conformance byte-identical). Tag it as an opaque non-null reference for now.
+    rt_ref.ExnRef -> FuncRefVal(None)
     rt_ref.FuncRef -> FuncRefVal(None)
   }
 }
