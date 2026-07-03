@@ -152,8 +152,11 @@ splat/lane variants) — `rt_simd` provides the pure lane-assembly helpers, `rt_
 ## F. memory64 runtime (IR unchanged — `IdxType` already frozen)
 
 - `instance.gleam` `Binding` gains **`mem64_max_pages: Int`** (PROVISIONAL name) — the documented,
-  spec-aligned page cap for a 64-bit memory. **08 pins the exact constant + a spec citation** (the
-  WASM memory64 max is 2⁴⁸ bytes ⇒ 2³² pages; a real engine caps lower — pick honestly, cite it). 01
+  spec-aligned page cap for a 64-bit memory. **08 pins the exact constant + a spec citation** —
+  RECONCILED (S9): the memory64 spec DECLARABLE type-max is **2⁴⁸ pages** (= 2⁶⁴ bytes, validate
+  accepts up to this); the RUNTIME cap `mem64_max_pages` default is **2³² pages = 2⁴⁸ bytes = 256
+  TiB** (a sparse trap boundary the paged backend never allocates — grow beyond → -1, access beyond
+  current size → MemoryOutOfBounds). Do not conflate the two. 01
   freezes the field; `safe_default` sets it.
 - `lower.gleam`: **delete the `Memory64Unsupported` rejection** for `Idx64`; thread the i64 address
   width. `emit_core`: a 64-bit memory's addr/bounds arithmetic is i64 (a 32-bit memory unchanged →

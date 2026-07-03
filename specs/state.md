@@ -331,7 +331,107 @@ soundness lever + the "keep the IR analyzable" invariants).
 
 ---
 
+## Phase 6 — "Complete the WebAssembly 2.0 standard" (SIMD + memory64 runtime + cross-module linking)
+
+Goal & honest scope: see [`specs/phase-6/00-overview.md`](phase-6/00-overview.md) (decisions **I1–I8**)
+and the AUTHORITATIVE [`specs/phase-6/RECONCILIATION.md`](phase-6/RECONCILIATION.md) (decisions
+**S1–S15** — override the unit docs on conflict). Phases 1–5 built the complete standardized surface
+**minus SIMD**; Phase 6 closes the last three deferred features so the engine covers **the whole
+WebAssembly 2.0 fixed-width surface**: **SIMD** (`v128` + ~236 lane ops, emulated lane-wise via a new
+**`rt_simd`** mirroring `rt_num` — faithful, not hardware-accelerated, I3), the **memory64 runtime**
+(R12's deferred half — lower/link accept `Idx64`, i64 addressing, a documented spec-aligned page cap:
+declarable type-max 2⁴⁸ pages, runtime cap 2³² pages/256 TiB, S9), and **cross-module wasm→wasm
+function linking** (the greenfield imported-function-call path — `lower` rejects it today — via the new
+`CallImport` node + a linker-built closure capability, D3a-clean, S5). The IR grows again
+(language-neutrally, I7) — `TV128` + `ConstV128` + a compact `SimdOp` enum + the `CallImport` node —
+conformance-neutral by default. Post-2.0 proposals (tail-call/`return_call*`, GC, EH, stack-switching,
+component model, relaxed-SIMD) stay **categorized-deferred** (S12). Completing Phase 6 **unblocks
+Phase 7** (Porffor / JS-on-the-BEAM). Plan authored + adversarially critiqued (4 lenses, **8 blockers
++ 7 majors** caught) + reconciled (S1–S15).
+
+### Phase-6 freeze milestones (planned)
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«IR4-FROZEN»` — `ir.gleam` `TV128` ValType + `ConstV128` Value + the parametric `SimdOp` enum (incl. the saturating add/sub family, S3) + `Simd`/`SimdShuffle`/`SimdLoad`/`SimdStore`/`SimdLoadLane`/`SimdStoreLane` Expr nodes (bits, S2) + **`CallImport(slot,ty,args)`** (S5) + `effect` classification (pure lanewise / barrier memory, S7) + no new `TrapReason` (S8) + `.ir` grammar-delta pointer | P6-01 | **planned** | 02, 03, 05, 06, 07, 09 |
+| `«RT-SIMD-SIG»` — `runtime/rt_simd.gleam` (NEW) ~214–224 pure lane heads + the four v128 memory lane-assembly helpers (S4), doc-frozen todo-free | P6-01 | **planned** | 06, 07 |
+| `«MEM64-RUNTIME»` — `Binding.mem64_max_pages` cap field (S9) + the `lower`/`link` accept-`Idx64` contract + `rt_mem.load_bytes`/`store_bytes` head names (S4) | P6-01 | **planned** | 05, 08 |
+| `«XLINK»` — the `CallImport` node + the `fn(List(Dynamic))->List(Dynamic)` closure ABI + the `link.call_import(closure,args)` 1-ary seam (never `erlang:apply`-spread, S5) + uniform link-time host/cross-module resolution | P6-01 | **planned** | 06, 09 |
+| `«WASM-AST4»` — extended `frontend/wasm/ast.gleam` (`V128` valtype, shape-tagged `Simd(op)` + the 6 dedicated SIMD `Instr`s, S1) | P6-03 (day 1) | **planned** | 04, 05 |
+
+### Phase-6 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P6-01** Interface freeze (keystone) | [`01`](phase-6/01-interface-freeze.md) | **unclaimed** | — | IR4 (`TV128`/`ConstV128`/`SimdOp`/SIMD Expr nodes/`CallImport`) + `rt_simd` sig heads + memory64 cap + XLINK closure contract + `.ir` grammar-delta; lands green, byte-identical defaults. |
+| **P6-02** `.ir` printer/parser ext | [`02`](phase-6/02-ir-textual-form.md) | **unclaimed** | `«IR4»` | Full round-trip of `v128.const` + every `SimdOp` + `SimdShuffle` + SIMD-memory + `CallImport`; legacy byte-identical. |
+| **P6-03** decode ext (+ `«WASM-AST4»`) | [`03`](phase-6/03-decode.md) | **unclaimed** | — | `0xFD` prefix + all ~236 sub-opcodes + `v128.const`/shuffle/lane immediates + the v128 memory family; publishes AST4 (S1 shape). |
+| **P6-04** validate ext | [`04`](phase-6/04-validate.md) | **unclaimed** | `«WASM-AST4»` | SIMD typing (comparisons→v128 mask; lane-immediate bounds) + memory64 i64 typing + cross-module fn-import typing; **fail-closed** (S1). |
+| **P6-05** lower ext | [`05`](phase-6/05-lower.md) | **unclaimed** | `«WASM-AST4»`, `«IR4»` | AST4→IR4 SIMD (relabel to the parametric `SimdOp`, S3); accept `Idx64` (delete `Memory64Unsupported`); imported call → `CallImport(slot,ty,args)` (S5). |
+| **P6-06** emit_core ext | [`06`](phase-6/06-emit-core.md) | **unclaimed** | `«IR4»`, `«RT-SIMD-SIG»`, `«XLINK»` | Emit SIMD via the `rt_simd` seam; the pinned SIMD-memory compose table (S4); memory64 i64 addressing; `CallImport → link.call_import` closure dispatch (never apply-spread); extend the D3a test. Deepest codegen. |
+| **P6-07** rt_simd (NEW; 07a–07d) | [`07`](phase-6/07-rt-simd.md) | **unclaimed** | `«RT-SIMD-SIG»` | The ~214–224 lane heads over a 16-byte BitArray, bit-exact, reusing `rt_num`; the four memory lane-assembly helpers; **four balanced passes** (S10); differential vs oracle/wasmtime. |
+| **P6-08** rt_mem memory64 | [`08`](phase-6/08-rt-mem-memory64.md) | **unclaimed** | `«MEM64-RUNTIME»` | i64 addressing + 64-bit bounds + the documented cap (S9) + `load_bytes`/`store_bytes` (S4); paged (+portable); atomics/nif fail-closed over-cap; 32-bit byte-identical. |
+| **P6-09** cross-module linking | [`09`](phase-6/09-cross-module-linking.md) | **unclaimed** | `«XLINK»` | `link_imports` extended to functions (fail-closed → `assert_unlinkable`); the host + cross-module closures (host reuses `rt_host`; cross-module routes into the exporting instance's process); `(register …)` end-to-end; v128/boxed globals in `rt_state` (S6); cell-first (S5). |
+| **P6-10** conformance expansion | [`10`](phase-6/10-conformance-expansion.md) | **unclaimed** | 03–09 | Light up `simd/*.wast` + `memory64.wast` + `linking.wast`; the **empirical residual audit** (S11); the v128-lane-aware NaN-pattern value judge (M3); v128 invoke ABI (S14); differential vs `wasmtime`; measured skip-drop. |
+| **P6-11** capstone | [`11`](phase-6/11-capstone.md) | **unclaimed** | all above | WASM-2.0 complete green under the matrix; measured skip-drop headline + fail=0; conformance-neutral proof; SVG refresh; honest close (emulated SIMD, documented mem64 cap, post-2.0 deferred, S12); Phase 7 unblocked. |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §12 SIMD (fixed-width `v128`) | P6-01/03/04/05/06/07 | ~236 lane ops, emulated lane-wise via `rt_simd` (tier-P `bif`, reuses `rt_num`); faithful, not hardware-accelerated (I3). |
+| §12 `memory64` (runtime) | P6-01/05/06/08 | R12's deferred half — i64 addressing + documented page cap; `paged`/`portable` (atomics/nif fail-closed over-cap). |
+| §8/§10 cross-module wasm linking | P6-01/05/06/09 | The greenfield imported-function-call path via `CallImport` + linker-built closure capability (D3a-clean, S5); `(register …)`. |
+| §11 differential + interface conformance | P6-10 | the new surface held to `wasmtime` + the `rebuild` oracle; measured residual (S11). |
+
+### Deferred to Phase 7+ (explicit)
+
+**Phase 7 — "JS on the BEAM" via Porffor (now unblocked):** the Porffor-ABI `rt_host` shim + a
+JS-subset conformance harness. **Post-2.0 proposals (categorized-deferred, S12):** the **tail-call**
+proposal (`return_call*` — a plausibly-cheap BEAM-native fast-follow, EM-flagged), **GC** (incl.
+GC-proposal reftypes), **exception-handling**, **stack-switching**, the **component model**,
+**relaxed-SIMD**. **Later:** the Erlang/Gleam frontend; the single-`.beam` **B1** binding; tier-N
+numerics; a production **C NIF** for tier-N memory *or* real hardware **tier-N SIMD**; SIMD text in the
+WAT parser (S13); the **memory optimizer** (its own perf phase); the extended-const proposal.
+
+---
+
 ## Change log
+
+- **Phase-6 plan authored + adversarially critiqued + reconciled.** Scope decision (EM): **Phase 6 =
+  "complete the WebAssembly 2.0 standard"** — SIMD (`v128` + ~236 lane ops via a new `rt_simd`
+  mirroring `rt_num`), the memory64 runtime (R12's deferred half), and cross-module wasm→wasm function
+  linking (the greenfield imported-call path). Authored `phase-6/00-overview.md` (**I1–I8**) + an
+  EM-provided provisional IR4/AST4/rt_simd/linker surface, then an 11-agent scoping fan-out (each unit
+  doc built against the provisional surface for coherence) + a **4-lens adversarial critique**
+  (frontend-fidelity, runtime-semantics, security-consistency, scope-realism) that caught **8 blockers
+  + 7 majors**, all folded into the AUTHORITATIVE `phase-6/RECONCILIATION.md` (**S1–S15**):
+  - **B: the SIMD AST surface was frozen 3 incompatible ways** (03 shape-tagged + dedicated Instrs; 04
+    a flat sub-enum; 05 flat per-op) → pin 03's shape (the `ast.gleam` owner); 04/05 conform; **and
+    harden validate's `numeric_sig` fallthrough (a fail-OPEN hole) to intercept every SIMD Instr** (S1).
+  - **B: SIMD-memory width fields frozen bits-vs-bytes** (silent 8× mis-sizing) → pin BITS (S2).
+  - **B: `ir.SimdOp` frozen 2 ways** (keystone parametric vs 05 fully-named, which don't exist) → the
+    keystone's parametric taxonomy wins; 05 relabels; the saturating add/sub family (~392 asserts) is
+    IN the enum (S3).
+  - **B: the v128 load/store seam frozen 3 ways + `load_bytes`/`store_bytes` owned by nobody** → pin
+    rt_mem `load_bytes`/`store_bytes` (owner 08) + rt_simd's four lane-assembly helpers (owner 07) + a
+    pinned per-variant compose table (emitted by 06) (S4).
+  - **B: the cross-module closure ABI frozen 2 ways** (list-taking vs `erlang:apply`-spread crash) +
+    **the `CallImport` seam 3 ways** → pin the `CallImport(slot,ty,args)` node + a
+    `fn(List)->List(Dynamic)` closure invoked 1-ary via `link.call_import` (never apply-spread) +
+    uniform link-time host/cross-module resolution (host reuses `rt_host`; the imported-call path is
+    greenfield — `lower` rejects it today) (S5).
+  - **Majors folded:** 05's IR relabel (S3); v128/boxed globals reuse `rt_state.ref_globals` (owner 09,
+    S6); pure-lanewise-SIMD effect classification ratified sound (S7); TrapReason unchanged (S8); the
+    memory64 numbers corrected (declarable 2⁴⁸ pages / runtime cap 2³² pages, S9); rt_simd re-split
+    into **four** balanced passes (S10); the conformance residual/`table_copy` number MEASURED not
+    overstated (S11); the close qualified to **"WASM 2.0 complete"** with post-2.0 proposals
+    (tail-call/GC/EH/stack-switching/component-model/relaxed-SIMD) categorized-deferred — `return_call*`
+    added to the residual (S12); the SIMD-wat differential dropped (WAT parser has no SIMD text, S13);
+    the v128 invoke ABI (16 LE bytes) ratified (S14). Plan is now internally consistent; implementation
+    next, keystone-first.
+
+
 
 - **P5-12 landed (capstone) — PHASE 5 PROVEN.** The engine now executes the **complete standardized
   WebAssembly surface except SIMD**, proven under both modes and every shipped tier. Capstone
