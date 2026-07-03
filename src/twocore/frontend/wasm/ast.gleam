@@ -37,19 +37,25 @@
 import gleam/option.{type Option}
 
 /// A WebAssembly value type — the four number types, the 128-bit SIMD vector type
-/// (Phase 6, `«WASM-AST4»`), and the two MVP reference types (Phase 5, `«WASM-AST3»`).
+/// (Phase 6, `«WASM-AST4»`), the two MVP reference types (Phase 5, `«WASM-AST3»`), and
+/// the exception reference type `ExnRef` (Phase 7, `«WASM-AST5»`).
 ///
 /// In the binary format each is a single byte: `i32 = 0x7F`, `i64 = 0x7E`,
-/// `f32 = 0x7D`, `f64 = 0x7C`, `v128 = 0x7B`, `funcref = 0x70`, `externref = 0x6F`
-/// (spec binary/types.html#value-types). `V128` is the low-level 128-bit fixed-width
-/// SIMD value (`«WASM-AST4»`) — it is **NOT** a reference type: `decode_reftype`
-/// (reftype-only positions) still rejects `0x7B` with `BadHeapType`; only
-/// `decode_valtype` accepts it. There is **no separate `RefType`** in the AST — a
-/// reftype is exactly the `FuncRef`/`ExternRef` subset of `ValType`, validated
-/// positionally by `decode_reftype` (so one `decode_valtype` serves every valtype
-/// site). No GC-proposal reftypes. A non-SIMD module never carries `V128`, so every
+/// `f32 = 0x7D`, `f64 = 0x7C`, `v128 = 0x7B`, `funcref = 0x70`, `externref = 0x6F`,
+/// **`exnref = 0x69`** (spec binary/types.html#value-types + the exception-handling
+/// proposal). `V128` is the low-level 128-bit fixed-width SIMD value (`«WASM-AST4»`) —
+/// it is **NOT** a reference type: `decode_reftype` (reftype-only positions) still
+/// rejects `0x7B` with `BadHeapType`; only `decode_valtype` accepts it. `ExnRef`, by
+/// contrast, **IS** a reference type (`exn`/`0x69` is a legal abstract heaptype), so
+/// `decode_reftype` accepts `0x69` (for `ref.null exn`) — an OPAQUE handle to an
+/// in-flight/caught exception, structurally like `ExternRef`. There is **no separate
+/// `RefType`** in the AST — a reftype is exactly the `FuncRef`/`ExternRef`/`ExnRef`
+/// subset of `ValType`, validated positionally by `decode_reftype` (so one
+/// `decode_valtype` serves every valtype site). No GC-proposal reftypes. A non-SIMD
+/// module never carries `V128` and a non-EH module never carries `ExnRef`, so every
 /// existing exhaustive match over `ValType` gains one unreachable-in-practice arm and
-/// stays byte-identical (lower maps `V128 → ir.TV128`, 1:1 like `FuncRef`/`TFuncRef`).
+/// stays byte-identical (lower maps `V128 → ir.TV128` and `ExnRef → ir.TExnRef`, 1:1
+/// like `FuncRef`/`TFuncRef`).
 pub type ValType {
   I32
   I64
@@ -58,6 +64,7 @@ pub type ValType {
   V128
   FuncRef
   ExternRef
+  ExnRef
 }
 
 /// A function type (signature): the parameter value types and the result value
@@ -90,13 +97,15 @@ pub type Func {
 }
 
 /// What an export refers to. Phase 1 only ever *resolves* `ExportFunc`, but the
-/// binary kind byte may legally be any of these (`0x00`..`0x03`); the decoder
-/// records the kind faithfully and leaves use-site checks to Unit 10.
+/// binary kind byte may legally be any of these (`0x00`..`0x04`); the decoder
+/// records the kind faithfully and leaves use-site checks to Unit 10. Phase 7
+/// (`«WASM-AST5»`) adds `ExportTag` (kind byte `0x04`) — an exported exception tag.
 pub type ExportKind {
   ExportFunc
   ExportTable
   ExportMemory
   ExportGlobal
+  ExportTag
 }
 
 /// A single export entry: a UTF-8 name, the kind of thing exported, and its
@@ -272,21 +281,39 @@ pub type Import {
   Import(module: String, name: String, desc: ImportDesc)
 }
 
-/// An import descriptor (the four `importdesc` kinds).
+/// An import descriptor (the five `importdesc` kinds).
 ///
 /// - `ImportFunc(type_idx)`: `0x00 x:typeidx` — a function of the module's `types[x]`.
 /// - `ImportTable(TableType)`: `0x01 tt:tabletype` — a reference table.
 /// - `ImportMemory(MemType)`: `0x02 mt:memtype` — a linear memory.
 /// - `ImportGlobal(ty, mutable)`: `0x03 t:valtype m:mut` — a global (`mut` `0x00`
 ///   const / `0x01` var).
+/// - `ImportTag(type_idx)`: `0x04 0x00 x:typeidx` — an imported exception tag of
+///   `types[x]` (Phase 7, `«WASM-AST5»`). The `0x00` attribute byte is checked and
+///   dropped by decode (a non-`0x00` attribute is `Error(BadTagAttribute)`); only the
+///   tag's `type_idx` is stored.
 ///
 /// Decode records declarations only; link/instantiation (unit 09) resolves them
-/// fail-closed. An importdesc byte outside `0x00..0x03` is `BadImportKind`.
+/// fail-closed. An importdesc byte outside `0x00..0x04` is `BadImportKind`.
 pub type ImportDesc {
   ImportFunc(type_idx: Int)
   ImportTable(TableType)
   ImportMemory(MemType)
   ImportGlobal(ty: ValType, mutable: Bool)
+  ImportTag(type_idx: Int)
+}
+
+/// A tag declaration (tag section, id 13; Phase 7, `«WASM-AST5»`). A tag is an
+/// EXCEPTION type: on the wire `attribute:0x00 x:typeidx`. `type_idx` names the tag's
+/// `FuncType` in `Module.types`; that functype's PARAMETERS are the exception's operand
+/// types (the payload a `throw` of this tag carries) and its RESULTS must be empty
+/// (`[t*] → []`) — the empty-results check is validate's (unit 04), not decode's. The
+/// `0x00` attribute is consumed + checked by decode (a non-`0x00` byte is
+/// `Error(BadTagAttribute)`) and NOT stored; only the exception attribute exists today.
+/// Defined tags live in `Module.tags`; IMPORTED tags live in `Module.imports` as
+/// `ImportTag` (the tag index space is imported-then-defined, exactly like functions).
+pub type Tag {
+  Tag(type_idx: Int)
 }
 
 /// A whole decoded module.
@@ -302,6 +329,11 @@ pub type ImportDesc {
 /// - `tables`: the table section's table types (section 4), in order.
 /// - `memories`: the memory section's memory types (section 5), in order.
 /// - `globals`: the global section's global declarations (section 6), in order.
+/// - `tags`: the tag section's DEFINED exception tags (section 13, ordered between
+///   memory (5) and global (6) per the EH proposal), in order. Empty for a non-EH
+///   module (byte-identical to Phase 6). Imported tags are NOT here — they live in
+///   `imports` as `ImportTag`; the tag index space is `imported tags ++ tags` (the
+///   split derived by validate/lower, like the table/memory/global spaces).
 /// - `funcs`: the defined functions, in order. `funcs[i]` pairs the function
 ///   section's `i`-th type index with the code section's `i`-th body.
 /// - `start`: the start section's funcidx (section 8), or `None` if absent — run
@@ -322,6 +354,7 @@ pub type Module {
     tables: List(TableType),
     memories: List(MemType),
     globals: List(Global),
+    tags: List(Tag),
     funcs: List(Func),
     start: Option(Int),
     elements: List(ElementSegment),
@@ -488,6 +521,28 @@ pub type SimdLoadKind {
   LoadSplat(lane_bits: Int)
   LoadExtend(source_bits: Int, signed: Bool)
   LoadZero(lane_bits: Int)
+}
+
+/// A single `try_table` catch clause (Phase 7, `«WASM-AST5»`; spec: the EH proposal's
+/// `catch` vector). Each clause routes a caught exception to a block LABEL, optionally
+/// binding an `exnref`. Decode stores raw `tag`/`label` indices (`u32`); validate (04)
+/// resolves + types them. Constructor names mirror the spec keywords 1:1.
+///
+/// - `Catch(tag, label)`      — kind `0x00`: on a throw of `tag`, push its operands and
+///                              branch to `label`.
+/// - `CatchRef(tag, label)`   — kind `0x01`: on a throw of `tag`, push its operands AND
+///                              an `exnref` for the caught exception, branch to `label`.
+/// - `CatchAll(label)`        — kind `0x02`: on ANY throw, branch to `label` (no operands).
+/// - `CatchAllRef(label)`     — kind `0x03`: on ANY throw, push an `exnref`, branch to
+///                              `label`.
+///
+/// Wire order for the tag-bearing kinds is `tag` THEN `label` (anti-swap; a swap
+/// mis-decodes both indices). A kind byte outside `0x00..0x03` is `Error(BadCatchKind)`.
+pub type Catch {
+  Catch(tag: Int, label: Int)
+  CatchRef(tag: Int, label: Int)
+  CatchAll(label: Int)
+  CatchAllRef(label: Int)
 }
 
 /// A single decoded instruction (one constructor per Phase-1 opcode).
@@ -932,6 +987,50 @@ pub type Instr {
   /// `v128.storeN_lane` (0xFD 88..91): store the `width`-BIT (∈ {8,16,32,64} — S2) lane
   /// `lane` of the v128 operand to memory. Fields as `SimdLoadLane` (memarg THEN lane byte).
   SimdStoreLane(width: Int, arg: MemArg, lane: Int)
+
+  // ===================== Phase 7 («WASM-AST5») — exception handling =====================
+  // A flat-stream AST carries structured control as opener + markers + `End`, exactly as
+  // `Block`/`If`/`Else`/`End` already do. Decode is purely structural (§F.3): the legacy
+  // in-stream handler markers are NOT normalized to `try_table` here — lower (05) unifies
+  // both surfaces onto the one structured-exception IR.
+  // --- modern EH (spec: throw=0x08, throw_ref=0x0A, try_table=0x1F) ---
+  /// `throw x` (0x08 + `tagidx`) — throw a new exception of tag `x`, consuming the tag's
+  /// operand values from the stack as the payload. Does not return (bottom, like
+  /// `Return`/`Unreachable`); NOT a block-opener (no matching `End`). `tag` is a raw
+  /// `u32` tagidx; validate resolves it + checks the operands against `types[tag]`. This
+  /// opcode is SHARED with the legacy surface (Porffor emits it — §F).
+  Throw(tag: Int)
+  /// `throw_ref` (0x0A, no immediate) — re-raise the `exnref` on top of the stack. Does
+  /// not return. Consumes one `exnref` operand (validate's check); NOT a block-opener.
+  ThrowRef
+  /// `try_table bt catch*` (0x1F + blocktype + `vec(catch)`) — a BLOCK-OPENER (its body
+  /// runs to the matching `End`, exactly like `Block`) that installs `catches` for the
+  /// dynamic extent of the body: a thrown exception matching a clause transfers to that
+  /// clause's block `label` (binding the payload, and an `exnref` for the `_ref`
+  /// clauses); an unmatched exception propagates. `bt` is the body's blocktype;
+  /// `catches` is the decoded clause vector (in wire order — the first matching clause
+  /// wins, so order is load-bearing).
+  TryTable(bt: BlockType, catches: List(Catch))
+
+  // --- legacy EH (MEASURED: what Porffor 0.61.13 actually emits — §F) ---
+  /// `try bt` (0x06 + blocktype) — the LEGACY try block-opener. Its body runs to a
+  /// `LegacyCatch`/`LegacyCatchAll` handler marker (or straight to `End`), and the whole
+  /// construct is closed by `End` OR terminated by `LegacyDelegate`. A block-opener for
+  /// depth accounting (§F.2).
+  TryLegacy(bt: BlockType)
+  /// `catch x` (0x07 + `tagidx`) — a LEGACY in-block handler marker (like `Else` for
+  /// `If`): begins the handler for tag `x` within the enclosing `TryLegacy`. NOT an
+  /// opener/closer (depth unchanged).
+  LegacyCatch(tag: Int)
+  /// `catch_all` (0x19, no immediate) — a LEGACY in-block catch-all handler marker.
+  LegacyCatchAll
+  /// `delegate l` (0x18 + `labelidx`) — LEGACY: terminates the enclosing `TryLegacy`
+  /// (a block-CLOSER, replacing its `End`) and delegates any uncaught exception to the
+  /// `l`-th enclosing handler. `label` is a raw `u32`.
+  LegacyDelegate(label: Int)
+  /// `rethrow l` (0x09 + `labelidx`) — LEGACY: re-throw the exception caught by the
+  /// `l`-th enclosing `catch`/`catch_all`. Does not return; NOT a block-opener.
+  Rethrow(label: Int)
 }
 
 /// Every reason the decoder rejects a binary. UNTRUSTED input maps to EXACTLY
@@ -984,12 +1083,22 @@ pub type Instr {
 /// - `BadElemKind`: an element-segment leading flag is `> 7`, or an `elemkind` byte
 ///   (flags 1/2/3) is not `0x00` (funcref).
 /// - `BadDataKind`: a data-segment leading flag is not `0`/`1`/`2`.
-/// - `BadImportKind`: an importdesc kind byte is not `0x00..0x03`.
+/// - `BadImportKind`: an importdesc kind byte is not `0x00..0x04`.
 /// - `DataCountMissing`: a `memory.init`/`data.drop` instruction is present but the
 ///   module has no datacount section (R13 / spec §5.5.14 "data count section
 ///   required" — an `assert_malformed`).
 /// - `DataCountMismatch`: the datacount section's count does not equal the number of
 ///   data segments (spec §5.5.14 — an `assert_malformed`).
+/// - `BadTagAttribute`: a tag / imported-tag ATTRIBUTE byte is not `0x00` (Phase 7 —
+///   the only defined attribute is the exception attribute; spec: `tag ::= 0x00
+///   typeidx`). An `assert_malformed`-class error.
+/// - `BadCatchKind`: a `try_table` catch-clause KIND byte is not `0x00..0x03` (Phase 7
+///   — the catch grammar has exactly the four kinds catch/catch_ref/catch_all/
+///   catch_all_ref). An `assert_malformed`-class error.
+/// - `BadDelegate`: a LEGACY `delegate` (`0x18`) appears at block depth 0, with no
+///   enclosing `try` to terminate (Phase 7 — a well-formed opcode in a mis-nested
+///   position). A dedicated error rather than an overloaded `UnknownOpcode`, so the
+///   depth-0 `delegate` case is distinguishable from a genuinely-unassigned byte.
 pub type DecodeError {
   BadMagic
   BadVersion
@@ -1016,4 +1125,7 @@ pub type DecodeError {
   BadImportKind
   DataCountMissing
   DataCountMismatch
+  BadTagAttribute
+  BadCatchKind
+  BadDelegate
 }

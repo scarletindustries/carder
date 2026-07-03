@@ -1489,6 +1489,7 @@ fn phase_b(
     tables: list.reverse(st.tables),
     memories: list.reverse(st.memories),
     globals: list.reverse(st.globals),
+    tags: [],
     funcs: list.reverse(st.funcs),
     start: st.start,
     elements: list.reverse(st.elements),

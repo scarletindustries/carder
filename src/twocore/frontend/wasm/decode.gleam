@@ -1,5 +1,16 @@
 //// The WebAssembly binary decoder — turns an untrusted `BitArray` of `.wasm` bytes
-//// into the `twocore/frontend/wasm/ast` model (`«WASM-AST3»`).
+//// into the `twocore/frontend/wasm/ast` model (extended through `«WASM-AST5»`).
+////
+//// Phase 6 (`«WASM-AST4»`) added the `0xFD` fixed-width SIMD family. Phase 7
+//// (`«WASM-AST5»`) adds the exception-handling surface: the tag section (id 13), the
+//// tag import/export descriptors (kind `0x04`), the `exnref` value/heap/blocktype
+//// (`0x69` / s33 `-23`), the MODERN EH opcodes (`throw` 0x08 / `throw_ref` 0x0A /
+//// `try_table` 0x1F + the four catch kinds), and the LEGACY EH opcodes Porffor
+//// actually emits (`try` 0x06 / `catch` 0x07 / `rethrow` 0x09 / `delegate` 0x18 /
+//// `catch_all` 0x19). Decode stays purely structural — it does NOT type the exception
+//// stack, match `throw` operands, resolve tag/label indices, or restrict `exnref`
+//// placement; those are validate's (unit 04). `try`/`try_table` are block-openers;
+//// `throw`/`throw_ref` are not; a `delegate` at depth 0 is `Error(BadDelegate)`.
 ////
 //// THREAT MODEL: the input is attacker-controlled. Every function in this module
 //// is total over arbitrary bytes — any malformation returns a typed
@@ -37,9 +48,9 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import twocore/frontend/wasm/ast.{
-  type BlockType, type DataSegment, type ElementSegment, type Export, type Func,
-  type FuncType, type Global, type Import, type Instr, type Limits, type MemArg,
-  type MemType, type Module, type TableType, type ValType,
+  type BlockType, type Catch, type DataSegment, type ElementSegment, type Export,
+  type Func, type FuncType, type Global, type Import, type Instr, type Limits,
+  type MemArg, type MemType, type Module, type TableType, type Tag, type ValType,
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +188,7 @@ type DecodeState {
     tables: List(TableType),
     memories: List(MemType),
     globals: List(Global),
+    tags: List(Tag),
     func_type_idxs: List(Int),
     start: Option(Int),
     elements: List(ElementSegment),
@@ -194,6 +206,7 @@ fn empty_state() -> DecodeState {
     tables: [],
     memories: [],
     globals: [],
+    tags: [],
     func_type_idxs: [],
     start: None,
     elements: [],
@@ -280,16 +293,24 @@ fn decode_sections(
 }
 
 /// The canonical position of a non-custom section for the ascending-order check.
-/// The datacount section (12) sits between element (9) and code (10) per the
-/// bulk-memory proposal (spec §5.5.14), so it does NOT order by raw id: 12 → 10,
-/// code(10) → 11, data(11) → 12; ids 1..9 keep their id. This keeps the order
-/// `type < import < … < element < datacount < code < data` strictly ascending and
-/// rejects a misplaced datacount (e.g. after code) with `SectionOrder`.
+/// Two sections do NOT order by raw id: the tag section (13) sits between memory (5)
+/// and global (6) per the EH proposal, and the datacount section (12) between element
+/// (9) and code (10) per bulk-memory. So: tag(13) → 6, then global(6) → 7, export(7) →
+/// 8, start(8) → 9, element(9) → 10, datacount(12) → 11, code(10) → 12, data(11) → 13;
+/// ids 1..5 keep their id. This keeps the order `type < import < function < table <
+/// memory < TAG < global < export < start < element < datacount < code < data` strictly
+/// ascending — so a tag-free module's accept/reject decisions are byte-identical (§G),
+/// while a misplaced tag section (e.g. after global) is rejected with `SectionOrder`.
 fn section_rank(id: Int) -> Int {
   case id {
-    12 -> 10
-    10 -> 11
-    11 -> 12
+    13 -> 6
+    6 -> 7
+    7 -> 8
+    8 -> 9
+    9 -> 10
+    12 -> 11
+    10 -> 12
+    11 -> 13
     _ -> id
   }
 }
@@ -380,8 +401,30 @@ fn dispatch_section(
       use _ <- result.try(expect_empty(rest))
       Ok(DecodeState(..state, data_count: Some(count)))
     }
+    // tag section (id 13): vec(tag), each `attribute:0x00 x:typeidx` (Phase 7).
+    13 -> {
+      use #(tags, rest) <- result.try(decode_vec(contents, decode_tag))
+      use _ <- result.try(expect_empty(rest))
+      Ok(DecodeState(..state, tags: tags))
+    }
     // any unknown id: already sliced by the caller, so just drop the contents.
     _ -> Ok(state)
+  }
+}
+
+/// Decode one tag `attribute:0x00 x:typeidx` (tag section, id 13; Phase 7). The
+/// attribute MUST be `0x00` (the exception attribute — the only kind defined); any
+/// other byte is `Error(ast.BadTagAttribute)`. `typeidx` is a `u32` into `Module.types`;
+/// that it names a functype with empty results is validate's check. EOF before the
+/// attribute/typeidx is `Error(ast.Truncated)`.
+fn decode_tag(bytes: BitArray) -> Result(#(Tag, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x00, r0:bytes>> -> {
+      use #(type_idx, r1) <- result.try(decode_u_n(r0, 32))
+      Ok(#(ast.Tag(type_idx: type_idx), r1))
+    }
+    <<_:8, _:bytes>> -> Error(ast.BadTagAttribute)
+    _ -> Error(ast.Truncated)
   }
 }
 
@@ -424,6 +467,7 @@ fn assemble(state: DecodeState) -> Result(Module, ast.DecodeError) {
     tables: state.tables,
     memories: state.memories,
     globals: state.globals,
+    tags: state.tags,
     funcs: funcs,
     start: state.start,
     elements: state.elements,
@@ -516,12 +560,13 @@ fn decode_vec_n(
 }
 
 /// Decode one value type byte: `0x7F→I32 0x7E→I64 0x7D→F32 0x7C→F64`, the SIMD vector
-/// type `0x7B→V128` (Phase 6, `«WASM-AST4»`), plus the two MVP reference types
-/// `0x70→FuncRef 0x6F→ExternRef` (Phase 5). Any other byte (a GC heaptype, …) is
+/// type `0x7B→V128` (Phase 6, `«WASM-AST4»`), the two MVP reference types
+/// `0x70→FuncRef 0x6F→ExternRef` (Phase 5), plus the exception reference type
+/// `0x69→ExnRef` (Phase 7, `«WASM-AST5»`). Any other byte (a GC heaptype, …) is
 /// `Error(ast.BadValType)`; empty input is `Error(ast.Truncated)`. Used at every valtype
 /// site (params/results, locals, globals, typed `select` vectors). `v128` is NOT a
-/// reftype — `decode_reftype` still rejects `0x7B` (a reftype-only position never accepts
-/// v128).
+/// reftype — `decode_reftype` still rejects `0x7B` — but `exn` (`0x69`) IS a heaptype,
+/// so `decode_reftype` DOES accept it (for `ref.null exn`).
 fn decode_valtype(
   bytes: BitArray,
 ) -> Result(#(ValType, BitArray), ast.DecodeError) {
@@ -535,6 +580,7 @@ fn decode_valtype(
         0x7B -> Ok(#(ast.V128, rest))
         0x70 -> Ok(#(ast.FuncRef, rest))
         0x6F -> Ok(#(ast.ExternRef, rest))
+        0x69 -> Ok(#(ast.ExnRef, rest))
         _ -> Error(ast.BadValType)
       }
     _ -> Error(ast.Truncated)
@@ -542,10 +588,13 @@ fn decode_valtype(
 }
 
 /// Decode one REFTYPE byte at a reftype-only position: `0x70→FuncRef`,
-/// `0x6F→ExternRef`. Any other byte (a number type, `v128`, a GC heaptype) is
-/// `Error(ast.BadHeapType)`; empty input is `Error(ast.Truncated)`. Used by
-/// `ref.null`'s heaptype operand, a `tabletype`'s element type, and an element
-/// segment's flag-5/6/7 reftype (spec binary/types.html#reference-types).
+/// `0x6F→ExternRef`, `0x69→ExnRef` (Phase 7 — `exn` is a legal abstract heaptype).
+/// Any other byte (a number type, `v128`, a GC heaptype) is `Error(ast.BadHeapType)`;
+/// empty input is `Error(ast.Truncated)`. Used by `ref.null`'s heaptype operand, a
+/// `tabletype`'s element type, and an element segment's flag-5/6/7 reftype (spec
+/// binary/types.html#reference-types). Unlike `v128`, `exn` (`0x69`) is accepted here so
+/// `ref.null exn` (`0xD0 0x69`) decodes to `RefNull(ExnRef)`; validate owns whether an
+/// `exnref` may legally appear in a given table/global/element position.
 fn decode_reftype(
   bytes: BitArray,
 ) -> Result(#(ValType, BitArray), ast.DecodeError) {
@@ -554,6 +603,7 @@ fn decode_reftype(
       case b {
         0x70 -> Ok(#(ast.FuncRef, rest))
         0x6F -> Ok(#(ast.ExternRef, rest))
+        0x69 -> Ok(#(ast.ExnRef, rest))
         _ -> Error(ast.BadHeapType)
       }
     _ -> Error(ast.Truncated)
@@ -606,8 +656,9 @@ fn decode_name(
   }
 }
 
-/// Decode one export `[name][kind:8][idx u32]`. Kind byte `0x00`..`0x03` maps to
-/// the four `ExportKind`s; anything else is `Error(ast.BadExportKind)`.
+/// Decode one export `[name][kind:8][idx u32]`. Kind byte `0x00`..`0x04` maps to
+/// the five `ExportKind`s (`0x04 → ExportTag`, a tag export — Phase 7); anything else
+/// is `Error(ast.BadExportKind)`.
 fn decode_export(
   bytes: BitArray,
 ) -> Result(#(Export, BitArray), ast.DecodeError) {
@@ -619,6 +670,7 @@ fn decode_export(
         0x01 -> Ok(ast.ExportTable)
         0x02 -> Ok(ast.ExportMemory)
         0x03 -> Ok(ast.ExportGlobal)
+        0x04 -> Ok(ast.ExportTag)
         _ -> Error(ast.BadExportKind)
       })
       use #(index, rest) <- result.try(decode_u_n(after_kind, 32))
@@ -722,9 +774,10 @@ fn decode_memtype(
 /// Decode one import `mod:name nm:name d:importdesc` (spec
 /// binary/modules.html#import-section). The importdesc kind byte selects:
 /// `0x00 x:typeidx` (func), `0x01 tt:tabletype` (table), `0x02 mt:memtype` (mem),
-/// `0x03 t:valtype m:mut` (global). Any other kind byte is `Error(ast.BadImportKind)`;
-/// a missing kind byte is `Error(ast.Truncated)`. Decode records the declaration
-/// only — resolution/typing is validate/link's job.
+/// `0x03 t:valtype m:mut` (global), `0x04 0x00 x:typeidx` (tag — Phase 7). Any other
+/// kind byte is `Error(ast.BadImportKind)`; a missing kind byte is
+/// `Error(ast.Truncated)`. Decode records the declaration only — resolution/typing is
+/// validate/link's job.
 fn decode_import(
   bytes: BitArray,
 ) -> Result(#(Import, BitArray), ast.DecodeError) {
@@ -750,6 +803,17 @@ fn decode_import(
           use #(mutable, r) <- result.try(decode_mut(r4))
           Ok(#(ast.Import(module, name, ast.ImportGlobal(ty, mutable)), r))
         }
+        // imported tag (Phase 7): attribute 0x00 THEN typeidx. A non-0x00 attribute
+        // is `BadTagAttribute`; EOF before the attribute is `Truncated`.
+        0x04 ->
+          case r3 {
+            <<0x00, r4:bytes>> -> {
+              use #(type_idx, r) <- result.try(decode_u_n(r4, 32))
+              Ok(#(ast.Import(module, name, ast.ImportTag(type_idx)), r))
+            }
+            <<_:8, _:bytes>> -> Error(ast.BadTagAttribute)
+            _ -> Error(ast.Truncated)
+          }
         _ -> Error(ast.BadImportKind)
       }
     _ -> Error(ast.Truncated)
@@ -792,8 +856,19 @@ fn decode_const_go(
         0 -> Ok(#(list.reverse(acc), rest))
         _ -> decode_const_go(rest, depth - 1, [ast.End, ..acc])
       }
-    ast.Block(_) | ast.Loop(_) | ast.If(_) ->
-      decode_const_go(rest, depth + 1, [instr, ..acc])
+    // Block-openers (Phase 7 adds `try_table`/`try`): deepen nesting.
+    ast.Block(_)
+    | ast.Loop(_)
+    | ast.If(_)
+    | ast.TryTable(_, _)
+    | ast.TryLegacy(_) -> decode_const_go(rest, depth + 1, [instr, ..acc])
+    // A legacy `delegate` terminates its enclosing `try` (a closer, replacing `End`).
+    // At depth 0 it is mis-nested — fail-closed with the dedicated `BadDelegate`.
+    ast.LegacyDelegate(_) ->
+      case depth {
+        0 -> Error(ast.BadDelegate)
+        _ -> decode_const_go(rest, depth - 1, [instr, ..acc])
+      }
     _ -> decode_const_go(rest, depth, [instr, ..acc])
   }
 }
@@ -1037,8 +1112,9 @@ fn decode_locals_groups(
 /// Decode a structured-control blocktype: one signed-LEB(33). A non-negative
 /// value is a `BlockTypeIdx`; `-64` is `BlockEmpty`; the negative valtype encodings
 /// are the four number types `-1`..`-4`, the SIMD vector type `v128` (`0x7B` as
-/// s33 = `-5`, Phase 6), and the two reference types funcref (`0x70` as s33 = `-16`)
-/// / externref (`0x6F` = `-17`); any other negative value is `Error(ast.BadBlockType)`.
+/// s33 = `-5`, Phase 6), the two reference types funcref (`0x70` as s33 = `-16`)
+/// / externref (`0x6F` = `-17`), and the exception reference type exnref (`0x69` as
+/// s33 = `-23`, Phase 7); any other negative value is `Error(ast.BadBlockType)`.
 fn decode_blocktype(
   bytes: BitArray,
 ) -> Result(#(BlockType, BitArray), ast.DecodeError) {
@@ -1053,6 +1129,7 @@ fn decode_blocktype(
     _ if v == -5 -> Ok(#(ast.BlockVal(ast.V128), rest))
     _ if v == -16 -> Ok(#(ast.BlockVal(ast.FuncRef), rest))
     _ if v == -17 -> Ok(#(ast.BlockVal(ast.ExternRef), rest))
+    _ if v == -23 -> Ok(#(ast.BlockVal(ast.ExnRef), rest))
     _ -> Error(ast.BadBlockType)
   }
 }
@@ -1073,8 +1150,21 @@ fn decode_expr(
         0 -> Ok(#(list.reverse([ast.End, ..acc]), rest))
         _ -> decode_expr(rest, depth - 1, [ast.End, ..acc])
       }
-    ast.Block(_) | ast.Loop(_) | ast.If(_) ->
-      decode_expr(rest, depth + 1, [instr, ..acc])
+    // Block-openers (Phase 7 adds `try_table`/`try`): deepen nesting so their body's
+    // `End` is not mistaken for the function terminator.
+    ast.Block(_)
+    | ast.Loop(_)
+    | ast.If(_)
+    | ast.TryTable(_, _)
+    | ast.TryLegacy(_) -> decode_expr(rest, depth + 1, [instr, ..acc])
+    // A legacy `delegate` terminates its enclosing `try` (a closer, replacing its
+    // `End`), so it pops one nesting level. Only `End` may terminate the whole
+    // expression at depth 0; a `delegate` there is mis-nested → `BadDelegate`.
+    ast.LegacyDelegate(_) ->
+      case depth {
+        0 -> Error(ast.BadDelegate)
+        _ -> decode_expr(rest, depth - 1, [instr, ..acc])
+      }
     _ -> decode_expr(rest, depth, [instr, ..acc])
   }
 }
@@ -1130,6 +1220,37 @@ fn decode_instr(
           use #(ty, r1) <- result.try(decode_u_n(rest, 32))
           use #(table, r2) <- result.try(decode_u_n(r1, 32))
           Ok(#(ast.CallIndirect(type_idx: ty, table: table), r2))
+        }
+        // exception handling — legacy (Porffor's headline path, §F): try 0x06 /
+        // catch 0x07 / rethrow 0x09 / delegate 0x18 / catch_all 0x19.
+        0x06 -> {
+          use #(bt, r) <- result.try(decode_blocktype(rest))
+          Ok(#(ast.TryLegacy(bt), r))
+        }
+        0x07 -> {
+          use #(tag, r) <- result.try(decode_u_n(rest, 32))
+          Ok(#(ast.LegacyCatch(tag), r))
+        }
+        0x09 -> {
+          use #(label, r) <- result.try(decode_u_n(rest, 32))
+          Ok(#(ast.Rethrow(label), r))
+        }
+        0x18 -> {
+          use #(label, r) <- result.try(decode_u_n(rest, 32))
+          Ok(#(ast.LegacyDelegate(label), r))
+        }
+        0x19 -> Ok(#(ast.LegacyCatchAll, rest))
+        // exception handling — modern (spec-stable target, §E): throw 0x08 (shared
+        // with legacy) / throw_ref 0x0A / try_table 0x1F (blocktype + vec(catch)).
+        0x08 -> {
+          use #(tag, r) <- result.try(decode_u_n(rest, 32))
+          Ok(#(ast.Throw(tag), r))
+        }
+        0x0A -> Ok(#(ast.ThrowRef, rest))
+        0x1F -> {
+          use #(bt, r1) <- result.try(decode_blocktype(rest))
+          use #(catches, r2) <- result.try(decode_vec(r1, decode_catch))
+          Ok(#(ast.TryTable(bt, catches), r2))
         }
         // parametric
         0x1A -> Ok(#(ast.Drop, rest))
@@ -1230,6 +1351,39 @@ fn decode_instr(
               }
           }
       }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode one `try_table` catch clause (Phase 7; spec: the EH proposal's catch vector).
+/// The leading KIND byte selects the form; `catch`/`catch_ref` (`0x00`/`0x01`) then read
+/// a `tagidx` THEN a `labelidx`; `catch_all`/`catch_all_ref` (`0x02`/`0x03`) read a
+/// `labelidx` only. A kind byte outside `0x00..0x03` is `Error(ast.BadCatchKind)`; EOF is
+/// `Error(ast.Truncated)`. Both indices are raw `u32`s (validate resolves them). Order is
+/// load-bearing: the tag is read BEFORE the label (swapping mis-decodes both).
+fn decode_catch(
+  bytes: BitArray,
+) -> Result(#(Catch, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x00, r0:bytes>> -> {
+      use #(tag, r1) <- result.try(decode_u_n(r0, 32))
+      use #(label, r2) <- result.try(decode_u_n(r1, 32))
+      Ok(#(ast.Catch(tag, label), r2))
+    }
+    <<0x01, r0:bytes>> -> {
+      use #(tag, r1) <- result.try(decode_u_n(r0, 32))
+      use #(label, r2) <- result.try(decode_u_n(r1, 32))
+      Ok(#(ast.CatchRef(tag, label), r2))
+    }
+    <<0x02, r0:bytes>> -> {
+      use #(label, r1) <- result.try(decode_u_n(r0, 32))
+      Ok(#(ast.CatchAll(label), r1))
+    }
+    <<0x03, r0:bytes>> -> {
+      use #(label, r1) <- result.try(decode_u_n(r0, 32))
+      Ok(#(ast.CatchAllRef(label), r1))
+    }
+    <<_:8, _:bytes>> -> Error(ast.BadCatchKind)
     _ -> Error(ast.Truncated)
   }
 }

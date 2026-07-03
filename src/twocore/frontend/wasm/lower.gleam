@@ -245,15 +245,20 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
   // Exports of all four kinds. Functions → `f<funcidx>`; state exports carry the IR name
   // of the exported item (`t<tableidx>` / `g<globalidx>` / the raw memidx) — the same
   // absolute-index naming instruction lowering uses (H4/§G.5).
-  let exports =
-    list.map(module.exports, fn(e) {
+  use exports <- result.try(
+    list.try_map(module.exports, fn(e) {
       case e.kind {
-        ast.ExportFunc -> ir.ExportFn(e.name, "f" <> int.to_string(e.index))
-        ast.ExportTable -> ir.ExportTable(e.name, tname(e.index))
-        ast.ExportGlobal -> ir.ExportGlobal(e.name, gname(e.index))
-        ast.ExportMemory -> ir.ExportMemory(e.name, e.index)
+        ast.ExportFunc -> Ok(ir.ExportFn(e.name, "f" <> int.to_string(e.index)))
+        ast.ExportTable -> Ok(ir.ExportTable(e.name, tname(e.index)))
+        ast.ExportGlobal -> Ok(ir.ExportGlobal(e.name, gname(e.index)))
+        ast.ExportMemory -> Ok(ir.ExportMemory(e.name, e.index))
+        // A tag export («WASM-AST5», Phase 7) — fail closed; real tag-export lowering
+        // is P7-05's (validate already rejects it, so this is unreachable for a valid
+        // module, but stays fail-closed rather than silently dropping the export).
+        ast.ExportTag -> Error(Unsupported("tag export (P7-05)"))
       }
-    })
+    }),
+  )
   use imports <- result.try(lower_imports(module))
   use globals <- result.try(lower_globals(module, typed.imported_global_count))
   use elements <- result.try(lower_elements(module))
@@ -2234,6 +2239,7 @@ fn to_ir_vt(t: ast.ValType) -> ir.ValType {
     ast.V128 -> ir.TV128
     ast.FuncRef -> ir.TFuncRef
     ast.ExternRef -> ir.TExternRef
+    ast.ExnRef -> ir.TExnRef
   }
 }
 
@@ -2557,6 +2563,9 @@ fn lower_imports(
           mt.limits.max,
           to_ir_idxtype(mt.idx_type),
         ))
+      // An imported tag («WASM-AST5», Phase 7) — fail closed; real imported-tag
+      // lowering (into `Module.tags`/the tag index space) is P7-05's.
+      ast.ImportTag(_) -> Error(Unsupported("imported tag (P7-05)"))
     }
   })
 }

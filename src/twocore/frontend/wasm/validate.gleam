@@ -1167,6 +1167,21 @@ fn validate_instr(
         simd_lane_count(width),
       )
 
+    // exception handling («WASM-AST5», Phase 7). Every EH `Instr` constructor is
+    // intercepted HERE, BEFORE the `validate_numeric` fallthrough, so none reaches
+    // `numeric_sig`'s fail-OPEN `_ -> #([], [])` catch-all (T2 — the fail-closed
+    // security invariant; a genuinely-unsupported EH form must be a typed error, never
+    // a silent no-op). Real EH typing (both encodings) is P7-04's job; until then every
+    // arm fails closed with `Unsupported`.
+    ast.Throw(_)
+    | ast.ThrowRef
+    | ast.TryTable(_, _)
+    | ast.TryLegacy(_)
+    | ast.LegacyCatch(_)
+    | ast.LegacyCatchAll
+    | ast.LegacyDelegate(_)
+    | ast.Rethrow(_) -> Error(Unsupported("exception handling (P7-04)"))
+
     // numeric / comparison / conversion / float leaves --------------------------
     _ -> validate_numeric(st, instr)
   }
@@ -1921,11 +1936,16 @@ fn check_data(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
 fn check_exports(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
   use _ <- result.try(check_export_names_unique(module.exports))
   list.try_each(module.exports, fn(ex) {
+    // A tag export (`ExportTag`, Phase 7) has no wired index space yet, so `count`
+    // is 0 → the range check always fails → the fail-closed `Unsupported` arm below.
+    // Real tag-export typing is P7-04's; no current fixture exports a tag, so this is
+    // byte-identical.
     let count = case ex.kind {
       ast.ExportFunc -> list.length(ctx.func_types)
       ast.ExportTable -> list.length(ctx.tables)
       ast.ExportMemory -> list.length(ctx.memories)
       ast.ExportGlobal -> list.length(ctx.globals)
+      ast.ExportTag -> 0
     }
     case ex.index >= 0 && ex.index < count {
       True -> Ok(Nil)
@@ -1935,6 +1955,7 @@ fn check_exports(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
           ast.ExportTable -> Error(UnknownTable(ex.index))
           ast.ExportMemory -> Error(UnknownMemory(ex.index))
           ast.ExportGlobal -> Error(UnknownGlobal(ex.index))
+          ast.ExportTag -> Error(Unsupported("tag export (P7-04)"))
         }
     }
   })

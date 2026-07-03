@@ -234,6 +234,7 @@ pub fn decode_add_fixture_test() {
         tables: [],
         memories: [],
         globals: [],
+        tags: [],
         funcs: [
           ast.Func(type_idx: 0, locals: [], body: [
             ast.LocalGet(0),
@@ -1431,9 +1432,10 @@ pub fn memarg_memidx_truncated_test() {
 }
 
 pub fn bad_import_kind_test() {
-  // importdesc kind byte 0x04 (not 0x00..0x03) → BadImportKind. Import "a" "b" 0x04.
+  // importdesc kind byte 0x05 (not 0x00..0x04 — Phase 7 added 0x04 = tag, but 0x05 is
+  // still out of range) → BadImportKind. Import "a" "b" 0x05.
   decode.decode(
-    bytes(module_with_section([0x02, 0x06, 0x01, 0x01, 0x61, 0x01, 0x62, 0x04])),
+    bytes(module_with_section([0x02, 0x06, 0x01, 0x01, 0x61, 0x01, 0x62, 0x05])),
   )
   |> should.equal(Error(ast.BadImportKind))
 }
@@ -2080,4 +2082,670 @@ pub fn decode_simd_opcode_map_audit_test() {
   // And exactly 236 subs are assigned (non-gap).
   list.length(int_range(0, 255)) - list.length(gaps)
   |> should.equal(236)
+}
+
+// ═════════════════ Phase 7: exception handling (the EH surface, «WASM-AST5») ═════════════════
+// Assertions target the WebAssembly exception-handling proposal's BINARY ENCODING (and,
+// for the LEGACY surface, the MEASURED bytes of real Porffor 0.61.13 output), cited per
+// fixture — never "whatever decode emits":
+//  - tag section (id 13; `tag ::= 0x00 typeidx`):   binary/modules.html#tag-section
+//  - tag import/export descriptor (kind 0x04):      binary/modules.html#import/#export
+//  - throw=0x08 / throw_ref=0x0A / try_table=0x1F + catch kinds 0x00..0x03:
+//                                                    binary/instructions.html
+//  - legacy try=0x06 / catch=0x07 / rethrow=0x09 / delegate=0x18 / catch_all=0x19:
+//                                                    measured Porffor 0.61.13 (03-decode.md §F)
+//  - exnref/exn heaptype byte 0x69; blocktype -23:  binary/types.html + #binary-blocktype
+// Every worked-AST fixture below is a byte sequence VERIFIED against `wasm-tools parse`
+// (modern surface) or against `npx porffor wasm` raw bytes (legacy surface).
+
+// The 8-byte module preamble (`\0asm` + version 1).
+const preamble: List(Int) = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
+
+/// The FIRST function's body of a `module_with_body`-shaped module, or a panic-free
+/// failure surfaced as the assertion diff.
+fn only_body(module_bytes: List(Int)) -> List(ast.Instr) {
+  let assert Ok(m) = decode.decode(bytes(module_bytes))
+  let assert [func] = m.funcs
+  func.body
+}
+
+// ───────────────────────────── §B exnref valtype / heaptype / blocktype ─────────────────────────────
+
+pub fn exnref_param_result_test() {
+  // `(func (param exnref) (result exnref) local.get 0)` — exnref valtype byte 0x69 in
+  // both the param and result vectors (verified: wasm-tools functype `60 01 69 01 69`).
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        module_with_sig_body([0x60, 0x01, 0x69, 0x01, 0x69], [0x20, 0x00, 0x0B]),
+      ),
+    )
+  m.types
+  |> should.equal([ast.FuncType(params: [ast.ExnRef], results: [ast.ExnRef])])
+}
+
+pub fn exnref_local_test() {
+  // `(local exnref)` — the RLE local group `01 01 69` expands to one ExnRef local.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        module_with_locals_body([0x60, 0x00, 0x00], [0x01, 0x01, 0x69], [0x0B]),
+      ),
+    )
+  let assert [func] = m.funcs
+  func.locals
+  |> should.equal([ast.ExnRef])
+}
+
+pub fn ref_null_exn_test() {
+  // `ref.null exn` = `d0 69` — decode_reftype accepts 0x69 (exn IS a heaptype), unlike
+  // v128 (verified: wasm-tools assembles `ref.null exn` to exactly `d0 69`).
+  only_body(module_with_body([0xD0, 0x69, 0x0B]))
+  |> should.equal([ast.RefNull(ast.ExnRef), ast.End])
+}
+
+pub fn select_t_exnref_test() {
+  // `select (result exnref)` = `1c 01 69` — a typed-select whose valtype vec is [exnref].
+  only_body(module_with_body([0x1C, 0x01, 0x69, 0x0B]))
+  |> should.equal([ast.SelectT([ast.ExnRef]), ast.End])
+}
+
+pub fn block_result_exnref_test() {
+  // `(block (result exnref) …)` — opener `02 69`, blocktype s33 = -23 (verified:
+  // wasm-tools assembles `block (result exnref)` to opener bytes `02 69`).
+  only_body(module_with_body([0x02, 0x69, 0x0B, 0x0B]))
+  |> should.equal([ast.Block(ast.BlockVal(ast.ExnRef)), ast.End, ast.End])
+}
+
+pub fn byte_0x69_instruction_is_popcnt_test() {
+  // Context disambiguation: 0x69 in an INSTRUCTION position is `i32.popcnt`, NOT exnref
+  // (exactly as the SIMD spec disambiguates 0x7B). Only the type/heaptype/blocktype
+  // positions read 0x69 as exnref.
+  only_body(module_with_body([0x69, 0x0B]))
+  |> should.equal([ast.I32Popcnt, ast.End])
+}
+
+// ───────────────────────────── §C the tag section (id 13) ─────────────────────────────
+
+pub fn tag_section_one_tag_test() {
+  // A module with `(tag (type 0))` where types[0] = `(func (param f64 i32))`.
+  // Type section `01 06 01 60 02 7c 7f 00`; tag section `0d 03 01 00 00` (id 13, size 3,
+  // count 1, attribute 0x00, typeidx 0) → `Module.tags == [Tag(0)]`.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        list.flatten([
+          preamble,
+          [0x01, 0x06, 0x01, 0x60, 0x02, 0x7C, 0x7F, 0x00],
+          [0x0D, 0x03, 0x01, 0x00, 0x00],
+        ]),
+      ),
+    )
+  m.tags
+  |> should.equal([ast.Tag(type_idx: 0)])
+}
+
+pub fn tag_section_two_tags_in_order_test() {
+  // Two tags decode in order. Two empty functypes; tag section `0d 05 02 00 00 00 01`
+  // (count 2, [attr 0x00, typeidx 0], [attr 0x00, typeidx 1]).
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        list.flatten([
+          preamble,
+          [0x01, 0x07, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00, 0x00],
+          [0x0D, 0x05, 0x02, 0x00, 0x00, 0x00, 0x01],
+        ]),
+      ),
+    )
+  m.tags
+  |> should.equal([ast.Tag(0), ast.Tag(1)])
+}
+
+pub fn tag_attribute_before_typeidx_test() {
+  // Anti-swap: the attribute (0x00) is read BEFORE the typeidx. A tag `00 05` must
+  // decode `Tag(5)` (attribute 0x00, typeidx 5) — NOT `Tag(0)` with a stray 5. Decode
+  // does not range-check the typeidx, so a distinct value proves the read order.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        list.flatten([
+          preamble,
+          [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+          [0x0D, 0x03, 0x01, 0x00, 0x05],
+        ]),
+      ),
+    )
+  m.tags
+  |> should.equal([ast.Tag(5)])
+}
+
+pub fn tag_section_before_global_ok_test() {
+  // Section ORDER: the tag section (13) sits between memory (5) and global (6). A tag
+  // section BEFORE the global section decodes Ok (proving `section_rank` ranks tag < global).
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        list.flatten([
+          preamble,
+          [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+          [0x0D, 0x03, 0x01, 0x00, 0x00],
+          [0x06, 0x06, 0x01, 0x7F, 0x00, 0x41, 0x00, 0x0B],
+        ]),
+      ),
+    )
+  m.tags
+  |> should.equal([ast.Tag(0)])
+}
+
+pub fn tag_section_after_global_rejected_test() {
+  // The SAME sections with the tag section AFTER the global section → SectionOrder
+  // (tag's canonical rank 6 is not strictly greater than global's rank 7).
+  decode.decode(
+    bytes(
+      list.flatten([
+        preamble,
+        [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+        [0x06, 0x06, 0x01, 0x7F, 0x00, 0x41, 0x00, 0x0B],
+        [0x0D, 0x03, 0x01, 0x00, 0x00],
+      ]),
+    ),
+  )
+  |> should.equal(Error(ast.SectionOrder))
+}
+
+pub fn tag_section_porffor_bytes_test() {
+  // The REAL Porffor 0.61.13 tag section `0d 03 01 00 03` (id 13, size 3, count 1,
+  // attribute 0x00, typeidx 3 = `(func (param f64 i32))`) → `[Tag(3)]`. Verified byte-
+  // for-byte from `npx porffor wasm`. Four functypes so typeidx 3 exists (decode does
+  // not require it, but this mirrors the real module).
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        list.flatten([
+          preamble,
+          [
+            0x01, 0x0F, 0x04, 0x60, 0x00, 0x00, 0x60, 0x00, 0x00, 0x60, 0x00,
+            0x00, 0x60, 0x02, 0x7C, 0x7F, 0x00,
+          ],
+          [0x0D, 0x03, 0x01, 0x00, 0x03],
+        ]),
+      ),
+    )
+  m.tags
+  |> should.equal([ast.Tag(3)])
+}
+
+// ───────────────────────────── §D tag import / export descriptors ─────────────────────────────
+
+pub fn import_tag_test() {
+  // `(import "m" "t" (tag (type 0)))` — importdesc `04 00 00` (kind 0x04, attribute 0x00,
+  // typeidx 0). Verified: `01 01 6d 01 74 04 00 00` = one import "m"/"t" desc tag.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(
+        list.flatten([
+          preamble,
+          [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+          [0x02, 0x08, 0x01, 0x01, 0x6D, 0x01, 0x74, 0x04, 0x00, 0x00],
+        ]),
+      ),
+    )
+  m.imports
+  |> should.equal([ast.Import("m", "t", ast.ImportTag(0))])
+}
+
+pub fn export_tag_test() {
+  // `(export "e" (tag 0))` — export desc kind 0x04, tagidx 0. Section `07 05 01 01 65 04 00`.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(module_with_section([0x07, 0x05, 0x01, 0x01, 0x65, 0x04, 0x00])),
+    )
+  m.exports
+  |> should.equal([ast.Export(name: "e", kind: ast.ExportTag, index: 0)])
+}
+
+pub fn export_tag_porffor_bytes_test() {
+  // The REAL Porffor export byte pair `04 00` (kind 0x04 = tag, tagidx 0) — the tag
+  // export named "0" (0x30). Verified from `npx porffor wasm`.
+  let assert Ok(m) =
+    decode.decode(
+      bytes(module_with_section([0x07, 0x05, 0x01, 0x01, 0x30, 0x04, 0x00])),
+    )
+  m.exports
+  |> should.equal([ast.Export(name: "0", kind: ast.ExportTag, index: 0)])
+}
+
+// ───────────────────────────── §E modern EH opcodes ─────────────────────────────
+
+pub fn throw_test() {
+  // `throw 0` = `08 00` (Porffor emits exactly this; shared with the modern surface).
+  only_body(module_with_body([0x08, 0x00, 0x0B]))
+  |> should.equal([ast.Throw(0), ast.End])
+}
+
+pub fn throw_multibyte_tagidx_test() {
+  // `throw 128` = `08 80 01` — proves the tagidx is a LEB u32, not a single raw byte.
+  only_body(module_with_body([0x08, 0x80, 0x01, 0x0B]))
+  |> should.equal([ast.Throw(128), ast.End])
+}
+
+pub fn throw_ref_test() {
+  // `throw_ref` = `0a` (no immediate).
+  only_body(module_with_body([0x0A, 0x0B]))
+  |> should.equal([ast.ThrowRef, ast.End])
+}
+
+pub fn try_table_four_catch_kinds_test() {
+  // Ground truth (wasm-tools `try_table (result i32) (catch 0 1) (catch_ref 0 0)
+  // (catch_all 1) (catch_all_ref 0)`): immediate `1f 7f 04 | 00 00 01 | 01 00 00 |
+  // 02 01 | 03 00`. Body then `41 07` (i32.const 7) `0b` (close try_table) `0b` (func end).
+  only_body(
+    module_with_body([
+      0x1F, 0x7F, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x02, 0x01, 0x03,
+      0x00, 0x41, 0x07, 0x0B, 0x0B,
+    ]),
+  )
+  |> should.equal([
+    ast.TryTable(ast.BlockVal(ast.I32), [
+      ast.Catch(0, 1),
+      ast.CatchRef(0, 0),
+      ast.CatchAll(1),
+      ast.CatchAllRef(0),
+    ]),
+    ast.I32Const(7),
+    ast.End,
+    ast.End,
+  ])
+}
+
+pub fn catch_clause_anti_swap_test() {
+  // Anti-swap: a `catch` clause with DISTINCT tag/label (`00 01 03` = kind 0, tag 1,
+  // label 3) must decode `Catch(1, 3)` — NOT `Catch(3, 1)`. The tag is read before the
+  // label; a swap mis-decodes both.
+  only_body(module_with_body([0x1F, 0x40, 0x01, 0x00, 0x01, 0x03, 0x0B, 0x0B]))
+  |> should.equal([
+    ast.TryTable(ast.BlockEmpty, [ast.Catch(1, 3)]),
+    ast.End,
+    ast.End,
+  ])
+}
+
+pub fn try_table_empty_catch_vec_test() {
+  // An empty catch vector `1f 40 00` → `TryTable(BlockEmpty, [])`.
+  only_body(module_with_body([0x1F, 0x40, 0x00, 0x0B, 0x0B]))
+  |> should.equal([ast.TryTable(ast.BlockEmpty, []), ast.End, ast.End])
+}
+
+pub fn try_table_exnref_blocktype_test() {
+  // `try_table (result exnref)` — blocktype 0x69 (s33 -23) decodes as BlockVal(ExnRef).
+  only_body(module_with_body([0x1F, 0x69, 0x00, 0x0B, 0x0B]))
+  |> should.equal([ast.TryTable(ast.BlockVal(ast.ExnRef), []), ast.End, ast.End])
+}
+
+pub fn try_table_is_block_opener_test() {
+  // `try_table` is a block-opener: a nested `block…end` inside its body, then the
+  // try_table's OWN `end`, must nest correctly (its body's `end` is not read as the
+  // function terminator). Body `1f 40 00 | 02 40 0b | 0b | 0b`.
+  only_body(module_with_body([0x1F, 0x40, 0x00, 0x02, 0x40, 0x0B, 0x0B, 0x0B]))
+  |> should.equal([
+    ast.TryTable(ast.BlockEmpty, []),
+    ast.Block(ast.BlockEmpty),
+    ast.End,
+    ast.End,
+    ast.End,
+  ])
+}
+
+// ───────────────────────────── §F legacy EH opcodes (measured Porffor) ─────────────────────────────
+
+pub fn legacy_try_catch_porffor_bytes_test() {
+  // The REAL Porffor legacy encoding: `try` `06 40` (blocktype empty), `throw 0` `08 00`,
+  // `catch 0` `07 00`, `end` `0b`. The whole `try …/catch 0 …/end` decodes with the
+  // catch marker at the SAME depth as the body and the final `end` closing the try.
+  only_body(module_with_body([0x06, 0x40, 0x08, 0x00, 0x07, 0x00, 0x0B, 0x0B]))
+  |> should.equal([
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.Throw(0),
+    ast.LegacyCatch(0),
+    ast.End,
+    ast.End,
+  ])
+}
+
+pub fn legacy_catch_all_test() {
+  // Authored (Porffor omits it): `catch_all` = `19` — a legacy in-block handler marker.
+  only_body(module_with_body([0x06, 0x40, 0x19, 0x0B, 0x0B]))
+  |> should.equal([
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.LegacyCatchAll,
+    ast.End,
+    ast.End,
+  ])
+}
+
+pub fn legacy_delegate_closes_try_test() {
+  // Authored: `delegate 1` = `18 01` TERMINATES its enclosing (inner) try — a block-
+  // closer replacing that try's `end`. Outer try, inner try, delegate 1 (closes inner),
+  // `0b` (closes outer), `0b` (func end).
+  only_body(module_with_body([0x06, 0x40, 0x06, 0x40, 0x18, 0x01, 0x0B, 0x0B]))
+  |> should.equal([
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.LegacyDelegate(1),
+    ast.End,
+    ast.End,
+  ])
+}
+
+pub fn legacy_rethrow_test() {
+  // Authored: `rethrow 0` = `09 00` — re-throw the exception caught by the 0-th enclosing
+  // catch. Not a block-opener.
+  only_body(module_with_body([0x06, 0x40, 0x09, 0x00, 0x0B, 0x0B]))
+  |> should.equal([
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.Rethrow(0),
+    ast.End,
+    ast.End,
+  ])
+}
+
+// ───────────────────────── real Porffor end-to-end module ─────────────────────────
+
+// The FULL 331-byte output of `npx porffor wasm trycatch.js` (Porffor 0.61.13) — a JS
+// `try { … throw … } catch { … }` compiled to WASM. Carries the tag section `0d 03 01
+// 00 03`, the tag export `04 00`, and the legacy `try`/`catch`/`throw` control. Embedded
+// verbatim as the concrete proof that decode accepts REAL Porffor output.
+const porffor_eh_module: List(Int) = [
+  0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x1C, 0x04, 0x60, 0x00,
+  0x02, 0x7C, 0x7F, 0x60, 0x06, 0x7C, 0x7F, 0x7C, 0x7F, 0x7C, 0x7F, 0x02, 0x7C,
+  0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x02, 0x7C, 0x7F, 0x00, 0x03,
+  0x04, 0x03, 0x00, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x0D, 0x03, 0x01,
+  0x00, 0x03, 0x07, 0x0D, 0x03, 0x01, 0x24, 0x02, 0x00, 0x01, 0x30, 0x04, 0x00,
+  0x01, 0x6D, 0x00, 0x00, 0x0A, 0x80, 0x02, 0x03, 0x29, 0x01, 0x01, 0x7F, 0x44,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x44, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x14, 0x40, 0x41, 0x01, 0x10, 0x01, 0x22, 0x00, 0x0B, 0xB0, 0x01,
+  0x06, 0x01, 0x7C, 0x01, 0x7F, 0x01, 0x7C, 0x01, 0x7F, 0x01, 0x7C, 0x01, 0x7F,
+  0x06, 0x40, 0x20, 0x04, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x64, 0xB8, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x04,
+  0x40, 0x20, 0x04, 0x20, 0x05, 0x08, 0x00, 0x1A, 0x0B, 0x44, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0xF0, 0x3F, 0x21, 0x06, 0x41, 0x01, 0x21, 0x07, 0x20, 0x00,
+  0xFC, 0x03, 0x04, 0x40, 0x20, 0x06, 0xFC, 0x02, 0x20, 0x07, 0x10, 0x02, 0x45,
+  0x04, 0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B, 0x0B, 0x20, 0x06, 0x20, 0x07,
+  0x0F, 0x1A, 0x07, 0x00, 0x21, 0x09, 0x22, 0x08, 0x21, 0x0A, 0x20, 0x09, 0x21,
+  0x0B, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x21, 0x06, 0x41,
+  0x01, 0x21, 0x07, 0x20, 0x00, 0xFC, 0x03, 0x04, 0x40, 0x20, 0x06, 0xFC, 0x02,
+  0x20, 0x07, 0x10, 0x02, 0x45, 0x04, 0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B,
+  0x0B, 0x20, 0x06, 0x20, 0x07, 0x0F, 0x1A, 0x0B, 0x20, 0x00, 0xFC, 0x03, 0x04,
+  0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x41, 0x00, 0x0F, 0x0B, 0x22, 0x01, 0x01, 0x7F, 0x20, 0x01,
+  0x21, 0x02, 0x20, 0x00, 0x41, 0x00, 0x47, 0x20, 0x02, 0x41, 0x05, 0x4A, 0x71,
+  0x20, 0x02, 0x41, 0xC3, 0x00, 0x47, 0x71, 0x20, 0x02, 0x41, 0xC3, 0x01, 0x47,
+  0x71, 0x0F, 0x0B, 0x0B, 0x01, 0x00,
+]
+
+pub fn porffor_eh_module_decodes_test() {
+  // The real Porffor EH module decodes Ok, with the tag section (`[Tag(3)]`), the tag
+  // export ("0" → ExportTag 0), and its legacy `try`/`catch`/`throw` nodes present in a
+  // function body.
+  let assert Ok(m) = decode.decode(bytes(porffor_eh_module))
+  m.tags
+  |> should.equal([ast.Tag(3)])
+  list.contains(m.exports, ast.Export("0", ast.ExportTag, 0))
+  |> should.equal(True)
+  // Some function body carries the legacy try opener, a legacy catch marker, and a throw.
+  let has = fn(pred) { list.any(m.funcs, fn(f) { list.any(f.body, pred) }) }
+  has(fn(i) { i == ast.TryLegacy(ast.BlockEmpty) })
+  |> should.equal(True)
+  has(fn(i) { i == ast.LegacyCatch(0) })
+  |> should.equal(True)
+  has(fn(i) { i == ast.Throw(0) })
+  |> should.equal(True)
+}
+
+// ───────────────────────── neutrality (tag-free byte-identical) ─────────────────────────
+
+pub fn non_eh_module_has_empty_tags_test() {
+  // A non-EH module (the `add` fixture) decodes with `tags == []` — the new field's
+  // empty default, so the AST is structurally unchanged.
+  let assert Ok(m) = decode.decode(bytes(add_fixture))
+  m.tags
+  |> should.equal([])
+}
+
+// ───────────────────────── §Verification 2: fail-closed fuzz ─────────────────────────
+
+pub fn tag_bad_attribute_test() {
+  // A tag with a non-0x00 attribute (`0d 03 01 01 00`) → BadTagAttribute.
+  decode.decode(
+    bytes(
+      list.flatten([
+        preamble,
+        [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+        [0x0D, 0x03, 0x01, 0x01, 0x00],
+      ]),
+    ),
+  )
+  |> should.equal(Error(ast.BadTagAttribute))
+}
+
+pub fn imported_tag_bad_attribute_test() {
+  // An imported tag with a non-0x00 attribute (`04 01 00`) → BadTagAttribute.
+  decode.decode(
+    bytes(
+      list.flatten([
+        preamble,
+        [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+        [0x02, 0x08, 0x01, 0x01, 0x6D, 0x01, 0x74, 0x04, 0x01, 0x00],
+      ]),
+    ),
+  )
+  |> should.equal(Error(ast.BadTagAttribute))
+}
+
+pub fn catch_kind_out_of_range_test() {
+  // A try_table catch clause with a kind byte >= 0x04 (`1f 40 01 04 …`) → BadCatchKind.
+  decode.decode(
+    bytes(module_with_body([0x1F, 0x40, 0x01, 0x04, 0x00, 0x0B, 0x0B])),
+  )
+  |> should.equal(Error(ast.BadCatchKind))
+}
+
+pub fn tag_section_truncated_test() {
+  // A truncated tag section (attribute present, typeidx at EOF) → Truncated.
+  decode.decode(
+    bytes(
+      list.flatten([
+        preamble,
+        [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+        [0x0D, 0x02, 0x01, 0x00],
+      ]),
+    ),
+  )
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn catch_vector_truncated_test() {
+  // A truncated catch vector (count says 2, one clause present) → Truncated.
+  decode.decode(bytes(module_with_body([0x1F, 0x40, 0x02, 0x00, 0x00, 0x01])))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn throw_tagidx_truncated_test() {
+  // `throw` with the tagidx LEB truncated (opcode at EOF) → Truncated.
+  decode.decode(bytes(module_with_body([0x08])))
+  |> should.equal(Error(ast.Truncated))
+}
+
+pub fn throw_tagidx_too_long_test() {
+  // `throw` with an over-wide tagidx LEB (6 bytes for a u32) → LebTooLong.
+  decode.decode(
+    bytes(module_with_body([0x08, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0B])),
+  )
+  |> should.equal(Error(ast.LebTooLong))
+}
+
+pub fn try_table_bad_blocktype_test() {
+  // A try_table whose blocktype byte is a bad negative s33 (`0x78` = -8) → BadBlockType.
+  decode.decode(bytes(module_with_body([0x1F, 0x78, 0x00, 0x0B, 0x0B])))
+  |> should.equal(Error(ast.BadBlockType))
+}
+
+pub fn exnref_tabletype_accepted_test() {
+  // 0x69 in a tabletype element position is ACCEPTED as ExnRef (exn IS a heaptype).
+  // Table section `04 04 01 69 00 01` (count 1, elem 0x69, limits min 1).
+  let assert Ok(m) =
+    decode.decode(
+      bytes(module_with_section([0x04, 0x04, 0x01, 0x69, 0x00, 0x01])),
+    )
+  m.tables
+  |> should.equal([ast.TableType(ast.ExnRef, ast.Limits(min: 1, max: None))])
+}
+
+pub fn v128_tabletype_still_rejected_test() {
+  // But 0x7B (v128) in a tabletype element position is STILL BadHeapType (unchanged —
+  // v128 is not a reftype; the exnref addition did not widen this).
+  decode.decode(
+    bytes(module_with_section([0x04, 0x04, 0x01, 0x7B, 0x00, 0x01])),
+  )
+  |> should.equal(Error(ast.BadHeapType))
+}
+
+pub fn legacy_delegate_depth_zero_rejected_test() {
+  // A legacy `delegate 0` with no open try (block depth 0) is mis-nested → BadDelegate
+  // (a dedicated error, never a negative-depth loop, never a crash).
+  decode.decode(bytes(module_with_body([0x18, 0x00, 0x0B])))
+  |> should.equal(Error(ast.BadDelegate))
+}
+
+// A packed fixture exercising the whole EH surface (modern + legacy) in one body, so
+// the mutation/truncation sweeps cover every EH sub-decoder. `try_table` (empty, no
+// catches) opens; a legacy `try`/`catch`/`throw`/`throw_ref`/`rethrow`/`catch_all`
+// interleave; two ends close the legacy try and the try_table; a final end terminates.
+fn eh_fixture() -> List(Int) {
+  module_with_body([
+    0x1F, 0x40, 0x00, 0x08, 0x00, 0x0A, 0x06, 0x40, 0x09, 0x00, 0x19, 0x07, 0x00,
+    0x0B, 0x0B, 0x0B,
+  ])
+}
+
+pub fn eh_fixture_decodes_test() {
+  // The packed EH fixture decodes cleanly to the expected instructions (so the fuzz
+  // sweeps below are meaningful).
+  only_body(eh_fixture())
+  |> should.equal([
+    ast.TryTable(ast.BlockEmpty, []),
+    ast.Throw(0),
+    ast.ThrowRef,
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.Rethrow(0),
+    ast.LegacyCatchAll,
+    ast.LegacyCatch(0),
+    ast.End,
+    ast.End,
+    ast.End,
+  ])
+}
+
+pub fn fuzz_eh_fixture_mutations_test() {
+  // Every single-byte mutation of the EH fixture stays TOTAL (a Result, never a panic) —
+  // the fail-closed property over the whole EH surface (D4/H6).
+  sweep_single_byte_mutations(eh_fixture())
+  |> should.equal(True)
+}
+
+pub fn fuzz_eh_fixture_truncation_test() {
+  // Every prefix of the EH fixture decodes to a Result; the full fixture is Ok and every
+  // shorter prefix is an Error (never a crash / never a negative-depth loop).
+  let fixture = eh_fixture()
+  let full = decode.decode(bytes(fixture))
+  let len = list.length(fixture)
+  list.all(int_range(0, len), fn(n) {
+    let r = decode.decode(bytes(list.take(fixture, n)))
+    case n == len {
+      True -> r == full
+      False -> is_total(r) && r != full
+    }
+  })
+  |> should.equal(True)
+}
+
+pub fn fuzz_porffor_eh_module_mutations_test() {
+  // Every single-byte mutation of the REAL Porffor EH module stays TOTAL — decode is
+  // fail-closed over hostile mutations of genuine legacy-EH output.
+  sweep_single_byte_mutations(porffor_eh_module)
+  |> should.equal(True)
+}
+
+// ───────────────────── §Verification 3: the EH opcode-map audit ─────────────────────
+
+pub fn eh_opcode_map_audit_test() {
+  // Derived from the spec/measured EH opcode tables, NOT the implementation: each of the
+  // eight assigned EH opcodes decodes Ok to its §E/§F node with a minimal well-formed
+  // immediate. A mis-transcribed opcode fails this. (delegate 0x18 is exercised inside a
+  // try so it is not depth-0-rejected.)
+  let cases = [
+    #([0x06, 0x40, 0x0B, 0x0B], ast.TryLegacy(ast.BlockEmpty)),
+    #([0x07, 0x00, 0x0B], ast.LegacyCatch(0)),
+    #([0x08, 0x00, 0x0B], ast.Throw(0)),
+    #([0x09, 0x00, 0x0B], ast.Rethrow(0)),
+    #([0x0A, 0x0B], ast.ThrowRef),
+    #([0x19, 0x0B], ast.LegacyCatchAll),
+    #([0x1F, 0x40, 0x00, 0x0B, 0x0B], ast.TryTable(ast.BlockEmpty, [])),
+  ]
+  let bad =
+    list.filter(cases, fn(c) {
+      let #(body, expected) = c
+      case decode.decode(bytes(module_with_body(body))) {
+        Ok(m) ->
+          case m.funcs {
+            [f] -> !list.contains(f.body, expected)
+            _ -> True
+          }
+        Error(_) -> True
+      }
+    })
+  bad
+  |> should.equal([])
+  // `delegate 1` inside a try must decode to LegacyDelegate(1) (block-closer path).
+  only_body(module_with_body([0x06, 0x40, 0x18, 0x01, 0x0B]))
+  |> should.equal([
+    ast.TryLegacy(ast.BlockEmpty),
+    ast.LegacyDelegate(1),
+    ast.End,
+  ])
+}
+
+pub fn catch_kind_dispatch_audit_test() {
+  // The four catch-clause kinds 0x00..0x03 each decode Ok to the right clause shape,
+  // while 0x04 → BadCatchKind. Derived from the spec's catch grammar.
+  let kinds = [
+    #([0x00, 0x02, 0x03], ast.Catch(2, 3)),
+    #([0x01, 0x02, 0x03], ast.CatchRef(2, 3)),
+    #([0x02, 0x03], ast.CatchAll(3)),
+    #([0x03, 0x03], ast.CatchAllRef(3)),
+  ]
+  let bad =
+    list.filter(kinds, fn(c) {
+      let #(clause, expected) = c
+      let body = list.flatten([[0x1F, 0x40, 0x01], clause, [0x0B, 0x0B]])
+      case decode.decode(bytes(module_with_body(body))) {
+        Ok(m) ->
+          case m.funcs {
+            [f] ->
+              f.body
+              != [ast.TryTable(ast.BlockEmpty, [expected]), ast.End, ast.End]
+            _ -> True
+          }
+        Error(_) -> True
+      }
+    })
+  bad
+  |> should.equal([])
+  // kind 0x04 is out of range → BadCatchKind.
+  decode.decode(
+    bytes(module_with_body([0x1F, 0x40, 0x01, 0x04, 0x00, 0x0B, 0x0B])),
+  )
+  |> should.equal(Error(ast.BadCatchKind))
 }
