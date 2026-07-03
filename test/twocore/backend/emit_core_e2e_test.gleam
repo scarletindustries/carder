@@ -18,6 +18,7 @@ import twocore/backend/build_beam
 import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
+import twocore/pipeline
 import twocore/runtime/instance
 import twocore/runtime/link
 import twocore/runtime/rt_meter
@@ -2338,4 +2339,258 @@ pub fn cross_module_call_import_e2e_test() {
   assert catch_apply(mod_b, atom.create("caller"), [41]) == Ok(42)
   // And a second value, to confirm it is the real function, not a constant.
   assert catch_apply(mod_b, atom.create("caller"), [100]) == Ok(101)
+}
+
+// ════════════════════ Phase-7: exception handling END-TO-END (RUN on the BEAM) ════════════════════
+//
+// Hand-built EH IR compiled + loaded + RUN, asserting spec (the exception-handling proposal +
+// core-spec §4.4.9): a `throw` unwinds to the nearest matching handler carrying its payload; an
+// uncaught exception surfaces DISTINCTLY from a trap (T8); `catch_all` catches WASM exceptions but
+// a TRAP propagates through it (spec §4.4); a non-matching tag re-raises (stacktrace-preserving);
+// and `throw_ref` re-raises a captured exception. EH ships CELL-only (T6). These are the FIRST time
+// WASM/JS exception handling runs end-to-end on the BEAM.
+
+/// A one-page-memory EH module: `functions` (exported by name) carrying `tags`, under Cell.
+fn eh_module_full(
+  name: String,
+  memory: option.Option(ir.MemoryDecl),
+  functions: List(ir.Function),
+  tags: List(ir.TagDecl),
+) -> ir.Module {
+  ir.Module(
+    name: "twocore@ehe2e@" <> name,
+    uses_numerics: True,
+    memories: case memory {
+      option.Some(m) -> [m]
+      option.None -> []
+    },
+    globals: [],
+    imports: [],
+    functions: functions,
+    exports: list.map(functions, fn(f) { ir.ExportFn(f.name, f.name) }),
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+    tags: tags,
+  )
+}
+
+/// Emit + compile `module` to an in-memory `.beam` (for the `pipeline.invoke` run-ABI, which splits
+/// an uncaught `{wasm_exn,…}` from a trap — T8). `let assert` is the test's success contract.
+fn to_beam(module: ir.Module) -> BitArray {
+  let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
+  let core = core_printer.print_module(cm)
+  let assert Ok(#(_atom, beam)) =
+    build_beam.compile_core(bit_array.from_string(core))
+  beam
+}
+
+/// A tag carrying one i32 operand at some index (the Porffor-ish shape, reduced to i32 for the ABI).
+fn tag1_i32(name: String) -> ir.TagDecl {
+  ir.TagDecl(name, [ir.TI32])
+}
+
+/// **Uncaught throw → `UncaughtException`, DISTINCT from a trap (T8).** `boom(p0)` unconditionally
+/// `throw`s `tag0(p0, 195)`; nothing catches it, so it unwinds out of the export as a WASM
+/// exception. The run-ABI reports `UncaughtException(0, [p0, 195])` — the module-local tag index +
+/// the operand payload — NOT `Trapped` (`assert_exception` ≠ `assert_trap`, spec §4.4.9).
+pub fn eh_uncaught_throw_reports_uncaught_exception_e2e_test() {
+  let boom =
+    ir.Function(
+      "boom",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Throw("tag0", [ir.Var("p0"), ir.ConstI32(195)]),
+    )
+  let m =
+    eh_module_full("uncaught", option.None, [boom], [
+      ir.TagDecl("tag0", [ir.TI32, ir.TI32]),
+    ])
+  let beam = to_beam(m)
+  assert pipeline.invoke(beam, m.name, "boom", [16])
+    == pipeline.UncaughtException(0, [16, 195])
+}
+
+/// **A trap stays `Trapped`, NOT `UncaughtException`.** A genuine runtime trap (i32 div-by-zero →
+/// `{wasm_trap, int_div_by_zero}`, ERROR class) is a DIFFERENT run-ABI outcome from a WASM
+/// exception — the split rests on the term shape (`{wasm_trap,_}` vs `{wasm_exn,_,_}`, T8).
+pub fn eh_trap_stays_trapped_not_exception_e2e_test() {
+  let dz =
+    ir.Function(
+      "dz",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Let(
+        ["r"],
+        ir.Num(ir.IDivS(ir.W32), [ir.Var("p0"), ir.ConstI32(0)]),
+        ir.Return([ir.Var("r")]),
+      ),
+    )
+  let m = eh_module_full("trapdz", option.None, [dz], [])
+  let assert pipeline.Trapped(reason) =
+    pipeline.invoke(to_beam(m), m.name, "dz", [10])
+  assert string.contains(reason, "wasm_trap")
+}
+
+/// **A caught legacy `try/catch` recovers the payload (the Porffor shape).** `f(p0)` runs
+/// `try { throw tag0(p0) } catch tag0 (p) { return p + 1 }` — the throw unwinds to the matching
+/// handler, the `(p)` operand round-trips through the catch, and the handler yields `p + 1`. So
+/// `f(5) → 6` and `f(-2) → -1` (the §Porffor `f(5)=6`/`f(-2)=-1` shape). Runs on the BEAM.
+pub fn eh_caught_legacy_trycatch_recovers_value_e2e_test() {
+  let f =
+    ir.Function(
+      "f",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("p0")]), [
+        ir.CatchHandler(
+          ir.OnTag("tag0"),
+          ["p"],
+          option.None,
+          ir.Let(
+            ["r"],
+            ir.Num(ir.IAdd(ir.W32), [ir.Var("p"), ir.ConstI32(1)]),
+            ir.Return([ir.Var("r")]),
+          ),
+        ),
+      ]),
+    )
+  let mod = load(eh_module_full("caught", option.None, [f], [tag1_i32("tag0")]))
+  assert catch_apply(mod, atom.create("f"), [5]) == Ok(6)
+  // -2 as the unsigned i32 bit pattern 4294967294 → -1 (4294967295): the payload rode through.
+  assert catch_apply(mod, atom.create("f"), [4_294_967_294])
+    == Ok(4_294_967_295)
+}
+
+/// **`catch_all` catches a WASM exception.** `h(p0)` runs `try { throw tag0(p0) } catch_all
+/// { return 42 }` — the thrown exception is caught by the catch-all and the handler's `42` is
+/// yielded. Runs on the BEAM.
+pub fn eh_catch_all_catches_wasm_exn_e2e_test() {
+  let h =
+    ir.Function(
+      "h",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("p0")]), [
+        ir.CatchHandler(ir.OnAll, [], option.None, ir.Return([ir.ConstI32(42)])),
+      ]),
+    )
+  let mod =
+    load(eh_module_full("catchall", option.None, [h], [tag1_i32("tag0")]))
+  assert catch_apply(mod, atom.create("h"), [7]) == Ok(42)
+}
+
+/// **A TRAP propagates through `catch_all` (spec §4.4 — the sandbox floor, T7).** `g(addr)` runs
+/// `try { i32.load addr } catch_all { return 999 }` around a load that is OUT OF BOUNDS at
+/// `addr = 0xFFFFFF00` (one page = 65536 bytes). The load traps `MemoryOutOfBounds`; `is_wasm_exn`
+/// is false for a `{wasm_trap,_}`, so the trap PROPAGATES uncaught — it must NOT land at the
+/// catch_all handler. The result is the trap, never `Ok(999)`.
+pub fn eh_trap_propagates_through_catch_all_e2e_test() {
+  let g =
+    ir.Function(
+      "g",
+      [ir.Local("addr", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Try(
+        [ir.TI32],
+        ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("addr"), 0, ir.TI32),
+        [
+          ir.CatchHandler(
+            ir.OnAll,
+            [],
+            option.None,
+            ir.Return([ir.ConstI32(999)]),
+          ),
+        ],
+      ),
+    )
+  let mod =
+    load(
+      eh_module_full(
+        "trapthrutry",
+        option.Some(ir.MemoryDecl(1, option.None, ir.Idx32)),
+        [g],
+        [tag1_i32("tag0")],
+      ),
+    )
+  instantiate(mod)
+  // an in-bounds load succeeds (proves the try body's normal path works) …
+  assert catch_apply(mod, atom.create("g"), [0]) == Ok(0)
+  // … but an OOB load TRAPS through the catch_all — never the handler's 999.
+  let assert Error(reason) = catch_apply(mod, atom.create("g"), [4_294_967_040])
+  assert string.contains(reason, "memory_out_of_bounds")
+}
+
+/// **A non-matching tag RE-RAISES (uncaught).** `r(p0)` runs `try { throw tag1(p0) } catch tag0 (p)
+/// { return p }` — `tag1 ≠ tag0`, so the handler does not match and the exception re-raises past the
+/// `try` (spec §4.4.9, stacktrace-preserving). Uncaught, it surfaces as `UncaughtException(1, [p0])`
+/// — the RE-RAISED tag's index (1) + its payload, proving the re-raise carries the original exn.
+pub fn eh_non_matching_tag_reraises_e2e_test() {
+  let r =
+    ir.Function(
+      "r",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Try([ir.TI32], ir.Throw("tag1", [ir.Var("p0")]), [
+        ir.CatchHandler(
+          ir.OnTag("tag0"),
+          ["p"],
+          option.None,
+          ir.Return([
+            ir.Var("p"),
+          ]),
+        ),
+      ]),
+    )
+  let m =
+    eh_module_full("reraise", option.None, [r], [
+      tag1_i32("tag0"),
+      tag1_i32("tag1"),
+    ])
+  assert pipeline.invoke(to_beam(m), m.name, "r", [16])
+    == pipeline.UncaughtException(1, [16])
+}
+
+/// **`throw_ref` re-raises a captured exnref (T9).** `tr(p0)` nests: the INNER `try { throw tag0(p0)
+/// } catch_ref tag0 (as e) { throw_ref e }` captures the caught exception as an opaque `exnref` and
+/// re-raises it; the OUTER `try … catch tag0 (p) { return p }` then catches the re-raised exception
+/// by tag and recovers its payload. So `tr(9) → 9` — the captured exception round-tripped through
+/// `capture`/`throw_ref`. (Porffor-inert modern surface; proves the exnref path on the BEAM.)
+pub fn eh_throw_ref_reraises_captured_exn_e2e_test() {
+  let inner =
+    ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("p0")]), [
+      ir.CatchHandler(
+        ir.OnTag("tag0"),
+        ["q"],
+        option.Some("e"),
+        ir.ThrowRef(ir.Var("e")),
+      ),
+    ])
+  let tr =
+    ir.Function(
+      "tr",
+      [ir.Local("p0", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Try([ir.TI32], inner, [
+        ir.CatchHandler(
+          ir.OnTag("tag0"),
+          ["p"],
+          option.None,
+          ir.Return([
+            ir.Var("p"),
+          ]),
+        ),
+      ]),
+    )
+  let mod =
+    load(eh_module_full("throwref", option.None, [tr], [tag1_i32("tag0")]))
+  assert catch_apply(mod, atom.create("tr"), [9]) == Ok(9)
 }

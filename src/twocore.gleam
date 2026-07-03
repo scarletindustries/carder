@@ -529,7 +529,18 @@ fn cmd_run(
     Error(e) -> Error(pipeline.describe(e))
     Ok(pipeline.Returned(values)) -> Ok(format_values(values))
     Ok(pipeline.Trapped(reason)) -> Error("trap: " <> reason)
+    Ok(pipeline.UncaughtException(tag_id, payload)) ->
+      Error(format_uncaught(tag_id, payload))
   }
+}
+
+/// Render an uncaught WASM exception for CLI stderr — DISTINCT from a trap (T8): the throwing
+/// tag's module-local index + its operand payload. Diagnostic only.
+fn format_uncaught(tag_id: Int, payload: List(Int)) -> String {
+  "uncaught exception: tag "
+  <> int.to_string(tag_id)
+  <> " payload "
+  <> string.inspect(payload)
 }
 
 /// `exec [-n COUNT] <in.beam> <export> <args…>` — load a PREBUILT `.beam` (no compile step)
@@ -548,6 +559,8 @@ fn cmd_exec(
   case pipeline.exec_beam(beam, export, args, repeat) {
     Error(e) -> Error(e)
     Ok(#(_micros, pipeline.Trapped(reason))) -> Error("trap: " <> reason)
+    Ok(#(_micros, pipeline.UncaughtException(tag_id, payload))) ->
+      Error(format_uncaught(tag_id, payload))
     Ok(#(micros, pipeline.Returned(values))) ->
       Ok(format_values(values) <> "\n" <> timing_line(repeat, micros))
   }

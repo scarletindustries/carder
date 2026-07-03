@@ -37,8 +37,8 @@ import gleam/string_tree.{type StringTree}
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CAtom, CBinary, CCall, CCase, CCons, CFloat, CFun, CInt,
-  CLet, CLetrec, CNil, CPrimop, CTuple, CValues, CVar, PAtom, PCons, PInt, PNil,
-  PTuple, PVar,
+  CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, PAtom, PCons, PInt,
+  PNil, PTuple, PVar,
 }
 
 /// One indentation step. Whitespace is insignificant to the Core Erlang scanner,
@@ -193,7 +193,59 @@ fn print_expr(e: CExpr, ind: String) -> StringTree {
         list.map(args, print_expr(_, ind)) |> string_tree.join(", "),
         st(")"),
       ])
+    CTry(arg, body_vars, body, evars, handler) ->
+      print_try(arg, body_vars, body, evars, handler, ind)
   }
+}
+
+/// Print a Core Erlang `try … of … catch …` (T5). The OTP-29-accepted form has NO outer
+/// parentheses and NO `end` (verified against `core_scan`/`core_parse`):
+/// ```text
+/// try
+///     <Arg>
+/// of <V1,…> ->
+///     <Body>
+/// catch <Ec,Er,Es> ->
+///     <Handler>
+/// ```
+/// The `of`/`catch` variable lists are ALWAYS value-list-wrapped `<…>` (matching the
+/// `arg`/raise arity, exactly like a `case` clause pattern). `ind` is the `try` keyword's
+/// own indentation; `arg`/`body`/`handler` continue at `ind <> indent_unit`.
+fn print_try(
+  arg: CExpr,
+  body_vars: List(String),
+  body: CExpr,
+  evars: List(String),
+  handler: CExpr,
+  ind: String,
+) -> StringTree {
+  let inner = ind <> indent_unit
+  string_tree.concat([
+    st("try\n"),
+    st(inner),
+    print_expr(arg, inner),
+    st("\n" <> ind <> "of "),
+    print_var_list(body_vars),
+    st(" ->\n"),
+    st(inner),
+    print_expr(body, inner),
+    st("\n" <> ind <> "catch "),
+    print_var_list(evars),
+    st(" ->\n"),
+    st(inner),
+    print_expr(handler, inner),
+  ])
+}
+
+/// Print a Core value-list of variable binders `<V1,V2,…>` (legalized), used for a `try`'s
+/// `of`/`catch` variable lists. A single binder is still wrapped `<V>` (the `try` grammar
+/// requires the value-list brackets, like a `case` clause pattern).
+fn print_var_list(vars: List(String)) -> StringTree {
+  string_tree.concat([
+    st("<"),
+    list.map(vars, fn(v) { st(legalize_var(v)) }) |> string_tree.join(", "),
+    st(">"),
+  ])
 }
 
 /// Print `fun (V1, V2) -> Body`, with the body on its own indented line.

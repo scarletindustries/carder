@@ -108,3 +108,56 @@ pub fn js_on_beam_differential_test() {
       })
   }
 }
+
+// ════════════════════ THE EH HEADLINE — JS exceptions running as BEAM exceptions (P7-06) ════════════════════
+
+/// **THE EH HEADLINE — a real Porffor `try/catch` JS program runs as BEAM exceptions.** The
+/// committed `trycatch.wasm` was compiled by **Porffor 0.61.13** from
+/// `try { throw new Error("boom") } catch (e) { console.log("caught") }` — it carries a tag +
+/// `throw` + legacy `try`/`catch` (verified: `wasm-tools print` shows `(tag …)`, `throw 0`,
+/// `try`/`catch 0`; `wasm-tools validate --features=all` passes with EH). Run through the FULL
+/// 2core pipeline under `profiles.porffor()`, the WASM/JS exception handling executes as native
+/// BEAM `try…catch`/`raise` (P7-06): the throw unwinds to the catch, and the handler's
+/// `console.log("caught")` runs. Its console output is BYTE-IDENTICAL to the measured `porf run`
+/// output ("caught\n") on a clean completion (`trapped: None`). This is JavaScript exceptions
+/// running on the BEAM.
+pub fn js_on_beam_trycatch_headline_test() {
+  let assert Ok(wasm) = simplifile.read_bits(fixture_dir <> "trycatch.wasm")
+  let assert Ok(run) = pipeline.run_porffor(wasm, "m")
+  run.trapped |> should.equal(None)
+  run.output |> should.equal(bit_array.from_string("caught\n"))
+}
+
+/// **The guarded LIVE differential for the EH headline (T13).** When Porffor is on `PATH`, run the
+/// `try/catch` program through `porf run` (V8 executing the SAME `.wasm`) and assert 2core's console
+/// output equals it byte-for-byte — a divergence would be a 2core EH bug. Skips gracefully when
+/// Porffor is not installed (recorded), exactly like the EH-free differential.
+pub fn js_on_beam_trycatch_differential_test() {
+  case ffi.find_executable("npx") {
+    Error(_) -> {
+      io.println(
+        "\n[porffor-eh] npx/porffor not installed — try/catch LIVE differential SKIPPED (recorded)",
+      )
+      Nil
+    }
+    Ok(npx) -> {
+      let js = fixture_dir <> "trycatch.js"
+      let assert Ok(wasm) = simplifile.read_bits(fixture_dir <> "trycatch.wasm")
+      let assert Ok(run) = pipeline.run_porffor(wasm, "m")
+      let #(code, oracle) = ffi.run(npx, ["porffor", js])
+      case code {
+        0 -> {
+          io.println(
+            "[porffor-eh] trycatch porf run == 2core: "
+            <> string.inspect(oracle),
+          )
+          run.output |> should.equal(bit_array.from_string(oracle))
+        }
+        _ ->
+          io.println(
+            "[porffor-eh] porf run nonzero exit for trycatch (skipped)",
+          )
+      }
+    }
+  }
+}

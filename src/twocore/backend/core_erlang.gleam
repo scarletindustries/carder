@@ -146,6 +146,38 @@ pub type CExpr {
   /// A compiler primop, printed `primop 'Name'(Args)` (e.g.
   /// `primop 'match_fail'(…)`). `name` is the primop atom in logical form.
   CPrimop(name: String, args: List(CExpr))
+  /// A `try … catch`, printed (per the verified OTP-29 `core_pp` form, T5):
+  /// ```text
+  /// try
+  ///     <Arg>
+  /// of <V1,…> ->
+  ///     <Body>
+  /// catch <Ec,Er,Es> ->
+  ///     <Handler>
+  /// ```
+  /// with NO outer parentheses and NO Erlang-style `end` (Core Erlang has no general
+  /// `( expr )` rule and the `try` form is self-delimiting — both empirically verified
+  /// against `core_scan`/`core_parse`). Models cerl's `#c_try{arg, vars, body, evars,
+  /// handler}`.
+  ///
+  /// - `arg`: the protected expression (its exceptions are caught).
+  /// - `body_vars`: bind `arg`'s success value(s); P7-06 always uses a SINGLE transparent
+  ///   binder (every emitted expr reduces to one packaged value — the try's `of <V> -> V`
+  ///   pass-through, §C.1).
+  /// - `body`: the success continuation (P7-06 emits `CVar(v)` — the identity).
+  /// - `evars`: the THREE exception pattern variables `[Class, Reason, Stack]` bound on a
+  ///   raise (all classes caught; the handler dispatches on the term shape). The third is
+  ///   the RAW stacktrace token — to re-raise faithfully a caller must first pass it through
+  ///   `primop 'build_stacktrace'` (verified: `erlang:raise/3` on the raw token returns
+  ///   `badarg`).
+  /// - `handler`: the catch body (P7-06's `case`-on-`Reason` tag dispatch + re-raise default).
+  CTry(
+    arg: CExpr,
+    body_vars: List(String),
+    body: CExpr,
+    evars: List(String),
+    handler: CExpr,
+  )
 }
 
 /// A `case` clause, printed `<P1,P2,…> when Guard -> Body`.

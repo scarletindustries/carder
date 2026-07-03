@@ -64,8 +64,10 @@ import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import twocore/backend/build_beam
 import twocore/backend/core_printer
@@ -129,9 +131,63 @@ pub fn describe(error: PipelineError) -> String {
 /// - `Trapped(reason)`: a runtime trap or capability denial — the catchable BEAM error
 ///   reason rendered as text (e.g. `"{wasm_trap,int_div_by_zero}"`,
 ///   `"{capability_denied,env,forbidden}"`). The caller maps it to the spec phrase.
+/// - `UncaughtException(tag_id, payload)`: a WASM **exception** that unwound out of the
+///   export uncaught (Phase-7, T8) — DISTINCT from a trap (`assert_exception` ≠ `assert_trap`).
+///   `tag_id` is the throwing module's module-local tag index (T4); `payload` is the operand
+///   value list (raw bit-pattern integers). Split from a `{wasm_exn, TagId, Payload}` BEAM
+///   error term (raised by `rt_exn`) at the run-ABI boundary; a `{wasm_trap, Kind}` stays
+///   `Trapped`. NOT a `TrapReason` (a WASM exception rides its own term class — S8/T8).
 pub type RunResult {
   Returned(values: List(Int))
   Trapped(reason: String)
+  UncaughtException(tag_id: Int, payload: List(Int))
+}
+
+/// Split a rendered BEAM error `reason` (from `twocore_cli_ffi`'s `render_reason`, i.e.
+/// `io_lib:format("~0p", [Reason])`) into the distinct run-ABI outcome (T8): a
+/// `{wasm_exn, TagId, Payload}` term (an uncaught WASM exception raised by `rt_exn`) becomes
+/// `UncaughtException(tag_id, payload)`; ANY other reason — a `{wasm_trap, Kind}` trap, a
+/// `{capability_denied, …}` host denial, a fuel raise, or any incidental BEAM error — stays
+/// `Trapped(reason)`. The tag id is always recovered; the payload is best-effort (a payload of
+/// all-printable bytes that `~0p` rendered as a string decodes to `[]`, harmless — the tag id is
+/// the load-bearing discriminant). Total — never panics.
+fn classify_run_error(reason: String) -> RunResult {
+  case string.starts_with(reason, "{wasm_exn,") {
+    False -> Trapped(reason)
+    True -> {
+      // "{wasm_exn,<tag>,<payload>}" → drop the tag atom + trailing "}", split off <tag>.
+      let inner =
+        reason
+        |> string.drop_start(string.length("{wasm_exn,"))
+        |> string.drop_end(1)
+      case string.split_once(inner, ",") {
+        Error(_) -> Trapped(reason)
+        Ok(#(tag_str, payload_str)) ->
+          case int.parse(tag_str) {
+            Error(_) -> Trapped(reason)
+            Ok(tag_id) -> UncaughtException(tag_id, parse_payload(payload_str))
+          }
+      }
+    }
+  }
+}
+
+/// Best-effort parse of a `~0p`-rendered payload list `"[16,195]"` into `List(Int)`. Returns
+/// `[]` when the payload is not a bracketed integer list (e.g. `~0p` rendered an all-printable
+/// byte list as a quoted string) — the tag id remains the reliable discriminant. Total.
+fn parse_payload(s: String) -> List(Int) {
+  case string.starts_with(s, "[") && string.ends_with(s, "]") {
+    False -> []
+    True ->
+      case string.drop_start(s, 1) |> string.drop_end(1) {
+        "" -> []
+        body ->
+          list.try_map(string.split(body, ","), fn(e) {
+            int.parse(string.trim(e))
+          })
+          |> result.unwrap([])
+      }
+  }
 }
 
 /// Load `beam` into the build VM (D10) and apply `export`/`length(args)` IN THE CALLING
@@ -161,7 +217,7 @@ pub fn invoke(
     Ok(mod_atom) ->
       case ffi_catch_apply(mod_atom, atom.create(export), args) {
         Ok(value) -> Returned([value])
-        Error(reason) -> Trapped(reason)
+        Error(reason) -> classify_run_error(reason)
       }
   }
 }
@@ -232,7 +288,7 @@ pub fn invoke_instance(
   let InstanceProc(pid) = proc
   case ffi_call_instance(pid, atom.create(export), args) {
     Ok(value) -> Returned([value])
-    Error(reason) -> Trapped(reason)
+    Error(reason) -> classify_run_error(reason)
   }
 }
 
@@ -508,8 +564,9 @@ pub fn run_source(
             Error(e) -> Error(e)
             Ok(beam) ->
               case instantiate(beam, m.name) {
-                // An instantiation-time trap is a runtime outcome, not a compile error.
-                Error(reason) -> Ok(Trapped(reason))
+                // An instantiation-time trap / uncaught throw (e.g. a throwing `start`) is a
+                // runtime outcome, not a compile error — split exn vs trap identically (T8).
+                Error(reason) -> Ok(classify_run_error(reason))
                 Ok(proc) -> {
                   let result = invoke_instance(proc, export, args)
                   stop_instance(proc)

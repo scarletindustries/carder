@@ -15,8 +15,8 @@ import gleam/list
 import gleam/option
 import twocore/backend/core_erlang.{
   type CExpr, CApply, CAtom, CBinary, CCall, CCase, CClause, CCons, CFun, CInt,
-  CLet, CLetrec, CNil, CTuple, CValues, CVar, FName, FunDef, PAtom, PCons, PInt,
-  PNil, PTuple, PVar,
+  CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, FName, FunDef,
+  PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/backend/emit_core
 import twocore/ir
@@ -2416,4 +2416,215 @@ fn module_with_import(f: ir.Function, imp: ir.ImportDecl) -> ir.Module {
     start: option.None,
     tags: [],
   )
+}
+
+// ════════════════════ Phase-7 (P7-06): EH codegen AST goldens (T1/T5/T7) ════════════════════
+//
+// Structural, spec-cited (NOT change-detectors): each pattern-matches the emitted `core_erlang`
+// AST against the WebAssembly-EH-spec semantics the neutral IR models — `throw`=0x08 raises the
+// build-controlled `{wasm_exn, TagId, Payload}` term through the `rt_exn` chokepoint (T3/T7); a
+// `try` is a Core `try…catch` whose handler dispatches on the term shape via `rt_exn` helpers and
+// re-raises a non-match (spec §4.4.9); `catch_all` catches exceptions but NOT traps (T7). The tag
+// identity is a module-local `Int` used symmetrically at throw + catch (T4).
+
+/// The Phase-7 `rt_exn` chokepoint module atom (T3) — the ONE place the `{wasm_exn,…}` term shape
+/// lives; every EH seam call targets it.
+const eh_exn_module = "twocore@runtime@rt_exn"
+
+/// A one-function EH module: body `body` (result `[i32]`, param `a`), carrying `tags`, exported.
+fn eh_module(body: ir.Expr, tags: List(ir.TagDecl)) -> ir.Module {
+  ir.Module(
+    name: "twocore@test@eh",
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [],
+    functions: [ir.Function("f", [ir.Local("a", ir.TI32)], [ir.TI32], [], body)],
+    exports: [ir.ExportFn("f", "f")],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+    tags: tags,
+  )
+}
+
+/// The measured-Porffor tag shape at index 0 (`tag0` carrying one i32 operand, for the goldens).
+fn tag0() -> ir.TagDecl {
+  ir.TagDecl("tag0", [ir.TI32])
+}
+
+/// Extract the `CTry` from an EH function body. P7-06 HOISTS the protected body into a local
+/// nullary `letrec` (so the try's `Arg` is a single `apply` — the `ambiguous_catch_try_state`
+/// fix), so the emitted body is `letrec 'trybody'/0 = fun() -> <body> in <CTry>`.
+fn ctry_of(module: ir.Module) -> CExpr {
+  let assert CLetrec(_, ctry) = body_of(module, "f")
+  ctry
+}
+
+/// `throw tag0 (a, 195)` lowers to `call rt_exn:throw_exn(0, [a, 195])` — the module-local tag
+/// index (T4), the payload as an UN-interpreted operand LIST («PORFFOR-ABI»), bottom (drops
+/// `cont`, like `Trap`). Cite `throw`=0x08 + spec §4.4.9 (throw creates + unwinds).
+pub fn throw_lowers_to_rt_exn_throw_exn_test() {
+  let body = ir.Throw("tag0", [ir.Var("a"), ir.ConstI32(195)])
+  let assert CCall(CAtom(m), CAtom("throw_exn"), [CInt(0), payload]) =
+    body_of(eh_module(body, [ir.TagDecl("tag0", [ir.TI32, ir.TI32])]), "f")
+  assert m == eh_exn_module
+  // the payload is the operand value LIST `[a|[195|[]]]`, rendered verbatim (never interpreted).
+  assert payload == CCons(CVar("a"), CCons(CInt(195), CNil))
+}
+
+/// The tag identity is the module-local imports-first tag INDEX (T4): throwing the SECOND defined
+/// tag resolves to index `1`, not `0` — so throw + catch agree on one identity across the module.
+pub fn throw_resolves_module_local_tag_index_test() {
+  let body = ir.Throw("tag1", [ir.Var("a")])
+  let assert CCall(CAtom(_), CAtom("throw_exn"), [CInt(1), _]) =
+    body_of(
+      eh_module(body, [
+        ir.TagDecl("tag0", [ir.TI32]),
+        ir.TagDecl("tag1", [ir.TI32]),
+      ]),
+      "f",
+    )
+}
+
+/// A `Throw`/catch referencing an UNDECLARED tag is a typed `Error(UnknownTag)` — fail-closed,
+/// never a panic (D4). No `{wasm_exn, …}` term can be built without a resolved identity.
+pub fn throw_unknown_tag_is_error_test() {
+  assert emit_core.emit_module(eh_module(ir.Throw("nope", []), []), binding())
+    == Error(emit_core.UnknownTag("nope"))
+}
+
+/// `try` lowers to the Core `CTry`: a TRANSPARENT `of <v> -> v` success clause (every emitted expr
+/// is one packaged value, §C.1), THREE catch pattern vars `<C,R,S>`, and a handler that dispatches
+/// `case rt_exn:match_tag(R, 0) of {ok,[p]} -> <h> ; _ -> <reraise> end`. The re-raise faithfully
+/// rebuilds the stacktrace (`primop build_stacktrace`) before `rt_exn:reraise` (spec §4.4.9).
+pub fn try_lowers_to_ctry_with_tag_dispatch_test() {
+  let body =
+    ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("a")]), [
+      ir.CatchHandler(
+        ir.OnTag("tag0"),
+        ["p"],
+        option.None,
+        ir.Return([ir.Var("p")]),
+      ),
+    ])
+  let assert CTry(_arg, [v], CVar(vb), [c, r, s], handler) =
+    ctry_of(eh_module(body, [tag0()]))
+  // transparent success binder: `of <v> -> v`.
+  assert v == vb
+  // handler dispatch on the SAME tag identity (T4) via match_tag (T7).
+  let assert CCase(
+    CCall(CAtom(m0), CAtom("match_tag"), [CVar(r0), CInt(0)]),
+    [matched, default],
+  ) = handler
+  assert m0 == eh_exn_module
+  assert r0 == r
+  // matched clause: `{ok, [p]}` binds the payload operand directly (throw/catch arities agree).
+  let assert CClause(
+    [PTuple([PAtom("ok"), PCons(PVar("p"), PNil)])],
+    CAtom("true"),
+    _hbody,
+  ) = matched
+  // default clause: re-raise faithfully — build the stacktrace, then rt_exn:reraise(c, r, s').
+  let assert CClause([PVar(_)], CAtom("true"), reraise) = default
+  let assert CLet(
+    [stk],
+    CPrimop("build_stacktrace", [CVar(ss)]),
+    CCall(CAtom(mr), CAtom("reraise"), [CVar(cc), CVar(rr), CVar(stk2)]),
+  ) = reraise
+  assert ss == s
+  assert cc == c
+  assert rr == r
+  assert stk == stk2
+  assert mr == eh_exn_module
+}
+
+/// `catch_all` dispatches on `rt_exn:is_wasm_exn(R)` — the LOAD-BEARING rule (T7): it is `'true'`
+/// ONLY for a `{wasm_exn,_,_}`, never a `{wasm_trap,_}` trap / fuel raise, whose `'false'` falls
+/// to the re-raise default — so a trap PROPAGATES uncaught (structural: there is no `_ -> handler`
+/// clause that would swallow a trap). Cite spec §4.4 (traps are not catchable by handlers).
+pub fn catch_all_lowers_to_is_wasm_exn_test() {
+  let body =
+    ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("a")]), [
+      ir.CatchHandler(ir.OnAll, [], option.None, ir.Return([ir.ConstI32(42)])),
+    ])
+  let assert CTry(_, _, _, [_c, r, _s], handler) =
+    ctry_of(eh_module(body, [tag0()]))
+  let assert CCase(
+    CCall(CAtom(m), CAtom("is_wasm_exn"), [CVar(r0)]),
+    [
+      CClause([PAtom("true")], CAtom("true"), _h),
+      CClause([PAtom("false")], CAtom("true"), _default),
+    ],
+  ) = handler
+  assert m == eh_exn_module
+  assert r0 == r
+}
+
+/// Clause ORDER is preserved (spec: catches are tried in order): `[catch tag0, catch_all]` emits
+/// the `match_tag(_,0)` case OUTERMOST, whose `_` default is the `is_wasm_exn` (catch_all) case.
+pub fn catch_clause_order_preserved_test() {
+  let body =
+    ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("a")]), [
+      ir.CatchHandler(
+        ir.OnTag("tag0"),
+        ["p"],
+        option.None,
+        ir.Return([ir.Var("p")]),
+      ),
+      ir.CatchHandler(ir.OnAll, [], option.None, ir.Return([ir.ConstI32(0)])),
+    ])
+  let assert CTry(_, _, _, _, handler) = ctry_of(eh_module(body, [tag0()]))
+  let assert CCase(
+    CCall(_, CAtom("match_tag"), _),
+    [_matched, CClause(_, _, next)],
+  ) = handler
+  let assert CCase(CCall(_, CAtom("is_wasm_exn"), _), _) = next
+}
+
+/// A `catch_ref`/`catch_all_ref` clause CAPTURES the caught exception as an opaque `exnref` handle
+/// (`e = rt_exn:capture_exnref(R)`) before the handler runs (§E/T9 — forge-proof, Porffor-inert).
+pub fn catch_ref_captures_exnref_test() {
+  let body =
+    ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("a")]), [
+      ir.CatchHandler(
+        ir.OnTag("tag0"),
+        ["p"],
+        option.Some("e"),
+        ir.Return([ir.Var("p")]),
+      ),
+    ])
+  let assert CTry(_, _, _, [_c, r, _s], handler) =
+    ctry_of(eh_module(body, [tag0()]))
+  let assert CCase(_, [CClause(_, _, hbody), _]) = handler
+  let assert CLet(
+    ["e"],
+    CCall(CAtom(m), CAtom("capture_exnref"), [CVar(r0)]),
+    _,
+  ) = hbody
+  assert m == eh_exn_module
+  assert r0 == r
+}
+
+/// `throw_ref e` lowers to `call rt_exn:throw_ref(e)` — bottom (drops `cont`), re-raising the
+/// captured exception (throw_ref=0x0A + exnref opacity, T9).
+pub fn throw_ref_lowers_to_rt_exn_throw_ref_test() {
+  let assert CCall(CAtom(m), CAtom("throw_ref"), [CVar("e")]) =
+    body_of(eh_module(ir.ThrowRef(ir.Var("e")), []), "f")
+  assert m == eh_exn_module
+}
+
+/// J6 byte-identity: a TAG-FREE module emits NO `CTry` and NO `rt_exn` call — its function body is
+/// exactly the Phase-6 `CVar("a")` (a plain `Return([a])`), unchanged. The EH arms are unreached.
+pub fn tag_free_module_is_byte_identical_test() {
+  let m =
+    module_with(ir.Function(
+      "f",
+      [ir.Local("a", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Return([ir.Var("a")]),
+    ))
+  let assert CVar("a") = body_of(m, "f")
 }

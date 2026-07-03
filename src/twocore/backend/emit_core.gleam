@@ -84,8 +84,8 @@ import gleam/string
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CAtom, CBinary, CBitSeg, CCall, CCase, CClause, CCons,
-  CFun, CInt, CLet, CLetrec, CNil, CTuple, CValues, CVar, FName, FunDef, PAtom,
-  PCons, PInt, PNil, PTuple, PVar,
+  CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, FName,
+  FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/ir.{
   type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
@@ -136,6 +136,17 @@ const link_module = "twocore@runtime@link"
 /// else, I3/I8.)
 const simd_module = "twocore@runtime@rt_simd"
 
+/// The tagged-exception runtime module (`runtime/rt_exn` → `twocore@runtime@rt_exn`, J1/T3).
+/// The EH binding chokepoint — every `Throw`/`Try`/`ThrowRef` seam call targets it
+/// (`throw_exn`/`match_tag`/`is_wasm_exn`/`reraise`/`capture_exnref`/`throw_ref`, the ONE place
+/// the `{wasm_exn, …}` term shape lives — T7/D3b). A fixed build-controlled atom (D3a); like
+/// `rt_ref`/`link`/`rt_simd` the keystone did not add a `binding.exn_module` field (there is no
+/// alternate exception backend to tier-swap, D2), so this literal is its home and it is admitted
+/// by the security walk's allow-set exactly like a `binding.*_module`. `erlang:throw`/
+/// `erlang:raise/3` live INSIDE `rt_exn`, never in generated code — the homogeneous twocore-only
+/// allow-set (S5, no `erlang` entry).
+const exn_module = "twocore@runtime@rt_exn"
+
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
 /// This stage's own error type (D4 — there is no shared `StageError`). `emit_module`
@@ -167,6 +178,12 @@ pub type EmitError {
   UnboundLabel(label: String)
   UnknownFunction(name: String)
   NonConstInit(detail: String)
+  /// A `Throw`/`Try` catch clause referencing a tag NAME the module does not declare
+  /// (neither in `Module.tags` nor as an imported `ImportTag`, T4). Fail-closed — the tag's
+  /// module-local `Int` identity cannot be resolved, so no `{wasm_exn, TagId, …}` term can be
+  /// built. Validation upstream already resolves tag references; this is the backend defence
+  /// (never a panic).
+  UnknownTag(name: String)
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -209,6 +226,12 @@ type Ctx {
     elements: List(ir.ElementSegment),
     data_segments: List(ir.DataSegment),
     ref_global_names: Set(String),
+    /// Each exception-tag NAME → its module-local `Int` identity (its absolute tagidx in the
+    /// imports-first tag-index space, T4). `Throw(tag)` resolves to `rt_exn:throw_exn(<idx>, …)`
+    /// and a `CatchTag.OnTag(tag)` dispatches on the SAME `<idx>` via `rt_exn:match_tag(R, <idx>)`,
+    /// so throw and catch agree on ONE identity (the spec tag-identity match, §4.5). Empty for a
+    /// tag-free module (no `Throw`/`Try` ever resolves) — inert, byte-identical to Phase 6.
+    tag_index: Dict(String, Int),
   )
 }
 
@@ -350,6 +373,7 @@ pub fn emit_module(
       elements: module.elements,
       data_segments: module.data_segments,
       ref_global_names: reference_global_names(module),
+      tag_index: build_tag_index(module),
     )
   use defs <- result.try(
     list.try_map(module.functions, fn(f) { emit_function(f, ctx) }),
@@ -652,6 +676,35 @@ fn build_table_index(module: Module) -> Dict(String, Int) {
   dict.from_list(list.append(list.reverse(imported), defined))
 }
 
+/// Build the tag NAME → module-local `Int` identity map over the imports-first tag-index space
+/// (spec §2.5.1: imports precede definitions — the same discipline as tables/globals, T4).
+/// Imported tags (`ImportTag`) occupy the low indices in import order (named `tag<k>`, the
+/// `lower` convention); then `module.tags` continue at `imported_tag_count + i` (their
+/// `TagDecl.name` is already `tag<abs>`). A `Throw`/`OnTag` resolving a same-module tag maps to
+/// this `Int` symmetrically at throw + catch. Empty for a tag-free module (no `ImportTag`, no
+/// `tags`) → inert, byte-identical to Phase 6.
+fn build_tag_index(module: Module) -> Dict(String, Int) {
+  let #(imported, itc) =
+    list.fold(module.imports, #([], 0), fn(acc, imp) {
+      let #(pairs, k) = acc
+      case imp {
+        ir.ImportTag(..) -> #([#("tag" <> int.to_string(k), k), ..pairs], k + 1)
+        _ -> #(pairs, k)
+      }
+    })
+  let defined = list.index_map(module.tags, fn(t, i) { #(t.name, itc + i) })
+  dict.from_list(list.append(list.reverse(imported), defined))
+}
+
+/// Resolve an exception-tag NAME to its module-local `Int` identity (T4), or `Error(UnknownTag)`
+/// if the module declares no such tag (fail-closed — validation guarantees the name exists).
+fn resolve_tag(ctx: Ctx, name: String) -> Result(Int, EmitError) {
+  case dict.get(ctx.tag_index, name) {
+    Ok(i) -> Ok(i)
+    Error(_) -> Error(UnknownTag(name))
+  }
+}
+
 /// The set of BOXED global NAMES — reference (funcref/externref, R8) AND `v128` (S6) — the union of
 /// imported boxed globals (named `g<idx>` in imports-first order) and defined boxed globals
 /// (`GlobalDecl.name`). Used so `ExportGlobal` and the op-site `global.get`/`global.set` route a
@@ -817,6 +870,13 @@ fn expr_touches_state(expr: Expr) -> Bool {
     Block(_, _, body) -> expr_touches_state(body)
     Loop(_, _, _, body) -> expr_touches_state(body)
     Charge(_, body) -> expr_touches_state(body)
+    // Phase-7 (T6): a `Try` around a state-touching body is state-reaching — RECURSE into the
+    // body + each handler (like `Block`/`If`). `Throw`/`ThrowRef` carry NO state in the thrown
+    // term (Cell-only), so they are NOT seeds (fall to `_ -> False`). A tag-free module has none
+    // of these, so its classification is byte-identical to Phase 6.
+    ir.Try(_, body, handlers) ->
+      expr_touches_state(body)
+      || list.any(handlers, fn(h) { expr_touches_state(h.handler) })
     _ -> False
   }
 }
@@ -840,6 +900,13 @@ fn direct_callees(expr: Expr, acc: Set(String)) -> Set(String) {
     Block(_, _, body) -> direct_callees(body, acc)
     Loop(_, _, _, body) -> direct_callees(body, acc)
     Charge(_, body) -> direct_callees(body, acc)
+    // Phase-7: a `CallDirect` inside a `Try` body or handler is a real call-graph edge — RECURSE
+    // (like `Block`/`Loop`). `Throw`/`ThrowRef`'s operands are atomic `Value`s (no call), so they
+    // fall to `_ -> acc`.
+    ir.Try(_, body, handlers) -> {
+      let acc = direct_callees(body, acc)
+      list.fold(handlers, acc, fn(a, h) { direct_callees(h.handler, a) })
+    }
     _ -> acc
   }
 }
@@ -977,13 +1044,14 @@ fn emit(
     // an ambient `apply` of a data-named `module:atom` — D3a). ──
     ir.CallImport(slot, ty, args) ->
       emit_call_import(slot, ty, args, cont, sc, state, ctx)
-    // ── Phase-7 EH nodes (§J/T5): the keystone lands these as a typed `UnsupportedNode` — no
-    // module carries a tag until P7-05 lowers them, so these arms are UNREACHED and the tree
-    // stays byte-identical. P7-06 replaces them with the real `try…catch` / `rt_exn` codegen
-    // (adding the `CTry` Core Erlang construct — the keystone does NOT add `CTry`, T5). ──
-    ir.Throw(_, _) -> Error(UnsupportedNode("throw"))
-    ir.Try(_, _, _) -> Error(UnsupportedNode("try"))
-    ir.ThrowRef(_) -> Error(UnsupportedNode("throw_ref"))
+    // ── Phase-7 EH nodes (§J/T1/T5/T7): BEAM-native exceptions through the `rt_exn` chokepoint.
+    // `Throw`/`ThrowRef` are BOTTOM transfers (like `Trap`/`Return`) — they drop `cont`; `Try`
+    // installs a Core Erlang `try…catch` (the `CTry` node) around its body. EH ships CELL-ONLY
+    // (T6): no state travels in the thrown term. A tag-free module reaches NONE of these. ──
+    ir.Throw(tag, args) -> emit_throw(tag, args, state, ctx)
+    ir.Try(result, body, handlers) ->
+      emit_try(result, body, handlers, cont, sc, state, ctx)
+    ir.ThrowRef(exnref) -> emit_throw_ref(exnref, state)
     // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
     // boxing `Convert`s remain unlowered (still a later-phase deferral).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
@@ -3567,6 +3635,200 @@ fn emit_charge(
   let charge_call =
     CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
   Ok(#(CLet([wild], charge_call, body_c), state3))
+}
+
+// ─────────────────────────── Phase-7 exception handling (§J/T1/T5/T7) ───────────────────────────
+
+/// Lower `Throw(tag, args)` — a BEAM-native raise of the build-controlled `{wasm_exn, TagId,
+/// Payload}` term through the `rt_exn` chokepoint (J1/D3a). BOTTOM: never returns, so `cont` is
+/// dropped (exactly like `Trap`). Emits `call '<rt_exn>':'throw_exn'(<tag_index>, [args…])`, where
+/// `tag_index` is the tag's module-local `Int` identity (T4, resolved from `Module.tags`) and the
+/// payload is the operand value LIST — rendered, never interpreted (the `(f64,i32)` pair rides
+/// opaquely, «PORFFOR-ABI»). Cell-only (T6): no state travels in the term, so `sc` is irrelevant.
+/// `Error(UnknownTag)` if the module declares no such tag.
+fn emit_throw(
+  tag: String,
+  args: List(Value),
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use tag_id <- result.try(resolve_tag(ctx, tag))
+  let payload = core_list(list.map(args, emit_value))
+  Ok(#(seam_call(exn_module, "throw_exn", [CInt(tag_id), payload]), state))
+}
+
+/// Lower `ThrowRef(exnref)` — re-raise the exception captured in `exnref` (J1/T9). BOTTOM (never
+/// returns), so `cont` is dropped. Emits `call '<rt_exn>':'throw_ref'(<exnref>)`; `rt_exn` unboxes
+/// `{ref_exn, Reason}` and re-raises (a null exnref traps, owned by `rt_exn`). State-neutral.
+/// Porffor-INERT (spec-conformance surface only).
+fn emit_throw_ref(
+  exnref: Value,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  Ok(#(seam_call(exn_module, "throw_ref", [emit_value(exnref)]), state))
+}
+
+/// Lower `Try(result, body, handlers)` to a BEAM-native `try … catch` (the `CTry` node, J1/§C).
+///
+/// `body` is emitted under the (materialised) OUTER continuation `exit_cont`, so its normal
+/// completion / `br`-to-enclosing / `return` dispose through `cont` AS TODAY and the `of <V> -> V`
+/// clause is a TRANSPARENT pass-through (sound because every emitted expr reduces to ONE packaged
+/// value — §C.1). The `catch <C,R,S>` handler (`try_dispatch`) matches the thrown tag against
+/// `handlers` in order via the `rt_exn` helpers, transfers a matching handler (its result also
+/// disposing through `exit_cont` — so it yields the try's `result`), and re-raises a non-match
+/// (T7). Constant-space + the result arity are preserved. Cell-only (T6): the same `sc` flows to
+/// the handler (no state travels in the throw — Threaded+EH is a categorised-unsupported combo).
+fn emit_try(
+  result: List(ValType),
+  body: Expr,
+  handlers: List(ir.CatchHandler),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use #(join, exit_cont, s1) <- result.try(materialize(
+    cont,
+    list.length(result),
+    sc,
+    state,
+    ctx,
+  ))
+  use #(body_c, s2) <- result.try(emit(body, exit_cont, sc, s1, ctx))
+  // Hoist the protected body into a local NULLARY function so the try's `Arg` is a SINGLE
+  // `apply 'trybody'/0()` (a closure over the try-site scope). This is required for correctness,
+  // not cosmetics: a trapping op inside the body emits a `case`-and-raise, and a `case` whose
+  // branch raises sitting DIRECTLY in a try `Arg` together with the handler's own `case` makes the
+  // BEAM validator reject the module (`ambiguous_catch_try_state` — empirically verified). Routing
+  // the body through a single `apply` (whose exceptions the try still catches, exactly as for a
+  // bare `Throw` call) sidesteps it. `trybody` sits lexically inside the join `letrec` (via
+  // `wrap_join`), so a `br`-to-enclosing (`apply J`) inside the body still resolves.
+  let #(bname, s2b) = fresh_fn(s2)
+  let body_fn = FName(bname, 0)
+  let body_def = FunDef(body_fn, CFun([], body_c))
+  // The single transparent success binder (§C.1) + the three exception pattern variables.
+  let #(vv, s3) = fresh_var(s2b)
+  let #(cvar, s4) = fresh_var(s3)
+  let #(rvar, s5) = fresh_var(s4)
+  let #(svar, s6) = fresh_var(s5)
+  use #(handler_c, s7) <- result.try(try_dispatch(
+    handlers,
+    cvar,
+    rvar,
+    svar,
+    exit_cont,
+    sc,
+    s6,
+    ctx,
+  ))
+  let ctry =
+    CTry(
+      arg: CApply(body_fn, []),
+      body_vars: [vv],
+      body: CVar(vv),
+      evars: [cvar, rvar, svar],
+      handler: handler_c,
+    )
+  Ok(#(wrap_join(join, CLetrec([body_def], ctry)), s7))
+}
+
+/// Build the `catch <C,R,S>` handler body for a `Try`'s clauses (§C.3, `Produces` #2): a chain of
+/// `case`s, ONE per `CatchHandler` in order, ending in a re-raise default. Each `OnTag(t)` clause
+/// tests `rt_exn:match_tag(R, <t index>)` (matched → the payload bound + the handler; else the
+/// next clause); each `OnAll` clause tests `rt_exn:is_wasm_exn(R)` (`'true'` → the handler; else
+/// next). The final default re-raises via `rt_exn:reraise(C, R, <built stacktrace>)` — so a wrong
+/// tag AND any trap `{wasm_trap,_}` / fuel raise PROPAGATE uncaught (T7 — the load-bearing rule
+/// that `catch_all` catches exceptions but NOT traps, enforced by `is_wasm_exn`). The stacktrace
+/// is rebuilt via `primop 'build_stacktrace'` (verified: `erlang:raise/3` on the raw catch token
+/// returns `badarg`). D3a: every reach is a fixed-atom `rt_exn` seam call — no `erlang:*` emitted.
+fn try_dispatch(
+  handlers: List(ir.CatchHandler),
+  cvar: String,
+  rvar: String,
+  svar: String,
+  exit_cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(stk_var, state1) = fresh_var(state)
+  let reraise =
+    CLet(
+      [stk_var],
+      CPrimop("build_stacktrace", [CVar(svar)]),
+      seam_call(exn_module, "reraise", [
+        CVar(cvar),
+        CVar(rvar),
+        CVar(stk_var),
+      ]),
+    )
+  // Fold from the LAST handler inward so the FIRST handler becomes the OUTERMOST case (clause
+  // order preserved — a `catch $t` before a `catch_all` tests the tag first).
+  list.try_fold(list.reverse(handlers), #(reraise, state1), fn(acc, h) {
+    let #(next, st) = acc
+    emit_catch_clause(h, rvar, next, exit_cont, sc, st, ctx)
+  })
+}
+
+/// Emit ONE catch clause of the `try_dispatch` chain: `case <test> of <matched> -> <handler> ;
+/// <_> -> <next> end`. The handler `Expr` is emitted under the try's `exit_cont` (so it yields the
+/// try's result, composing with the label-continuation machinery — a modern Break/Continue/Return
+/// transfer or a legacy inline handler); its payload names bind from the matched term, and an
+/// `exnref` (if any) is captured via `rt_exn:capture_exnref(R)` before the handler runs (§E).
+fn emit_catch_clause(
+  h: ir.CatchHandler,
+  rvar: String,
+  next: CExpr,
+  exit_cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let ir.CatchHandler(on, payload, exnref, hexpr) = h
+  use #(hbody0, state1) <- result.try(emit(hexpr, exit_cont, sc, state, ctx))
+  // Capture the caught exception as an opaque `exnref` handle if the handler binds one (T9).
+  let hbody = case exnref {
+    Some(name) ->
+      CLet(
+        [name],
+        seam_call(exn_module, "capture_exnref", [CVar(rvar)]),
+        hbody0,
+      )
+    None -> hbody0
+  }
+  case on {
+    // `catch $t` — match the SAME module-local tag identity throw used (T4); the matched clause
+    // binds the payload operands directly (`{ok, [P0,P1,…]}`), so throw/catch arities agree.
+    ir.OnTag(tag) -> {
+      use tag_id <- result.try(resolve_tag(ctx, tag))
+      let match = seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
+      let #(wild, state2) = fresh_var(state1)
+      Ok(#(
+        CCase(match, [
+          CClause(
+            [PTuple([PAtom("ok"), list_pattern(payload)])],
+            CAtom("true"),
+            hbody,
+          ),
+          CClause([PVar(wild)], CAtom("true"), next),
+        ]),
+        state2,
+      ))
+    }
+    // `catch_all` — catch ANY wasm exception but NOT a trap (T7): `is_wasm_exn` is `'false'` for a
+    // `{wasm_trap,_}` / fuel raise, which falls to `next` (ultimately the re-raise), so a trap
+    // propagates through the region untouched. No payload is bound.
+    ir.OnAll -> {
+      let is_exn = seam_call(exn_module, "is_wasm_exn", [CVar(rvar)])
+      Ok(#(
+        CCase(is_exn, [
+          CClause([PAtom("true")], CAtom("true"), hbody),
+          CClause([PAtom("false")], CAtom("true"), next),
+        ]),
+        state1,
+      ))
+    }
+  }
 }
 
 // ─────────────────────────────── values ───────────────────────────────

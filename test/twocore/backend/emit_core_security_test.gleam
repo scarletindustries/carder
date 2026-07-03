@@ -22,7 +22,7 @@ import gleam/option
 import gleam/set.{type Set}
 import twocore/backend/core_erlang.{
   type CExpr, type CModule, CApply, CAtom, CCall, CCase, CClause, CCons, CFun,
-  CLet, CLetrec, CTuple, CValues, FunDef,
+  CLet, CLetrec, CPrimop, CTry, CTuple, CValues, FunDef,
 }
 import twocore/backend/emit_core
 import twocore/ir
@@ -53,6 +53,11 @@ fn runtime_modules(b: instance.Binding) -> Set(String) {
     // through the already-admitted `link.call_import` (S5 — a homogeneous twocore-only allow-set;
     // there is deliberately NO `erlang` entry, since no `erlang:apply` is emitted).
     "twocore@runtime@rt_simd",
+    // Phase-7 (P7-06): the tagged-exception chokepoint — a fixed build-controlled atom `emit_core`
+    // reaches WITHOUT a `Binding` field (like `rt_ref`/`link`/`rt_simd`), admitted here exactly
+    // like a `binding.*_module` (D3a). `erlang:throw`/`erlang:raise/3` live INSIDE `rt_exn`, never
+    // in generated code, so there is still deliberately NO `erlang` entry (homogeneous, S5).
+    "twocore@runtime@rt_exn",
   ])
 }
 
@@ -89,6 +94,13 @@ fn children(e: CExpr) -> List(CExpr) {
     CCons(h, t) -> [h, t]
     CTuple(xs) -> xs
     CValues(xs) -> xs
+    // Phase-7 (P7-06): the `try…catch` node MUST be walked — a `CCall` inside the protected `arg`,
+    // the success `body`, or the catch `handler` would otherwise ESCAPE the D3a walk (a fail-OPEN
+    // hole in the security test itself, §G). The `body_vars`/`evars` are binders (no sub-exprs).
+    CTry(arg, _, body, _, handler) -> [arg, body, handler]
+    // A compiler primop's args are ordinary sub-exprs (the re-raise's `build_stacktrace(S)`) —
+    // walked defensively so a future `CCall` inside a primop arg is reached too.
+    CPrimop(_, args) -> args
     _ -> []
   }
 }
@@ -785,5 +797,98 @@ fn erlang_calls(m: CModule) -> List(#(CExpr, CExpr)) {
   |> list.filter(fn(pair) {
     let #(mod, _f) = pair
     mod == CAtom("erlang")
+  })
+}
+
+/// A Phase-7 module exercising the WHOLE new EH authority surface (P7-06 §G): a `throw` (the raise
+/// chokepoint), a MULTI-clause `try` (`catch $t0` + `catch_ref $t1` + `catch_all` + the implicit
+/// re-raise), and a `throw_ref` (re-raise a captured exnref) — so every emitted EH `call` is
+/// covered under the D3a walk, INCLUDING calls buried inside the try body + handler dispatch.
+fn p7_eh_module() -> ir.Module {
+  let handlers = [
+    // catch $t0 — recover the payload.
+    ir.CatchHandler(
+      ir.OnTag("tag0"),
+      ["p"],
+      option.None,
+      ir.Return([ir.Var("p")]),
+    ),
+    // catch_ref $t1 — capture an exnref, then throw_ref it (re-raise).
+    ir.CatchHandler(
+      ir.OnTag("tag1"),
+      ["q"],
+      option.Some("e"),
+      ir.ThrowRef(ir.Var("e")),
+    ),
+    // catch_all — recover a constant (catches any wasm exn, NOT a trap).
+    ir.CatchHandler(ir.OnAll, [], option.None, ir.Return([ir.ConstI32(0)])),
+  ]
+  let f =
+    ir.Function(
+      "f",
+      [ir.Local("a", ir.TI32)],
+      [ir.TI32],
+      [],
+      ir.Try([ir.TI32], ir.Throw("tag0", [ir.Var("a")]), handlers),
+    )
+  ir.Module(
+    name: "twocore@test@p7eh",
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [],
+    functions: [f],
+    exports: [ir.ExportFn("f", "f")],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+    tags: [ir.TagDecl("tag0", [ir.TI32]), ir.TagDecl("tag1", [ir.TI32])],
+  )
+}
+
+/// EXTENDED D3a security invariant for the Phase-7 EH surface (P7-06 §G): a `throw`, a multi-clause
+/// `try` (`catch` + `catch_ref` + `catch_all` + re-raise), and a `throw_ref`, under Cell, Threaded,
+/// AND the Unsafe posture — all still ambient-free. (a) every `call` targets a fixed allow-set
+/// runtime atom (now including `rt_exn`) with a literal function; (b) every `apply` is a static
+/// local `FName`; (c) NO `erlang:*` call is emitted — the raise / catch-dispatch / re-raise /
+/// exnref-capture ALL route through `rt_exn` (`erlang:throw`/`raise/3` live inside it, homogeneous
+/// allow-set, S5); (d) the EH seams are delegated to `rt_exn`. Because the `throw_exn` lives in the
+/// try's protected ARG and `capture_exnref`/`reraise` live INSIDE the catch handler, asserting them
+/// present is also the regression guard that the `children` walk descends into the `CTry` (§G).
+pub fn phase7_eh_ops_have_no_ambient_authority_test() {
+  let cell = instance.safe_default()
+  let threaded =
+    instance.Binding(
+      ..instance.safe_default(),
+      state_strategy: instance.Threaded,
+    )
+  let unsafe = profiles.unsafe()
+  list.each([cell, threaded, unsafe], fn(binding) {
+    let assert Ok(m) = emit_core.emit_module(p7_eh_module(), binding)
+    // (a) every call → a fixed runtime/allow-set module + literal function atom.
+    assert_calls_are_runtime(m, binding)
+    // (b) every apply → a static local FName, never a runtime-module atom.
+    let allowed = runtime_modules(binding)
+    let applies =
+      list.flat_map(m.defs, fn(d) {
+        let core_erlang.FunDef(_, v) = d
+        applies_in(v)
+      })
+    list.each(applies, fn(name) {
+      let core_erlang.FName(n, _arity) = name
+      assert set.contains(allowed, n) == False
+    })
+    // (c) NO `erlang:*` is emitted — the whole EH authority routes through `rt_exn` (S5).
+    assert has_call(m, "erlang", "apply") == False
+    assert erlang_calls(m) == []
+    // (d) the EH seams are delegated to `rt_exn` — reached INSIDE the CTry arg + handler (the
+    // `children`-walk regression guard: a missing `CTry` arm makes these `has_call`s FALSE).
+    assert has_call(m, "twocore@runtime@rt_exn", "throw_exn")
+    assert has_call(m, "twocore@runtime@rt_exn", "match_tag")
+    assert has_call(m, "twocore@runtime@rt_exn", "is_wasm_exn")
+    assert has_call(m, "twocore@runtime@rt_exn", "reraise")
+    assert has_call(m, "twocore@runtime@rt_exn", "capture_exnref")
+    assert has_call(m, "twocore@runtime@rt_exn", "throw_ref")
   })
 }
