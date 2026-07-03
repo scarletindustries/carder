@@ -54,15 +54,38 @@
 //// byte-identical IR3 (H7): every new immediate defaults away (`mem: 0`, `FuncRef`,
 //// `ElemActive`/`DataActive`).
 ////
-//// **memory64 (R12).** A 64-bit memory (`Idx64`, from the limits index-type flag)
-//// decodes and validates, but lower **rejects** it with `Error(Memory64Unsupported)` —
-//// the `Idx64` runtime is deferred to Phase 6. The IR `IdxType` axis stays frozen.
+//// Phase 6 (unit P6-05) closes the three deferred holes (I1–I5):
 ////
-//// Still out of scope (returns a typed `LowerError`, never a panic): SIMD (`v128` +
-//// lane ops) and the GC-proposal reference types (`Error(Unsupported(_))`); a 64-bit
-//// memory (`Error(Memory64Unsupported)`); and any const-expr that is not a single
-//// `t.const` / `ref.func` / `ref.null` / `global.get` (`Error(NonConstInitExpr)` —
-//// extended-const arithmetic chains stay rejected).
+//// 1. **SIMD.** Every standardized `v128` lane instruction lowers into IR4 — `ast.Simd(op)`
+////    relabels to `ir.Simd(<neutral op>, args)` (the parametric keystone `ir.SimdOp`; float
+////    ops gain the `SF` prefix, the widen/narrow/extmul/pairwise families copy their
+////    `from`/`half`/`signed` fields — S3), `ast.V128Const(bytes)` pushes a `ConstV128(bytes)`
+////    value literal (like a numeric const — D5, splat/const are not trapping),
+////    `ast.I8x16Shuffle` → the dedicated `SimdShuffle(lanes, a, b)` node, and the four
+////    SIMD-memory instructions → the `SimdLoad`/`SimdStore`/`SimdLoadLane`/`SimdStoreLane`
+////    `Expr` nodes (memidx + BITS width (S2) + static offset + lane threaded), routed
+////    downstream (06/07) through the bounds-checked `rt_mem` seam. The pure lane ops bind a
+////    fresh name via `emit_value_op_t` (like `Num`); the two stores are zero-result effects.
+////
+//// 2. **memory64 (I4).** The 64-bit-memory rejection is GONE: a 64-bit memory decodes,
+////    validates, and now **lowers**, carrying `Idx64` on `MemoryDecl`/`ImportMemory` (via
+////    `to_ir_idxtype`). The i64 address operands flow through the memory nodes unchanged (no
+////    width branch in any arm — the width is a per-memory `idx_type` fact emit_core derives
+////    from the node's `mem` index, keeping a 32-bit memory byte-identical). The page cap is a
+////    runtime trap boundary (a `Binding` field), never lower's concern.
+////
+//// 3. **Cross-module function imports (I5/S5).** A `call` of an imported function (funcidx
+////    `< imported`) lowers to `ir.CallImport(slot, ty, args)` — the positional function-import
+////    slot (= the funcidx, since function imports occupy the low funcidx range) + the import's
+////    signature. emit_core dispatches it via the linker-built closure capability
+////    (`link.call_import`), never an ambient `apply` of an attacker-named `module:atom` (D3a).
+////    A same-module call stays `CallDirect`.
+////
+//// Still out of scope (returns a typed `LowerError`, never a panic): relaxed-SIMD (the
+//// separate non-deterministic proposal) and the GC-proposal reference types
+//// (`Error(Unsupported(_))`); and any const-expr that is not a single `t.const` / `v128.const`
+//// / `ref.func` / `ref.null` / `global.get` (`Error(NonConstInitExpr)` — extended-const
+//// arithmetic chains stay rejected).
 
 import gleam/dict.{type Dict}
 import gleam/int
@@ -89,14 +112,14 @@ import twocore/ir
 ///   of range (validation should have caught it; kept so lowering is total).
 /// - `NonConstInitExpr(detail)`: a global init / element-item / element-or-data offset
 ///   constant expression outside the admissible const-expr grammar. Phase 5 accepts a
-///   single `t.const` / `ref.func` / `ref.null` / `global.get` (of an immutable imported
-///   global); an extended-const arithmetic chain (a separate proposal) is rejected here —
-///   validation already blocks it, this is fail-closed insurance. `detail` is a stable tag.
-/// - `Memory64Unsupported`: the module declares (or imports) a 64-bit-indexed memory
-///   (`Idx64`, memory64). Decode/validate accept it so a genuinely-invalid memory64
-///   module still fails `assert_invalid`, but the `Idx64` **runtime is deferred to Phase
-///   6** (R12), so lower stops here rather than mis-lower i64 addressing. The conformance
-///   harness reports the module as a categorized skip (`memory64 runtime → Phase 6`).
+///   single `t.const` / `v128.const` / `ref.func` / `ref.null` / `global.get` (of an
+///   immutable imported global); an extended-const arithmetic chain (a separate proposal) is
+///   rejected here — validation already blocks it, this is fail-closed insurance. `detail` is
+///   a stable tag.
+///
+/// Phase 6 (P6-05) REMOVED `Memory64Unsupported`: a 64-bit-indexed memory now lowers (I4), so
+/// nothing produces that variant. The conformance harness's `memory64 runtime → Phase 6`
+/// categorized skip is likewise retired (P6-10).
 pub type LowerError {
   Unsupported(detail: String)
   StackUnderflow
@@ -105,7 +128,6 @@ pub type LowerError {
   UnknownTypeIndex(index: Int)
   UnknownFuncIndex(index: Int)
   NonConstInitExpr(detail: String)
-  Memory64Unsupported
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -216,10 +238,6 @@ type GoResult {
 /// (`NonConstInitExpr`).
 pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
   let module = typed.module
-  // memory64's runtime is deferred to Phase 6 (R12): reject a 64-bit memory here rather
-  // than mis-lower i64 addressing. Decode/validate already accepted it, so a genuinely
-  // invalid memory64 module still fails `assert_invalid` upstream.
-  use _ <- result.try(reject_memory64(module))
   use functions <- result.try(
     list.index_map(module.funcs, fn(f, i) { lower_func(f, i, typed) })
     |> result.all,
@@ -253,24 +271,6 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
     elements: elements,
     start: lower_start(module),
   ))
-}
-
-/// Reject a module that declares or imports a 64-bit-indexed memory (`Idx64`, memory64)
-/// with `Error(Memory64Unsupported)` (R12 — the `Idx64` runtime is deferred to Phase 6).
-/// A 32-bit-only module returns `Ok(Nil)` (byte-identical to Phase 4).
-fn reject_memory64(module: ast.Module) -> Result(Nil, LowerError) {
-  let defined = list.map(module.memories, fn(m) { m.idx_type })
-  let imported =
-    list.filter_map(module.imports, fn(imp) {
-      case imp.desc {
-        ast.ImportMemory(mt) -> Ok(mt.idx_type)
-        _ -> Error(Nil)
-      }
-    })
-  case list.any(list.append(imported, defined), fn(it) { it == ast.Idx64 }) {
-    True -> Error(Memory64Unsupported)
-    False -> Ok(Nil)
-  }
 }
 
 /// A sanitised base for the IR module name, derived from the first function export
@@ -859,6 +859,117 @@ fn go(
         ast.DataDrop(data) ->
           emit_effect(0, fn(_) { ir.DataDrop(data) }, tail, ctx, st)
 
+        // ── Phase-6 SIMD (0xFD family; I1/I2) — spec exec/instructions §vector ──
+        // `v128.const` is a value literal (like a numeric const, D5): push `ConstV128(bytes)`
+        // — no `Let`, no `Expr` (splat/const are not trapping). The 16 raw little-endian bytes
+        // flow verbatim from decode (P6-03).
+        ast.V128Const(bytes) -> go(tail, ctx, push(st, ir.ConstV128(bytes)))
+        // Every pure lane-wise op relabels to the neutral `ir.SimdOp` and routes through the
+        // shared `emit_value_op_t` path (its arity + result type derived from the op — §C/§D/§E).
+        ast.Simd(op) -> lower_simd(op, tail, ctx, st)
+        // `i8x16.shuffle` — a dedicated node carrying its 16 static lane indices (verbatim from
+        // decode; validate range-checked them 0..31). Stack `[v128 v128] → [v128]`, operands
+        // `[a, b]` (a deeper, b on top) select bytes from `a ++ b`.
+        ast.I8x16Shuffle(lanes) ->
+          emit_value_op_t(
+            2,
+            ir.TV128,
+            fn(args) {
+              case args {
+                [a, b] -> ir.SimdShuffle(lanes, a, b)
+                _ -> ir.SimdShuffle(lanes, zv128(), zv128())
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        // SIMD memory (§F) — the four dedicated `rt_mem`-routed nodes. Loads produce a v128
+        // (bound via `emit_value_op_t`); stores are zero-result effects (`emit_effect`, never
+        // dropped — I6). Each carries the memidx (`arg.mem`, default 0 → byte-identical), the
+        // static `arg.offset`, and (lane ops) the BITS width (S2) + lane immediate. The address
+        // operand is whatever the SSA stack holds — an i32 for a 32-bit memory, an i64 for a
+        // 64-bit memory (validate typed it), forwarded unchanged (no width branch — §G).
+        ast.SimdLoad(kind, arg) ->
+          emit_value_op_t(
+            1,
+            ir.TV128,
+            fn(args) {
+              case args {
+                [addr] ->
+                  ir.SimdLoad(
+                    arg.mem,
+                    relabel_load_kind(kind),
+                    addr,
+                    arg.offset,
+                  )
+                _ ->
+                  ir.SimdLoad(arg.mem, relabel_load_kind(kind), z(), arg.offset)
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.SimdStore(arg) ->
+          emit_effect(
+            2,
+            fn(args) {
+              case args {
+                [addr, value] -> ir.SimdStore(arg.mem, addr, value, arg.offset)
+                _ -> ir.SimdStore(arg.mem, z(), zv128(), arg.offset)
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.SimdLoadLane(width, arg, lane) ->
+          emit_value_op_t(
+            2,
+            ir.TV128,
+            fn(args) {
+              case args {
+                [addr, vec] ->
+                  ir.SimdLoadLane(arg.mem, width, addr, arg.offset, lane, vec)
+                _ ->
+                  ir.SimdLoadLane(
+                    arg.mem,
+                    width,
+                    z(),
+                    arg.offset,
+                    lane,
+                    zv128(),
+                  )
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+        ast.SimdStoreLane(width, arg, lane) ->
+          emit_effect(
+            2,
+            fn(args) {
+              case args {
+                [addr, vec] ->
+                  ir.SimdStoreLane(arg.mem, width, addr, arg.offset, lane, vec)
+                _ ->
+                  ir.SimdStoreLane(
+                    arg.mem,
+                    width,
+                    z(),
+                    arg.offset,
+                    lane,
+                    zv128(),
+                  )
+              }
+            },
+            tail,
+            ctx,
+            st,
+          )
+
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
       }
@@ -1185,47 +1296,340 @@ fn finish_select(
   ))
 }
 
-/// Lower a direct `call f`. Pops the callee's parameters, binds its results to fresh
-/// names (multi-value capable), pushes them, and continues. A funcidx below
-/// `imported` (a host import) is out of Phase-1 scope.
+/// Lower a `call f` (direct or cross-module import). Pops the callee's parameters, binds its
+/// results to fresh names (multi-value capable), pushes them, and continues.
+///
+/// The callee signature is fetched up front (needed for BOTH branches — Phase 5 fetched it
+/// only in the defined branch) from `ctx.func_types`, which spans `imports ++ defined`, so an
+/// imported funcidx recovers its signature.
+///
+/// - `f < ctx.imported` (a function import) → `ir.CallImport(slot, ty, args)` (I5/S5): `slot`
+///   is the positional function-import index, which *is* `f` because function imports occupy
+///   funcidx `0 .. imported-1`; `ty` is the import's IR signature. emit_core (06) dispatches
+///   this via the linker-built closure capability (`link.call_import`), never a name lookup
+///   (D3a). This un-skips both `spectest.print`-style host calls and `linking.wast`
+///   cross-module wasm calls — a single mechanism (Phase 5 rejected them at lower).
+/// - `f >= ctx.imported` (a same-module function) → `ir.CallDirect("f<f>", args)` (unchanged,
+///   byte-identical).
+///
+/// `Error(UnknownFuncIndex(f))` if `f` is out of range; `Error(StackUnderflow)` if the stack
+/// lacks the params (both only reachable on an unvalidated module — fail-closed insurance).
 fn lower_call(
   f: Int,
   tail: List(ast.Instr),
   ctx: LCtx,
   st: LState,
 ) -> Result(GoResult, LowerError) {
-  case f < ctx.imported {
-    True -> Error(Unsupported("imported call"))
-    False -> {
-      use sig <- result.try(nth_err(ctx.func_types, f, UnknownFuncIndex(f)))
-      let pcount = list.length(sig.params)
-      let rcount = list.length(sig.results)
-      let args = take_push_order(st.stack, pcount)
-      case list.length(args) == pcount {
-        False -> Error(StackUnderflow)
-        True -> {
-          let rest_stack = list.drop(st.stack, pcount)
-          let #(names, c2) = fresh_n(st.counter, rcount)
-          let result_vars = list.map(names, ir.Var)
-          let st2 =
-            record_types(
-              LState(
-                ..st,
-                stack: list.append(list.reverse(result_vars), rest_stack),
-                counter: c2,
-              ),
-              list.zip(names, list.map(sig.results, to_ir_vt)),
-            )
-          use inner <- result.try(go(tail, ctx, st2))
-          Ok(wrap_let(
-            names,
-            ir.CallDirect("f" <> int.to_string(f), args),
-            inner,
-          ))
-        }
+  use sig <- result.try(nth_err(ctx.func_types, f, UnknownFuncIndex(f)))
+  let pcount = list.length(sig.params)
+  let rcount = list.length(sig.results)
+  let args = take_push_order(st.stack, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let rest_stack = list.drop(st.stack, pcount)
+      let #(names, c2) = fresh_n(st.counter, rcount)
+      let result_vars = list.map(names, ir.Var)
+      let st2 =
+        record_types(
+          LState(
+            ..st,
+            stack: list.append(list.reverse(result_vars), rest_stack),
+            counter: c2,
+          ),
+          list.zip(names, list.map(sig.results, to_ir_vt)),
+        )
+      use inner <- result.try(go(tail, ctx, st2))
+      let call = case f < ctx.imported {
+        True -> ir.CallImport(f, ir_functype(sig), args)
+        False -> ir.CallDirect("f" <> int.to_string(f), args)
       }
+      Ok(wrap_let(names, call, inner))
     }
   }
+}
+
+// ─────────────────────────────── SIMD lane-op lowering ───────────────────────────────
+
+/// Lower a pure lane-wise SIMD op (`ast.Simd(op)`) to `ir.Simd(<neutral op>, args)`. Relabels
+/// the AST op to the frozen parametric `ir.SimdOp` (S3), derives the operand arity + result
+/// type from it (`simd_op_arity_result`), and routes through the shared `emit_value_op_t` path
+/// — the same shape as a numeric op. Operand order follows the spec stack types (deepest-first
+/// via `take_push_order`): a binary op yields `[a, b]`, a shift `[v, count]`, `bitselect`
+/// `[v1, v2, mask]`, `replace_lane` `[vec, x]`, `swizzle` `[a, idx]`.
+fn lower_simd(
+  op: ast.SimdOp,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  let ir_op = relabel_simd_op(op)
+  let #(arity, result_type) = simd_op_arity_result(ir_op)
+  emit_value_op_t(
+    arity,
+    result_type,
+    fn(args) { ir.Simd(ir_op, args) },
+    tail,
+    ctx,
+    st,
+  )
+}
+
+/// The operand arity + IR result type of a neutral `ir.SimdOp` (the routing facts
+/// `emit_value_op_t` needs). Per the spec vector-instruction stack types
+/// ([exec/instructions#vector-instructions](https://webassembly.github.io/spec/core/exec/instructions.html#vector-instructions)):
+///
+/// - Most ops yield a `v128` (`TV128`): binary arithmetic/compare/shift/narrow/extmul/dot/q15/
+///   swizzle (arity 2), unary neg/abs/popcnt/extend/pairwise/float-unary/conversions (arity 1),
+///   `bitselect` (arity 3), splat/replace-lane. **Comparisons yield a v128 MASK, not i32** (the
+///   classic pitfall — spec § SIMD comparisons).
+/// - The boolean reductions `any_true`/`all_true`/`bitmask` yield `TI32` (arity 1).
+/// - `extract_lane` yields the lane's SCALAR type (`i32`/`i64`/`f32`/`f64` per shape); the
+///   signed/unsigned narrow-shape variants yield `TI32`.
+///
+/// This mapping is INDEPENDENT of validate (lower runs after); validate already rejected any
+/// illegal `(op, shape)` combination fail-closed.
+fn simd_op_arity_result(op: ir.SimdOp) -> #(Int, ir.ValType) {
+  case op {
+    // binary integer arith / min-max / avgr / shifts / compares / narrow / extmul / dot /
+    // q15 / swizzle → a v128 (compares yield a v128 mask, NOT i32).
+    ir.SAdd(_)
+    | ir.SSub(_)
+    | ir.SMul(_)
+    | ir.SAddSatS(_)
+    | ir.SAddSatU(_)
+    | ir.SSubSatS(_)
+    | ir.SSubSatU(_)
+    | ir.SMinS(_)
+    | ir.SMinU(_)
+    | ir.SMaxS(_)
+    | ir.SMaxU(_)
+    | ir.SAvgrU(_)
+    | ir.SShl(_)
+    | ir.SShrS(_)
+    | ir.SShrU(_)
+    | ir.SEq(_)
+    | ir.SNe(_)
+    | ir.SLtS(_)
+    | ir.SLtU(_)
+    | ir.SLeS(_)
+    | ir.SLeU(_)
+    | ir.SGtS(_)
+    | ir.SGtU(_)
+    | ir.SGeS(_)
+    | ir.SGeU(_)
+    | ir.SNarrow(_, _)
+    | ir.SExtMul(_, _, _)
+    | ir.SDotI16x8S
+    | ir.SQ15MulrSatS
+    | ir.SSwizzle -> #(2, ir.TV128)
+    // unary integer / extend / pairwise → v128.
+    ir.SNeg(_)
+    | ir.SAbs(_)
+    | ir.SPopcnt(_)
+    | ir.SExtend(_, _, _)
+    | ir.SExtAddPairwise(_, _) -> #(1, ir.TV128)
+    // v128 bitwise (shape-agnostic).
+    ir.VNot -> #(1, ir.TV128)
+    ir.VAnd | ir.VOr | ir.VXor | ir.VAndNot -> #(2, ir.TV128)
+    ir.VBitselect -> #(3, ir.TV128)
+    // boolean reductions → i32.
+    ir.VAnyTrue | ir.SAllTrue(_) | ir.SBitmask(_) -> #(1, ir.TI32)
+    // splat (scalar → v128) / replace-lane (v128 + scalar → v128).
+    ir.SSplat(_) -> #(1, ir.TV128)
+    ir.SReplaceLane(_, _) -> #(2, ir.TV128)
+    // extract-lane → the lane's scalar type (plain, or sign/zero-extended to i32).
+    ir.SExtractLane(shape, _) -> #(1, lane_scalar_type(shape))
+    ir.SExtractLaneS(_, _) | ir.SExtractLaneU(_, _) -> #(1, ir.TI32)
+    // float binary (arith / min-max / pmin-pmax / compares → v128 mask).
+    ir.SFAdd(_)
+    | ir.SFSub(_)
+    | ir.SFMul(_)
+    | ir.SFDiv(_)
+    | ir.SFMin(_)
+    | ir.SFMax(_)
+    | ir.SFPMin(_)
+    | ir.SFPMax(_)
+    | ir.SFEq(_)
+    | ir.SFNe(_)
+    | ir.SFLt(_)
+    | ir.SFLe(_)
+    | ir.SFGt(_)
+    | ir.SFGe(_) -> #(2, ir.TV128)
+    // float unary → v128.
+    ir.SFNeg(_)
+    | ir.SFAbs(_)
+    | ir.SFSqrt(_)
+    | ir.SFCeil(_)
+    | ir.SFFloor(_)
+    | ir.SFTrunc(_)
+    | ir.SFNearest(_) -> #(1, ir.TV128)
+    // conversions (int↔float lane; demote/promote) → v128, all unary.
+    ir.STruncSatF32x4S
+    | ir.STruncSatF32x4U
+    | ir.STruncSatF64x2SZero
+    | ir.STruncSatF64x2UZero
+    | ir.SConvertF32x4I32x4S
+    | ir.SConvertF32x4I32x4U
+    | ir.SConvertF64x2LowI32x4S
+    | ir.SConvertF64x2LowI32x4U
+    | ir.SDemoteF64x2Zero
+    | ir.SPromoteLowF32x4 -> #(1, ir.TV128)
+  }
+}
+
+/// The IR scalar type a shape's lane holds — the result type of a plain `extract_lane`
+/// (`i32x4`→`TI32`, `i64x2`→`TI64`, `f32x4`→`TF32`, `f64x2`→`TF64`). `I8x16`/`I16x8` never use
+/// the plain extract (they use the sign/zero-extending `_s`/`_u` variants → `TI32`), but map
+/// defensively to `TI32` so this stays total.
+fn lane_scalar_type(shape: ir.SimdShape) -> ir.ValType {
+  case shape {
+    ir.I8x16 | ir.I16x8 | ir.I32x4 -> ir.TI32
+    ir.I64x2 -> ir.TI64
+    ir.F32x4 -> ir.TF32
+    ir.F64x2 -> ir.TF64
+  }
+}
+
+/// Relabel an AST SIMD op (`ast.SimdOp`) to the frozen neutral IR op (`ir.SimdOp`) — a pure,
+/// mechanical, semantics-preserving mapping (S3). The two enums mirror each other
+/// constructor-for-constructor with two spelling deltas the keystone pins: the float ops are
+/// `F`-prefixed in the AST but **`SF`-prefixed** in the IR (the IR's `NumOp` already owns
+/// `FAdd`/…), and the parametric widen/narrow/extmul/pairwise families copy their
+/// `from`/`half`/`signed` fields (relabelling only the nested `SimdShape`/`SimdHalf`).
+fn relabel_simd_op(op: ast.SimdOp) -> ir.SimdOp {
+  case op {
+    // integer arithmetic / saturating / min-max / avgr / shifts / popcnt
+    ast.SAdd(s) -> ir.SAdd(relabel_shape(s))
+    ast.SSub(s) -> ir.SSub(relabel_shape(s))
+    ast.SMul(s) -> ir.SMul(relabel_shape(s))
+    ast.SNeg(s) -> ir.SNeg(relabel_shape(s))
+    ast.SAbs(s) -> ir.SAbs(relabel_shape(s))
+    ast.SAddSatS(s) -> ir.SAddSatS(relabel_shape(s))
+    ast.SAddSatU(s) -> ir.SAddSatU(relabel_shape(s))
+    ast.SSubSatS(s) -> ir.SSubSatS(relabel_shape(s))
+    ast.SSubSatU(s) -> ir.SSubSatU(relabel_shape(s))
+    ast.SMinS(s) -> ir.SMinS(relabel_shape(s))
+    ast.SMinU(s) -> ir.SMinU(relabel_shape(s))
+    ast.SMaxS(s) -> ir.SMaxS(relabel_shape(s))
+    ast.SMaxU(s) -> ir.SMaxU(relabel_shape(s))
+    ast.SAvgrU(s) -> ir.SAvgrU(relabel_shape(s))
+    ast.SShl(s) -> ir.SShl(relabel_shape(s))
+    ast.SShrS(s) -> ir.SShrS(relabel_shape(s))
+    ast.SShrU(s) -> ir.SShrU(relabel_shape(s))
+    ast.SPopcnt(s) -> ir.SPopcnt(relabel_shape(s))
+    // comparisons (→ v128 mask)
+    ast.SEq(s) -> ir.SEq(relabel_shape(s))
+    ast.SNe(s) -> ir.SNe(relabel_shape(s))
+    ast.SLtS(s) -> ir.SLtS(relabel_shape(s))
+    ast.SLtU(s) -> ir.SLtU(relabel_shape(s))
+    ast.SLeS(s) -> ir.SLeS(relabel_shape(s))
+    ast.SLeU(s) -> ir.SLeU(relabel_shape(s))
+    ast.SGtS(s) -> ir.SGtS(relabel_shape(s))
+    ast.SGtU(s) -> ir.SGtU(relabel_shape(s))
+    ast.SGeS(s) -> ir.SGeS(relabel_shape(s))
+    ast.SGeU(s) -> ir.SGeU(relabel_shape(s))
+    // v128 bitwise + boolean reductions
+    ast.VNot -> ir.VNot
+    ast.VAnd -> ir.VAnd
+    ast.VOr -> ir.VOr
+    ast.VXor -> ir.VXor
+    ast.VAndNot -> ir.VAndNot
+    ast.VBitselect -> ir.VBitselect
+    ast.VAnyTrue -> ir.VAnyTrue
+    ast.SAllTrue(s) -> ir.SAllTrue(relabel_shape(s))
+    ast.SBitmask(s) -> ir.SBitmask(relabel_shape(s))
+    // lane access / build (lane index copied)
+    ast.SSplat(s) -> ir.SSplat(relabel_shape(s))
+    ast.SExtractLane(s, lane) -> ir.SExtractLane(relabel_shape(s), lane)
+    ast.SExtractLaneS(s, lane) -> ir.SExtractLaneS(relabel_shape(s), lane)
+    ast.SExtractLaneU(s, lane) -> ir.SExtractLaneU(relabel_shape(s), lane)
+    ast.SReplaceLane(s, lane) -> ir.SReplaceLane(relabel_shape(s), lane)
+    // float lanes: F* (AST) → SF* (IR) — same semantics, S3 spelling delta
+    ast.FAdd(s) -> ir.SFAdd(relabel_shape(s))
+    ast.FSub(s) -> ir.SFSub(relabel_shape(s))
+    ast.FMul(s) -> ir.SFMul(relabel_shape(s))
+    ast.FDiv(s) -> ir.SFDiv(relabel_shape(s))
+    ast.FNeg(s) -> ir.SFNeg(relabel_shape(s))
+    ast.FAbs(s) -> ir.SFAbs(relabel_shape(s))
+    ast.FSqrt(s) -> ir.SFSqrt(relabel_shape(s))
+    ast.FMin(s) -> ir.SFMin(relabel_shape(s))
+    ast.FMax(s) -> ir.SFMax(relabel_shape(s))
+    ast.FPMin(s) -> ir.SFPMin(relabel_shape(s))
+    ast.FPMax(s) -> ir.SFPMax(relabel_shape(s))
+    ast.FCeil(s) -> ir.SFCeil(relabel_shape(s))
+    ast.FFloor(s) -> ir.SFFloor(relabel_shape(s))
+    ast.FTrunc(s) -> ir.SFTrunc(relabel_shape(s))
+    ast.FNearest(s) -> ir.SFNearest(relabel_shape(s))
+    ast.FEq(s) -> ir.SFEq(relabel_shape(s))
+    ast.FNe(s) -> ir.SFNe(relabel_shape(s))
+    ast.FLt(s) -> ir.SFLt(relabel_shape(s))
+    ast.FLe(s) -> ir.SFLe(relabel_shape(s))
+    ast.FGt(s) -> ir.SFGt(relabel_shape(s))
+    ast.FGe(s) -> ir.SFGe(relabel_shape(s))
+    // parametric widen / narrow / extmul / pairwise (copy from/half/signed)
+    ast.SNarrow(from, signed) -> ir.SNarrow(relabel_shape(from), signed)
+    ast.SExtend(from, half, signed) ->
+      ir.SExtend(relabel_shape(from), relabel_half(half), signed)
+    ast.SExtMul(from, half, signed) ->
+      ir.SExtMul(relabel_shape(from), relabel_half(half), signed)
+    ast.SExtAddPairwise(from, signed) ->
+      ir.SExtAddPairwise(relabel_shape(from), signed)
+    // conversions (named — copied 1:1)
+    ast.STruncSatF32x4S -> ir.STruncSatF32x4S
+    ast.STruncSatF32x4U -> ir.STruncSatF32x4U
+    ast.STruncSatF64x2SZero -> ir.STruncSatF64x2SZero
+    ast.STruncSatF64x2UZero -> ir.STruncSatF64x2UZero
+    ast.SConvertF32x4I32x4S -> ir.SConvertF32x4I32x4S
+    ast.SConvertF32x4I32x4U -> ir.SConvertF32x4I32x4U
+    ast.SConvertF64x2LowI32x4S -> ir.SConvertF64x2LowI32x4S
+    ast.SConvertF64x2LowI32x4U -> ir.SConvertF64x2LowI32x4U
+    ast.SDemoteF64x2Zero -> ir.SDemoteF64x2Zero
+    ast.SPromoteLowF32x4 -> ir.SPromoteLowF32x4
+    // dot / q15 / swizzle (named — copied 1:1)
+    ast.SDotI16x8S -> ir.SDotI16x8S
+    ast.SQ15MulrSatS -> ir.SQ15MulrSatS
+    ast.SSwizzle -> ir.SSwizzle
+  }
+}
+
+/// Relabel an AST SIMD lane shape to the mirrored IR `SimdShape` (1:1).
+fn relabel_shape(s: ast.SimdShape) -> ir.SimdShape {
+  case s {
+    ast.I8x16 -> ir.I8x16
+    ast.I16x8 -> ir.I16x8
+    ast.I32x4 -> ir.I32x4
+    ast.I64x2 -> ir.I64x2
+    ast.F32x4 -> ir.F32x4
+    ast.F64x2 -> ir.F64x2
+  }
+}
+
+/// Relabel an AST widening/extending half-selector to the IR `SimdHalf` (1:1).
+fn relabel_half(h: ast.SimdHalf) -> ir.SimdHalf {
+  case h {
+    ast.Low -> ir.Low
+    ast.High -> ir.High
+  }
+}
+
+/// Relabel an AST `SimdLoadKind` to the mirrored IR `SimdLoadKind`. All bit-width fields are
+/// **BITS** in both enums (S2 — `LoadSplat`/`LoadZero`'s `lane_bits`, `LoadExtend`'s
+/// `source_bits`), copied verbatim.
+fn relabel_load_kind(k: ast.SimdLoadKind) -> ir.SimdLoadKind {
+  case k {
+    ast.LoadV128 -> ir.LoadV128
+    ast.LoadSplat(lane_bits) -> ir.LoadSplat(lane_bits)
+    ast.LoadExtend(source_bits, signed) -> ir.LoadExtend(source_bits, signed)
+    ast.LoadZero(lane_bits) -> ir.LoadZero(lane_bits)
+  }
+}
+
+/// A defensive all-zero `v128` value literal (`<<0:128>>`), the v128 counterpart of `z/0`,
+/// used only in the unreachable `_ ->` arm of a SIMD node's `build` (the arity was already
+/// checked). Never appears in the output of a validated module.
+fn zv128() -> ir.Value {
+  ir.ConstV128(<<0:size(128)>>)
 }
 
 // ─────────────────────────────── structured-control lowering ───────────────────────────────
@@ -1840,9 +2244,10 @@ fn to_ir_reftype(t: ast.ValType) -> ir.RefType {
   }
 }
 
-/// Map a WASM memory address-width tag to the IR `IdxType`. `Idx64` (memory64) is rejected
-/// by `reject_memory64` before any successful lowering, so a lowered module only ever
-/// carries `Idx32` — but the mapping is faithful for completeness.
+/// Map a WASM memory address-width tag to the IR `IdxType`. Both widths are live in Phase 6
+/// (I4 — memory64's runtime lands): `Idx64` now flows through onto the lowered
+/// `MemoryDecl`/`ImportMemory`, carrying the address width to emit_core (06) + rt_mem (08); a
+/// 32-bit memory maps `Idx32` exactly as before (byte-identical).
 fn to_ir_idxtype(it: ast.IdxType) -> ir.IdxType {
   case it {
     ast.Idx32 -> ir.Idx32
@@ -1996,10 +2401,10 @@ fn table_reftype(ctx: LCtx, x: Int) -> ir.RefType {
 /// Lower the memory section to the IR memories vector (H3), in index order. Each declared
 /// memory → `MemoryDecl(min, max, idx_type)`. A single 32-bit memory becomes a one-element
 /// `[MemoryDecl(min, max, Idx32)]` (byte-identical to Phase-4); `[]` if the module declares
-/// no memory. `reject_memory64` has already stopped a 64-bit memory (R12), so the mapped
-/// `idx_type` is always `Idx32` for a successfully-lowered module. These are the *defined*
-/// memories; imported memories occupy the low indices of the memory index space and are
-/// surfaced as `ImportMemory` (their runtime slot wiring is P5-09's).
+/// no memory. A 64-bit memory carries `Idx64` (I4 — memory64 runtime lands in Phase 6); the
+/// address width rides on the decl for emit_core/rt_mem, never as a per-node field. These are
+/// the *defined* memories; imported memories occupy the low indices of the memory index space
+/// and are surfaced as `ImportMemory` (their runtime slot wiring is P5-09's).
 fn lower_memory(module: ast.Module) -> List(ir.MemoryDecl) {
   list.map(module.memories, fn(m) {
     ir.MemoryDecl(m.limits.min, m.limits.max, to_ir_idxtype(m.idx_type))
@@ -2172,7 +2577,8 @@ fn lower_start(module: ast.Module) -> Option(String) {
 /// `end`; a trailing `End` is stripped defensively here too):
 ///
 /// - `t.const` → `Values([Const…])`. Integers are stored as their raw unsigned bit pattern;
-///   floats keep their raw IEEE-754 bits (D5).
+///   floats keep their raw IEEE-754 bits (D5); `v128.const` keeps its raw 16 little-endian
+///   bytes as `ConstV128(bytes)` (I1 — a `v128` global's initialiser).
 /// - `ref.func x` → `RefFunc("f<x>")` (a funcref to that function).
 /// - `ref.null t` → `Values([ConstNull(t)])` (the null reference literal — R1c: `ref.null`
 ///   reduces to the `ConstNull` value, not a separate `Expr`).
@@ -2192,6 +2598,9 @@ fn lower_const_expr(instrs: List(ast.Instr)) -> Result(ir.Expr, LowerError) {
     [ast.I64Const(v)] -> Ok(ir.Values([ir.ConstI64(unsigned_bits(v, 64))]))
     [ast.F32Const(bits)] -> Ok(ir.Values([ir.ConstF32(bits)]))
     [ast.F64Const(bits)] -> Ok(ir.Values([ir.ConstF64(bits)]))
+    // `v128.const` is a constant instruction (spec valid/instructions §constant-expressions),
+    // so a `v128` global's initialiser is a single `v128.const` — the raw 16 bytes verbatim.
+    [ast.V128Const(bytes)] -> Ok(ir.Values([ir.ConstV128(bytes)]))
     [ast.RefFunc(x)] -> Ok(ir.RefFunc("f" <> int.to_string(x)))
     [ast.RefNull(rt)] -> Ok(ir.Values([ir.ConstNull(to_ir_reftype(rt))]))
     [ast.GlobalGet(i)] -> Ok(ir.GlobalGet(gname(i)))

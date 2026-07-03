@@ -664,13 +664,6 @@ pub fn br_to_if_e2e_test() {
 
 // ═════════════════════════ Phase 5 (P5-05): reference / table / bulk ═════════════════════════
 
-/// Decode → validate → lower without asserting success (for fail-closed cases).
-fn try_build(bytes: BitArray) -> Result(ir.Module, lower.LowerError) {
-  let assert Ok(m) = decode.decode(bytes)
-  let assert Ok(typed) = validate.validate(m)
-  lower.lower(typed)
-}
-
 // ── reference instructions (spec exec/instructions §reference-instructions) ──
 
 /// `ref.null t` reduces to the null-reference VALUE `ConstNull(t)` (R1c — no separate
@@ -813,7 +806,7 @@ pub fn bulk_memory_test() {
   ])
 }
 
-// ── multi-memory + memory64 (H3/R12) ──
+// ── multi-memory + memory64 (H3/I4) ──
 
 /// Multi-memory (H3): a module with two memories lowers each memory-touching node with the
 /// SPEC memory index. A store/copy/fill/load against memory `$b` (index 1) carries `mem: 1`;
@@ -856,11 +849,22 @@ pub fn multimemory_test() {
   |> should.equal(True)
 }
 
-/// memory64 (R12): a module declaring a 64-bit memory decodes and validates (so a truly
-/// invalid memory64 module still fails `assert_invalid` upstream), but lower REJECTS it with
-/// `Error(Memory64Unsupported)` — the `Idx64` runtime is deferred to Phase 6. Never a panic.
-pub fn memory64_rejected_test() {
-  try_build(mem64_wasm) |> should.equal(Error(lower.Memory64Unsupported))
+/// memory64 (I4): a module declaring a 64-bit memory now LOWERS (Phase 6 deleted the
+/// `Memory64Unsupported` rejection). The declared memory carries `Idx64`
+/// (`MemoryDecl(1, None, Idx64)`), and an `i64.load` against it forwards the i64 address
+/// operand unchanged — there is no width branch in the memory arm (spec: a 64-bit memory's
+/// address operand is `i64`; the runtime does the 64-bit bounds arithmetic — P6-08).
+pub fn memory64_lowers_test() {
+  let irm = build(mem64_wasm)
+  irm.memories |> should.equal([ir.MemoryDecl(1, option.None, ir.Idx64)])
+  // the `i64.load (local.get 0)` forwards `p0` (the i64 address) with no truncation/mask.
+  list.any(all_exprs(func(irm, "f0").body), fn(e) {
+    case e {
+      ir.MemLoad(0, ir.MemAccess(8, False), ir.Var("p0"), 0, ir.TI64) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
 }
 
 // ── typed select (spec exec/instructions §select) ──
@@ -992,6 +996,581 @@ pub fn ref_local_zero_init_test() {
       _ -> False
     }
   })
+  |> should.equal(True)
+}
+
+// ═════════════════════════ Phase 6 (P6-05): SIMD / memory64 / imports ═════════════════════════
+//
+// SIMD text is out of scope for the WAT parser (S13) and hand-baking `0xFD` bytes is
+// error-prone, so these focused lower tests build the `ast.Module` directly and run it through
+// the REAL validate → lower chain — asserting the exact IR4 node the spec/keystone demand.
+
+/// A single defined-function module (funcidx 0 → `"f0"`): one function of the given signature +
+/// declared locals + body, plus the given memories. No imports, tables, globals, or segments.
+fn one_func_module(
+  params: List(ast.ValType),
+  results: List(ast.ValType),
+  locals: List(ast.ValType),
+  body: List(ast.Instr),
+  memories: List(ast.MemType),
+) -> ast.Module {
+  ast.Module(
+    imported_func_count: 0,
+    types: [ast.FuncType(params, results)],
+    imports: [],
+    tables: [],
+    memories: memories,
+    globals: [],
+    funcs: [ast.Func(0, locals, body)],
+    start: option.None,
+    elements: [],
+    data: [],
+    data_count: option.None,
+    exports: [ast.Export("f", ast.ExportFunc, 0)],
+  )
+}
+
+/// Validate then lower an AST module (both must succeed — these are valid fixtures).
+fn lower_ast(m: ast.Module) -> ir.Module {
+  let assert Ok(typed) = validate.validate(m)
+  let assert Ok(irm) = lower.lower(typed)
+  irm
+}
+
+/// `True` if any expression in `f0`'s body satisfies `pred`.
+fn f0_has(irm: ir.Module, pred: fn(ir.Expr) -> Bool) -> Bool {
+  list.any(all_exprs(func(irm, "f0").body), pred)
+}
+
+/// A 32-bit memory of one page (for the SIMD-memory fixtures).
+fn mem32() -> List(ast.MemType) {
+  [ast.MemType(ast.Limits(1, option.None), ast.Idx32)]
+}
+
+/// Lower a single pure lane op `op` over `arity` locals of types `param_types`, returning the
+/// produced `ir.Simd` node. The op's single result is `drop`ped so the declared function result
+/// is `[]` regardless of the op's result type (so one helper serves every op).
+fn simd_of(param_types: List(ast.ValType), op: ast.SimdOp) -> ir.Expr {
+  let n = list.length(param_types)
+  let getters = list.map(int_range(0, n - 1), ast.LocalGet)
+  let body = list.append(getters, [ast.Simd(op), ast.Drop, ast.End])
+  let irm = lower_ast(one_func_module(param_types, [], [], body, []))
+  let nodes =
+    list.filter(all_exprs(func(irm, "f0").body), fn(e) {
+      case e {
+        ir.Simd(_, _) -> True
+        _ -> False
+      }
+    })
+  let assert [node] = nodes
+  node
+}
+
+/// Observe lower's COMPUTED result type for a pure lane op (not validate's): produce the op's
+/// result twice, `select` between the two copies, and read the resulting `If`'s result-type
+/// list. `select` types itself from the SSA-recorded type of its first operand (`value_type`),
+/// so the `If`'s result type is exactly what lower recorded for the op. `spec_result` is the
+/// op's spec result type (the declared function result — validate rejects a wrong one).
+fn simd_result_type(
+  param_types: List(ast.ValType),
+  op: ast.SimdOp,
+  spec_result: ast.ValType,
+) -> List(ir.ValType) {
+  let n = list.length(param_types)
+  let getters = list.map(int_range(0, n - 1), ast.LocalGet)
+  let body =
+    list.append(getters, [ast.Simd(op)])
+    |> list.append(getters)
+    |> list.append([ast.Simd(op), ast.I32Const(0), ast.Select, ast.End])
+  let irm = lower_ast(one_func_module(param_types, [spec_result], [], body, []))
+  let assert Ok(rt) =
+    list.find_map(all_exprs(func(irm, "f0").body), fn(e) {
+      case e {
+        ir.If(_, rt, _, _) -> Ok(rt)
+        _ -> Error(Nil)
+      }
+    })
+  rt
+}
+
+// ── B. v128 value & const (spec exec/instructions §vector const) ──
+
+/// `v128.const` lowers to a pushed `ConstV128(bytes)` VALUE literal (like a numeric const — no
+/// `Let`, no `Expr`), holding the 16 raw little-endian bytes UNCHANGED (D5: a `-0.0` lane and a
+/// NaN-payload lane survive bit-for-bit — no lane decoding). The function's result type is
+/// `TV128`.
+pub fn v128_const_lowers_test() {
+  // lane 0 = -0.0f (0x80000000 LE); lane 1 = a NaN-ish 0x7FFFFFFF; lanes 2/3 = 0.
+  let bytes = <<0, 0, 0, 128, 255, 255, 255, 127, 0, 0, 0, 0, 0, 0, 0, 0>>
+  let irm =
+    lower_ast(
+      one_func_module([], [ast.V128], [], [ast.V128Const(bytes), ast.End], []),
+    )
+  let f = func(irm, "f0")
+  f.result |> should.equal([ir.TV128])
+  f.body |> should.equal(ir.Values([ir.ConstV128(bytes)]))
+}
+
+/// A declared `v128` local zero-initialises to the all-zero 16-byte vector `ConstV128(<<0:128>>)`
+/// (spec local initialisation — a numeric zero).
+pub fn v128_local_zero_init_test() {
+  let irm =
+    lower_ast(
+      one_func_module(
+        [],
+        [ast.V128],
+        [ast.V128],
+        [ast.LocalGet(0), ast.End],
+        [],
+      ),
+    )
+  f0_has(irm, fn(e) {
+    case e {
+      ir.Let([_], ir.Values([ir.ConstV128(bytes)]), _) ->
+        bytes == <<0:size(128)>>
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// A `v128` global initialised by `v128.const` lowers to `GlobalDecl("g0", TV128, _,
+/// Values([ConstV128(bytes)]))` (spec: `v128.const` is a constant instruction).
+pub fn v128_global_init_test() {
+  let bytes = <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16>>
+  let m =
+    ast.Module(
+      imported_func_count: 0,
+      types: [ast.FuncType([], [ast.V128])],
+      imports: [],
+      tables: [],
+      memories: [],
+      globals: [ast.Global(ast.V128, False, [ast.V128Const(bytes)])],
+      funcs: [ast.Func(0, [], [ast.GlobalGet(0), ast.End])],
+      start: option.None,
+      elements: [],
+      data: [],
+      data_count: option.None,
+      exports: [],
+    )
+  lower_ast(m).globals
+  |> should.equal([
+    ir.GlobalDecl("g0", ir.TV128, False, ir.Values([ir.ConstV128(bytes)])),
+  ])
+}
+
+// ── C. integer-lane ops → Simd(op, args) (spec exec/instructions §vector) ──
+
+/// A representative integer op from each family relabels to the exact neutral `Simd(op, args)`
+/// with the right shape, arity, and PUSH-order operands (`[a, b]` deepest-first): add/sub/mul,
+/// neg/abs/popcnt, the saturating add/sub family, min/max, avgr, shifts (`[v, count]`),
+/// comparisons (→ a v128 mask), the whole v128 bitwise + reduction set, and dot/q15.
+pub fn simd_integer_ops_test() {
+  let vv = [ast.V128, ast.V128]
+  simd_of(vv, ast.SAdd(ast.I32x4))
+  |> should.equal(ir.Simd(ir.SAdd(ir.I32x4), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.SMul(ast.I16x8))
+  |> should.equal(ir.Simd(ir.SMul(ir.I16x8), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of([ast.V128], ast.SNeg(ast.I64x2))
+  |> should.equal(ir.Simd(ir.SNeg(ir.I64x2), [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SPopcnt(ast.I8x16))
+  |> should.equal(ir.Simd(ir.SPopcnt(ir.I8x16), [ir.Var("p0")]))
+  // saturating add/sub family (S3 — the eight `i8x16`/`i16x8` ops)
+  simd_of(vv, ast.SAddSatS(ast.I8x16))
+  |> should.equal(ir.Simd(ir.SAddSatS(ir.I8x16), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.SSubSatU(ast.I16x8))
+  |> should.equal(ir.Simd(ir.SSubSatU(ir.I16x8), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.SMinS(ast.I32x4))
+  |> should.equal(ir.Simd(ir.SMinS(ir.I32x4), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.SAvgrU(ast.I8x16))
+  |> should.equal(ir.Simd(ir.SAvgrU(ir.I8x16), [ir.Var("p0"), ir.Var("p1")]))
+  // shift: `[v128 i32] → [v128]`, operands `[v, count]`
+  simd_of([ast.V128, ast.I32], ast.SShl(ast.I16x8))
+  |> should.equal(ir.Simd(ir.SShl(ir.I16x8), [ir.Var("p0"), ir.Var("p1")]))
+  // comparison → the operands unchanged (the mask-ness is the RESULT type — asserted below)
+  simd_of(vv, ast.SLtU(ast.I32x4))
+  |> should.equal(ir.Simd(ir.SLtU(ir.I32x4), [ir.Var("p0"), ir.Var("p1")]))
+  // v128 bitwise + reductions
+  simd_of([ast.V128], ast.VNot)
+  |> should.equal(ir.Simd(ir.VNot, [ir.Var("p0")]))
+  simd_of([ast.V128, ast.V128, ast.V128], ast.VBitselect)
+  |> should.equal(
+    ir.Simd(ir.VBitselect, [ir.Var("p0"), ir.Var("p1"), ir.Var("p2")]),
+  )
+  simd_of([ast.V128], ast.VAnyTrue)
+  |> should.equal(ir.Simd(ir.VAnyTrue, [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SAllTrue(ast.I8x16))
+  |> should.equal(ir.Simd(ir.SAllTrue(ir.I8x16), [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SBitmask(ast.I32x4))
+  |> should.equal(ir.Simd(ir.SBitmask(ir.I32x4), [ir.Var("p0")]))
+  // dot / q15
+  simd_of(vv, ast.SDotI16x8S)
+  |> should.equal(ir.Simd(ir.SDotI16x8S, [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.SQ15MulrSatS)
+  |> should.equal(ir.Simd(ir.SQ15MulrSatS, [ir.Var("p0"), ir.Var("p1")]))
+}
+
+/// Comparison ops yield a v128 MASK, not i32 (the classic pitfall); reductions yield i32. Both
+/// are observed via lower's recorded result type (§simd_result_type).
+pub fn simd_result_types_test() {
+  // `i32x4.lt_u` → a v128 mask (NOT i32)
+  simd_result_type([ast.V128, ast.V128], ast.SLtU(ast.I32x4), ast.V128)
+  |> should.equal([ir.TV128])
+  // `f32x4.eq` → a v128 mask
+  simd_result_type([ast.V128, ast.V128], ast.FEq(ast.F32x4), ast.V128)
+  |> should.equal([ir.TV128])
+  // `i8x16.all_true` / `v128.any_true` / `i16x8.bitmask` → i32
+  simd_result_type([ast.V128], ast.SAllTrue(ast.I8x16), ast.I32)
+  |> should.equal([ir.TI32])
+  simd_result_type([ast.V128], ast.VAnyTrue, ast.I32)
+  |> should.equal([ir.TI32])
+  simd_result_type([ast.V128], ast.SBitmask(ast.I16x8), ast.I32)
+  |> should.equal([ir.TI32])
+  // `i64x2.extract_lane` → i64; `f64x2.extract_lane` → f64 (the lane's scalar type)
+  simd_result_type([ast.V128], ast.SExtractLane(ast.I64x2, 0), ast.I64)
+  |> should.equal([ir.TI64])
+  simd_result_type([ast.V128], ast.SExtractLane(ast.F64x2, 0), ast.F64)
+  |> should.equal([ir.TF64])
+}
+
+// ── D. float-lane ops → Simd(SF*, args) (F-prefixed AST → SF-prefixed IR, S3) ──
+
+/// The float lane ops relabel `F*` (AST) → `SF*` (IR) — the S3 spelling delta — keeping shape,
+/// arity, and operand order; `pmin`/`pmax` stay DISTINCT from `min`/`max`.
+pub fn simd_float_ops_test() {
+  let vv = [ast.V128, ast.V128]
+  simd_of(vv, ast.FAdd(ast.F32x4))
+  |> should.equal(ir.Simd(ir.SFAdd(ir.F32x4), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.FDiv(ast.F64x2))
+  |> should.equal(ir.Simd(ir.SFDiv(ir.F64x2), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.FPMin(ast.F32x4))
+  |> should.equal(ir.Simd(ir.SFPMin(ir.F32x4), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of(vv, ast.FMax(ast.F64x2))
+  |> should.equal(ir.Simd(ir.SFMax(ir.F64x2), [ir.Var("p0"), ir.Var("p1")]))
+  simd_of([ast.V128], ast.FSqrt(ast.F32x4))
+  |> should.equal(ir.Simd(ir.SFSqrt(ir.F32x4), [ir.Var("p0")]))
+  simd_of(vv, ast.FEq(ast.F32x4))
+  |> should.equal(ir.Simd(ir.SFEq(ir.F32x4), [ir.Var("p0"), ir.Var("p1")]))
+}
+
+// ── E. lane access, splat, shuffle, swizzle ──
+
+/// `extract_lane`/`replace_lane` carry the static lane immediate inside the `SimdOp`; `splat`
+/// builds a v128 from a scalar; `i8x16.shuffle` is the dedicated `SimdShuffle(lanes, a, b)` node
+/// (16 indices verbatim); `i8x16.swizzle` rides the op table (`SSwizzle`, operands `[a, idx]`).
+pub fn simd_lane_and_shuffle_test() {
+  // extract (lane immediate threaded); replace_lane operands `[vec, x]`
+  simd_of([ast.V128], ast.SExtractLaneS(ast.I8x16, 3))
+  |> should.equal(ir.Simd(ir.SExtractLaneS(ir.I8x16, 3), [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SExtractLane(ast.I32x4, 2))
+  |> should.equal(ir.Simd(ir.SExtractLane(ir.I32x4, 2), [ir.Var("p0")]))
+  simd_of([ast.V128, ast.I32], ast.SReplaceLane(ast.I32x4, 2))
+  |> should.equal(
+    ir.Simd(ir.SReplaceLane(ir.I32x4, 2), [ir.Var("p0"), ir.Var("p1")]),
+  )
+  // splat from the lane scalar (i32 for i8x16/i16x8/i32x4, i64/f32/f64 for the others)
+  simd_of([ast.I32], ast.SSplat(ast.I8x16))
+  |> should.equal(ir.Simd(ir.SSplat(ir.I8x16), [ir.Var("p0")]))
+  simd_of([ast.F64], ast.SSplat(ast.F64x2))
+  |> should.equal(ir.Simd(ir.SSplat(ir.F64x2), [ir.Var("p0")]))
+  // swizzle (dynamic; operands `[a, idx]`)
+  simd_of([ast.V128, ast.V128], ast.SSwizzle)
+  |> should.equal(ir.Simd(ir.SSwizzle, [ir.Var("p0"), ir.Var("p1")]))
+  // shuffle — the dedicated node with its 16 indices verbatim + operands `[a, b]`
+  let lanes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  let irm =
+    lower_ast(
+      one_func_module(
+        [ast.V128, ast.V128],
+        [],
+        [],
+        [
+          ast.LocalGet(0),
+          ast.LocalGet(1),
+          ast.I8x16Shuffle(lanes),
+          ast.Drop,
+          ast.End,
+        ],
+        [],
+      ),
+    )
+  f0_has(irm, fn(e) { e == ir.SimdShuffle(lanes, ir.Var("p0"), ir.Var("p1")) })
+  |> should.equal(True)
+}
+
+// ── C.5 / D.4 shape-changing families (parametric relabel copies from/half/signed — S3) ──
+
+/// The parametric widen/narrow/extmul/pairwise families copy their `from` (source shape),
+/// `half`, and `signed` fields (at least one low + one high + one signed + one unsigned); the
+/// named conversions copy 1:1. (spec exec/instructions §vector narrow/extend/convert.)
+pub fn simd_shape_changing_ops_test() {
+  let vv = [ast.V128, ast.V128]
+  // narrow (saturating): signed + unsigned
+  simd_of(vv, ast.SNarrow(ast.I16x8, True))
+  |> should.equal(
+    ir.Simd(ir.SNarrow(ir.I16x8, True), [ir.Var("p0"), ir.Var("p1")]),
+  )
+  simd_of(vv, ast.SNarrow(ast.I32x4, False))
+  |> should.equal(
+    ir.Simd(ir.SNarrow(ir.I32x4, False), [ir.Var("p0"), ir.Var("p1")]),
+  )
+  // extend: low+signed and high+unsigned
+  simd_of([ast.V128], ast.SExtend(ast.I8x16, ast.Low, True))
+  |> should.equal(ir.Simd(ir.SExtend(ir.I8x16, ir.Low, True), [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SExtend(ast.I16x8, ast.High, False))
+  |> should.equal(ir.Simd(ir.SExtend(ir.I16x8, ir.High, False), [ir.Var("p0")]))
+  // extmul: high+unsigned and low+signed
+  simd_of(vv, ast.SExtMul(ast.I8x16, ast.High, False))
+  |> should.equal(
+    ir.Simd(ir.SExtMul(ir.I8x16, ir.High, False), [ir.Var("p0"), ir.Var("p1")]),
+  )
+  simd_of(vv, ast.SExtMul(ast.I32x4, ast.Low, True))
+  |> should.equal(
+    ir.Simd(ir.SExtMul(ir.I32x4, ir.Low, True), [ir.Var("p0"), ir.Var("p1")]),
+  )
+  // extadd_pairwise
+  simd_of([ast.V128], ast.SExtAddPairwise(ast.I16x8, True))
+  |> should.equal(ir.Simd(ir.SExtAddPairwise(ir.I16x8, True), [ir.Var("p0")]))
+  // named conversions (copied 1:1)
+  simd_of([ast.V128], ast.STruncSatF32x4S)
+  |> should.equal(ir.Simd(ir.STruncSatF32x4S, [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SConvertF32x4I32x4U)
+  |> should.equal(ir.Simd(ir.SConvertF32x4I32x4U, [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SDemoteF64x2Zero)
+  |> should.equal(ir.Simd(ir.SDemoteF64x2Zero, [ir.Var("p0")]))
+  simd_of([ast.V128], ast.SPromoteLowF32x4)
+  |> should.equal(ir.Simd(ir.SPromoteLowF32x4, [ir.Var("p0")]))
+}
+
+// ── F. SIMD memory (spec exec/instructions §vector memory) ──
+
+/// The plain/splat/extend/zero loads lower to `SimdLoad(mem, kind, addr, offset)` with the kind
+/// discriminant, the memidx, the static offset, and the address operand forwarded. Bit widths
+/// on `LoadSplat`/`LoadExtend`/`LoadZero` are BITS (S2), copied verbatim.
+pub fn simd_load_test() {
+  let load = fn(kind: ast.SimdLoadKind, offset: Int) {
+    lower_ast(one_func_module(
+      [ast.I32],
+      [],
+      [],
+      [
+        ast.LocalGet(0),
+        ast.SimdLoad(kind, ast.MemArg(0, offset, 0)),
+        ast.Drop,
+        ast.End,
+      ],
+      mem32(),
+    ))
+  }
+  f0_has(load(ast.LoadV128, 0), fn(e) {
+    e == ir.SimdLoad(0, ir.LoadV128, ir.Var("p0"), 0)
+  })
+  |> should.equal(True)
+  // splat: lane_bits in BITS; a non-zero static offset threaded
+  f0_has(load(ast.LoadSplat(32), 16), fn(e) {
+    e == ir.SimdLoad(0, ir.LoadSplat(32), ir.Var("p0"), 16)
+  })
+  |> should.equal(True)
+  // extending load (8-bit source lanes, unsigned)
+  f0_has(load(ast.LoadExtend(8, False), 0), fn(e) {
+    e == ir.SimdLoad(0, ir.LoadExtend(8, False), ir.Var("p0"), 0)
+  })
+  |> should.equal(True)
+  // load64_zero → LoadZero(64)
+  f0_has(load(ast.LoadZero(64), 0), fn(e) {
+    e == ir.SimdLoad(0, ir.LoadZero(64), ir.Var("p0"), 0)
+  })
+  |> should.equal(True)
+}
+
+/// `v128.store` lowers to `SimdStore(mem, addr, value, offset)` — a ZERO-result effect
+/// (`Let([], SimdStore(..), ..)`, never dropped), operands `[addr, value]` (address deeper).
+pub fn simd_store_test() {
+  let irm =
+    lower_ast(one_func_module(
+      [ast.I32, ast.V128],
+      [],
+      [],
+      [
+        ast.LocalGet(0),
+        ast.LocalGet(1),
+        ast.SimdStore(ast.MemArg(0, 8, 0)),
+        ast.End,
+      ],
+      mem32(),
+    ))
+  f0_has(irm, fn(e) {
+    case e {
+      ir.Let([], store, _) ->
+        store == ir.SimdStore(0, ir.Var("p0"), ir.Var("p1"), 8)
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// `v128.loadN_lane`/`storeN_lane` thread the memidx, static offset, BITS width (S2), lane
+/// immediate, and the input vector. The load yields a v128; the store is a zero-result effect.
+/// Operands are `[addr, vec]` (address deeper).
+pub fn simd_lane_memory_test() {
+  // load32_lane 2 → SimdLoadLane(mem, 32 BITS, addr, offset, 2, vec)
+  let load_irm =
+    lower_ast(one_func_module(
+      [ast.I32, ast.V128],
+      [],
+      [],
+      [
+        ast.LocalGet(0),
+        ast.LocalGet(1),
+        ast.SimdLoadLane(32, ast.MemArg(0, 0, 0), 2),
+        ast.Drop,
+        ast.End,
+      ],
+      mem32(),
+    ))
+  f0_has(load_irm, fn(e) {
+    e == ir.SimdLoadLane(0, 32, ir.Var("p0"), 0, 2, ir.Var("p1"))
+  })
+  |> should.equal(True)
+  // store64_lane 1 → SimdStoreLane(mem, 64 BITS, addr, offset, 1, vec), a zero-result effect
+  let store_irm =
+    lower_ast(one_func_module(
+      [ast.I32, ast.V128],
+      [],
+      [],
+      [
+        ast.LocalGet(0),
+        ast.LocalGet(1),
+        ast.SimdStoreLane(64, ast.MemArg(0, 0, 0), 1),
+        ast.End,
+      ],
+      mem32(),
+    ))
+  f0_has(store_irm, fn(e) {
+    case e {
+      ir.Let([], store, _) ->
+        store == ir.SimdStoreLane(0, 64, ir.Var("p0"), 0, 1, ir.Var("p1"))
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// A SIMD load against a non-zero memidx (multi-memory) carries `mem: 1` (byte-identical memidx
+/// threading, exactly like scalar loads).
+pub fn simd_multimemory_test() {
+  let irm =
+    lower_ast(
+      one_func_module(
+        [ast.I32],
+        [],
+        [],
+        [
+          ast.LocalGet(0),
+          ast.SimdLoad(ast.LoadV128, ast.MemArg(0, 0, 1)),
+          ast.Drop,
+          ast.End,
+        ],
+        [
+          ast.MemType(ast.Limits(1, option.None), ast.Idx32),
+          ast.MemType(ast.Limits(1, option.None), ast.Idx32),
+        ],
+      ),
+    )
+  f0_has(irm, fn(e) { e == ir.SimdLoad(1, ir.LoadV128, ir.Var("p0"), 0) })
+  |> should.equal(True)
+}
+
+// ── G. memory64 (imported) — the width axis flows onto ImportMemory ──
+
+/// An IMPORTED 64-bit memory lowers to `ImportMemory(module, name, min, max, Idx64)` — the
+/// address-width axis rides onto the import decl (no rejection; I4).
+pub fn memory64_imported_test() {
+  let m =
+    ast.Module(
+      imported_func_count: 0,
+      types: [ast.FuncType([], [])],
+      imports: [
+        ast.Import(
+          "env",
+          "mem",
+          ast.ImportMemory(ast.MemType(ast.Limits(1, option.Some(3)), ast.Idx64)),
+        ),
+      ],
+      tables: [],
+      memories: [],
+      globals: [],
+      funcs: [ast.Func(0, [], [ast.End])],
+      start: option.None,
+      elements: [],
+      data: [],
+      data_count: option.None,
+      exports: [],
+    )
+  lower_ast(m).imports
+  |> should.equal([
+    ir.ImportMemory("env", "mem", 1, option.Some(3), ir.Idx64),
+  ])
+}
+
+// ── H. cross-module / imported-function calls → CallImport (S5) ──
+
+/// A `call` of an imported function lowers to `CallImport(slot, ty, args)` — `slot` the
+/// positional function-import index (= the funcidx), `ty` the import's IR signature, args in
+/// push order. A void import is sequenced as a zero-result effect (`Let([], CallImport(..), ..)`).
+/// A same-module call stays `CallDirect("f<idx>", args)`.
+pub fn imported_call_test() {
+  let m =
+    ast.Module(
+      imported_func_count: 2,
+      types: [ast.FuncType([ast.I32], [ast.I32]), ast.FuncType([ast.I32], [])],
+      imports: [
+        ast.Import("host", "inc", ast.ImportFunc(0)),
+        ast.Import("host", "log", ast.ImportFunc(1)),
+      ],
+      tables: [],
+      memories: [],
+      globals: [],
+      funcs: [
+        // funcidx 2 — a same-module function ("f2")
+        ast.Func(0, [], [ast.I32Const(5), ast.End]),
+        // funcidx 3 ("f3") — calls import 0 (result), import 1 (void), then defined func 2
+        ast.Func(0, [], [
+          ast.LocalGet(0),
+          ast.Call(0),
+          ast.Drop,
+          ast.LocalGet(0),
+          ast.Call(1),
+          ast.LocalGet(0),
+          ast.Call(2),
+          ast.End,
+        ]),
+      ],
+      start: option.None,
+      elements: [],
+      data: [],
+      data_count: option.None,
+      exports: [ast.Export("test", ast.ExportFunc, 3)],
+    )
+  let irm = lower_ast(m)
+  let caller = func(irm, "f3")
+  let has = fn(pred) { list.any(all_exprs(caller.body), pred) }
+  // import 0 (has a result) → CallImport(slot=0, ty=[i32]->[i32], [p0])
+  has(fn(e) {
+    e == ir.CallImport(0, ir.FuncType([ir.TI32], [ir.TI32]), [ir.Var("p0")])
+  })
+  |> should.equal(True)
+  // import 1 (void) → CallImport(slot=1, ty=[i32]->[], [p0]) sequenced as a zero-result effect
+  has(fn(e) {
+    case e {
+      ir.Let([], call, _) ->
+        call == ir.CallImport(1, ir.FuncType([ir.TI32], []), [ir.Var("p0")])
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  // same-module call → CallDirect (unchanged)
+  has(fn(e) { e == ir.CallDirect("f2", [ir.Var("p0")]) })
   |> should.equal(True)
 }
 
@@ -1176,7 +1755,8 @@ const multimem_wasm: BitArray = <<
 >>
 
 // `(memory i64 1) (func (export "m64") (param i64) (result i64) (i64.load (local.get 0)))`
-// — wat2wasm --enable-memory64. Lower must REJECT this (Memory64Unsupported, R12).
+// — wat2wasm --enable-memory64. Lower now ACCEPTS this (I4): the memory carries `Idx64`
+// and the i64 address flows through unchanged (`memory64_lowers_test`).
 const mem64_wasm: BitArray = <<
   0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 126, 1, 126, 3, 2, 1, 0, 5, 3, 1,
   4, 1, 7, 7, 1, 3, 109, 54, 52, 0, 0, 10, 9, 1, 7, 0, 32, 0, 41, 3, 0, 11,
