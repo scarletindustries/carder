@@ -245,6 +245,16 @@ pub type Binding {
     table_module: String,
     state_module: String,
     safe_max_pages: Int,
+    /// The documented, spec-aligned RUNTIME page cap for a 64-bit (`Idx64`) memory (memory64,
+    /// I4/S9). We do NOT reserve 2^64 bytes: the `paged` backend grows on demand, so this is a
+    /// **trap boundary**, not a reservation — `memory.grow` beyond it returns `-1`, and an
+    /// access beyond the *current* size traps `MemoryOutOfBounds` (the spec's `assert_trap`).
+    /// DISTINCT from validate's DECLARABLE type maximum of 2^48 pages (= 2^64 bytes, spec
+    /// §2.5 / the memory64 proposal); this is the smaller IMPLEMENTATION cap. Default 2^32 pages
+    /// = 2^48 bytes = 256 TiB (S9 — a sparse trap boundary the paged backend never allocates).
+    /// Ignored for `Idx32` memories (so 32-bit output stays byte-identical). P6-08 pins the exact
+    /// constant + `rt_mem` addressing; `atomics`/`nif` fail closed for an over-cap 64-bit memory.
+    mem64_max_pages: Int,
     // ── Phase-3 policy fields (F7) ──────────────────────────────────────────
     opt_level: OptLevel,
     meter: MeterMode,
@@ -283,6 +293,11 @@ pub fn safe_default() -> Binding {
     // cap (2^16 pages = 4 GiB), so the module's DECLARED max governs for conformance; unit
     // 11 lowers it to a real Safe resource bound.
     safe_max_pages: 65_536,
+    // The memory64 runtime page cap (S9/I4): 2^32 pages = 2^48 bytes = 256 TiB — a documented,
+    // spec-aligned trap boundary the `paged` backend never allocates (it grows on demand), NOT a
+    // reservation. Distinct from validate's 2^48-page DECLARABLE limit. No Phase-1..5 module uses
+    // an `Idx64` memory, so this is conformance-neutral; P6-08 pins the exact constant + citation.
+    mem64_max_pages: 4_294_967_296,
     // ── Phase-3 Safe posture (F7). Every field is the fail-closed choice. ──
     opt_level: Baseline,
     meter: MeterFuel,

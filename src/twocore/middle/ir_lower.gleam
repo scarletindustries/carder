@@ -204,7 +204,17 @@ fn lower_expr(
     | ir.MemFill(_, _, _, _)
     | ir.MemCopy(_, _, _, _, _)
     | ir.MemInit(_, _, _, _, _)
-    | ir.DataDrop(_) -> Ok(expr)
+    | ir.DataDrop(_)
+    | // Phase-6 SIMD nodes + `CallImport` carry only `Value` operands (no sub-`Expr`), so this
+      // CallHost-gate + Loop-meter pass leaves them unchanged. `CallImport` is a call but NOT a
+      // `CallHost` (no capability-policy gate applies; it resolves to a linker-built closure, S5).
+      ir.Simd(_, _)
+    | ir.SimdShuffle(_, _, _)
+    | ir.SimdLoad(_, _, _, _)
+    | ir.SimdStore(_, _, _, _)
+    | ir.SimdLoadLane(_, _, _, _, _, _)
+    | ir.SimdStoreLane(_, _, _, _, _, _)
+    | ir.CallImport(_, _, _) -> Ok(expr)
 
     // THE capability boundary — gate it; the node is left unchanged for `emit_core` to route
     ir.CallHost(cap, name, args) ->

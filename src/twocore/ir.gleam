@@ -284,6 +284,18 @@ pub type ValType {
   TTerm
   TFuncRef
   TExternRef
+  /// A 128-bit fixed-width low-level value (`v128`, I1/I2 — Phase 6 keystone). Represented at
+  /// runtime as a 16-byte binary (`<<_:128>>`) — the natural BEAM fixed-width byte container
+  /// (the BEAM has no 128-bit scalar), consistent with how linear-memory bytes are already
+  /// handled. NEUTRAL: a generic 128-bit vector value, not a WASM-only construct (I7) — a
+  /// future SIMD-capable frontend reuses it. On the **low-level (numeric) path**, never the term
+  /// layer (I2): no implicit bridging to terms (only an explicit boxing `Convert` bridges, as for
+  /// i32/i64). Placed AFTER the reference types (S15: keystone placement, consistent) so it falls
+  /// to the `_` default of every `ValType` match with a catch-all (it is not a reference type).
+  ///
+  /// Spec anchor: `v128` is the sole vector type; `vectype = v128 ⊆ valtype`
+  /// ([spec §2.3.2 vector types](https://webassembly.github.io/spec/core/syntax/types.html)).
+  TV128
 }
 
 /// The subset of `ValType` that is a reference type (H1). Used wherever the spec's `reftype`
@@ -405,6 +417,13 @@ pub type Value {
   ConstF32(bits: Int)
   ConstF64(bits: Int)
   ConstNull(ty: RefType)
+  /// The `v128.const` literal — EXACTLY 16 raw bytes in **little-endian lane layout** (D5:
+  /// store the bits, never a decoded lane structure, so every lane value, NaN payload, and
+  /// `-0.0` is bit-exact). A `BitArray` of length 16; two equal byte sequences compare `==`
+  /// (BEAM binary equality), so v128 constants const-fold / dedup like the other `Const*`.
+  /// Pure (it is a `Value`). Invariant (validate/lower/emit uphold it): `bit_size(bytes) == 128`.
+  /// This is the analogue of `ConstF32(bits)`'s raw-bit representation, one level wider (I1/I2).
+  ConstV128(bytes: BitArray)
 }
 
 // ───────────────────── Expressions (yield value lists) ─────────────────────
@@ -587,6 +606,266 @@ pub type Expr {
   /// Metering hook (D9): charge `cost` fuel, then evaluate `body`. Inserted by
   /// `ir_lower` (unit 11).
   Charge(cost: Int, body: Expr)
+  // ── Phase-6 SIMD (I1/I2) — six new nodes. Two PURE lane-wise (classify like `Num`, §effect);
+  // four SIMD-memory BARRIERS (route through the bounds-checked `rt_mem` seam). ──
+  /// A pure lane-wise SIMD op (P6-01 keystone). `args` arity matches `op` (1 unary, 2 binary,
+  /// 3 for `VBitselect`; `SSplat` takes a scalar i32/i64/f32/f64-bits value; `SExtractLane*`
+  /// yields a scalar; `SReplaceLane` takes v128 + scalar). Yields a `v128` (or an
+  /// i32/i64/f32/f64-bits scalar for extract-lane / `VAnyTrue` / `SAllTrue` / `SBitmask`).
+  /// PURE (no trap, no state — I3): participates in const-fold / DCE / CSE exactly like a
+  /// non-trapping `Num`. `emit_core` (P6-06) maps `op` → a concrete `rt_simd` fn (the binding
+  /// chokepoint, like `NumOp → rt_num`).
+  Simd(op: SimdOp, args: List(Value))
+  /// `i8x16.shuffle` — 16 immediate lane indices (each 0..31), selecting bytes from `a ++ b`
+  /// (indices 0..15 pick from `a`, 16..31 from `b`). Kept a DEDICATED node (not a `Simd`
+  /// variant) because its 16-element immediate does not fit the uniform `SimdOp` shape. PURE
+  /// (a byte permutation over two `Value` operands). Yields a v128.
+  SimdShuffle(lanes: List(Int), a: Value, b: Value)
+  /// `v128.load` and the splat/extend/zero load family. `kind` (a `SimdLoadKind`) selects the
+  /// exact form. Effective address is `addr + offset` (offset a static immediate ≥ 0) on memory
+  /// `mem`. **Bounds-checked → traps `MemoryOutOfBounds`** on OOB, before any partial effect
+  /// (I6). Yields a v128. NOT pure (reads mutable memory → a barrier like `MemLoad`, §effect).
+  /// (`mem` default 0; a single-memory module keeps `mem = 0`, byte-identical.)
+  SimdLoad(mem: Int, kind: SimdLoadKind, addr: Value, offset: Int)
+  /// `v128.store` — write the 16-byte `value` to memory `mem` at `addr + offset`.
+  /// **Bounds-checked → traps `MemoryOutOfBounds`.** NOT pure (writes memory → a barrier).
+  SimdStore(mem: Int, addr: Value, value: Value, offset: Int)
+  /// `v128.loadN_lane` — load `width` BITS (8/16/32/64, S2) from memory `mem` at `addr + offset`
+  /// into lane `lane` of `vec` (the other lanes preserved). **Bounds-checked → traps.** Yields a
+  /// v128. NOT pure (reads memory → a barrier).
+  SimdLoadLane(
+    mem: Int,
+    width: Int,
+    addr: Value,
+    offset: Int,
+    lane: Int,
+    vec: Value,
+  )
+  /// `v128.storeN_lane` — store lane `lane` (`width` BITS, 8/16/32/64 — S2) of `vec` to memory
+  /// `mem` at `addr + offset`. **Bounds-checked → traps.** NOT pure (writes memory → a barrier).
+  SimdStoreLane(
+    mem: Int,
+    width: Int,
+    addr: Value,
+    offset: Int,
+    lane: Int,
+    vec: Value,
+  )
+  // ── Phase-6 cross-module / imported-function call (S5) ──
+  /// A call to an IMPORTED function by its positional function-import `slot` (S5). `slot` counts
+  /// function imports only (imports occupy the low funcidx range). `ty` is the import's declared
+  /// signature (drives the run-ABI). Distinct from `CallDirect`, which stays **same-module only**
+  /// (`apply 'f'/n`): `CallImport` is resolved at LINK TIME to a handed-in closure capability (a
+  /// host/`spectest` import routes through the checked `rt_host` dispatch; a cross-module import
+  /// routes into the exporting instance) and lowered by `emit_core` (P6-06) to
+  /// `link.call_import(closure, args_list)` over the caller's positional import-slot vector — a
+  /// CAPABILITY, never an ambient `apply` of a data-named `module:atom` (D3a). Effectful (it is a
+  /// call — §effect). No Phase-1..5 module produces this node; P6-05 lowers imported calls to it.
+  CallImport(slot: Int, ty: FuncType, args: List(Value))
+}
+
+// ───────────────────────────── SIMD (Phase-6, I1/I2) ─────────────────────────────
+
+/// The six standardized SIMD lane shapes (spec §2.3.2 / §4.4). Carried by shape-uniform
+/// `SimdOp` constructors the way `IntWidth` is carried by `NumOp`. Integer shapes
+/// (`I8x16`/`I16x8`/`I32x4`/`I64x2`) serve the integer ops; float shapes (`F32x4`/`F64x2`) the
+/// float ops. A shape's lane bit-width is `128 / lane_count`: I8x16→8, I16x8→16, I32x4→32,
+/// I64x2→64, F32x4→32, F64x2→64. NEUTRAL (a generic lane-shape tag, not a WASM opcode — D6).
+pub type SimdShape {
+  I8x16
+  I16x8
+  I32x4
+  I64x2
+  F32x4
+  F64x2
+}
+
+/// Which half of a source vector a widening/extending op consumes (`extend`, `extmul`). `Low`
+/// selects lanes `0 .. n/2-1`, `High` selects `n/2 .. n-1` of the source, each promoted to the
+/// double-width result shape. Neutral (a generic half-selector, not a WASM opcode string — D6).
+pub type SimdHalf {
+  Low
+  High
+}
+
+/// Neutral, shape-and-lane-tagged SIMD lane operations (I2 — never WASM opcode strings, D6).
+///
+/// The ~236 standardized SIMD instructions collapse to this compact op-enum, carried by the
+/// pure `Simd`/`SimdShuffle` `Expr` nodes; `emit_core` (P6-06) maps each `(SimdOp[, shape])` to
+/// a concrete `rt_simd` function — the binding chokepoint, exactly like `NumOp → rt_num`. The
+/// design discipline (matching `NumOp`): **shape-tag the uniform ops** (one constructor for all
+/// applicable lane shapes, like `IAdd(IntWidth)`); **name the genuinely-singular ops** (like
+/// `ConvOp.I32WrapI64`); and **tag the uniform-over-a-parameter families** (widen/extend/
+/// extmul/pairwise) rather than spell out every opcode string.
+///
+/// The enum is **permissive** — the shape-tag admits illegal combos (e.g. `SMul(I8x16)` — there
+/// is no `i8x16.mul`; `i64x2` has no min/max; `i64x2` comparisons are `eq/ne/lt_s/le_s/gt_s/ge_s`
+/// only; `SAvgrU`/`SAddSat*`/`SSubSat*` are `i8x16`/`i16x8` only; `SPopcnt` is `i8x16` only).
+/// **`validate` (P6-04) rejects the illegal combinations fail-closed**, and `emit_core` (P6-06)
+/// only has a `rt_simd` mapping for the legal ones — exactly as `Num(IAdd(W32))` admits a
+/// nonsensical width elsewhere.
+///
+/// ## Per-lane semantics (held to the spec, not the implementation — I3; 07 must honour)
+///
+/// - Integer lanes wrap two's-complement at the *lane* width (8/16/32/64), never 128-bit;
+///   `SShl`/`SShrS`/`SShrU` take a scalar i32 shift count masked mod the lane bit-width.
+/// - Comparisons yield a per-lane mask: all-ones (`-1` in the lane) if true, all-zeros if false.
+/// - Saturating ops saturate exactly, never trap (`SAddSat*`, `SSubSat*`, `SNarrow`,
+///   `SQ15MulrSatS`, `STruncSat*`) — I3: saturation replaces the overflow trap. `SAvgrU` is the
+///   rounding unsigned average `(a + b + 1) >> 1` at lane width.
+/// - Float lanes are IEEE-754 with f32x4 rounded to single precision after every op, `FMin`/
+///   `FMax` returning the spec NaN / `-0.0` result, `FPMin`/`FPMax` the pseudo-min/max variants,
+///   NaN canonicalization/propagation per the SIMD spec (mirrors scalar).
+/// - SIMD ops do NOT trap (I3). The only trap on the SIMD surface is the memory-bounds trap on
+///   a SIMD load/store, via the `rt_mem` seam (the `SimdLoad*`/`SimdStore*` `Expr` nodes).
+pub type SimdOp {
+  // ── lane-uniform integer arithmetic (shape ∈ integer shapes) ─────────────────
+  /// Lane-wise integer add. `SMul` is illegal for `I8x16` (there is no `i8x16.mul`).
+  SAdd(SimdShape)
+  SSub(SimdShape)
+  SMul(SimdShape)
+  SNeg(SimdShape)
+  SAbs(SimdShape)
+  /// Saturating signed add (I8x16/I16x8 only) — saturates to the signed lane range, never traps.
+  SAddSatS(SimdShape)
+  /// Saturating unsigned add (I8x16/I16x8 only).
+  SAddSatU(SimdShape)
+  /// Saturating signed subtract (I8x16/I16x8 only).
+  SSubSatS(SimdShape)
+  /// Saturating unsigned subtract (I8x16/I16x8 only).
+  SSubSatU(SimdShape)
+  /// Lane-wise signed minimum (I8x16/I16x8/I32x4).
+  SMinS(SimdShape)
+  SMinU(SimdShape)
+  SMaxS(SimdShape)
+  SMaxU(SimdShape)
+  /// Rounding unsigned average `(a + b + 1) >> 1` (I8x16/I16x8 only).
+  SAvgrU(SimdShape)
+  /// Lane-wise shift-left by a scalar i32 count masked mod the lane bit-width.
+  SShl(SimdShape)
+  SShrS(SimdShape)
+  SShrU(SimdShape)
+  /// Per-lane population count (I8x16 only).
+  SPopcnt(SimdShape)
+  // ── lane-uniform comparisons → a v128 MASK (all-ones / all-zeros per lane) ───
+  SEq(SimdShape)
+  SNe(SimdShape)
+  /// Signed/unsigned lane comparisons. The `U` variants are illegal for `I64x2` (no unsigned
+  /// i64x2 comparisons in the spec).
+  SLtS(SimdShape)
+  SLtU(SimdShape)
+  SLeS(SimdShape)
+  SLeU(SimdShape)
+  SGtS(SimdShape)
+  SGtU(SimdShape)
+  SGeS(SimdShape)
+  SGeU(SimdShape)
+  // ── v128 bitwise (shape-agnostic — operate on the whole 128 bits) ────────────
+  VNot
+  VAnd
+  VOr
+  VXor
+  VAndNot
+  VBitselect
+  // ── boolean reductions / mask ─────────────────────────────────────────────────
+  /// `v128.any_true` — over the whole v128 → i32 0/1.
+  VAnyTrue
+  /// `iNxM.all_true` (integer shapes) → i32 0/1 (all lanes non-zero).
+  SAllTrue(SimdShape)
+  /// `iNxM.bitmask` (integer shapes) → i32 (the high bit of each lane packed).
+  SBitmask(SimdShape)
+  // ── lane access / build (immediates ride as fields) ──────────────────────────
+  /// scalar → v128 (all lanes = the scalar).
+  SSplat(SimdShape)
+  /// Extract a full lane (I32x4/I64x2/F32x4/F64x2 — no sign variant; yields the whole lane).
+  SExtractLane(shape: SimdShape, lane: Int)
+  /// Extract + sign-extend a lane to i32 (I8x16/I16x8).
+  SExtractLaneS(shape: SimdShape, lane: Int)
+  /// Extract + zero-extend a lane to i32 (I8x16/I16x8).
+  SExtractLaneU(shape: SimdShape, lane: Int)
+  /// Replace lane `lane` with a scalar (v128 + scalar → v128).
+  SReplaceLane(shape: SimdShape, lane: Int)
+  // ── float-lane ops (shape ∈ F32x4/F64x2) ─────────────────────────────────────
+  // NB: `SF`-prefixed (Simd-Float) — NOT `F`-prefixed — because `NumOp` already defines
+  // `FAdd`/`FSub`/…/`FGe` in this same module and Gleam requires module-unique constructor
+  // names. A necessary deviation from the unit-doc spelling; semantics are identical.
+  SFAdd(SimdShape)
+  SFSub(SimdShape)
+  SFMul(SimdShape)
+  SFDiv(SimdShape)
+  SFNeg(SimdShape)
+  SFAbs(SimdShape)
+  SFSqrt(SimdShape)
+  /// Spec `min`/`max` (NaN- and `-0.0`-aware).
+  SFMin(SimdShape)
+  SFMax(SimdShape)
+  /// Pseudo-min/max (`pmin`/`pmax`) — return the second operand when either is NaN, no `-0.0`
+  /// special-casing.
+  SFPMin(SimdShape)
+  SFPMax(SimdShape)
+  SFCeil(SimdShape)
+  SFFloor(SimdShape)
+  SFTrunc(SimdShape)
+  SFNearest(SimdShape)
+  SFEq(SimdShape)
+  SFNe(SimdShape)
+  SFLt(SimdShape)
+  SFLe(SimdShape)
+  SFGt(SimdShape)
+  SFGe(SimdShape)
+  // ── widen / narrow / extended-multiply / pairwise (TAGGED — Deviation 1) ─────
+  /// Saturating narrow of `from` to the half-width shape (I16x8→I8x16, I32x4→I16x8). `signed`
+  /// selects the signed vs unsigned saturation range.
+  SNarrow(from: SimdShape, signed: Bool)
+  /// Extend the `half` of `from` to the double-width shape (I8x16→I16x8, I16x8→I32x4,
+  /// I32x4→I64x2). `signed` selects sign vs zero extension. NB: `from` is the SOURCE shape (the
+  /// result is the double-width shape) — a slightly different reading than `SAdd(shape)`'s
+  /// result-shape tag.
+  SExtend(from: SimdShape, half: SimdHalf, signed: Bool)
+  /// Extended multiply of the `half` of `from` (same source shapes as `SExtend`).
+  SExtMul(from: SimdShape, half: SimdHalf, signed: Bool)
+  /// Extended pairwise add of `from` (I8x16→I16x8, I16x8→I32x4).
+  SExtAddPairwise(from: SimdShape, signed: Bool)
+  // ── conversions (genuinely singular — named like ConvOp) ─────────────────────
+  /// f32x4 → i32x4 saturating truncation (signed; never traps).
+  STruncSatF32x4S
+  STruncSatF32x4U
+  /// f64x2 → i32x4 saturating truncation, upper two lanes = 0 (signed).
+  STruncSatF64x2SZero
+  STruncSatF64x2UZero
+  /// i32x4 → f32x4 conversion (signed).
+  SConvertF32x4I32x4S
+  SConvertF32x4I32x4U
+  /// low two i32x4 lanes → f64x2 (signed).
+  SConvertF64x2LowI32x4S
+  SConvertF64x2LowI32x4U
+  /// f64x2 → f32x4 (upper two lanes = 0).
+  SDemoteF64x2Zero
+  /// low two f32x4 lanes → f64x2.
+  SPromoteLowF32x4
+  // ── dot / q15 (singular) ─────────────────────────────────────────────────────
+  /// `i32x4.dot_i16x8_s` — i16x8·i16x8 → i32x4 (pairwise multiply-add; WRAPS at i32).
+  SDotI16x8S
+  /// `i16x8.q15mulr_sat_s` — fixed-point rounding multiply, saturating.
+  SQ15MulrSatS
+  // ── byte swizzle (dynamic; shuffle is a dedicated Expr node) ──────────────────
+  /// `i8x16.swizzle` — dynamic byte select; OOB index (≥ 16) → 0.
+  SSwizzle
+}
+
+/// The v128 memory-load family (spec §5.4.9). Distinguishes the load forms `SimdLoad` carries.
+/// All bit-widths are BITS (S2), never bytes.
+///
+/// - `LoadV128`: a plain 16-byte load.
+/// - `LoadSplat(lane_bits)`: load `lane_bits` (8/16/32/64) and splat to all lanes.
+/// - `LoadExtend(source_bits, signed)`: load 8 bytes as `source_bits`-wide lanes (8/16/32 →
+///   8/4/2 lanes) and sign/zero-extend each to double width (`load8x8`/`load16x4`/`load32x2`).
+/// - `LoadZero(lane_bits)`: load `lane_bits` (32/64) into the low lane, zero the rest.
+pub type SimdLoadKind {
+  LoadV128
+  LoadSplat(lane_bits: Int)
+  LoadExtend(source_bits: Int, signed: Bool)
+  LoadZero(lane_bits: Int)
 }
 
 /// A named loop iteration variable with its initial value.
@@ -782,6 +1061,24 @@ pub type MemAccess {
 ///   produces `Trap(FuelExhausted)`); it lives in `TrapReason` only so it rides the existing
 ///   catchable `{wasm_trap, Kind}` channel and surfaces through the run-ABI as an ordinary
 ///   `Trapped(reason)`.
+///
+/// ## Phase 6 adds ZERO variants (S8 — argued; keep the exhaustive `spec_trap_message` /
+/// `trap_reason_atom` matches untouched)
+///
+/// - **SIMD lane ops are total** (I3): saturation replaces the overflow trap, there is no SIMD
+///   divide-trap, and conversions saturate — so no `Simd`/`SimdShuffle` traps. No variant needed.
+/// - **SIMD memory** (`SimdLoad*`/`SimdStore*`) out of bounds reuses `MemoryOutOfBounds` (a SIMD
+///   memory access is a linear-memory access — the same bounds trap, routed through the same
+///   `rt_mem` seam, address-width-agnostic).
+/// - **memory64** (an `Idx64` memory access beyond current size / the page cap) reuses
+///   `MemoryOutOfBounds` — it is address-width-agnostic, so memory64 adds no distinct reason.
+/// - **Cross-module linking**: an unsatisfied / signature-mismatched function import is a
+///   **link-time `ImportError`** (`UnknownImport`/`IncompatibleImportType`, surfaced as
+///   `assert_unlinkable`), NOT a runtime `TrapReason`.
+///
+/// Confirmed against the SIMD + memory64 + linking suites: `"out of bounds memory access"`
+/// covers every SIMD/memory64 OOB. If a pinned `.wast` `assert_trap` empirically distinguishes a
+/// message this set cannot produce (expected: none), add exactly one variant consciously (10/11).
 pub type TrapReason {
   IntDivByZero
   IntOverflow

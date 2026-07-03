@@ -905,6 +905,18 @@ fn emit(
     ir.MemInit(mem, seg, dst, src, count) ->
       emit_mem_init(mem, seg, dst, src, count, cont, sc, state, ctx)
     ir.DataDrop(seg) -> emit_data_drop(seg, cont, sc, state, ctx)
+    // ── Phase-6 SIMD + cross-module call (§J). NO Phase-1..5 module produces these nodes (P6-05
+    // lowers them), so a typed `UnsupportedNode` arm keeps the corpus + suite byte-identical and
+    // is genuinely unreachable now. P6-06 replaces each with the real lowering: `Simd`/`SimdShuffle`
+    // → the `rt_simd` seam; `SimdLoad*`/`SimdStore*` → the `rt_mem`-compose-`rt_simd` seam;
+    // `CallImport` → `link.call_import(closure, args)` over the positional import-slot vector. ──
+    ir.Simd(..) -> Error(UnsupportedNode("simd_lane"))
+    ir.SimdShuffle(..) -> Error(UnsupportedNode("simd_shuffle"))
+    ir.SimdLoad(..) -> Error(UnsupportedNode("simd_load"))
+    ir.SimdStore(..) -> Error(UnsupportedNode("simd_store"))
+    ir.SimdLoadLane(..) -> Error(UnsupportedNode("simd_load_lane"))
+    ir.SimdStoreLane(..) -> Error(UnsupportedNode("simd_store_lane"))
+    ir.CallImport(..) -> Error(UnsupportedNode("call_import"))
     // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
     // boxing `Convert`s remain unlowered (still a later-phase deferral).
     TermOp(..) -> Error(UnsupportedNode("term_op"))
@@ -1571,6 +1583,9 @@ fn result_width(t: ValType) -> Int {
     TI64 | TF64 -> 64
     // Reference types are never a numeric load result (validate rejects it); defaulted to 32.
     ir.TFuncRef | ir.TExternRef -> 32
+    // A `v128` is a 16-byte value — 128 bits. Never a scalar numeric-load result (validate
+    // rejects it; SIMD loads route through the dedicated `SimdLoad*` nodes, P6-06). §J.
+    ir.TV128 -> 128
   }
 }
 
@@ -2828,6 +2843,9 @@ fn emit_value(v: Value) -> CExpr {
     // The null-reference literal (both reftypes share ONE sentinel, R1) — the forge-proof
     // `{ref_null}` term `rt_ref.null_ref` produces. Reftype-agnostic at runtime.
     ir.ConstNull(_ty) -> null_ref_term()
+    // The `v128.const` literal (I1/D5) — the 16 raw little-endian bytes as a Core binary
+    // literal, verbatim (like `ConstF32`'s raw bits, one level wider). Pure; no `rt_simd` call.
+    ir.ConstV128(bytes) -> core_binary_bytes(bytes)
   }
 }
 
@@ -2914,6 +2932,8 @@ fn valtype_atom(t: ValType) -> CExpr {
     TTerm -> "term"
     ir.TFuncRef -> "funcref"
     ir.TExternRef -> "externref"
+    // Phase-6 SIMD value type (§J). Self-consistent inside `func_type_term`.
+    ir.TV128 -> "v128"
   })
 }
 
@@ -4094,6 +4114,11 @@ fn const_value_bits(v: Value) -> Result(Int, EmitError) {
     // P5-06/09's (a `ConstNull` never appears in a Phase-1..4 numeric offset/init).
     ir.ConstNull(_) ->
       Error(NonConstInit("null reference in constant init/offset"))
+    // A `v128` constant is a 16-byte binary, not a scalar `Int`, so it has no numeric bit
+    // pattern for a memory offset/numeric-global seed; a v128 GLOBAL is a boxed `Dynamic`
+    // seeded via `ref_globals` (S6, P6-06/08/09), never through this numeric path.
+    ir.ConstV128(_) ->
+      Error(NonConstInit("v128 constant in numeric constant init/offset"))
   }
 }
 
@@ -4367,6 +4392,18 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Continue(_, vs) -> collect_values(vs, acc)
     Trap(_) -> acc
     Charge(_, body) -> collect_expr(body, acc)
+    // ── Phase-6 SIMD nodes + `CallImport`: collect the `Var` names in their `Value` operands
+    // (over-approximating keeps gensym collision-free). ──
+    ir.Simd(_, args) -> collect_values(args, acc)
+    ir.SimdShuffle(_, a, b) -> collect_value(b, collect_value(a, acc))
+    ir.SimdLoad(_, _, addr, _) -> collect_value(addr, acc)
+    ir.SimdStore(_, addr, value, _) ->
+      collect_value(value, collect_value(addr, acc))
+    ir.SimdLoadLane(_, _, addr, _, _, vec) ->
+      collect_value(vec, collect_value(addr, acc))
+    ir.SimdStoreLane(_, _, addr, _, _, vec) ->
+      collect_value(vec, collect_value(addr, acc))
+    ir.CallImport(_, _, args) -> collect_values(args, acc)
   }
 }
 

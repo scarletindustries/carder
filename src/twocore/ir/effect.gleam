@@ -36,6 +36,16 @@
 //// conservative* than the keystone (it never narrows anything the keystone called effectful),
 //// so it needs no signature change.
 ////
+//// ## Phase-6 SIMD refinement (S7 — the one structural divergence)
+////
+//// Unlike every Phase-5 new node (all barriers), Phase 6's PURE lane-wise SIMD ops
+//// (`Simd`/`SimdShuffle`) classify **`Pure` like `Num`**: a lane-wise vector instruction is a
+//// TOTAL, DETERMINISTIC value transform (WASM §4.4 — no trap, since saturation replaces the
+//// overflow trap and there is no SIMD divide-trap; no state read/write), so CSE / DCE / reorder
+//// over it preserve observable behaviour exactly, enabling later SIMD const-fold. The four SIMD
+//// MEMORY nodes (`SimdLoad`/`SimdStore`/`SimdLoadLane`/`SimdStoreLane`) touch mutable memory and
+//// can trap OOB, so they stay barriers; `CallImport` is a call, so it is a barrier too.
+////
 //// ## Spec anchor
 ////
 //// WASM has a defined store/evaluation model (WebAssembly spec §4.2 Runtime Structure and
@@ -46,11 +56,12 @@
 import gleam/list
 import twocore/ir.{
   type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallDirect,
-  CallHost, CallIndirect, Charge, Continue, Convert, DataDrop, ElemDrop,
-  GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let, Loop, MemCopy,
-  MemFill, MemGrow, MemInit, MemLoad, MemSize, MemStore, Num, RefFunc, RefIsNull,
-  Return, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit, TableSet,
-  TableSize, TermOp, Trap, TruncS, TruncU, Values,
+  CallHost, CallImport, CallIndirect, Charge, Continue, Convert, DataDrop,
+  ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let, Loop,
+  MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize, MemStore, Num, RefFunc,
+  RefIsNull, Return, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
+  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
+  TableSet, TableSize, TermOp, Trap, TruncS, TruncU, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -115,11 +126,30 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     | MemFill(_, _, _, _)
     | MemCopy(_, _, _, _, _)
     | MemInit(_, _, _, _, _)
-    | DataDrop(_) -> True
+    | DataDrop(_)
+    | // ── Phase-6 SIMD MEMORY (S7): the four v128 load/store nodes read/write mutable memory
+      // state and can trap (OOB → `MemoryOutOfBounds`), so they are barriers exactly like
+      // `MemLoad`/`MemStore` — no CSE across a store, no reorder across a grow, no DCE. ──
+      SimdLoad(_, _, _, _)
+    | SimdStore(_, _, _, _)
+    | SimdLoadLane(_, _, _, _, _, _)
+    | SimdStoreLane(_, _, _, _, _, _)
+    | // Phase-6 imported-function CALL (S5/S7): a call is a barrier (it may read/write any
+      // state and trap) — classified like `CallDirect`/`CallHost`.
+      CallImport(_, _, _) -> True
     Num(op, _) -> trapping_numop(op)
     Convert(op, _) -> trapping_convop(op)
+    // ── Phase-6 PURE lane-wise SIMD (S7): `Simd`/`SimdShuffle` are TOTAL and DETERMINISTIC —
+    // no trap (I3: saturation replaces overflow-trap; no SIMD divide-trap), no state read/write.
+    // So they are non-barriers, classified `Pure` like a non-trapping `Num`: CSE / DCE / reorder
+    // over them preserve observable behaviour exactly. They carry only `Value` operands (no
+    // sub-`Expr`), so `children_all_pure` reaches its `_ -> True` catch-all vacuously. A
+    // deliberate, argued improvement over Phase-5's conservatism (spec §4.4: vector instructions
+    // are total value transforms), enabling SIMD const-fold/DCE later. ──
     Values(_)
     | TermOp(_, _)
+    | Simd(_, _)
+    | SimdShuffle(_, _, _)
     | Let(_, _, _)
     | Block(_, _, _)
     | If(_, _, _, _)

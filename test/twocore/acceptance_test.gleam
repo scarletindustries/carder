@@ -262,6 +262,9 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
     ir.TTerm -> I32Val(raw)
     ir.TFuncRef -> I32Val(raw)
     ir.TExternRef -> I32Val(raw)
+    // A `v128` result is 16 raw little-endian bytes (S14); the numeric acceptance corpus never
+    // produces one, so this arm is unreachable — an i32 fallback keeps the function total.
+    ir.TV128 -> I32Val(raw)
   }
 }
 

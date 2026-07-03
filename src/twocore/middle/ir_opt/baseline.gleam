@@ -913,6 +913,40 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
     ir.Return(values) -> ir.Return(subst_values(values, subs))
     ir.Trap(_) -> e
     ir.Charge(cost, body) -> ir.Charge(cost, subst_expr(body, subs))
+    // ── Phase-6 SIMD nodes + `CallImport`: substitute into their `Value` operands (they carry
+    // only `Value`s, no sub-`Expr`). ──
+    ir.Simd(op, sargs) -> ir.Simd(op, subst_values(sargs, subs))
+    ir.SimdShuffle(lanes, a, b) ->
+      ir.SimdShuffle(lanes, subst_value(a, subs), subst_value(b, subs))
+    ir.SimdLoad(mem, kind, addr, offset) ->
+      ir.SimdLoad(mem, kind, subst_value(addr, subs), offset)
+    ir.SimdStore(mem, addr, value, offset) ->
+      ir.SimdStore(
+        mem,
+        subst_value(addr, subs),
+        subst_value(value, subs),
+        offset,
+      )
+    ir.SimdLoadLane(mem, width, addr, offset, lane, vec) ->
+      ir.SimdLoadLane(
+        mem,
+        width,
+        subst_value(addr, subs),
+        offset,
+        lane,
+        subst_value(vec, subs),
+      )
+    ir.SimdStoreLane(mem, width, addr, offset, lane, vec) ->
+      ir.SimdStoreLane(
+        mem,
+        width,
+        subst_value(addr, subs),
+        offset,
+        lane,
+        subst_value(vec, subs),
+      )
+    ir.CallImport(slot, ty, cargs) ->
+      ir.CallImport(slot, ty, subst_values(cargs, subs))
   }
 }
 
@@ -1021,6 +1055,17 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.Return(values) -> values_names(values)
     ir.Trap(_) -> []
     ir.Charge(_, body) -> expr_vars(body)
+    // ── Phase-6 SIMD nodes + `CallImport`: collect the `Var` names in their `Value` operands. ──
+    ir.Simd(_, args) -> values_names(args)
+    ir.SimdShuffle(_, a, b) -> list.append(value_name(a), value_name(b))
+    ir.SimdLoad(_, _, addr, _) -> value_name(addr)
+    ir.SimdStore(_, addr, value, _) ->
+      list.append(value_name(addr), value_name(value))
+    ir.SimdLoadLane(_, _, addr, _, _, vec) ->
+      list.append(value_name(addr), value_name(vec))
+    ir.SimdStoreLane(_, _, addr, _, _, vec) ->
+      list.append(value_name(addr), value_name(vec))
+    ir.CallImport(_, _, args) -> values_names(args)
   }
 }
 

@@ -84,9 +84,23 @@ const spectest_mem_safe_cap = 65_536
 ///   `ref_ty`/`min`/`max` drive table matching. `rt_state` stores `value` as-is (opaque).
 /// - `ProvidedMemory(value, min_pages, max_pages, idx_type)`: a memory externval — the OPAQUE
 ///   `rt_mem` value; the limits + `idx_type` drive memory matching.
-/// - `ProvidedFunc(ty)`: a FUNCTION export's signature, used ONLY for function-import matching
-///   (§C.3) — a function import is a call-site capability, so this contributes NO positional state
-///   slot and carries no callable value (dispatch is via `rt_host.call_host`).
+/// - `ProvidedFunc(ty, call)`: a FUNCTION export made callable across instances (I5/S5/«XLINK»).
+///   `ty` drives fail-closed function-import matching (spec §3.2, unchanged from P5 — `match_fn`
+///   compares `FuncType`, never the closure). `call` is the **linker-built closure capability**:
+///   a first-class `fun` the LINKER (P6-09) constructs, capturing the exporting instance + its
+///   exported function (a host/`spectest` import routes through the checked `rt_host` dispatch; a
+///   cross-module import routes into the exporting instance's owning process). The generated
+///   caller lowers an imported-function call (`CallImport`) to `link.call_import(call, args_list)`
+///   over this HANDED-IN closure — a CAPABILITY, exactly like `externref`/`call_host`, NOT an
+///   ambient `apply` of an attacker-chosen `module:atom` (D3a). The closure is held by the
+///   caller's POSITIONAL import slot (R4 — name-free), never looked up by a runtime name in
+///   generated code. A `ProvidedFunc` carrying a `fun` must NEVER be compared with `==` (BEAM
+///   compares funs by identity); nothing here does (matching uses `ty` only). No P5 site
+///   CONSTRUCTS a `ProvidedFunc` (it was only matched — cross-instance dispatch was absent, I5);
+///   P6-09 adds the construction + the function-import `link_imports` path. The closure takes the
+///   argument list and returns a **value LIST** (`List(Dynamic)`) — multi-value results (a host
+///   `print*` returns `[]`, a cross-module fn returns 0/1/many), consistent with the R17 value-list
+///   invoke ABI (S5).
 pub type Provided {
   ProvidedGlobal(value: Int, ty: ValType, mutable: Bool)
   ProvidedRefGlobal(value: Dynamic, ty: ValType, mutable: Bool)
@@ -97,7 +111,7 @@ pub type Provided {
     max_pages: Option(Int),
     idx_type: IdxType,
   )
-  ProvidedFunc(ty: FuncType)
+  ProvidedFunc(ty: FuncType, call: fn(List(Dynamic)) -> List(Dynamic))
 }
 
 /// A source of externvals for a `#(module, name)` import (spec §4.5.4). Two build-controlled
@@ -351,7 +365,7 @@ fn resolve_fn_import(
         False -> Ok(None)
         True ->
           case lookup_registered(capability, name, providers) {
-            Ok(ProvidedFunc(sig)) -> match_fn(capability, name, sig, ty)
+            Ok(ProvidedFunc(sig, _)) -> match_fn(capability, name, sig, ty)
             Ok(_) ->
               Error(IncompatibleImportType(
                 capability,

@@ -414,6 +414,9 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
     ir.TF64 -> F64Bits(raw)
     ir.TTerm -> I32Val(raw)
     ir.TFuncRef | ir.TExternRef -> I32Val(raw)
+    // A `v128` result is 16 raw little-endian bytes (S14) — its result-tagging is P6-10's; no
+    // SIMD conformance runs at the keystone, so this arm is unreachable. Defensive fallback.
+    ir.TV128 -> I32Val(raw)
   }
 }
 
@@ -430,6 +433,9 @@ fn tag_term(ty: ir.ValType, term: Dynamic) -> SpecValue {
     ir.TTerm -> I32Val(term_to_int(term))
     ir.TFuncRef -> tag_ref(term, FuncRefTag)
     ir.TExternRef -> tag_ref(term, ExternRefTag)
+    // A `v128` result is 16 raw little-endian bytes (S14) — P6-10's result ABI; unreachable at
+    // the keystone (no SIMD conformance runs). Defensive fallback keeps this total.
+    ir.TV128 -> I32Val(term_to_int(term))
   }
 }
 

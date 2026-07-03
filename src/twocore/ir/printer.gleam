@@ -440,6 +440,8 @@ fn print_valtype(t: ValType) -> String {
     TTerm -> "term"
     ir.TFuncRef -> "funcref"
     ir.TExternRef -> "externref"
+    // Phase-6 SIMD value type (I1). Conformance-neutral — no legacy module has it.
+    ir.TV128 -> "v128"
   }
 }
 
@@ -469,6 +471,9 @@ fn print_value(v: Value) -> String {
     // The null-reference literal, tagged by reftype (a single dotted token so it lexes as one
     // word, like `i32.const`): `null.funcref` / `null.externref` (R1c).
     ir.ConstNull(ty) -> "null." <> print_reftype(ty)
+    // The `v128.const` literal — the 16 raw little-endian bytes as `0x` + 32 lower-case hex
+    // digits (D5). No legacy module has it; P6-02 reconciles the exact round-trip spelling.
+    ir.ConstV128(bytes) -> "v128.const " <> print_hexbytes(bytes)
   }
 }
 
@@ -705,6 +710,212 @@ fn print_expr(indent: Int, e: Expr) -> String {
     Trap(reason) -> "trap " <> trapreason_to_string(reason)
     Charge(cost, body) ->
       "charge " <> int.to_string(cost) <> "\n" <> stmt(indent, body)
+    // ── Phase-6 SIMD nodes + cross-module call (I1/I2/S5). No Phase-1..5 module contains these,
+    // so any spelling is conformance-neutral by construction; P6-02 makes it the round-trip
+    // spelling. SIMD-memory nodes elide `mem=0` (like the scalar memory nodes, §A.6). ──
+    ir.Simd(op, args) ->
+      "simd " <> simdop_to_string(op) <> " " <> value_list(args)
+    ir.SimdShuffle(lanes, a, b) ->
+      "simd.shuffle ["
+      <> string.join(list.map(lanes, int.to_string), ", ")
+      <> "] "
+      <> print_value(a)
+      <> " "
+      <> print_value(b)
+    ir.SimdLoad(mem, kind, addr, offset) ->
+      "simd.load "
+      <> simdloadkind_str(kind)
+      <> " "
+      <> print_value(addr)
+      <> " offset="
+      <> int.to_string(offset)
+      <> print_memidx(mem)
+    ir.SimdStore(mem, addr, value, offset) ->
+      "simd.store "
+      <> print_value(addr)
+      <> " "
+      <> print_value(value)
+      <> " offset="
+      <> int.to_string(offset)
+      <> print_memidx(mem)
+    ir.SimdLoadLane(mem, width, addr, offset, lane, vec) ->
+      "simd.load_lane "
+      <> int.to_string(width)
+      <> " "
+      <> print_value(addr)
+      <> " offset="
+      <> int.to_string(offset)
+      <> " lane="
+      <> int.to_string(lane)
+      <> " "
+      <> print_value(vec)
+      <> print_memidx(mem)
+    ir.SimdStoreLane(mem, width, addr, offset, lane, vec) ->
+      "simd.store_lane "
+      <> int.to_string(width)
+      <> " "
+      <> print_value(addr)
+      <> " offset="
+      <> int.to_string(offset)
+      <> " lane="
+      <> int.to_string(lane)
+      <> " "
+      <> print_value(vec)
+      <> print_memidx(mem)
+    ir.CallImport(slot, ty, args) ->
+      "call_import "
+      <> int.to_string(slot)
+      <> " : "
+      <> print_functype(ty)
+      <> " "
+      <> value_list(args)
+  }
+}
+
+/// Renders a SIMD lane shape token (`i8x16`/`i16x8`/`i32x4`/`i64x2`/`f32x4`/`f64x2`). Shared by
+/// the shape-tagged `simdop` spellings (§F). Total.
+fn simdshape_str(s: ir.SimdShape) -> String {
+  case s {
+    ir.I8x16 -> "i8x16"
+    ir.I16x8 -> "i16x8"
+    ir.I32x4 -> "i32x4"
+    ir.I64x2 -> "i64x2"
+    ir.F32x4 -> "f32x4"
+    ir.F64x2 -> "f64x2"
+  }
+}
+
+/// Renders a widen/extend half token (`low`/`high`). Total.
+fn simdhalf_str(h: ir.SimdHalf) -> String {
+  case h {
+    ir.Low -> "low"
+    ir.High -> "high"
+  }
+}
+
+/// Renders the signed/unsigned suffix `s`/`u` for the tagged shape-changing families. Total.
+fn signed_str(signed: Bool) -> String {
+  case signed {
+    True -> "s"
+    False -> "u"
+  }
+}
+
+/// Renders a SIMD-load kind token (§F): `v128` / `splat <bits>` / `extend <bits> s|u` /
+/// `zero <bits>`. All widths are BITS (S2). Total.
+fn simdloadkind_str(k: ir.SimdLoadKind) -> String {
+  case k {
+    ir.LoadV128 -> "v128"
+    ir.LoadSplat(bits) -> "splat " <> int.to_string(bits)
+    ir.LoadExtend(bits, signed) ->
+      "extend " <> int.to_string(bits) <> " " <> signed_str(signed)
+    ir.LoadZero(bits) -> "zero " <> int.to_string(bits)
+  }
+}
+
+/// Renders a neutral, shape-tagged `SimdOp` token for the `.ir` text (§F). Minimal round-trip
+/// surface for the keystone; P6-02 reconciles the canonical spelling table with the parser.
+/// Total — the exhaustive `case` fails to compile if a `SimdOp` constructor is added later.
+fn simdop_to_string(op: ir.SimdOp) -> String {
+  case op {
+    ir.SAdd(s) -> simdshape_str(s) <> ".add"
+    ir.SSub(s) -> simdshape_str(s) <> ".sub"
+    ir.SMul(s) -> simdshape_str(s) <> ".mul"
+    ir.SNeg(s) -> simdshape_str(s) <> ".neg"
+    ir.SAbs(s) -> simdshape_str(s) <> ".abs"
+    ir.SAddSatS(s) -> simdshape_str(s) <> ".add_sat_s"
+    ir.SAddSatU(s) -> simdshape_str(s) <> ".add_sat_u"
+    ir.SSubSatS(s) -> simdshape_str(s) <> ".sub_sat_s"
+    ir.SSubSatU(s) -> simdshape_str(s) <> ".sub_sat_u"
+    ir.SMinS(s) -> simdshape_str(s) <> ".min_s"
+    ir.SMinU(s) -> simdshape_str(s) <> ".min_u"
+    ir.SMaxS(s) -> simdshape_str(s) <> ".max_s"
+    ir.SMaxU(s) -> simdshape_str(s) <> ".max_u"
+    ir.SAvgrU(s) -> simdshape_str(s) <> ".avgr_u"
+    ir.SShl(s) -> simdshape_str(s) <> ".shl"
+    ir.SShrS(s) -> simdshape_str(s) <> ".shr_s"
+    ir.SShrU(s) -> simdshape_str(s) <> ".shr_u"
+    ir.SPopcnt(s) -> simdshape_str(s) <> ".popcnt"
+    ir.SEq(s) -> simdshape_str(s) <> ".eq"
+    ir.SNe(s) -> simdshape_str(s) <> ".ne"
+    ir.SLtS(s) -> simdshape_str(s) <> ".lt_s"
+    ir.SLtU(s) -> simdshape_str(s) <> ".lt_u"
+    ir.SLeS(s) -> simdshape_str(s) <> ".le_s"
+    ir.SLeU(s) -> simdshape_str(s) <> ".le_u"
+    ir.SGtS(s) -> simdshape_str(s) <> ".gt_s"
+    ir.SGtU(s) -> simdshape_str(s) <> ".gt_u"
+    ir.SGeS(s) -> simdshape_str(s) <> ".ge_s"
+    ir.SGeU(s) -> simdshape_str(s) <> ".ge_u"
+    ir.VNot -> "v128.not"
+    ir.VAnd -> "v128.and"
+    ir.VOr -> "v128.or"
+    ir.VXor -> "v128.xor"
+    ir.VAndNot -> "v128.andnot"
+    ir.VBitselect -> "v128.bitselect"
+    ir.VAnyTrue -> "v128.any_true"
+    ir.SAllTrue(s) -> simdshape_str(s) <> ".all_true"
+    ir.SBitmask(s) -> simdshape_str(s) <> ".bitmask"
+    ir.SSplat(s) -> simdshape_str(s) <> ".splat"
+    ir.SExtractLane(s, lane) ->
+      simdshape_str(s) <> ".extract_lane." <> int.to_string(lane)
+    ir.SExtractLaneS(s, lane) ->
+      simdshape_str(s) <> ".extract_lane_s." <> int.to_string(lane)
+    ir.SExtractLaneU(s, lane) ->
+      simdshape_str(s) <> ".extract_lane_u." <> int.to_string(lane)
+    ir.SReplaceLane(s, lane) ->
+      simdshape_str(s) <> ".replace_lane." <> int.to_string(lane)
+    ir.SFAdd(s) -> simdshape_str(s) <> ".fadd"
+    ir.SFSub(s) -> simdshape_str(s) <> ".fsub"
+    ir.SFMul(s) -> simdshape_str(s) <> ".fmul"
+    ir.SFDiv(s) -> simdshape_str(s) <> ".fdiv"
+    ir.SFNeg(s) -> simdshape_str(s) <> ".fneg"
+    ir.SFAbs(s) -> simdshape_str(s) <> ".fabs"
+    ir.SFSqrt(s) -> simdshape_str(s) <> ".fsqrt"
+    ir.SFMin(s) -> simdshape_str(s) <> ".fmin"
+    ir.SFMax(s) -> simdshape_str(s) <> ".fmax"
+    ir.SFPMin(s) -> simdshape_str(s) <> ".pmin"
+    ir.SFPMax(s) -> simdshape_str(s) <> ".pmax"
+    ir.SFCeil(s) -> simdshape_str(s) <> ".fceil"
+    ir.SFFloor(s) -> simdshape_str(s) <> ".ffloor"
+    ir.SFTrunc(s) -> simdshape_str(s) <> ".ftrunc"
+    ir.SFNearest(s) -> simdshape_str(s) <> ".fnearest"
+    ir.SFEq(s) -> simdshape_str(s) <> ".feq"
+    ir.SFNe(s) -> simdshape_str(s) <> ".fne"
+    ir.SFLt(s) -> simdshape_str(s) <> ".flt"
+    ir.SFLe(s) -> simdshape_str(s) <> ".fle"
+    ir.SFGt(s) -> simdshape_str(s) <> ".fgt"
+    ir.SFGe(s) -> simdshape_str(s) <> ".fge"
+    ir.SNarrow(from, signed) ->
+      "narrow." <> simdshape_str(from) <> "." <> signed_str(signed)
+    ir.SExtend(from, half, signed) ->
+      "extend."
+      <> simdshape_str(from)
+      <> "."
+      <> simdhalf_str(half)
+      <> "."
+      <> signed_str(signed)
+    ir.SExtMul(from, half, signed) ->
+      "extmul."
+      <> simdshape_str(from)
+      <> "."
+      <> simdhalf_str(half)
+      <> "."
+      <> signed_str(signed)
+    ir.SExtAddPairwise(from, signed) ->
+      "extadd_pairwise." <> simdshape_str(from) <> "." <> signed_str(signed)
+    ir.STruncSatF32x4S -> "i32x4.trunc_sat_f32x4_s"
+    ir.STruncSatF32x4U -> "i32x4.trunc_sat_f32x4_u"
+    ir.STruncSatF64x2SZero -> "i32x4.trunc_sat_f64x2_s_zero"
+    ir.STruncSatF64x2UZero -> "i32x4.trunc_sat_f64x2_u_zero"
+    ir.SConvertF32x4I32x4S -> "f32x4.convert_i32x4_s"
+    ir.SConvertF32x4I32x4U -> "f32x4.convert_i32x4_u"
+    ir.SConvertF64x2LowI32x4S -> "f64x2.convert_low_i32x4_s"
+    ir.SConvertF64x2LowI32x4U -> "f64x2.convert_low_i32x4_u"
+    ir.SDemoteF64x2Zero -> "f32x4.demote_f64x2_zero"
+    ir.SPromoteLowF32x4 -> "f64x2.promote_low_f32x4"
+    ir.SDotI16x8S -> "i32x4.dot_i16x8_s"
+    ir.SQ15MulrSatS -> "i16x8.q15mulr_sat_s"
+    ir.SSwizzle -> "i8x16.swizzle"
   }
 }
 

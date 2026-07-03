@@ -563,6 +563,44 @@ fn apply_rename_subst(
     ir.Trap(_) -> e
     ir.Charge(cost, body) ->
       ir.Charge(cost, apply_rename_subst(body, rename, subst))
+    // ── Phase-6 SIMD nodes + `CallImport`: rewrite their `Value` operands (their op tag / lane
+    // immediates / mem index / import slot are static). ──
+    ir.Simd(op, sargs) -> ir.Simd(op, rs_values(sargs, rename, subst))
+    ir.SimdShuffle(lanes, a, b) ->
+      ir.SimdShuffle(
+        lanes,
+        rs_value(a, rename, subst),
+        rs_value(b, rename, subst),
+      )
+    ir.SimdLoad(mem, kind, addr, offset) ->
+      ir.SimdLoad(mem, kind, rs_value(addr, rename, subst), offset)
+    ir.SimdStore(mem, addr, value, offset) ->
+      ir.SimdStore(
+        mem,
+        rs_value(addr, rename, subst),
+        rs_value(value, rename, subst),
+        offset,
+      )
+    ir.SimdLoadLane(mem, width, addr, offset, lane, vec) ->
+      ir.SimdLoadLane(
+        mem,
+        width,
+        rs_value(addr, rename, subst),
+        offset,
+        lane,
+        rs_value(vec, rename, subst),
+      )
+    ir.SimdStoreLane(mem, width, addr, offset, lane, vec) ->
+      ir.SimdStoreLane(
+        mem,
+        width,
+        rs_value(addr, rename, subst),
+        offset,
+        lane,
+        rs_value(vec, rename, subst),
+      )
+    ir.CallImport(slot, ty, cargs) ->
+      ir.CallImport(slot, ty, rs_values(cargs, rename, subst))
   }
 }
 

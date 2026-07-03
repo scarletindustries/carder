@@ -1114,6 +1114,8 @@ fn parse_valtype(
         "term" -> Ok(#(TTerm, rest))
         "funcref" -> Ok(#(ir.TFuncRef, rest))
         "externref" -> Ok(#(ir.TExternRef, rest))
+        // Phase-6 SIMD value type (I1). Conformance-neutral; P6-02 owns the full round-trip.
+        "v128" -> Ok(#(ir.TV128, rest))
         _ -> Error(UnexpectedToken(l, c, "valtype", w))
       }
     [PToken(t, l, c), ..] ->
@@ -1159,6 +1161,12 @@ fn parse_value(
         // The null-reference literal, tagged by reftype (R1c): `null.funcref` / `null.externref`.
         "null.funcref" -> Ok(#(ir.ConstNull(ir.FuncRef), rest))
         "null.externref" -> Ok(#(ir.ConstNull(ir.ExternRef), rest))
+        // The `v128.const` literal — 16 raw little-endian bytes as `0x` + hex (I1/D5). P6-02
+        // owns the full round-trip + the `bit_size == 128` validation; the keystone just parses.
+        "v128.const" -> {
+          use #(bytes, rest) <- result.try(parse_hexbytes(rest))
+          Ok(#(ir.ConstV128(bytes), rest))
+        }
         _ -> Error(UnexpectedToken(l, c, "value", w))
       }
     [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, "value", describe(t)))

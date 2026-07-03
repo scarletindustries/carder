@@ -133,7 +133,18 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | ir.MemFill(..)
     | ir.MemCopy(..)
     | ir.MemInit(..)
-    | ir.DataDrop(..) -> e
+    | ir.DataDrop(..)
+    | // Phase-6 SIMD nodes + `CallImport` carry only `Value` operands (no sub-`Expr`), so like
+      // the memory leaves they return unchanged from this `Expr`-traversal combinator. The pure
+      // `Simd`/`SimdShuffle` participate in const-fold/DCE (§effect); a pass that rewrites their
+      // `Value` operands does so in its own per-node arm, not here.
+      ir.Simd(..)
+    | ir.SimdShuffle(..)
+    | ir.SimdLoad(..)
+    | ir.SimdStore(..)
+    | ir.SimdLoadLane(..)
+    | ir.SimdStoreLane(..)
+    | ir.CallImport(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
     ir.Let(names, rhs, body) ->
       ir.Let(names, map_expr(rhs, rewrite), map_expr(body, rewrite))

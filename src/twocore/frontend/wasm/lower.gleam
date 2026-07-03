@@ -1858,6 +1858,9 @@ fn zero_value(t: ir.ValType) -> ir.Value {
     // Phase-1..4 WASM surface (only numeric locals); P5-05 exercises reference locals.
     ir.TFuncRef -> ir.ConstNull(ir.FuncRef)
     ir.TExternRef -> ir.ConstNull(ir.ExternRef)
+    // A `v128` slot's zero value is the all-zero 16-byte vector (I1). Never arises from the
+    // Phase-1..5 WASM surface; P6-05 exercises real v128 locals.
+    ir.TV128 -> ir.ConstV128(<<0:128>>)
   }
 }
 
@@ -1945,6 +1948,8 @@ fn value_type(st: LState, v: ir.Value) -> ir.ValType {
     ir.ConstF64(_) -> ir.TF64
     // A null-reference literal is self-describing via its reftype tag (H1).
     ir.ConstNull(ty) -> ir.reftype_to_valtype(ty)
+    // A `v128.const` literal is self-describing (I1).
+    ir.ConstV128(_) -> ir.TV128
     ir.Var(n) -> dict.get(st.var_types, n) |> result.unwrap(ir.TI32)
   }
 }
