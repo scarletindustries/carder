@@ -554,440 +554,480 @@ pub fn i32x4_dot_i16x8_s(a: BitArray, b: BitArray) -> BitArray {
   panic as "rt_simd.i32x4_dot_i16x8_s — implemented in P6-07"
 }
 
+// ─────────────────────────── pass 07b private helpers (compare / bitwise / reductions / lane access) ───────────────────────────
+//
+// PRIVATE infrastructure for the comparison-mask, whole-vector bitwise, boolean-reduction and
+// lane-access families. All funnel through the 07a codec (`decode_lanes`/`encode_lanes`/
+// `map2_lanes`/`mask_low`/`signed_of`/`all_ones`/`pow2`); the only genuinely new primitives are
+// the 128-bit whole-vector view (`bits128`/`from_bits128`) the shape-agnostic bitwise ops need
+// and the lane-index read/write (`lane_at`/`set_lane`) the extract/replace ops need. Signed lane
+// comparisons reuse the codec's `signed_of` (the sanctioned local mirror of `rt_num`'s two's-
+// complement interpretation, §A.3), exactly as 07a's `min_s`/`max_s` do.
+
+/// Decode the whole 16-byte v128 as ONE 128-bit unsigned integer. Endianness is irrelevant for
+/// a shape-agnostic bitwise op: `bits128` and `from_bits128` use the same bit direction, so every
+/// bit round-trips to its original position. Crashes node-safe if `v` is not exactly 16 bytes (an
+/// internal-invariant failure — validation guarantees a 16-byte v128 — never a WASM trap).
+fn bits128(v: BitArray) -> Int {
+  let assert <<n:128>> = v
+  n
+}
+
+/// Re-encode a 128-bit integer `n ∈ [0, 2^128)` as the 16-byte v128 (the inverse of `bits128`).
+fn from_bits128(n: Int) -> BitArray {
+  <<n:128>>
+}
+
+/// Per-lane comparison → mask: decode both operands into `w`-bit lanes, apply the boolean
+/// relation `rel` to each corresponding lane pair, and emit the WASM lane result — `all_ones(w)`
+/// (a lane of `-1` in two's complement, e.g. `0xFF` for i8) where the relation holds, `0`
+/// (all-zeros) where it does not (spec `ieq`/`ilt_s`/… over vectors, §exec/numerics).
+fn cmp_mask(
+  a: BitArray,
+  b: BitArray,
+  w: Int,
+  rel: fn(Int, Int) -> Bool,
+) -> BitArray {
+  map2_lanes(a, b, w, fn(x, y) {
+    case rel(x, y) {
+      True -> all_ones(w)
+      False -> 0
+    }
+  })
+}
+
+/// `1` if EVERY `w`-bit lane of `v` is non-zero, else `0` (spec `all_true`). An empty-lane
+/// vacuous truth cannot occur (a v128 always has ≥ 2 lanes).
+fn all_true(v: BitArray, w: Int) -> Int {
+  case list.all(decode_lanes(v, w), fn(lane) { lane != 0 }) {
+    True -> 1
+    False -> 0
+  }
+}
+
+/// Gather the SIGN bit (bit `w-1`) of each `w`-bit lane of `v` into the low bits of an i32,
+/// lane 0 → bit 0 (spec `bitmask`): a set sign bit in lane `i` contributes `1 << i`. Yields a
+/// 16-bit result for i8x16, 8-bit for i16x8, 4-bit for i32x4, 2-bit for i64x2.
+fn bitmask(v: BitArray, w: Int) -> Int {
+  list.index_fold(decode_lanes(v, w), 0, fn(acc, lane, i) {
+    case int.bitwise_and(lane, pow2(w - 1)) {
+      0 -> acc
+      _ -> int.bitwise_or(acc, int.bitwise_shift_left(1, i))
+    }
+  })
+}
+
+/// The raw `w`-bit lane at index `lane` of `v` as its non-negative bit pattern. `lane` is a
+/// static immediate validation guarantees in `[0, 128/w)`; an out-of-range index crashes
+/// node-safe (an internal-invariant failure, never a WASM trap).
+fn lane_at(v: BitArray, w: Int, lane: Int) -> Int {
+  let assert [x, ..] = list.drop(decode_lanes(v, w), lane)
+  x
+}
+
+/// A copy of `v` with lane `lane` (of width `w`) replaced by the raw bits `x mod 2^w`. `lane`
+/// is a static immediate in `[0, 128/w)` (validation-guaranteed).
+fn set_lane(v: BitArray, w: Int, lane: Int, x: Int) -> BitArray {
+  encode_lanes(
+    list.index_map(decode_lanes(v, w), fn(l, i) {
+      case i == lane {
+        True -> mask_low(x, w)
+        False -> l
+      }
+    }),
+    w,
+  )
+}
+
+/// Broadcast the raw-bit scalar `x` (taken mod `2^w`) into all `128/w` lanes of width `w`
+/// (spec `splat`) — all 16 bytes are the scalar repeated in little-endian lane order.
+fn splat(x: Int, w: Int) -> BitArray {
+  encode_lanes(list.repeat(mask_low(x, w), 128 / w), w)
+}
+
 // ── integer comparisons → a v128 MASK (all-ones / all-zeros per lane) ─────────────────────────────────────────────
 
-/// `i8x16.eq` — lane-wise comparison → per-lane mask.
+/// `i8x16.eq` — per-lane equality; each lane → `0xFF` (all-ones) if equal, `0x00` otherwise.
 pub fn i8x16_eq(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_eq — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { x == y })
 }
 
-/// `i8x16.ne` — lane-wise comparison → per-lane mask.
+/// `i8x16.ne` — per-lane inequality; `0xFF` if unequal, `0x00` otherwise.
 pub fn i8x16_ne(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_ne — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { x != y })
 }
 
-/// `i8x16.lt_s` — lane-wise comparison → per-lane mask.
+/// `i8x16.lt_s` — per-lane SIGNED less-than (two's-complement); `0xFF` if `a < b`, else `0x00`.
 pub fn i8x16_lt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_lt_s — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { signed_of(x, 8) < signed_of(y, 8) })
 }
 
-/// `i8x16.lt_u` — lane-wise comparison → per-lane mask.
+/// `i8x16.lt_u` — per-lane UNSIGNED less-than (raw pattern); `0xFF` if `a < b`, else `0x00`.
 pub fn i8x16_lt_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_lt_u — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { x < y })
 }
 
-/// `i8x16.gt_s` — lane-wise comparison → per-lane mask.
+/// `i8x16.gt_s` — per-lane SIGNED greater-than; `0xFF` if `a > b`, else `0x00`.
 pub fn i8x16_gt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_gt_s — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { signed_of(x, 8) > signed_of(y, 8) })
 }
 
-/// `i8x16.gt_u` — lane-wise comparison → per-lane mask.
+/// `i8x16.gt_u` — per-lane UNSIGNED greater-than; `0xFF` if `a > b`, else `0x00`.
 pub fn i8x16_gt_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_gt_u — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { x > y })
 }
 
-/// `i8x16.le_s` — lane-wise comparison → per-lane mask.
+/// `i8x16.le_s` — per-lane SIGNED less-or-equal; `0xFF` if `a ≤ b`, else `0x00`.
 pub fn i8x16_le_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_le_s — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { signed_of(x, 8) <= signed_of(y, 8) })
 }
 
-/// `i8x16.le_u` — lane-wise comparison → per-lane mask.
+/// `i8x16.le_u` — per-lane UNSIGNED less-or-equal; `0xFF` if `a ≤ b`, else `0x00`.
 pub fn i8x16_le_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_le_u — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { x <= y })
 }
 
-/// `i8x16.ge_s` — lane-wise comparison → per-lane mask.
+/// `i8x16.ge_s` — per-lane SIGNED greater-or-equal; `0xFF` if `a ≥ b`, else `0x00`.
 pub fn i8x16_ge_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_ge_s — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { signed_of(x, 8) >= signed_of(y, 8) })
 }
 
-/// `i8x16.ge_u` — lane-wise comparison → per-lane mask.
+/// `i8x16.ge_u` — per-lane UNSIGNED greater-or-equal; `0xFF` if `a ≥ b`, else `0x00`.
 pub fn i8x16_ge_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i8x16_ge_u — implemented in P6-07"
+  cmp_mask(a, b, 8, fn(x, y) { x >= y })
 }
 
-/// `i16x8.eq` — lane-wise comparison → per-lane mask.
+/// `i16x8.eq` — per-lane equality; each lane → `0xFFFF` if equal, `0x0000` otherwise.
 pub fn i16x8_eq(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_eq — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { x == y })
 }
 
-/// `i16x8.ne` — lane-wise comparison → per-lane mask.
+/// `i16x8.ne` — per-lane inequality; `0xFFFF` if unequal, `0x0000` otherwise.
 pub fn i16x8_ne(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_ne — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { x != y })
 }
 
-/// `i16x8.lt_s` — lane-wise comparison → per-lane mask.
+/// `i16x8.lt_s` — per-lane SIGNED less-than; `0xFFFF` if `a < b`, else `0x0000`.
 pub fn i16x8_lt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_lt_s — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { signed_of(x, 16) < signed_of(y, 16) })
 }
 
-/// `i16x8.lt_u` — lane-wise comparison → per-lane mask.
+/// `i16x8.lt_u` — per-lane UNSIGNED less-than; `0xFFFF` if `a < b`, else `0x0000`.
 pub fn i16x8_lt_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_lt_u — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { x < y })
 }
 
-/// `i16x8.gt_s` — lane-wise comparison → per-lane mask.
+/// `i16x8.gt_s` — per-lane SIGNED greater-than; `0xFFFF` if `a > b`, else `0x0000`.
 pub fn i16x8_gt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_gt_s — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { signed_of(x, 16) > signed_of(y, 16) })
 }
 
-/// `i16x8.gt_u` — lane-wise comparison → per-lane mask.
+/// `i16x8.gt_u` — per-lane UNSIGNED greater-than; `0xFFFF` if `a > b`, else `0x0000`.
 pub fn i16x8_gt_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_gt_u — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { x > y })
 }
 
-/// `i16x8.le_s` — lane-wise comparison → per-lane mask.
+/// `i16x8.le_s` — per-lane SIGNED less-or-equal; `0xFFFF` if `a ≤ b`, else `0x0000`.
 pub fn i16x8_le_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_le_s — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { signed_of(x, 16) <= signed_of(y, 16) })
 }
 
-/// `i16x8.le_u` — lane-wise comparison → per-lane mask.
+/// `i16x8.le_u` — per-lane UNSIGNED less-or-equal; `0xFFFF` if `a ≤ b`, else `0x0000`.
 pub fn i16x8_le_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_le_u — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { x <= y })
 }
 
-/// `i16x8.ge_s` — lane-wise comparison → per-lane mask.
+/// `i16x8.ge_s` — per-lane SIGNED greater-or-equal; `0xFFFF` if `a ≥ b`, else `0x0000`.
 pub fn i16x8_ge_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_ge_s — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { signed_of(x, 16) >= signed_of(y, 16) })
 }
 
-/// `i16x8.ge_u` — lane-wise comparison → per-lane mask.
+/// `i16x8.ge_u` — per-lane UNSIGNED greater-or-equal; `0xFFFF` if `a ≥ b`, else `0x0000`.
 pub fn i16x8_ge_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i16x8_ge_u — implemented in P6-07"
+  cmp_mask(a, b, 16, fn(x, y) { x >= y })
 }
 
-/// `i32x4.eq` — lane-wise comparison → per-lane mask.
+/// `i32x4.eq` — per-lane equality; each lane → `0xFFFFFFFF` if equal, `0` otherwise.
 pub fn i32x4_eq(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_eq — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { x == y })
 }
 
-/// `i32x4.ne` — lane-wise comparison → per-lane mask.
+/// `i32x4.ne` — per-lane inequality; `0xFFFFFFFF` if unequal, `0` otherwise.
 pub fn i32x4_ne(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_ne — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { x != y })
 }
 
-/// `i32x4.lt_s` — lane-wise comparison → per-lane mask.
+/// `i32x4.lt_s` — per-lane SIGNED less-than; `0xFFFFFFFF` if `a < b`, else `0`.
 pub fn i32x4_lt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_lt_s — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { signed_of(x, 32) < signed_of(y, 32) })
 }
 
-/// `i32x4.lt_u` — lane-wise comparison → per-lane mask.
+/// `i32x4.lt_u` — per-lane UNSIGNED less-than; `0xFFFFFFFF` if `a < b`, else `0`.
 pub fn i32x4_lt_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_lt_u — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { x < y })
 }
 
-/// `i32x4.gt_s` — lane-wise comparison → per-lane mask.
+/// `i32x4.gt_s` — per-lane SIGNED greater-than; `0xFFFFFFFF` if `a > b`, else `0`.
 pub fn i32x4_gt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_gt_s — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { signed_of(x, 32) > signed_of(y, 32) })
 }
 
-/// `i32x4.gt_u` — lane-wise comparison → per-lane mask.
+/// `i32x4.gt_u` — per-lane UNSIGNED greater-than; `0xFFFFFFFF` if `a > b`, else `0`.
 pub fn i32x4_gt_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_gt_u — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { x > y })
 }
 
-/// `i32x4.le_s` — lane-wise comparison → per-lane mask.
+/// `i32x4.le_s` — per-lane SIGNED less-or-equal; `0xFFFFFFFF` if `a ≤ b`, else `0`.
 pub fn i32x4_le_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_le_s — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { signed_of(x, 32) <= signed_of(y, 32) })
 }
 
-/// `i32x4.le_u` — lane-wise comparison → per-lane mask.
+/// `i32x4.le_u` — per-lane UNSIGNED less-or-equal; `0xFFFFFFFF` if `a ≤ b`, else `0`.
 pub fn i32x4_le_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_le_u — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { x <= y })
 }
 
-/// `i32x4.ge_s` — lane-wise comparison → per-lane mask.
+/// `i32x4.ge_s` — per-lane SIGNED greater-or-equal; `0xFFFFFFFF` if `a ≥ b`, else `0`.
 pub fn i32x4_ge_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_ge_s — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { signed_of(x, 32) >= signed_of(y, 32) })
 }
 
-/// `i32x4.ge_u` — lane-wise comparison → per-lane mask.
+/// `i32x4.ge_u` — per-lane UNSIGNED greater-or-equal; `0xFFFFFFFF` if `a ≥ b`, else `0`.
 pub fn i32x4_ge_u(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i32x4_ge_u — implemented in P6-07"
+  cmp_mask(a, b, 32, fn(x, y) { x >= y })
 }
 
-/// `i64x2.eq` — lane-wise comparison → per-lane mask.
+/// `i64x2.eq` — per-lane equality; each lane → all-ones (64-bit) if equal, `0` otherwise.
 pub fn i64x2_eq(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_eq — implemented in P6-07"
+  cmp_mask(a, b, 64, fn(x, y) { x == y })
 }
 
-/// `i64x2.ne` — lane-wise comparison → per-lane mask.
+/// `i64x2.ne` — per-lane inequality; all-ones if unequal, `0` otherwise.
 pub fn i64x2_ne(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_ne — implemented in P6-07"
+  cmp_mask(a, b, 64, fn(x, y) { x != y })
 }
 
-/// `i64x2.lt_s` — lane-wise comparison → per-lane mask.
+/// `i64x2.lt_s` — per-lane SIGNED less-than; all-ones if `a < b`, else `0`. (i64x2 has only
+/// SIGNED ordering compares — no unsigned variants exist in the spec.)
 pub fn i64x2_lt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_lt_s — implemented in P6-07"
+  cmp_mask(a, b, 64, fn(x, y) { signed_of(x, 64) < signed_of(y, 64) })
 }
 
-/// `i64x2.gt_s` — lane-wise comparison → per-lane mask.
+/// `i64x2.gt_s` — per-lane SIGNED greater-than; all-ones if `a > b`, else `0`.
 pub fn i64x2_gt_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_gt_s — implemented in P6-07"
+  cmp_mask(a, b, 64, fn(x, y) { signed_of(x, 64) > signed_of(y, 64) })
 }
 
-/// `i64x2.le_s` — lane-wise comparison → per-lane mask.
+/// `i64x2.le_s` — per-lane SIGNED less-or-equal; all-ones if `a ≤ b`, else `0`.
 pub fn i64x2_le_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_le_s — implemented in P6-07"
+  cmp_mask(a, b, 64, fn(x, y) { signed_of(x, 64) <= signed_of(y, 64) })
 }
 
-/// `i64x2.ge_s` — lane-wise comparison → per-lane mask.
+/// `i64x2.ge_s` — per-lane SIGNED greater-or-equal; all-ones if `a ≥ b`, else `0`.
 pub fn i64x2_ge_s(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.i64x2_ge_s — implemented in P6-07"
+  cmp_mask(a, b, 64, fn(x, y) { signed_of(x, 64) >= signed_of(y, 64) })
 }
 
 // ── v128 bitwise (shape-agnostic — operate on the whole 128 bits) ─────────────────────────────────────────────
 
-/// `v128.not` — bitwise complement.
+/// `v128.not` — bitwise complement of all 128 bits (`~a`), computed as `a XOR all-ones`.
 pub fn v128_not(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.v128_not — implemented in P6-07"
+  from_bits128(int.bitwise_exclusive_or(bits128(a), all_ones(128)))
 }
 
-/// `v128.and` — bitwise AND.
+/// `v128.and` — bitwise AND of all 128 bits.
 pub fn v128_and(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.v128_and — implemented in P6-07"
+  from_bits128(int.bitwise_and(bits128(a), bits128(b)))
 }
 
-/// `v128.or` — bitwise OR.
+/// `v128.or` — bitwise OR of all 128 bits.
 pub fn v128_or(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.v128_or — implemented in P6-07"
+  from_bits128(int.bitwise_or(bits128(a), bits128(b)))
 }
 
-/// `v128.xor` — bitwise XOR.
+/// `v128.xor` — bitwise XOR of all 128 bits.
 pub fn v128_xor(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.v128_xor — implemented in P6-07"
+  from_bits128(int.bitwise_exclusive_or(bits128(a), bits128(b)))
 }
 
-/// `v128.andnot` — `a AND (NOT b)`.
+/// `v128.andnot` — `a AND (NOT b)` over all 128 bits (note the fixed operand order: `a` is kept
+/// where `b` is clear).
 pub fn v128_andnot(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.v128_andnot — implemented in P6-07"
+  from_bits128(int.bitwise_and(
+    bits128(a),
+    int.bitwise_exclusive_or(bits128(b), all_ones(128)),
+  ))
 }
 
-/// `v128.bitselect` — per-bit `(a AND mask) OR (b AND NOT mask)`.
+/// `v128.bitselect` — per-bit `(a AND mask) OR (b AND NOT mask)`: bit `i` of the result is `a`'s
+/// bit where `mask`'s bit is 1, else `b`'s bit.
 pub fn v128_bitselect(a: BitArray, b: BitArray, mask: BitArray) -> BitArray {
-  let _ = #(a, b, mask)
-  panic as "rt_simd.v128_bitselect — implemented in P6-07"
+  let m = bits128(mask)
+  from_bits128(int.bitwise_or(
+    int.bitwise_and(bits128(a), m),
+    int.bitwise_and(bits128(b), int.bitwise_exclusive_or(m, all_ones(128))),
+  ))
 }
 
 // ── boolean reductions / mask (→ i32) ─────────────────────────────────────────────
 
-/// `v128.any_true` — 1 if any bit set, else 0.
+/// `v128.any_true` — `1` if ANY bit of the whole 128-bit value is set, else `0`
+/// (shape-agnostic; spec `any_true`).
 pub fn v128_any_true(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.v128_any_true — implemented in P6-07"
+  case bits128(a) {
+    0 -> 0
+    _ -> 1
+  }
 }
 
-/// `i8x16.all_true` — 1 if every lane is non-zero, else 0.
+/// `i8x16.all_true` — `1` if every one of the 16 i8 lanes is non-zero, else `0`.
 pub fn i8x16_all_true(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i8x16_all_true — implemented in P6-07"
+  all_true(a, 8)
 }
 
-/// `i16x8.all_true` — 1 if every lane is non-zero, else 0.
+/// `i16x8.all_true` — `1` if every one of the 8 i16 lanes is non-zero, else `0`.
 pub fn i16x8_all_true(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i16x8_all_true — implemented in P6-07"
+  all_true(a, 16)
 }
 
-/// `i32x4.all_true` — 1 if every lane is non-zero, else 0.
+/// `i32x4.all_true` — `1` if every one of the 4 i32 lanes is non-zero, else `0`.
 pub fn i32x4_all_true(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i32x4_all_true — implemented in P6-07"
+  all_true(a, 32)
 }
 
-/// `i64x2.all_true` — 1 if every lane is non-zero, else 0.
+/// `i64x2.all_true` — `1` if both i64 lanes are non-zero, else `0`.
 pub fn i64x2_all_true(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i64x2_all_true — implemented in P6-07"
+  all_true(a, 64)
 }
 
-/// `i8x16.bitmask` — pack the high bit of each lane into an i32.
+/// `i8x16.bitmask` — gather the high bit of each of the 16 i8 lanes into the low 16 bits of an
+/// i32 (lane 0 → bit 0).
 pub fn i8x16_bitmask(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i8x16_bitmask — implemented in P6-07"
+  bitmask(a, 8)
 }
 
-/// `i16x8.bitmask` — pack the high bit of each lane into an i32.
+/// `i16x8.bitmask` — gather the high bit of each of the 8 i16 lanes into the low 8 bits of an i32.
 pub fn i16x8_bitmask(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i16x8_bitmask — implemented in P6-07"
+  bitmask(a, 16)
 }
 
-/// `i32x4.bitmask` — pack the high bit of each lane into an i32.
+/// `i32x4.bitmask` — gather the high bit of each of the 4 i32 lanes into the low 4 bits of an i32.
 pub fn i32x4_bitmask(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i32x4_bitmask — implemented in P6-07"
+  bitmask(a, 32)
 }
 
-/// `i64x2.bitmask` — pack the high bit of each lane into an i32.
+/// `i64x2.bitmask` — gather the high bit of each of the 2 i64 lanes into the low 2 bits of an i32.
 pub fn i64x2_bitmask(a: BitArray) -> Int {
-  let _ = a
-  panic as "rt_simd.i64x2_bitmask — implemented in P6-07"
+  bitmask(a, 64)
 }
 
 // ── splat — scalar (raw bits) → v128 (all lanes = scalar) ─────────────────────────────────────────────
 
-/// `i8x16.splat` — `x` = i32 raw bits, low 8 used per lane.
+/// `i8x16.splat` — broadcast `x`'s low 8 bits (i32 raw scalar, `x mod 2^8`) into all 16 lanes.
 pub fn i8x16_splat(x: Int) -> BitArray {
-  let _ = x
-  panic as "rt_simd.i8x16_splat — implemented in P6-07"
+  splat(x, 8)
 }
 
-/// `i16x8.splat` — `x` = i32 raw bits, low 16 used per lane.
+/// `i16x8.splat` — broadcast `x`'s low 16 bits (`x mod 2^16`) into all 8 lanes.
 pub fn i16x8_splat(x: Int) -> BitArray {
-  let _ = x
-  panic as "rt_simd.i16x8_splat — implemented in P6-07"
+  splat(x, 16)
 }
 
-/// `i32x4.splat` — `x` = i32 raw bits.
+/// `i32x4.splat` — broadcast the i32 raw bits `x` into all 4 lanes.
 pub fn i32x4_splat(x: Int) -> BitArray {
-  let _ = x
-  panic as "rt_simd.i32x4_splat — implemented in P6-07"
+  splat(x, 32)
 }
 
-/// `i64x2.splat` — `x` = i64 raw bits.
+/// `i64x2.splat` — broadcast the i64 raw bits `x` into both lanes.
 pub fn i64x2_splat(x: Int) -> BitArray {
-  let _ = x
-  panic as "rt_simd.i64x2_splat — implemented in P6-07"
+  splat(x, 64)
 }
 
-/// `f32x4.splat` — `x` = f32 raw bits.
+/// `f32x4.splat` — broadcast the f32 raw bit pattern `x` into all 4 lanes (identical byte layout
+/// to `i32x4.splat`; the float interpretation is `rt_num`'s job, not the codec's).
 pub fn f32x4_splat(x: Int) -> BitArray {
-  let _ = x
-  panic as "rt_simd.f32x4_splat — implemented in P6-07"
+  splat(x, 32)
 }
 
-/// `f64x2.splat` — `x` = f64 raw bits.
+/// `f64x2.splat` — broadcast the f64 raw bit pattern `x` into both lanes.
 pub fn f64x2_splat(x: Int) -> BitArray {
-  let _ = x
-  panic as "rt_simd.f64x2_splat — implemented in P6-07"
+  splat(x, 64)
 }
 
 // ── extract / replace lane (immediates as Int args) ─────────────────────────────────────────────
 
-/// `i8x16.extract_lane_s` — sign-extend lane `lane` to i32.
+/// `i8x16.extract_lane_s` — read lane `lane` (an i8) SIGN-extended to i32 raw bits (reuses
+/// `rt_num.i32_extend8_s`): byte `0xFF` → `0xFFFFFFFF` (=−1).
 pub fn i8x16_extract_lane_s(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.i8x16_extract_lane_s — implemented in P6-07"
+  rt_num.i32_extend8_s(lane_at(a, 8, lane))
 }
 
-/// `i8x16.extract_lane_u` — zero-extend lane `lane` to i32.
+/// `i8x16.extract_lane_u` — read lane `lane` (an i8) ZERO-extended to i32: byte `0xFF` →
+/// `0x000000FF` (=255). (The raw lane pattern is already the zero-extension.)
 pub fn i8x16_extract_lane_u(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.i8x16_extract_lane_u — implemented in P6-07"
+  lane_at(a, 8, lane)
 }
 
-/// `i16x8.extract_lane_s` — sign-extend lane `lane` to i32.
+/// `i16x8.extract_lane_s` — read lane `lane` (an i16) SIGN-extended to i32 raw bits (reuses
+/// `rt_num.i32_extend16_s`): `0x8000` → `0xFFFF8000`.
 pub fn i16x8_extract_lane_s(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.i16x8_extract_lane_s — implemented in P6-07"
+  rt_num.i32_extend16_s(lane_at(a, 16, lane))
 }
 
-/// `i16x8.extract_lane_u` — zero-extend lane `lane` to i32.
+/// `i16x8.extract_lane_u` — read lane `lane` (an i16) ZERO-extended to i32.
 pub fn i16x8_extract_lane_u(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.i16x8_extract_lane_u — implemented in P6-07"
+  lane_at(a, 16, lane)
 }
 
-/// `i32x4.extract_lane` — lane `lane` as i32 raw bits.
+/// `i32x4.extract_lane` — read lane `lane` as its i32 raw bits (no s/u — the lane already fills
+/// an i32).
 pub fn i32x4_extract_lane(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.i32x4_extract_lane — implemented in P6-07"
+  lane_at(a, 32, lane)
 }
 
-/// `i64x2.extract_lane` — lane `lane` as i64 raw bits.
+/// `i64x2.extract_lane` — read lane `lane` as its i64 raw bits.
 pub fn i64x2_extract_lane(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.i64x2_extract_lane — implemented in P6-07"
+  lane_at(a, 64, lane)
 }
 
-/// `f32x4.extract_lane` — lane `lane` as f32 raw bits.
+/// `f32x4.extract_lane` — read lane `lane` as its f32 raw bit pattern (no re-interpretation).
 pub fn f32x4_extract_lane(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.f32x4_extract_lane — implemented in P6-07"
+  lane_at(a, 32, lane)
 }
 
-/// `f64x2.extract_lane` — lane `lane` as f64 raw bits.
+/// `f64x2.extract_lane` — read lane `lane` as its f64 raw bit pattern.
 pub fn f64x2_extract_lane(a: BitArray, lane: Int) -> Int {
-  let _ = #(a, lane)
-  panic as "rt_simd.f64x2_extract_lane — implemented in P6-07"
+  lane_at(a, 64, lane)
 }
 
-/// `i8x16.replace_lane` — replace lane `lane` with scalar `x` (raw bits).
+/// `i8x16.replace_lane` — a copy of `a` with lane `lane` set to `x`'s low 8 bits (`x mod 2^8`).
 pub fn i8x16_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
-  let _ = #(a, lane, x)
-  panic as "rt_simd.i8x16_replace_lane — implemented in P6-07"
+  set_lane(a, 8, lane, x)
 }
 
-/// `i16x8.replace_lane` — replace lane `lane` with scalar `x` (raw bits).
+/// `i16x8.replace_lane` — a copy of `a` with lane `lane` set to `x`'s low 16 bits.
 pub fn i16x8_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
-  let _ = #(a, lane, x)
-  panic as "rt_simd.i16x8_replace_lane — implemented in P6-07"
+  set_lane(a, 16, lane, x)
 }
 
-/// `i32x4.replace_lane` — replace lane `lane` with scalar `x` (raw bits).
+/// `i32x4.replace_lane` — a copy of `a` with lane `lane` set to the i32 raw bits `x`.
 pub fn i32x4_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
-  let _ = #(a, lane, x)
-  panic as "rt_simd.i32x4_replace_lane — implemented in P6-07"
+  set_lane(a, 32, lane, x)
 }
 
-/// `i64x2.replace_lane` — replace lane `lane` with scalar `x` (raw bits).
+/// `i64x2.replace_lane` — a copy of `a` with lane `lane` set to the i64 raw bits `x`.
 pub fn i64x2_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
-  let _ = #(a, lane, x)
-  panic as "rt_simd.i64x2_replace_lane — implemented in P6-07"
+  set_lane(a, 64, lane, x)
 }
 
-/// `f32x4.replace_lane` — replace lane `lane` with scalar `x` (raw bits).
+/// `f32x4.replace_lane` — a copy of `a` with lane `lane` set to the f32 raw bit pattern `x`.
 pub fn f32x4_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
-  let _ = #(a, lane, x)
-  panic as "rt_simd.f32x4_replace_lane — implemented in P6-07"
+  set_lane(a, 32, lane, x)
 }
 
-/// `f64x2.replace_lane` — replace lane `lane` with scalar `x` (raw bits).
+/// `f64x2.replace_lane` — a copy of `a` with lane `lane` set to the f64 raw bit pattern `x`.
 pub fn f64x2_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
-  let _ = #(a, lane, x)
-  panic as "rt_simd.f64x2_replace_lane — implemented in P6-07"
+  set_lane(a, 64, lane, x)
 }
 
 // ── float lanes — IEEE-754 (f32x4 single-rounding); no trap ─────────────────────────────────────────────
