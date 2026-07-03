@@ -28,14 +28,20 @@ agents enumerate the full set by probing more builtins). Module name is `""`.
 | `call_indirect` + `funcref` | ✓ (8–9× — JS first-class fns / methods) | ✓ Phase 2 / 5 |
 | bulk memory (`memory.copy`) | ✓ (6–7×) | ✓ Phase 5 |
 | **v128 / SIMD** | ✓ (16× — string/memory ops) | ✓ **Phase 6** |
-| **exception handling** (`(tag)` + `throw` + `try_table`/`catch`) | ✓ (**64× throw** in a trivial program; a `(tag (param f64 i32))` carrying the thrown JS value; `catch` for JS `try/catch`) | ✗ **NOT BUILT — the gate** |
+| **exception handling** (`(tag)` + `throw` + **legacy `try`/`catch`/`end`**) | ✓ (**64× throw** in a trivial program; a `(tag (param f64 i32))` carrying the thrown JS value; the **legacy block-form `try`/`catch`** for JS `try/catch` — RE-MEASURED: Porffor emits the LEGACY EH encoding `try`=0x06/`catch`=0x07/`throw`=0x08/`end`=0x0B, NOT the modern `try_table`; `wasm-tools validate` needs `--features=legacy-exceptions`) | ✗ **NOT BUILT — the gate** |
 | GC (`struct`/`array`/`i31`/typed refs) | ✗ (confirmed empty — Porffor stays in core+common, §8.2) | ✗ (deferred; **not needed**) |
 
 **Exception handling is the single missing WASM feature.** Porffor throws pervasively (every JS
 error path / type check → a `throw` of a `(tag (param f64 i32))` carrying the thrown JS value); `try/
-catch` JS → `try_table`/`catch`. Both `--exception-mode=stack` (default) and `lut` still emit tag/
+catch` JS → the **legacy block-form `try`/`catch`/`end`** (RE-MEASURED — Porffor uses the *legacy*
+EH encoding, not `try_table`; and across every probe it emits exactly ONE `(tag (param f64 i32))`,
+pervasive `throw`, and `try`/`catch` — **never** `catch_all`/`catch_ref`/`delegate`/`rethrow`/
+`throw_ref`/`try_table`/`exnref`). Both `--exception-mode=stack` (default) and `lut` still emit tag/
 throw/catch — there is **no Porffor mode that avoids WASM EH**. So *JS on the BEAM is gated on WASM
-exception handling.*
+exception handling* — specifically **tags + `throw` + legacy `try`/`catch`**. **IR consequence (S-level):
+freeze the EH IR encoding-neutral** — legacy (Porffor's headline path) and modern (`try_table`, for
+the spec `.wast`) lower onto the SAME IR nodes (`Throw`/`TryTable`/`ThrowRef`); `throw_ref`/`exnref`/
+`catch_all` are **spec-conformance surface only**, not Porffor-critical.
 
 ## The elegant fit — WASM EH maps onto BEAM-native exceptions
 
