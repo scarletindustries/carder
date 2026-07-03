@@ -927,8 +927,9 @@ fn parse_reftype(
 }
 
 /// Peeks an OPTIONAL reference type token, defaulting to `default` when the next token is not a
-/// reftype. Total — advances `toks` only if a `funcref`/`externref` token matched. Used where
-/// the reftype is elided in the legacy spelling (`table`).
+/// reftype. Total — advances `toks` only if a `funcref`/`externref`/`exnref` token matched. Used
+/// where the reftype is elided in the legacy spelling (`table`). The Phase-7 `exnref` arm lets an
+/// `exnref`-typed table (`table @t exnref …`) round-trip (spec-conformance surface, T9).
 fn parse_opt_reftype(
   toks: List(PToken),
   default: ir.RefType,
@@ -936,6 +937,7 @@ fn parse_opt_reftype(
   case toks {
     [PToken(TWord("funcref"), _, _), ..rest] -> #(ir.FuncRef, rest)
     [PToken(TWord("externref"), _, _), ..rest] -> #(ir.ExternRef, rest)
+    [PToken(TWord("exnref"), _, _), ..rest] -> #(ir.ExnRef, rest)
     _ -> #(default, toks)
   }
 }
@@ -957,7 +959,8 @@ fn parse_elem(
 ) -> Result(#(ElementSegment, List(PToken)), ParseError) {
   case toks {
     [PToken(TWord("funcref"), _, _), ..]
-    | [PToken(TWord("externref"), _, _), ..] -> {
+    | [PToken(TWord("externref"), _, _), ..]
+    | [PToken(TWord("exnref"), _, _), ..] -> {
       use #(ref_ty, rest) <- result.try(parse_reftype(toks))
       use #(mode, rest) <- result.try(parse_elem_mode(rest))
       use #(init, rest) <- result.try(parse_ref_init_list(rest))
@@ -1397,9 +1400,10 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           use #(body, rest) <- result.try(parse_expr(rest))
           Ok(#(Charge(cost, body), rest))
         }
-        // ── Phase-7 EH expressions (J2/T1). `throw`/`throw_ref` round-trip their printer
-        // spelling here; the `try` region's brace-delimited body + catch-handler list is P7-02's
-        // full round-trip (the printer emits it, this keystone does not re-read it). ──
+        // ── Phase-7 EH expressions (J2/T1, the INLINE-HANDLER shape). `throw`/`throw_ref` are
+        // the leaf transfers; `try` opens a guard-and-catch region whose brace-delimited body is
+        // followed by a catch-handler list (`catch @tag (…) [ref %e] {…}` / `catch_all …`),
+        // mirroring `printer.print_expr`'s `Try` arm + `print_catch_handler`. ──
         "throw" -> {
           use #(tag, rest) <- result.try(parse_at_name(rest))
           use #(args, rest) <- result.try(parse_value_list(rest))
@@ -1409,6 +1413,7 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           use #(exnref, rest) <- result.try(parse_value(rest))
           Ok(#(ir.ThrowRef(exnref), rest))
         }
+        "try" -> parse_try(rest)
         _ -> Error(UnexpectedToken(l, c, "expression", kw))
       }
     [PToken(t, l, c), ..] ->
@@ -1664,6 +1669,86 @@ fn parse_trap(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
     [PToken(t, l, c), ..] ->
       Error(UnexpectedToken(l, c, "trap reason", describe(t)))
     [] -> Error(UnexpectedEnd("trap reason"))
+  }
+}
+
+// ───────────────────────────── Phase-7 EH `try` region (mirror of printer §Try) ────
+
+/// Parses `try (results) { body } <catch-handler>*` → `Try(result, body, handlers)` (J2/T1, the
+/// INLINE-HANDLER shape). The leading `try` keyword has already been consumed. Reads the block-type
+/// valtype list (the values a normal fall-off `body` yields), then the braced body, then zero or
+/// more catch handlers via `parse_catch_handlers`.
+///
+/// The handler list terminates at the first token that is NOT `catch`/`catch_all` — so a `try`
+/// with an empty handler list (a plain protected region) is legal, and a `try` used as a `let`
+/// right-hand side is followed by its continuation body unambiguously (`catch`/`catch_all` are
+/// recognised only here, never as expression keywords, so they cannot shadow a following
+/// statement). Mirrors `printer.print_expr`'s `Try` arm. TOTAL — every fault flows a typed
+/// `ParseError` from the total helpers, never a panic.
+fn parse_try(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(result, rest) <- result.try(parse_paren_list(toks, parse_valtype))
+  use rest <- result.try(expect(rest, TLBrace, "{"))
+  use #(body, rest) <- result.try(parse_expr(rest))
+  use rest <- result.try(expect(rest, TRBrace, "}"))
+  use #(handlers, rest) <- result.try(parse_catch_handlers(rest, []))
+  Ok(#(ir.Try(result, body, handlers), rest))
+}
+
+/// Parses the catch-handler list following a `try` body: zero or more clauses, in order.
+///
+/// Peeks the leading word: `catch` → an `OnTag(tag)` handler, `catch_all` → an `OnAll` handler;
+/// any other token ends the list (accumulated reversed, flipped at the close). The two forms share
+/// the `(%payload,*) [ref %e] { handler }` tail (`parse_catch_handler_tail`). `catch`/`catch_all`
+/// are matched EXACTLY (not by prefix), so `catch` never prefix-swallows `catch_all`. Mirrors the
+/// concatenated `print_catch_handler` renderings. TOTAL.
+fn parse_catch_handlers(
+  toks: List(PToken),
+  acc: List(ir.CatchHandler),
+) -> Result(#(List(ir.CatchHandler), List(PToken)), ParseError) {
+  case toks {
+    [PToken(TWord("catch"), _, _), ..rest] -> {
+      use #(tag, rest) <- result.try(parse_at_name(rest))
+      use #(h, rest) <- result.try(parse_catch_handler_tail(rest, ir.OnTag(tag)))
+      parse_catch_handlers(rest, [h, ..acc])
+    }
+    [PToken(TWord("catch_all"), _, _), ..rest] -> {
+      use #(h, rest) <- result.try(parse_catch_handler_tail(rest, ir.OnAll))
+      parse_catch_handlers(rest, [h, ..acc])
+    }
+    _ -> Ok(#(list.reverse(acc), toks))
+  }
+}
+
+/// Parses the shared tail of a catch handler after its `on` selector: `(%payload,*) [ref %e]
+/// { handler }` → `CatchHandler(on, payload, exnref, handler)`. Reads the parenthesised payload
+/// name list (the names the tag's operand values bind to inside `handler`), an optional ` ref %e`
+/// exnref-capture clause (the `_ref` forms bind the caught exception as an `exnref` handle), then
+/// the braced inline handler expression. Shared by the `catch @tag` and `catch_all` forms. TOTAL.
+fn parse_catch_handler_tail(
+  toks: List(PToken),
+  on: ir.CatchTag,
+) -> Result(#(ir.CatchHandler, List(PToken)), ParseError) {
+  use #(payload, rest) <- result.try(parse_paren_list(toks, parse_local_name))
+  let #(exnref, rest) = parse_opt_exnref(rest)
+  use rest <- result.try(expect(rest, TLBrace, "{"))
+  use #(handler, rest) <- result.try(parse_expr(rest))
+  use rest <- result.try(expect(rest, TRBrace, "}"))
+  Ok(#(ir.CatchHandler(on, payload, exnref, handler), rest))
+}
+
+/// Peeks an OPTIONAL ` ref %name` exnref-capture clause on a catch handler (the `_ref` catch
+/// forms — the caught `exnref` is bound to `%name` inside the handler). Returns `#(Some(name),
+/// rest)` when the next two tokens are exactly `ref %name`, else `#(None, toks)` (nothing
+/// consumed — the handler body `{` follows). Total and unambiguous: a handler's payload parens are
+/// ALWAYS followed by either `ref %e` or the body `{`, and no other construct begins with a bare
+/// `ref` word in this position.
+fn parse_opt_exnref(toks: List(PToken)) -> #(Option(String), List(PToken)) {
+  case toks {
+    [PToken(TWord("ref"), _, _), PToken(TLocal(name), _, _), ..rest] -> #(
+      Some(name),
+      rest,
+    )
+    _ -> #(None, toks)
   }
 }
 

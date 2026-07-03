@@ -95,43 +95,65 @@ opcode `0x08`). Printed like `call @f (args)` — the tag `@name`, then a parent
 Arity is the tag's business; the parser does **not** arity-check (syntax only, like `Num`/
 `CallDirect`). `Throw` does not return (bottom, like `Return`/`Trap`). Example: `throw @exc (%x, %xt)`.
 
-## A.4 The `TryTable(result, body, catches)` expression + the catch clauses
+## A.4 The `Try(result, body, handlers)` expression + the catch handlers (FROZEN — inline-handler, T1)
+
+> **⚠ FROZEN SHAPE (P7-01, RECONCILIATION T1).** P7-01 froze the EH region as an **INLINE-HANDLER**
+> `Try`, **not** the modern label-branch `TryTable` this doc's earlier draft (and unit-02 §A.4)
+> proposed. Per the tracking rule above, **the frozen shape wins and this delta records the
+> implemented spelling.** A `CatchHandler` carries a full inline `handler` `Expr` (a legacy Porffor
+> handler maps 1:1; a modern `try_table` clause maps via a `Break`/`Continue`/`Return` transfer
+> inside the handler — see `ir.gleam`'s `Try`/`CatchHandler` docs). There is **no** bracketed
+> label-clause list, no `$label` on a clause, and no own label on `Try`.
 
 ```
-expr  += try_table : ( valtype,* ) [ <catch>,* ] { <body> }    ; TryTable(result, body, catches)
-catch  := catch @tag $label                     ; Catch(tag, label, capture_ref: False)     — 0x00
-        | catch_ref @tag $label                  ; Catch(tag, label, capture_ref: True)       — 0x01
-        | catch_all $label                       ; CatchAll(label, capture_ref: False)        — 0x02
-        | catch_all_ref $label                   ; CatchAll(label, capture_ref: True)         — 0x03
+expr        += try ( valtype,* ) { <body> } <catch-handler>*     ; Try(result, body, handlers)
+catchhandler := catch @tag ( %name,* ) [ref %name] { <handler> } ; CatchHandler(OnTag(tag), payload, exnref?, handler)
+             | catch_all ( %name,* ) [ref %name] { <handler> }   ; CatchHandler(OnAll,      payload, exnref?, handler)
 ```
 
-Evaluate `body`; a thrown exception matching a `catch @tag`/`catch_ref @tag` clause (by tag) or any
-`catch_all`/`catch_all_ref` clause transfers to that clause's `$label` (an enclosing block/loop
-label, D6) delivering the tag's payload (and, for the `_ref` variants, the caught `exnref` as a
-trailing value); an unmatched exception propagates ([EH proposal — `try_table`](https://github.com/WebAssembly/exception-handling/blob/main/proposals/exception-handling/Exceptions.md#try-table),
-opcode `0x1f`). Spelled like `block $l : (results) { body }`, but with a **bracketed catch-clause
-list** before the body:
+Evaluate `body`; on a thrown exception each `CatchHandler` is tried **in order**: a `catch @tag`
+handler matches an exception of that tag (binding its payload operands to the `%name` list); a
+`catch_all` matches ANY exception (spec: exceptions, **not** traps); an unmatched exception
+**propagates**. When a handler matches, its inline `handler` expression runs with the payload names
+bound (plus the caught `exnref` bound to `%name` if a ` ref %name` capture clause is present). `body`
+falling through yields `result`. ([EH proposal](https://github.com/WebAssembly/exception-handling/blob/main/proposals/exception-handling/Exceptions.md);
+the neutral `Try` abstracts BOTH the legacy `try 0x06 / catch 0x07 / end 0x0b` dialect Porffor emits
+and the modern `try_table 0x1f`.) Spelled like `block : (results) { body }` (no label — `Try` has
+none), with the handler list **after** the body's closing brace:
 
 ```
-try_table : (i32) [catch @exc $onexc, catch_all $onall] {
+try (i32) {
   throw @exc (%x, %xt)
+} catch @exc (%p0, %p1) {
+  return (%p1)
+} catch_all () {
+  return (i32.const 0)
 }
 ```
 
-- **`result`** is the block type (the values a normal fall-off yields), the `valtype_list` after
-  `:` — exactly like `block`/`if`/`switch`.
-- **The catch list** is a `[`-`]`-bracketed comma-separated clause list (mirroring the `elem` init
-  list); an **empty list `[]`** is legal (a plain protected region). Clauses are read by a dedicated
-  `parse_catch_clause`, so the four catch words are **not** global expression keywords and cannot
-  shadow an expression.
-- **`$label`** is a `TLabel` (an enclosing block/loop label — the same space `Break`/`Continue`
-  use). The parser does **not** check scope (that is `validate`/`lower`'s job).
-- **`capture_ref`** (the `_ref` suffix) records whether the caught `exnref` is delivered to the
-  label. Purely textual here.
+- **`result`** is the try region's block type (the values a normal fall-off `body` yields), the
+  `valtype_list` after `try` — exactly like `block`/`if`/`switch` carry theirs.
+- **The handler list** is zero or more `catch @tag …` / `catch_all …` clauses following the body,
+  read by a dedicated `parse_catch_handlers`. An **empty list** is legal (a plain protected region —
+  every exception propagates). `catch`/`catch_all` are recognised **only** here (never as expression
+  keywords), matched EXACTLY (so `catch` cannot prefix-swallow `catch_all`), so they never shadow a
+  following statement — a `try` used as a `let` right-hand side is followed by its continuation body
+  unambiguously.
+- **`payload`** is a parenthesised `%name` list — the names the tag's operand values bind to inside
+  `handler` (`()` for a `catch_all`, which carries no operand types). Reuses the `%local`-list
+  helper (`parse_paren_list(_, parse_local_name)`).
+- **The optional ` ref %name`** clause (the `_ref` catch forms — `capture_ref`) binds the caught
+  `exnref` handle inside `handler`, so it can be re-thrown by `throw_ref`. `Some(name)` when present,
+  `None` otherwise. Purely textual here; the actual exnref binding is 05/06's.
+- **`handler`** is a full braced `Expr` (the inline legacy handler, or the modern transfer to the
+  target frame — `Break`/`Continue`/`Return`). The parser does **not** check label scope or arity
+  (that is `validate`/`lower`'s job).
 
-**No own label on `TryTable`** (Seam B — J2 lists 3 fields). A `br` escaping the body targets an
-enclosing `Block` (the standard IR pattern). If P7-01 gives `TryTable` its own `$label`, the header
-gains `try_table $l : (results) …` and this delta records it.
+**`CatchTag` = `OnTag(tag)` | `OnAll`** (T4 — tag by NAME, never a numeric index in the IR core).
+**No own label on `Try`** (T1 — the fields are exactly `result`, `body`, `handlers`). The four
+proposal catch-clause spellings (`catch`/`catch_ref`/`catch_all`/`catch_all_ref`) collapse onto the
+two frozen forms above via the ` ref %name` capture suffix: `catch_ref`/`catch_all_ref` are simply
+`catch`/`catch_all` **with** a ` ref %e` clause.
 
 ## A.5 The `ThrowRef(exnref)` expression
 
@@ -153,35 +175,40 @@ null exnref (a runtime concern, 07); the parser round-trips `throw_ref null.exnr
 |---|---|---|
 | no exnref value type / no `null.exnref` | (never emitted) | yes — the new arms fire only for `TExnRef`/`ConstNull(ExnRef)` |
 | no tag | (no `tag` line — `tags: []`) | yes — the tag block is empty |
-| no EH expr | (never emitted) | yes — `Throw`/`TryTable`/`ThrowRef` never appear |
+| no EH expr | (never emitted) | yes — `Throw`/`Try`/`ThrowRef` never appear |
 | a host / cross-module function import | `import "…" "…" : …` (unchanged `ImportFn`) | yes |
 | a SIMD / v128 / memory64 module | unchanged Phase-6 spelling | yes |
 
 The round-trip suite asserts a Phase-4-shaped module (`legacy_module_byte_identical_test`) prints an
 EXACT expected string (unchanged), the six prior goldens (`add`/`sum_to`/`fib`/`mem_table`/
-`refs_bulk`/`simd`) re-print byte-identically, and a **tag-free control module** contains **no**
-`tag`/`exnref`/`throw`/`try_table`/`catch` token — so a regression that leaked a new token into
-legacy output fails closed.
+`refs_bulk`/`simd`) re-print byte-identically, and a **tag-free control module**
+(`tag_free_module_has_no_eh_token_test`) contains **no** `tag`/`exnref`/`throw`/`try`/`catch` token
+— so a regression that leaked a new token into legacy output fails closed.
 
 ## Reconciliation notes (deviations from the overview / open questions)
 
 - **The `.ir` EH surface is DIALECT-NEUTRAL.** Measured Porffor 0.61.13 emits the LEGACY
   `try`/`catch`/`end` dialect (opcodes `0x06`/`0x07`/`0x0b`) + `(tag)` + `throw` (`0x08`) — **not**
   `try_table`/`throw_ref`/`exnref` — for a trivial `try/catch` (59× `throw`, 1× legacy try/catch,
-  1 tag). The neutral `TryTable`/`Throw`/`ThrowRef` IR models the modern branch-to-label form; `decode`/`lower`
-  (03/05) translate *whichever* WASM EH dialect the binary used onto it. The `_ref`/`exnref`/
-  `throw_ref` IR surface is Porffor-*unexercised-but-spec-complete* and round-trips regardless.
+  1 tag). The frozen INLINE-HANDLER `Try`/`Throw`/`ThrowRef` IR (T1) maps the legacy dialect 1:1 and
+  the modern `try_table` via a `Break`/`Continue`/`Return` transfer inside each handler; `decode`/
+  `lower` (03/05) translate *whichever* WASM EH dialect the binary used onto it. The
+  ` ref %e`-capturing catch forms + `exnref`/`throw_ref` IR surface is
+  Porffor-*unexercised-but-spec-complete* and round-trips regardless.
   (Unit-doc §Seams F / §Deviations 1 — the #1 flag for 01/03.)
 - **Tags are referenced by NAME (`@tag`), not a positional index** (Seam C) — the P5 named-decl
   precedent (globals/tables); if 01 uses `tagidx: Int`, the spelling is a bare number.
 - **`exnref` is a full `RefType` (`ExnRef`)** (Seam G) — reusing the reftype/null machinery, so an
   exnref table/element/import round-trips; obliges `rt_ref.classify_ref` to gain an `is_exn` test
   (07's concern).
-- **`CatchClause` = `Catch(tag, label, capture_ref)` / `CatchAll(label, capture_ref)`** (Seam E) — a
-  flat 4-constructor enum round-trips identically; this delta records 01's frozen choice.
-- **`TryTable` is label-less** (Seam B — J2's 3 fields); catch labels are enclosing-block labels.
+- **`CatchHandler` = `CatchHandler(on: CatchTag, payload, exnref?, handler)`, `CatchTag =
+  OnTag(tag) | OnAll`** (T1, the FROZEN inline-handler shape — supersedes the draft's
+  `Catch`/`CatchAll` label-clauses). The `.ir` spells the two forms `catch @tag (%p,*) [ref %e]
+  {…}` / `catch_all (%p,*) [ref %e] {…}` (§A.4); `capture_ref` is the optional ` ref %e` clause.
+- **`Try` is label-less** (T1 — the fields are exactly `result`, `body`, `handlers`); the handlers
+  are INLINE (a full `handler` `Expr`), not branches to enclosing-block labels.
 - **No new `ParseError` variant** — an unknown catch word / a `throw` missing its tag is
-  `UnexpectedToken`, a wrong sigil is `BadSigil`, truncation is `UnexpectedEnd` (the six existing
-  `ParseError`s suffice, matching P5-02/P6-02).
+  `UnexpectedToken`, a wrong sigil (`%x` where `@tag` is required) is `BadSigil`, truncation is
+  `UnexpectedEnd` (the six existing `ParseError`s suffice, matching P5-02/P6-02).
 - **No new `TrapReason`** (expected) — a WASM exception is a *value* through the EH machinery, not a
   trap; the one edge is `throw_ref` on a null exnref (a spec trap), which 07 decides (OQ 1).

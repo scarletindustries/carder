@@ -25,6 +25,7 @@ import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 import twocore/ir
 import twocore/ir/parser
 import twocore/ir/printer
@@ -2222,6 +2223,472 @@ pub fn negative_garbage_inputs_never_panic_test() {
     "module @m { func @f () -> () { mem.init i32.const 0 i32.const 0 i32.const 1 } }",
     "module @m { func @f () -> () { mem.size mem= } }",
     "module @m { func @f () -> () { values (null.i32) } }",
+  ]
+  assert list.all(garbage, rejects)
+}
+
+// ───────────────────────────── Phase-7 EH (exception-handling IR surface) ────────
+//
+// The full EH-IR round-trip over the FROZEN INLINE-HANDLER shape (T1): the `Module.tags`
+// declaration space (`TagDecl`, `ImportTag`, `ExportTag`), the `TExnRef` valtype + `ExnRef`
+// reftype + `null.exnref` value, `Throw(tag, args)`, `ThrowRef(exnref)`, and `Try(result, body,
+// handlers)` with `CatchHandler(on, payload, exnref?, handler)` over `CatchTag` (`OnTag`/`OnAll`).
+// Built from the IR types + the grammar delta (specs/phase-7/ir-grammar-delta.md), never from the
+// printer's output — an independent oracle, not a change-detector.
+
+/// A representative instance of every NEW Phase-7 EH `Expr`, plus the `null.exnref` value, for the
+/// round-trip. Covers: `Throw` with zero / one / many args; `ThrowRef` of a `%var` and of the
+/// `null.exnref` literal; `Try` with an EMPTY handler list (a plain protected region); a `Try`
+/// with each single handler kind (`catch` by tag, `catch_all`, ref-capturing `catch`/`catch_all`);
+/// a `Try` combining ALL four handler kinds; a nested `try` (a `Try` inside another `Try`'s body);
+/// and multi-name payload binders.
+fn eh_expr_corpus() -> List(ir.Expr) {
+  [
+    // Throw: zero / one / many operands (arity is the tag's business, not the parser's)
+    ir.Throw("stop", []),
+    ir.Throw("exc", [ir.Var("a")]),
+    ir.Throw("exc", [ir.Var("x"), ir.Var("xt"), ir.ConstI32(3)]),
+    // ThrowRef of a caught handle and of the null exnref literal
+    ir.ThrowRef(ir.Var("e")),
+    ir.ThrowRef(ir.ConstNull(ir.ExnRef)),
+    // null.exnref flowing as an ordinary value (opacity: the ONLY exnref literal)
+    ir.Values([ir.ConstNull(ir.ExnRef)]),
+    ir.Return([ir.ConstNull(ir.ExnRef)]),
+    // Try with an EMPTY handler list — a bare protected region (every exception propagates)
+    ir.Try([ir.TI32], ir.Values([ir.ConstI32(1)]), []),
+    ir.Try([], ir.Return([]), []),
+    // Try with a single `catch @tag` handler binding a multi-name payload
+    ir.Try([ir.TI32], ir.Throw("exc", [ir.Var("x"), ir.Var("xt")]), [
+      ir.CatchHandler(
+        ir.OnTag("exc"),
+        ["p0", "p1"],
+        None,
+        ir.Return([
+          ir.Var("p0"),
+        ]),
+      ),
+    ]),
+    // Try with a single `catch_all` (no payload)
+    ir.Try([], ir.Throw("stop", []), [
+      ir.CatchHandler(ir.OnAll, [], None, ir.Return([])),
+    ]),
+    // Try with a ref-capturing `catch @tag` (`catch_ref`) — binds the exnref, re-throws it
+    ir.Try([ir.TExnRef], ir.Throw("exc", [ir.Var("x")]), [
+      ir.CatchHandler(
+        ir.OnTag("exc"),
+        ["p0"],
+        Some("e"),
+        ir.ThrowRef(ir.Var("e")),
+      ),
+    ]),
+    // Try with a ref-capturing `catch_all` (`catch_all_ref`)
+    ir.Try([ir.TExnRef], ir.Throw("stop", []), [
+      ir.CatchHandler(ir.OnAll, [], Some("e"), ir.Return([ir.Var("e")])),
+    ]),
+    // Try combining ALL four handler kinds in one region (order preserved)
+    ir.Try([ir.TI32], ir.Throw("exc", [ir.Var("x"), ir.Var("xt")]), [
+      ir.CatchHandler(
+        ir.OnTag("exc"),
+        ["p0", "p1"],
+        None,
+        ir.Return([
+          ir.Var("p1"),
+        ]),
+      ),
+      ir.CatchHandler(
+        ir.OnTag("exc"),
+        ["q0", "q1"],
+        Some("e0"),
+        ir.ThrowRef(ir.Var("e0")),
+      ),
+      ir.CatchHandler(ir.OnAll, [], None, ir.Return([ir.ConstI32(0)])),
+      ir.CatchHandler(ir.OnAll, [], Some("e1"), ir.ThrowRef(ir.Var("e1"))),
+    ]),
+    // nested try: a `Try` whose body is itself a `Try` (and whose handler is a `Try`)
+    ir.Try(
+      [ir.TI32],
+      ir.Try([ir.TI32], ir.Throw("exc", [ir.Var("x"), ir.Var("xt")]), [
+        ir.CatchHandler(
+          ir.OnTag("exc"),
+          ["p0", "p1"],
+          None,
+          ir.Return([
+            ir.Var("p0"),
+          ]),
+        ),
+      ]),
+      [ir.CatchHandler(ir.OnAll, [], None, ir.Return([ir.ConstI32(9)]))],
+    ),
+  ]
+}
+
+pub fn eh_expr_surface_roundtrip_test() {
+  list.each(eh_expr_corpus(), fn(e) { check_roundtrip(expr_module("eh", e)) })
+}
+
+/// The `TExnRef` value type is legal — and round-trips — in EVERY valtype position: a param, a
+/// local, a function result, a `FuncType` (via `call_indirect`), an imported global's type, and a
+/// module global's declared type (with a `null.exnref` initialiser). Mirrors the funcref/externref
+/// and v128 positional round-trips.
+fn exnref_valtype_module() -> ir.Module {
+  ir.Module(
+    name: "exnpos",
+    uses_numerics: True,
+    memories: [],
+    globals: [
+      ir.GlobalDecl(
+        "ge",
+        ir.TExnRef,
+        True,
+        ir.Values([ir.ConstNull(ir.ExnRef)]),
+      ),
+    ],
+    imports: [ir.ImportGlobal("env", "ie", ir.TExnRef, False)],
+    functions: [
+      ir.Function(
+        name: "f",
+        params: [ir.Local("a", ir.TExnRef)],
+        result: [ir.TExnRef],
+        locals: [ir.Local("l", ir.TExnRef)],
+        body: ir.Let(
+          ["x"],
+          ir.CallIndirect(
+            "t",
+            ir.Var("i"),
+            ir.FuncType([ir.TExnRef], [ir.TExnRef]),
+            [ir.Var("a")],
+          ),
+          ir.Return([ir.Var("a")]),
+        ),
+      ),
+    ],
+    exports: [],
+    data_segments: [],
+    tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
+    elements: [],
+    start: None,
+    tags: [],
+  )
+}
+
+pub fn exnref_valtype_positions_roundtrip_test() {
+  check_roundtrip(exnref_valtype_module())
+}
+
+/// The tag declaration space round-trips at every shape: a multi-param module tag (the Porffor
+/// `(f64, i32)` carrier), a NULLARY (`()`) module tag, an imported tag, and an exported tag — all
+/// in one module.
+fn tag_space_module() -> ir.Module {
+  ir.Module(
+    name: "tags",
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [ir.ImportTag("env", "host_exc", [ir.TI32])],
+    functions: [],
+    exports: [ir.ExportTag("exc", "exc")],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
+    tags: [ir.TagDecl("exc", [ir.TF64, ir.TI32]), ir.TagDecl("stop", [])],
+  )
+}
+
+pub fn tag_space_roundtrip_test() {
+  check_roundtrip(tag_space_module())
+}
+
+/// `ExnRef` is a full `RefType`: an `exnref`-typed table and an `exnref` element segment (with a
+/// `null.exnref` slot) round-trip — the reftype/null machinery carries the new reference type in
+/// every reftype position (spec-conformance surface, T9). Porffor never emits these, but the IR is
+/// capable and the printer/parser must not drop them.
+fn exnref_reftype_module() -> ir.Module {
+  ir.Module(
+    ..expr_module("exnrt", ir.Return([])),
+    tables: [ir.TableDecl("et", ir.ExnRef, 1, Some(4))],
+    elements: [
+      ir.ElementSegment(ir.ElemPassive, ir.ExnRef, [
+        ir.Values([ir.ConstNull(ir.ExnRef)]),
+      ]),
+    ],
+  )
+}
+
+pub fn exnref_reftype_positions_roundtrip_test() {
+  check_roundtrip(exnref_reftype_module())
+}
+
+// ─── the hand-authored Phase-7 golden (independent oracle) ───
+
+/// Expected `Module` for the Phase-7 golden `golden/exn.ir` (hand-built, INDEPENDENT of the
+/// printer). Exercises the full EH-IR surface in one module: two module tags (multi-param +
+/// nullary), an imported tag, an exported tag, the exnref value type (param + result), the
+/// `null.exnref` literal, `Throw`, a `Try` whose handlers cover `catch` / `catch_all` /
+/// ref-capturing `catch` / ref-capturing `catch_all`, and `ThrowRef`.
+fn exn_module() -> ir.Module {
+  ir.Module(
+    name: "exn",
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [ir.ImportTag("env", "host_exc", [ir.TI32])],
+    functions: [
+      ir.Function(
+        name: "guarded",
+        params: [ir.Local("x", ir.TF64), ir.Local("xt", ir.TI32)],
+        result: [ir.TI32],
+        locals: [],
+        body: ir.Try([ir.TI32], ir.Throw("exc", [ir.Var("x"), ir.Var("xt")]), [
+          ir.CatchHandler(
+            ir.OnTag("exc"),
+            ["p0", "p1"],
+            None,
+            ir.Return([
+              ir.Var("p1"),
+            ]),
+          ),
+          ir.CatchHandler(ir.OnAll, [], None, ir.Return([ir.ConstI32(0)])),
+        ]),
+      ),
+      ir.Function(
+        name: "capture",
+        params: [ir.Local("x", ir.TF64), ir.Local("xt", ir.TI32)],
+        result: [ir.TExnRef],
+        locals: [],
+        body: ir.Try(
+          [ir.TExnRef],
+          ir.Throw("exc", [ir.Var("x"), ir.Var("xt")]),
+          [
+            ir.CatchHandler(
+              ir.OnTag("exc"),
+              ["p0", "p1"],
+              Some("e"),
+              ir.Return([ir.Var("e")]),
+            ),
+            ir.CatchHandler(ir.OnAll, [], Some("e"), ir.Return([ir.Var("e")])),
+          ],
+        ),
+      ),
+      ir.Function(
+        name: "rethrow",
+        params: [ir.Local("e", ir.TExnRef)],
+        result: [],
+        locals: [],
+        body: ir.ThrowRef(ir.Var("e")),
+      ),
+      ir.Function(
+        name: "nullexn",
+        params: [],
+        result: [ir.TExnRef],
+        locals: [],
+        body: ir.Return([ir.ConstNull(ir.ExnRef)]),
+      ),
+    ],
+    exports: [ir.ExportTag("exc", "exc")],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
+    tags: [ir.TagDecl("exc", [ir.TF64, ir.TI32]), ir.TagDecl("stop", [])],
+  )
+}
+
+/// The Phase-7 golden parses to its hand-built expected `Module` — the INDEPENDENT oracle proving
+/// the printer and parser agree on the EH grammar delta (the tag space, exnref/null.exnref, Throw,
+/// the inline-handler Try + its catch-handler list, and ThrowRef), not merely with each other (D7).
+pub fn golden_exn_parses_to_expected_test() {
+  assert parser.parse_module(read_golden("exn.ir")) == Ok(exn_module())
+}
+
+/// The Phase-7 golden's parsed `Module` re-prints + re-parses stably (`parse(print(m)) == m`).
+pub fn golden_exn_reprint_stably_test() {
+  check_roundtrip(exn_module())
+}
+
+// ─── Phase-7 discrimination (no EH field dropped) ───
+
+/// A `catch @tag` (`OnTag`) handler vs a `catch_all` (`OnAll`) handler, else identical, are
+/// DISTINCT modules and each round-trips — the `CatchTag` selector is not collapsed.
+pub fn catch_tag_vs_catch_all_discrimination_test() {
+  let on_tag =
+    expr_module(
+      "ct",
+      ir.Try([], ir.Throw("t", []), [
+        ir.CatchHandler(ir.OnTag("t"), [], None, ir.Return([])),
+      ]),
+    )
+  let on_all =
+    expr_module(
+      "ct",
+      ir.Try([], ir.Throw("t", []), [
+        ir.CatchHandler(ir.OnAll, [], None, ir.Return([])),
+      ]),
+    )
+  assert module_equal(on_tag, on_all) == False
+  check_roundtrip(on_tag)
+  check_roundtrip(on_all)
+}
+
+/// A ref-capturing handler (`exnref: Some(name)`) vs a non-capturing one (`None`), else identical,
+/// are DISTINCT modules and each round-trips — the `_ref` capture flag (` ref %e`) is not dropped.
+pub fn catch_capture_ref_discrimination_test() {
+  let capturing =
+    expr_module(
+      "cr",
+      ir.Try([], ir.Throw("t", []), [
+        ir.CatchHandler(ir.OnTag("t"), [], Some("e"), ir.Return([])),
+      ]),
+    )
+  let plain =
+    expr_module(
+      "cr",
+      ir.Try([], ir.Throw("t", []), [
+        ir.CatchHandler(ir.OnTag("t"), [], None, ir.Return([])),
+      ]),
+    )
+  assert module_equal(capturing, plain) == False
+  check_roundtrip(capturing)
+  check_roundtrip(plain)
+}
+
+/// Two `Throw`s that differ only in their tag NAME are DISTINCT modules and each round-trips — the
+/// `Throw.tag` string is not dropped (tag identity, T4).
+pub fn throw_tag_name_discrimination_test() {
+  let a = expr_module("tn", ir.Throw("alpha", [ir.Var("x")]))
+  let b = expr_module("tn", ir.Throw("beta", [ir.Var("x")]))
+  assert module_equal(a, b) == False
+  check_roundtrip(a)
+  check_roundtrip(b)
+}
+
+/// Two module tags with the same NAME but different operand type lists are DISTINCT and each
+/// round-trips — the `TagDecl.params` list is carried losslessly (a tag's operand signature).
+pub fn tag_params_discrimination_test() {
+  let base = expr_module("tp", ir.Return([]))
+  let i32_tag = ir.Module(..base, tags: [ir.TagDecl("t", [ir.TI32])])
+  let i64_tag = ir.Module(..base, tags: [ir.TagDecl("t", [ir.TI64])])
+  let nullary = ir.Module(..base, tags: [ir.TagDecl("t", [])])
+  assert module_equal(i32_tag, i64_tag) == False
+  assert module_equal(i32_tag, nullary) == False
+  check_roundtrip(i32_tag)
+  check_roundtrip(i64_tag)
+  check_roundtrip(nullary)
+}
+
+/// A `ConstNull(ExnRef)` (`null.exnref`) is DISTINCT from `ConstNull(FuncRef)` / `ConstNull(
+/// ExternRef)` and each round-trips — the null literal's static reftype is not dropped, and the
+/// new exnref reftype does not collide with the existing two.
+pub fn null_exnref_discrimination_test() {
+  let ex = expr_module("ne", ir.Values([ir.ConstNull(ir.ExnRef)]))
+  let fr = expr_module("ne", ir.Values([ir.ConstNull(ir.FuncRef)]))
+  let er = expr_module("ne", ir.Values([ir.ConstNull(ir.ExternRef)]))
+  assert module_equal(ex, fr) == False
+  assert module_equal(ex, er) == False
+  check_roundtrip(ex)
+}
+
+// ─── Phase-7 conformance-neutrality (J6): a tag-free module carries NO EH token ───
+
+/// A Phase-1..6-shaped module (no tag, no `exnref`, no EH node) prints with NONE of the EH
+/// keywords, so an EH regression that leaked a token into legacy output fails closed. The control
+/// module deliberately uses names/ops that do not themselves contain an EH substring.
+pub fn tag_free_module_has_no_eh_token_test() {
+  let m =
+    ir.Module(
+      name: "plain",
+      uses_numerics: True,
+      memories: [],
+      globals: [],
+      imports: [ir.ImportFn("env", "log", ir.FuncType([ir.TI32], []))],
+      functions: [
+        ir.Function(
+          name: "f",
+          params: [ir.Local("p", ir.TI32)],
+          result: [ir.TI32],
+          locals: [],
+          body: ir.Return([ir.Var("p")]),
+        ),
+      ],
+      exports: [ir.ExportFn("main", "f")],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: None,
+      tags: [],
+    )
+  let text = printer.print_module(m)
+  assert string.contains(text, "tag") == False
+  assert string.contains(text, "exnref") == False
+  assert string.contains(text, "throw") == False
+  assert string.contains(text, "try") == False
+  assert string.contains(text, "catch") == False
+  // and it still round-trips
+  check_roundtrip(m)
+}
+
+// ─── Phase-7 negative corpus (totality, D4) ───
+
+/// A malformed `throw` — a `%local` where the `@tag` name is required — is a typed error
+/// (`BadSigil`), never a panic (the `@tag`/`%local`/`$label` sigils are checked, J1/J5).
+pub fn negative_throw_local_for_tag_test() {
+  let r =
+    parser.parse_module("module @m { func @f () -> () { throw %x (%a) } }")
+  assert case r {
+    Error(parser.BadSigil(_, _, _)) -> True
+    _ -> False
+  }
+}
+
+/// An unknown catch word inside a `try` handler list surfaces as a typed error, never a panic —
+/// `catch`/`catch_all` are the only recognised clause words.
+pub fn negative_unknown_catch_word_test() {
+  let r =
+    parser.parse_module(
+      "module @m { func @f () -> () { try (i32) { return (i32.const 0) } grab @t (%p) { return (%p) } } }",
+    )
+  // The `grab` word is not a catch clause, so the handler list ends and the `try` completes; the
+  // stray `grab` is then rejected where the function body's `}` is expected — a typed error.
+  assert case r {
+    Error(_) -> True
+    _ -> False
+  }
+}
+
+/// A battery of malformed EH forms: each returns a typed `Error` (never a panic). Reaching the end
+/// without crashing the runner IS the totality proof for the new EH surface.
+pub fn negative_eh_garbage_never_panic_test() {
+  let garbage = [
+    // throw
+    "module @m { func @f () -> () { throw } }",
+    "module @m { func @f () -> () { throw @t } }",
+    "module @m { func @f () -> () { throw (%a) } }",
+    "module @m { func @f () -> () { throw @t (%a } }",
+    // throw_ref
+    "module @m { func @f () -> () { throw_ref } }",
+    "module @m { func @f () -> () { throw_ref @t } }",
+    // try: missing result list / brace / body
+    "module @m { func @f () -> () { try } }",
+    "module @m { func @f () -> () { try (i32) } }",
+    "module @m { func @f () -> () { try (i32) return (i32.const 0) } }",
+    "module @m { func @f () -> () { try (i32) { } }",
+    "module @m { func @f () -> () { try (i32) { return (i32.const 0) } }",
+    // catch: missing tag / payload / body
+    "module @m { func @f () -> () { try (i32) { return (i32.const 0) } catch (%p) { return (%p) } } }",
+    "module @m { func @f () -> () { try (i32) { return (i32.const 0) } catch @t { return () } } }",
+    "module @m { func @f () -> () { try (i32) { return (i32.const 0) } catch @t (%p) } }",
+    // catch_all does not take a tag
+    "module @m { func @f () -> () { try (i32) { return (i32.const 0) } catch_all @t (%p) { return () } } }",
+    // ref clause without a name
+    "module @m { func @f () -> () { try (i32) { return (i32.const 0) } catch @t (%p) ref { return () } } }",
+    // module-level tag / import-tag / export-tag malformed
+    "module @m { tag }",
+    "module @m { tag @t }",
+    "module @m { tag @t (bogus) }",
+    "module @m { import \"a\" \"b\" tag }",
+    "module @m { export \"e\" = tag }",
+    // exnref where a non-reference position is required (a bad table sizing after it)
+    "module @m { table @t exnref }",
   ]
   assert list.all(garbage, rejects)
 }

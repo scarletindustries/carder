@@ -1,0 +1,42 @@
+; exn — a hand-authored Phase-7 golden for the INLINE-HANDLER exception IR (T1). Exercises, in
+; ONE module and by reading the grammar delta (specs/phase-7/ir-grammar-delta.md), never
+; printer-generated (D7): two module-level tag decls (the Porffor (f64, i32) exception carrier +
+; a nullary tag), an imported tag + an exported tag, the exnref value type (in param + result
+; position), the null.exnref literal, Throw, a Try whose handler list covers catch (by tag,
+; binding a payload) / catch_all / catch (ref-capturing an exnref) / catch_all (ref-capturing),
+; and ThrowRef re-raising a captured exnref. EH is conformance-neutral: a tag-free module is
+; byte-identical to Phase-6. Two independently authored artifacts (this file + the by-hand
+; exn_module() in roundtrip_test) agreeing defeats printer/parser collusion. A syntax-only
+; round-trip fixture, not an executable program (exactly as simd.ir was).
+module @exn {
+  numerics true
+  memory none
+  tag @exc (f64, i32)
+  tag @stop ()
+  import "env" "host_exc" tag (i32)
+  export "exc" = tag @exc
+  func @guarded (%x:f64, %xt:i32) -> (i32) {
+    try (i32) {
+      throw @exc (%x, %xt)
+    } catch @exc (%p0, %p1) {
+      return (%p1)
+    } catch_all () {
+      return (i32.const 0)
+    }
+  }
+  func @capture (%x:f64, %xt:i32) -> (exnref) {
+    try (exnref) {
+      throw @exc (%x, %xt)
+    } catch @exc (%p0, %p1) ref %e {
+      return (%e)
+    } catch_all () ref %e {
+      return (%e)
+    }
+  }
+  func @rethrow (%e:exnref) -> () {
+    throw_ref %e
+  }
+  func @nullexn () -> (exnref) {
+    return (null.exnref)
+  }
+}
