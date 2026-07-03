@@ -1,0 +1,36 @@
+; simd — a hand-authored Phase-6 golden. Exercises, in ONE module and by reading the grammar
+; delta (specs/phase-6/ir-grammar-delta.md), never printer-generated (D7): a v128.const whose
+; four f32 lanes are a qNaN-with-payload (0x7fc00001), a -0.0 (0x80000000), a +Inf (0x7f800000)
+; and a normal 1.0 (0x3f800000) — laid out little-endian, so the raw 16 bytes must survive
+; byte-exact (D5); a spread of SimdOps (splat, integer add, a float mul, sign-extending
+; extract-lane, a widening extend, a saturating narrow, bitselect, dot, swizzle); a SimdShuffle
+; with its 16 immediate lane indices; the v128-memory family (v128.load, a splat-load,
+; v128.store, a load_lane and a store_lane with their bit widths + lane immediates); and a
+; cross-module imported-function call (call_import). Independent oracle against printer/parser
+; collusion.
+module @simd {
+  numerics true
+  memory (min 1)
+  import "env" "sink" : (v128) -> ()
+  export "run" = @run
+  func @run ( %p:i32 ) -> (v128) {
+    let (%k) = values (v128.const 0x0100c07f000000800000807f0000803f) ;
+    let (%spl) = simd i32x4.splat (%p) ;
+    let (%sum) = simd i32x4.add (%spl, %k) ;
+    let (%prod) = simd f32x4.fmul (%k, %k) ;
+    let (%lane) = simd i8x16.extract_lane_s.3 (%sum) ;
+    let (%wide) = simd extend.i8x16.low.s (%sum) ;
+    let (%narr) = simd narrow.i16x8.s (%sum, %prod) ;
+    let (%sel) = simd v128.bitselect (%sum, %prod, %k) ;
+    let (%dot) = simd i32x4.dot_i16x8_s (%sum, %prod) ;
+    let (%swz) = simd i8x16.swizzle (%sum, %narr) ;
+    let (%shuf) = simd.shuffle [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23] %sum %swz ;
+    let (%ld) = simd.load v128 %p offset=0 ;
+    let (%splatld) = simd.load splat 32 %p offset=4 ;
+    let () = simd.store %p %ld offset=16 ;
+    let (%ldl) = simd.load_lane 32 %p offset=0 lane=1 %ld ;
+    let () = simd.store_lane 8 %p offset=0 lane=2 %ldl ;
+    let () = call_import 0 : (v128) -> () (%shuf) ;
+    return (%ldl)
+  }
+}

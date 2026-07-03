@@ -472,7 +472,8 @@ fn print_value(v: Value) -> String {
     // word, like `i32.const`): `null.funcref` / `null.externref` (R1c).
     ir.ConstNull(ty) -> "null." <> print_reftype(ty)
     // The `v128.const` literal — the 16 raw little-endian bytes as `0x` + 32 lower-case hex
-    // digits (D5). No legacy module has it; P6-02 reconciles the exact round-trip spelling.
+    // digits (D5, §A.2). Byte-exact, so NaN-payload / `-0.0` / `±Inf` lanes survive; the parser
+    // (`parse_value`) reads them back and enforces the 16-byte length. No legacy module has it.
     ir.ConstV128(bytes) -> "v128.const " <> print_hexbytes(bytes)
   }
 }
@@ -813,8 +814,12 @@ fn simdloadkind_str(k: ir.SimdLoadKind) -> String {
   }
 }
 
-/// Renders a neutral, shape-tagged `SimdOp` token for the `.ir` text (§F). Minimal round-trip
-/// surface for the keystone; P6-02 reconciles the canonical spelling table with the parser.
+/// Renders a neutral, shape-tagged `SimdOp` token for the `.ir` text — the canonical spelling
+/// table (documented in `specs/phase-6/ir-grammar-delta.md` §A.3). The parser's `string_to_simdop`
+/// is its EXACT inverse, proven by the full-surface round-trip (`test/twocore/ir/roundtrip_test`).
+/// The `<shape>.<op>` scheme (`i32x4.add`) is bijective: integer vs float ops use distinct
+/// mnemonics (`add` vs `fadd`), the tagged narrow/extend/extmul/pairwise families are op-name-first
+/// (`narrow.i16x8.s`), and the singular conversion/dot/q15/swizzle ops are fixed strings.
 /// Total — the exhaustive `case` fails to compile if a `SimdOp` constructor is added later.
 fn simdop_to_string(op: ir.SimdOp) -> String {
   case op {

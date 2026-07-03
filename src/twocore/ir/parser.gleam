@@ -1161,11 +1161,18 @@ fn parse_value(
         // The null-reference literal, tagged by reftype (R1c): `null.funcref` / `null.externref`.
         "null.funcref" -> Ok(#(ir.ConstNull(ir.FuncRef), rest))
         "null.externref" -> Ok(#(ir.ConstNull(ir.ExternRef), rest))
-        // The `v128.const` literal — 16 raw little-endian bytes as `0x` + hex (I1/D5). P6-02
-        // owns the full round-trip + the `bit_size == 128` validation; the keystone just parses.
+        // The `v128.const` literal — the 16 raw little-endian bytes as `0x` + 32 hex digits
+        // (I1/D5), byte-exact so NaN-payload / `-0.0` / `±Inf` lanes survive. Reuses the
+        // data-segment hex path (`parse_hexbytes` → `hex_to_bytes`, which already rejects
+        // odd-length hex), then enforces the STRUCTURAL 16-byte length so every parsed
+        // `ConstV128` upholds `ir.ConstV128`'s "exactly 16 bytes" contract (a wrong length is
+        // `BadNumberLiteral` — no new `ParseError` variant, §A.2).
         "v128.const" -> {
           use #(bytes, rest) <- result.try(parse_hexbytes(rest))
-          Ok(#(ir.ConstV128(bytes), rest))
+          case bit_array.byte_size(bytes) {
+            16 -> Ok(#(ir.ConstV128(bytes), rest))
+            _ -> Error(BadNumberLiteral(l, c, "v128.const (need 16 bytes)"))
+          }
         }
         _ -> Error(UnexpectedToken(l, c, "value", w))
       }
@@ -1305,6 +1312,16 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           use #(seg, rest) <- result.try(parse_seg(rest))
           Ok(#(ir.DataDrop(seg), rest))
         }
+        // ── Phase-6 SIMD expressions + the cross-module imported call (I1/I2/S5, §F–§H). The
+        // SIMD-memory nodes reuse the omit-when-zero `mem=` decorator (§A.6) so a single-memory
+        // (index-0) SIMD program parses byte-identically to its un-decorated form. ──
+        "simd" -> parse_simd(rest)
+        "simd.shuffle" -> parse_simd_shuffle(rest)
+        "simd.load" -> parse_simd_load(rest)
+        "simd.store" -> parse_simd_store(rest)
+        "simd.load_lane" -> parse_simd_load_lane(rest)
+        "simd.store_lane" -> parse_simd_store_lane(rest)
+        "call_import" -> parse_call_import(rest)
         "global.get" -> {
           use #(name, rest) <- result.try(parse_at_name(rest))
           Ok(#(GlobalGet(name), rest))
@@ -1601,6 +1618,394 @@ fn parse_trap(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
     [PToken(t, l, c), ..] ->
       Error(UnexpectedToken(l, c, "trap reason", describe(t)))
     [] -> Error(UnexpectedEnd("trap reason"))
+  }
+}
+
+// ───────────────────────────── Phase-6 SIMD (mirror of printer §F–§H) ─────────────
+
+/// Parses `simd <simdop> (args)` into a `Simd(op, args)` expression (§F).
+///
+/// Mirrors `parse_num`: read the op word, resolve it via `string_to_simdop` (the exact inverse
+/// of `printer.simdop_to_string`), then read a parenthesised value list. Arity is NOT checked
+/// (syntax only, exactly as `Num`) — the parser round-trips whatever value list is written; op
+/// legality is a typing rule (`validate`, 04). An unresolvable mnemonic is `UnknownOp`. TOTAL —
+/// every fault is a typed `ParseError`, never a panic.
+fn parse_simd(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
+  case toks {
+    [PToken(TWord(w), l, c), ..rest] ->
+      case string_to_simdop(w) {
+        Ok(op) -> {
+          use #(args, rest) <- result.try(parse_value_list(rest))
+          Ok(#(ir.Simd(op, args), rest))
+        }
+        Error(_) -> Error(UnknownOp(l, c, w))
+      }
+    [PToken(t, l, c), ..] ->
+      Error(UnexpectedToken(l, c, "simd op", describe(t)))
+    [] -> Error(UnexpectedEnd("simd op"))
+  }
+}
+
+/// Parses `simd.shuffle [ l0, …, l15 ] <a> <b>` into `SimdShuffle(lanes, a, b)` (§G).
+///
+/// The bracketed, comma-separated int list is the 16 immediate byte-lane indices; the two
+/// following values are the v128 operands. The parser does NOT enforce list length 16 or index
+/// range 0..31 (those are typing rules, `validate`); it round-trips whatever list is written.
+/// TOTAL.
+fn parse_simd_shuffle(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(lanes, rest) <- result.try(parse_lane_list(toks))
+  use #(a, rest) <- result.try(parse_value(rest))
+  use #(b, rest) <- result.try(parse_value(rest))
+  Ok(#(ir.SimdShuffle(lanes, a, b), rest))
+}
+
+/// Parses a bracketed, comma-separated int list `[ n0, n1, … ]` / `[]` (the shuffle lane
+/// immediates). Mirrors `parse_ref_init_list`'s shape but over bare numbers. TOTAL — a missing
+/// `[`/`,`/`]` or a non-number item is a typed `ParseError`.
+fn parse_lane_list(
+  toks: List(PToken),
+) -> Result(#(List(Int), List(PToken)), ParseError) {
+  use rest <- result.try(expect(toks, TLBracket, "["))
+  case rest {
+    [PToken(TRBracket, _, _), ..r] -> Ok(#([], r))
+    _ -> parse_lane_list_rest(rest, [])
+  }
+}
+
+/// Tail of `parse_lane_list`: reads one number, then either `,` (continue) or the closing `]`.
+/// Accumulates reversed and flips at the close. TOTAL.
+fn parse_lane_list_rest(
+  toks: List(PToken),
+  acc: List(Int),
+) -> Result(#(List(Int), List(PToken)), ParseError) {
+  use #(n, rest) <- result.try(expect_number(toks))
+  case rest {
+    [PToken(TComma, _, _), ..r] -> parse_lane_list_rest(r, [n, ..acc])
+    [PToken(TRBracket, _, _), ..r] -> Ok(#(list.reverse([n, ..acc]), r))
+    [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, ", or ]", describe(t)))
+    [] -> Error(UnexpectedEnd(", or ]"))
+  }
+}
+
+/// Parses `simd.load <loadkind> <addr> offset=<int> [mem=<int>]` into `SimdLoad` (§H). The
+/// `<loadkind>` is one of the variable-token forms `v128` / `splat <bits>` / `zero <bits>` /
+/// `extend <bits> <s|u>` (all widths in BITS, S2), read by `parse_simd_load_kind`; `offset=` is
+/// mandatory, the `mem=` memory-index decorator defaults to 0 when omitted (§A.6). TOTAL.
+fn parse_simd_load(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(kind, rest) <- result.try(parse_simd_load_kind(toks))
+  use #(addr, rest) <- result.try(parse_value(rest))
+  use #(off, rest) <- result.try(parse_offset(rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(ir.SimdLoad(mem, kind, addr, off), rest))
+}
+
+/// Parses a SIMD load-kind descriptor (§H): the single word `v128` → `LoadV128`; `splat <bits>`
+/// → `LoadSplat(bits)`; `zero <bits>` → `LoadZero(bits)`; `extend <bits> <s|u>` →
+/// `LoadExtend(bits, signed)`. All `<bits>` are the lane/source width in BITS (8/16/32/64, S2).
+/// The exact inverse of `printer.simdloadkind_str`. TOTAL — an unrecognised kind word or a
+/// missing bits/sign is a typed `ParseError`.
+fn parse_simd_load_kind(
+  toks: List(PToken),
+) -> Result(#(ir.SimdLoadKind, List(PToken)), ParseError) {
+  case toks {
+    [PToken(TWord("v128"), _, _), ..rest] -> Ok(#(ir.LoadV128, rest))
+    [PToken(TWord("splat"), _, _), ..rest] -> {
+      use #(bits, rest) <- result.try(expect_number(rest))
+      Ok(#(ir.LoadSplat(bits), rest))
+    }
+    [PToken(TWord("zero"), _, _), ..rest] -> {
+      use #(bits, rest) <- result.try(expect_number(rest))
+      Ok(#(ir.LoadZero(bits), rest))
+    }
+    [PToken(TWord("extend"), _, _), ..rest] -> {
+      use #(bits, rest) <- result.try(expect_number(rest))
+      use #(signed, rest) <- result.try(parse_signed_word(rest))
+      Ok(#(ir.LoadExtend(bits, signed), rest))
+    }
+    [PToken(t, l, c), ..] ->
+      Error(UnexpectedToken(l, c, "simd load kind", describe(t)))
+    [] -> Error(UnexpectedEnd("simd load kind"))
+  }
+}
+
+/// Parses `simd.store <addr> <value> offset=<int> [mem=<int>]` into `SimdStore` (§H). `offset=`
+/// is mandatory; the `mem=` decorator defaults to 0 when omitted (§A.6). TOTAL.
+fn parse_simd_store(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(addr, rest) <- result.try(parse_value(toks))
+  use #(val, rest) <- result.try(parse_value(rest))
+  use #(off, rest) <- result.try(parse_offset(rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(ir.SimdStore(mem, addr, val, off), rest))
+}
+
+/// Parses `simd.load_lane <width> <addr> offset=<int> lane=<int> <vec> [mem=<int>]` into
+/// `SimdLoadLane` (§H). `<width>` is the accessed width in BITS (8/16/32/64, S2); `offset=` and
+/// `lane=` are mandatory; the `mem=` decorator defaults to 0. Field order mirrors the printer
+/// exactly (width, addr, offset, lane, vec, mem). TOTAL.
+fn parse_simd_load_lane(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(width, rest) <- result.try(expect_number(toks))
+  use #(addr, rest) <- result.try(parse_value(rest))
+  use #(off, rest) <- result.try(parse_offset(rest))
+  use #(lane, rest) <- result.try(parse_lane(rest))
+  use #(vec, rest) <- result.try(parse_value(rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(ir.SimdLoadLane(mem, width, addr, off, lane, vec), rest))
+}
+
+/// Parses `simd.store_lane <width> <addr> offset=<int> lane=<int> <vec> [mem=<int>]` into
+/// `SimdStoreLane` (§H). Same shape/decorators as `parse_simd_load_lane`. TOTAL.
+fn parse_simd_store_lane(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(width, rest) <- result.try(expect_number(toks))
+  use #(addr, rest) <- result.try(parse_value(rest))
+  use #(off, rest) <- result.try(parse_offset(rest))
+  use #(lane, rest) <- result.try(parse_lane(rest))
+  use #(vec, rest) <- result.try(parse_value(rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(ir.SimdStoreLane(mem, width, addr, off, lane, vec), rest))
+}
+
+/// Parses a MANDATORY ` offset=<int>` decorator (shared by every SIMD load/store, identical to
+/// `mem.load`/`mem.store`). Returns the offset, or a typed `ParseError` on a missing
+/// `offset`/`=`/number. TOTAL.
+fn parse_offset(
+  toks: List(PToken),
+) -> Result(#(Int, List(PToken)), ParseError) {
+  use rest <- result.try(expect_word(toks, "offset"))
+  use rest <- result.try(expect(rest, TEquals, "="))
+  expect_number(rest)
+}
+
+/// Parses a MANDATORY ` lane=<int>` decorator (the destination/source lane index on
+/// `simd.load_lane`/`simd.store_lane`). Mirrors `parse_seg`: `lane` is recognised only when
+/// immediately followed by `=`, so it cannot swallow a following statement. TOTAL.
+fn parse_lane(toks: List(PToken)) -> Result(#(Int, List(PToken)), ParseError) {
+  use rest <- result.try(expect_word(toks, "lane"))
+  use rest <- result.try(expect(rest, TEquals, "="))
+  expect_number(rest)
+}
+
+/// Parses `call_import <slot> : <functype> (args)` into `CallImport(slot, ty, args)` (S5). The
+/// `slot` is the positional function-import index; the `:` + `functype` reuse the `call_indirect`
+/// signature form; the value list is the arguments. The parser does NOT check arity/type against
+/// the signature (syntax only). TOTAL.
+fn parse_call_import(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(slot, rest) <- result.try(expect_number(toks))
+  use rest <- result.try(expect(rest, TColon, ":"))
+  use #(ty, rest) <- result.try(parse_functype(rest))
+  use #(args, rest) <- result.try(parse_value_list(rest))
+  Ok(#(ir.CallImport(slot, ty, args), rest))
+}
+
+/// Resolves a neutral SIMD-op mnemonic to its `SimdOp` — the **exact inverse** of
+/// `printer.simdop_to_string` (§F). Fixed, shape-agnostic strings (the `v128.*` bitwise/boolean
+/// ops and the singular conversion/dot/q15/swizzle ops) match verbatim FIRST; the remaining forms
+/// are decomposed by splitting on `.`:
+///
+/// - prefix families `narrow`/`extend`/`extmul`/`extadd_pairwise` (op name, then source shape,
+///   then — for extend/extmul — the `low`/`high` half, then the `s`/`u` sign);
+/// - lane-access `<shape>.extract_lane[_s|_u].<n>` / `<shape>.replace_lane.<n>` (the lane index
+///   baked into the mnemonic);
+/// - the shape-tagged lane-uniform ops `<shape>.<mnemonic>` (int vs float selected by the
+///   DISTINCT mnemonic — `add` vs `fadd` — so no shape-based disambiguation is needed).
+///
+/// `Error(Nil)` for any unrecognised mnemonic/shape/half/sign/lane (surfaced as `UnknownOp` by
+/// `parse_simd`). TOTAL.
+fn string_to_simdop(w: String) -> Result(ir.SimdOp, Nil) {
+  case w {
+    // shape-agnostic bitwise & boolean-reduction (fixed literals)
+    "v128.not" -> Ok(ir.VNot)
+    "v128.and" -> Ok(ir.VAnd)
+    "v128.or" -> Ok(ir.VOr)
+    "v128.xor" -> Ok(ir.VXor)
+    "v128.andnot" -> Ok(ir.VAndNot)
+    "v128.bitselect" -> Ok(ir.VBitselect)
+    "v128.any_true" -> Ok(ir.VAnyTrue)
+    // singular conversions / dot / q15 / swizzle (fixed literals)
+    "i32x4.trunc_sat_f32x4_s" -> Ok(ir.STruncSatF32x4S)
+    "i32x4.trunc_sat_f32x4_u" -> Ok(ir.STruncSatF32x4U)
+    "i32x4.trunc_sat_f64x2_s_zero" -> Ok(ir.STruncSatF64x2SZero)
+    "i32x4.trunc_sat_f64x2_u_zero" -> Ok(ir.STruncSatF64x2UZero)
+    "f32x4.convert_i32x4_s" -> Ok(ir.SConvertF32x4I32x4S)
+    "f32x4.convert_i32x4_u" -> Ok(ir.SConvertF32x4I32x4U)
+    "f64x2.convert_low_i32x4_s" -> Ok(ir.SConvertF64x2LowI32x4S)
+    "f64x2.convert_low_i32x4_u" -> Ok(ir.SConvertF64x2LowI32x4U)
+    "f32x4.demote_f64x2_zero" -> Ok(ir.SDemoteF64x2Zero)
+    "f64x2.promote_low_f32x4" -> Ok(ir.SPromoteLowF32x4)
+    "i32x4.dot_i16x8_s" -> Ok(ir.SDotI16x8S)
+    "i16x8.q15mulr_sat_s" -> Ok(ir.SQ15MulrSatS)
+    "i8x16.swizzle" -> Ok(ir.SSwizzle)
+    _ ->
+      case string.split(w, ".") {
+        // prefix families: op name, then source shape[, half], sign
+        ["narrow", sh, sign] ->
+          case simd_shape_of(sh), parse_signed_str(sign) {
+            Ok(shape), Ok(signed) -> Ok(ir.SNarrow(shape, signed))
+            _, _ -> Error(Nil)
+          }
+        ["extend", sh, half, sign] ->
+          case simd_shape_of(sh), parse_half_str(half), parse_signed_str(sign) {
+            Ok(shape), Ok(h), Ok(signed) -> Ok(ir.SExtend(shape, h, signed))
+            _, _, _ -> Error(Nil)
+          }
+        ["extmul", sh, half, sign] ->
+          case simd_shape_of(sh), parse_half_str(half), parse_signed_str(sign) {
+            Ok(shape), Ok(h), Ok(signed) -> Ok(ir.SExtMul(shape, h, signed))
+            _, _, _ -> Error(Nil)
+          }
+        ["extadd_pairwise", sh, sign] ->
+          case simd_shape_of(sh), parse_signed_str(sign) {
+            Ok(shape), Ok(signed) -> Ok(ir.SExtAddPairwise(shape, signed))
+            _, _ -> Error(Nil)
+          }
+        // lane-access: shape, op, lane index
+        [sh, "extract_lane", lane] -> lane_op(sh, lane, ir.SExtractLane)
+        [sh, "extract_lane_s", lane] -> lane_op(sh, lane, ir.SExtractLaneS)
+        [sh, "extract_lane_u", lane] -> lane_op(sh, lane, ir.SExtractLaneU)
+        [sh, "replace_lane", lane] -> lane_op(sh, lane, ir.SReplaceLane)
+        // shape-tagged lane-uniform ops: shape, mnemonic
+        [sh, mnem] ->
+          case simd_shape_of(sh) {
+            Ok(shape) -> simd_shape_mnemonic(mnem, shape)
+            Error(_) -> Error(Nil)
+          }
+        _ -> Error(Nil)
+      }
+  }
+}
+
+/// Resolves a lane-access mnemonic tail `<shape>.<op>.<lane>` to `ctor(shape, lane)`. Shared by
+/// the four lane-access variants (`extract_lane`/`_s`/`_u`/`replace_lane`). `Error(Nil)` on a bad
+/// shape or a non-integer lane.
+fn lane_op(
+  sh: String,
+  lane: String,
+  ctor: fn(ir.SimdShape, Int) -> ir.SimdOp,
+) -> Result(ir.SimdOp, Nil) {
+  case simd_shape_of(sh), int.parse(lane) {
+    Ok(shape), Ok(n) -> Ok(ctor(shape, n))
+    _, _ -> Error(Nil)
+  }
+}
+
+/// Resolves a SIMD lane-shape token (`i8x16`/`i16x8`/`i32x4`/`i64x2`/`f32x4`/`f64x2`) to a
+/// `SimdShape` — the inverse of `printer.simdshape_str`. `Error(Nil)` for any other token.
+fn simd_shape_of(s: String) -> Result(ir.SimdShape, Nil) {
+  case s {
+    "i8x16" -> Ok(ir.I8x16)
+    "i16x8" -> Ok(ir.I16x8)
+    "i32x4" -> Ok(ir.I32x4)
+    "i64x2" -> Ok(ir.I64x2)
+    "f32x4" -> Ok(ir.F32x4)
+    "f64x2" -> Ok(ir.F64x2)
+    _ -> Error(Nil)
+  }
+}
+
+/// Resolves the widen/extend half token (`low`/`high`) to a `SimdHalf` — the inverse of
+/// `printer.simdhalf_str`. `Error(Nil)` otherwise.
+fn parse_half_str(s: String) -> Result(ir.SimdHalf, Nil) {
+  case s {
+    "low" -> Ok(ir.Low)
+    "high" -> Ok(ir.High)
+    _ -> Error(Nil)
+  }
+}
+
+/// Resolves a `s`/`u` sign token (as a bare `String`, for split mnemonics) to `True`/`False` —
+/// the inverse of `printer.signed_str`. `Error(Nil)` otherwise.
+fn parse_signed_str(s: String) -> Result(Bool, Nil) {
+  case s {
+    "s" -> Ok(True)
+    "u" -> Ok(False)
+    _ -> Error(Nil)
+  }
+}
+
+/// Consumes a `s`/`u` sign token (as a `TWord`, for the space-separated `extend` load kind),
+/// returning `True` for signed. A typed `ParseError` (never a panic) on a wrong/absent token.
+fn parse_signed_word(
+  toks: List(PToken),
+) -> Result(#(Bool, List(PToken)), ParseError) {
+  case toks {
+    [PToken(TWord("s"), _, _), ..rest] -> Ok(#(True, rest))
+    [PToken(TWord("u"), _, _), ..rest] -> Ok(#(False, rest))
+    [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, "s or u", describe(t)))
+    [] -> Error(UnexpectedEnd("s or u"))
+  }
+}
+
+/// Resolves a shape-tagged lane-uniform SIMD mnemonic (the segment after `<shape>.`) to its
+/// `SimdOp` at shape `s` — the inverse of `printer.simdop_to_string`'s shape-tagged arms. The
+/// integer and float families use DISTINCT mnemonics (`add` vs `fadd`, `eq` vs `feq`, …), so the
+/// mnemonic alone selects the integer-vs-float constructor; the shape tag is carried through
+/// verbatim. `Error(Nil)` for an unknown mnemonic.
+fn simd_shape_mnemonic(m: String, s: ir.SimdShape) -> Result(ir.SimdOp, Nil) {
+  case m {
+    "add" -> Ok(ir.SAdd(s))
+    "sub" -> Ok(ir.SSub(s))
+    "mul" -> Ok(ir.SMul(s))
+    "neg" -> Ok(ir.SNeg(s))
+    "abs" -> Ok(ir.SAbs(s))
+    "add_sat_s" -> Ok(ir.SAddSatS(s))
+    "add_sat_u" -> Ok(ir.SAddSatU(s))
+    "sub_sat_s" -> Ok(ir.SSubSatS(s))
+    "sub_sat_u" -> Ok(ir.SSubSatU(s))
+    "min_s" -> Ok(ir.SMinS(s))
+    "min_u" -> Ok(ir.SMinU(s))
+    "max_s" -> Ok(ir.SMaxS(s))
+    "max_u" -> Ok(ir.SMaxU(s))
+    "avgr_u" -> Ok(ir.SAvgrU(s))
+    "shl" -> Ok(ir.SShl(s))
+    "shr_s" -> Ok(ir.SShrS(s))
+    "shr_u" -> Ok(ir.SShrU(s))
+    "popcnt" -> Ok(ir.SPopcnt(s))
+    "eq" -> Ok(ir.SEq(s))
+    "ne" -> Ok(ir.SNe(s))
+    "lt_s" -> Ok(ir.SLtS(s))
+    "lt_u" -> Ok(ir.SLtU(s))
+    "le_s" -> Ok(ir.SLeS(s))
+    "le_u" -> Ok(ir.SLeU(s))
+    "gt_s" -> Ok(ir.SGtS(s))
+    "gt_u" -> Ok(ir.SGtU(s))
+    "ge_s" -> Ok(ir.SGeS(s))
+    "ge_u" -> Ok(ir.SGeU(s))
+    "all_true" -> Ok(ir.SAllTrue(s))
+    "bitmask" -> Ok(ir.SBitmask(s))
+    "splat" -> Ok(ir.SSplat(s))
+    "fadd" -> Ok(ir.SFAdd(s))
+    "fsub" -> Ok(ir.SFSub(s))
+    "fmul" -> Ok(ir.SFMul(s))
+    "fdiv" -> Ok(ir.SFDiv(s))
+    "fneg" -> Ok(ir.SFNeg(s))
+    "fabs" -> Ok(ir.SFAbs(s))
+    "fsqrt" -> Ok(ir.SFSqrt(s))
+    "fmin" -> Ok(ir.SFMin(s))
+    "fmax" -> Ok(ir.SFMax(s))
+    "pmin" -> Ok(ir.SFPMin(s))
+    "pmax" -> Ok(ir.SFPMax(s))
+    "fceil" -> Ok(ir.SFCeil(s))
+    "ffloor" -> Ok(ir.SFFloor(s))
+    "ftrunc" -> Ok(ir.SFTrunc(s))
+    "fnearest" -> Ok(ir.SFNearest(s))
+    "feq" -> Ok(ir.SFEq(s))
+    "fne" -> Ok(ir.SFNe(s))
+    "flt" -> Ok(ir.SFLt(s))
+    "fle" -> Ok(ir.SFLe(s))
+    "fgt" -> Ok(ir.SFGt(s))
+    "fge" -> Ok(ir.SFGe(s))
+    _ -> Error(Nil)
   }
 }
 

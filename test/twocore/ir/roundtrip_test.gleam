@@ -1466,6 +1466,682 @@ pub fn negative_missing_seg_test() {
   }
 }
 
+// ───────────────────────────── Phase-6 SIMD / v128 (IR4 surface) ────────────────
+//
+// The full IR4 round-trip: every `SimdOp` constructor and every `SimdShape`, `SimdShuffle`,
+// the four SIMD-memory nodes with every `SimdLoadKind`/width/lane at memory index 0 AND
+// non-zero, `CallImport`, the `TV128` valtype in every position, and `v128.const` with
+// NaN-payload / `-0.0` / `±Inf` / normal lanes (byte-exact, D5). Built from the IR types (what
+// forms must exist), never from the printer's output.
+
+/// The six standardized `SimdShape` lane geometries (used to spread coverage across shapes).
+fn all_simd_shapes() -> List(ir.SimdShape) {
+  [ir.I8x16, ir.I16x8, ir.I32x4, ir.I64x2, ir.F32x4, ir.F64x2]
+}
+
+/// Every shape-tagged (`fn(SimdShape) -> SimdOp`) lane-uniform SIMD op — the integer and float
+/// families whose `.ir` mnemonic is `<shape>.<mnemonic>` (§F.3–§F.5, §F.8–§F.9). Mapped over
+/// `all_simd_shapes()` this exercises each constructor at every shape (round-trip holds even for
+/// spec-illegal shape combos — the parser is a syntax layer, not a validator).
+fn shape_tagged_simdops() -> List(fn(ir.SimdShape) -> ir.SimdOp) {
+  [
+    ir.SAdd,
+    ir.SSub,
+    ir.SMul,
+    ir.SNeg,
+    ir.SAbs,
+    ir.SAddSatS,
+    ir.SAddSatU,
+    ir.SSubSatS,
+    ir.SSubSatU,
+    ir.SMinS,
+    ir.SMinU,
+    ir.SMaxS,
+    ir.SMaxU,
+    ir.SAvgrU,
+    ir.SShl,
+    ir.SShrS,
+    ir.SShrU,
+    ir.SPopcnt,
+    ir.SEq,
+    ir.SNe,
+    ir.SLtS,
+    ir.SLtU,
+    ir.SLeS,
+    ir.SLeU,
+    ir.SGtS,
+    ir.SGtU,
+    ir.SGeS,
+    ir.SGeU,
+    ir.SAllTrue,
+    ir.SBitmask,
+    ir.SSplat,
+    ir.SFAdd,
+    ir.SFSub,
+    ir.SFMul,
+    ir.SFDiv,
+    ir.SFNeg,
+    ir.SFAbs,
+    ir.SFSqrt,
+    ir.SFMin,
+    ir.SFMax,
+    ir.SFPMin,
+    ir.SFPMax,
+    ir.SFCeil,
+    ir.SFFloor,
+    ir.SFTrunc,
+    ir.SFNearest,
+    ir.SFEq,
+    ir.SFNe,
+    ir.SFLt,
+    ir.SFLe,
+    ir.SFGt,
+    ir.SFGe,
+  ]
+}
+
+/// EVERY `SimdOp` constructor, spread across shapes/halves/signs so every constructor AND every
+/// `SimdShape` appears at least once: the shape-tagged ops over all six shapes, the four
+/// lane-access ops over all six shapes (with lane immediates), the shape-agnostic bitwise/boolean
+/// ops, the tagged narrow/extend/extmul/pairwise families over their source shapes × half × sign,
+/// and the singular conversion/dot/q15/swizzle ops. The exhaustive `case` in
+/// `printer.simdop_to_string` fails to compile if a constructor is added later, and this list
+/// fails a round-trip if the parser's inverse drops one.
+fn all_simdops() -> List(ir.SimdOp) {
+  let shape_tagged =
+    list.flat_map(shape_tagged_simdops(), fn(mk) {
+      list.map(all_simd_shapes(), mk)
+    })
+  let lane_access =
+    list.flat_map(all_simd_shapes(), fn(s) {
+      [
+        ir.SExtractLane(s, 0),
+        ir.SExtractLaneS(s, 1),
+        ir.SExtractLaneU(s, 2),
+        ir.SReplaceLane(s, 3),
+      ]
+    })
+  let bitwise = [
+    ir.VNot,
+    ir.VAnd,
+    ir.VOr,
+    ir.VXor,
+    ir.VAndNot,
+    ir.VBitselect,
+    ir.VAnyTrue,
+  ]
+  let narrow =
+    list.flat_map([ir.I16x8, ir.I32x4], fn(s) {
+      [ir.SNarrow(s, True), ir.SNarrow(s, False)]
+    })
+  let ext =
+    list.flat_map([ir.I8x16, ir.I16x8, ir.I32x4], fn(s) {
+      list.flat_map([ir.Low, ir.High], fn(h) {
+        [
+          ir.SExtend(s, h, True),
+          ir.SExtend(s, h, False),
+          ir.SExtMul(s, h, True),
+          ir.SExtMul(s, h, False),
+        ]
+      })
+    })
+  let pairwise =
+    list.flat_map([ir.I8x16, ir.I16x8], fn(s) {
+      [ir.SExtAddPairwise(s, True), ir.SExtAddPairwise(s, False)]
+    })
+  let singular = [
+    ir.STruncSatF32x4S,
+    ir.STruncSatF32x4U,
+    ir.STruncSatF64x2SZero,
+    ir.STruncSatF64x2UZero,
+    ir.SConvertF32x4I32x4S,
+    ir.SConvertF32x4I32x4U,
+    ir.SConvertF64x2LowI32x4S,
+    ir.SConvertF64x2LowI32x4U,
+    ir.SDemoteF64x2Zero,
+    ir.SPromoteLowF32x4,
+    ir.SDotI16x8S,
+    ir.SQ15MulrSatS,
+    ir.SSwizzle,
+  ]
+  list.flatten([
+    shape_tagged,
+    lane_access,
+    bitwise,
+    narrow,
+    ext,
+    pairwise,
+    singular,
+  ])
+}
+
+/// Every `SimdOp` constructor round-trips through `Simd(op, args)`. Arity is irrelevant to the
+/// round-trip (the parser does not arity-check), so a fixed 2-arg list is used throughout.
+pub fn simdop_roundtrip_test() {
+  list.each(all_simdops(), fn(op) {
+    check_roundtrip(expr_module("so", ir.Simd(op, [ir.Var("a"), ir.Var("b")])))
+  })
+}
+
+/// The 16-byte v128 constant used by `golden/simd.ir` — four f32 lanes laid out little-endian:
+/// lane0 `0x7fc00001` (qNaN + payload), lane1 `0x80000000` (`-0.0`), lane2 `0x7f800000` (`+Inf`),
+/// lane3 `0x3f800000` (`1.0`). The raw bytes are what `ConstV128` stores (D5).
+fn v128_nan_neg0_inf_one() -> BitArray {
+  <<
+    0x01, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x80, 0x7f, 0x00,
+    0x00, 0x80, 0x3f,
+  >>
+}
+
+/// A `v128.const` whose lanes are a qNaN-with-payload, a `-0.0`, a `+Inf`, and a normal `1.0`
+/// round-trips byte-exact — the D5 fidelity `ConstF32`/`ConstF64` already have, one level wider.
+/// A lossy v128 spelling (e.g. one that re-parsed a NaN payload through a float) would corrupt
+/// exactly the bit patterns the SIMD conformance oracle checks; this fails closed on that.
+pub fn v128_const_bit_fidelity_roundtrip_test() {
+  check_roundtrip(expr_module(
+    "vc",
+    ir.Values([ir.ConstV128(v128_nan_neg0_inf_one())]),
+  ))
+}
+
+/// Two `v128.const`s that differ by a SINGLE bit (a NaN-payload low bit) are DISTINCT modules and
+/// each round-trips — no byte is dropped or normalised by print→parse. Also covers the all-zero
+/// and all-ones (every bit set) 16-byte patterns.
+pub fn v128_const_byte_discrimination_test() {
+  let a = ir.ConstV128(v128_nan_neg0_inf_one())
+  // flip the low payload bit of lane0: 0x01 -> 0x00
+  let b =
+    ir.ConstV128(<<
+      0x00, 0x00, 0xc0, 0x7f, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x80, 0x7f,
+      0x00, 0x00, 0x80, 0x3f,
+    >>)
+  let zeros = ir.ConstV128(<<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>)
+  let ones =
+    ir.ConstV128(<<
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+      0xff, 0xff, 0xff, 0xff,
+    >>)
+  assert module_equal(
+      expr_module("d", ir.Values([a])),
+      expr_module("d", ir.Values([b])),
+    )
+    == False
+  check_roundtrip(expr_module("d", ir.Values([a])))
+  check_roundtrip(expr_module("d", ir.Values([b])))
+  check_roundtrip(expr_module("d", ir.Values([zeros])))
+  check_roundtrip(expr_module("d", ir.Values([ones])))
+}
+
+/// A representative instance of every SIMD-memory node, `SimdShuffle`, and `CallImport`, covering:
+/// each `SimdLoadKind` (v128 / splat{8,16,32,64} / extend{8,16,32}×{s,u} / zero{32,64}); the
+/// memory-index decorator at 0 (omitted) and non-zero; every `load_lane`/`store_lane` bit width
+/// (8/16/32/64) and a spread of lane immediates; an empty and a full shuffle lane list; and
+/// `CallImport` at several slots/signatures incl. an empty arg/result list.
+fn simd_expr_corpus() -> List(ir.Expr) {
+  [
+    // every SimdLoadKind at memory 0 (mem= omitted)
+    ir.SimdLoad(0, ir.LoadV128, ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadSplat(8), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadSplat(16), ir.Var("a"), 4),
+    ir.SimdLoad(0, ir.LoadSplat(32), ir.Var("a"), 8),
+    ir.SimdLoad(0, ir.LoadSplat(64), ir.Var("a"), 16),
+    ir.SimdLoad(0, ir.LoadExtend(8, True), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadExtend(8, False), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadExtend(16, True), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadExtend(16, False), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadExtend(32, True), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadExtend(32, False), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadZero(32), ir.Var("a"), 0),
+    ir.SimdLoad(0, ir.LoadZero(64), ir.Var("a"), 0),
+    // memory index non-zero (mem= present)
+    ir.SimdLoad(2, ir.LoadV128, ir.Var("a"), 0),
+    ir.SimdLoad(1, ir.LoadSplat(32), ir.Var("a"), 4),
+    // store, at memory 0 and non-zero
+    ir.SimdStore(0, ir.Var("a"), ir.Var("v"), 0),
+    ir.SimdStore(3, ir.Var("a"), ir.Var("v"), 16),
+    // load_lane / store_lane, every width, mem 0 and non-zero, varied lanes
+    ir.SimdLoadLane(0, 8, ir.Var("a"), 0, 0, ir.Var("v")),
+    ir.SimdLoadLane(0, 16, ir.Var("a"), 2, 3, ir.Var("v")),
+    ir.SimdLoadLane(0, 32, ir.Var("a"), 4, 1, ir.Var("v")),
+    ir.SimdLoadLane(0, 64, ir.Var("a"), 8, 0, ir.Var("v")),
+    ir.SimdLoadLane(2, 32, ir.Var("a"), 0, 2, ir.Var("v")),
+    ir.SimdStoreLane(0, 8, ir.Var("a"), 0, 15, ir.Var("v")),
+    ir.SimdStoreLane(0, 16, ir.Var("a"), 0, 7, ir.Var("v")),
+    ir.SimdStoreLane(0, 32, ir.Var("a"), 0, 3, ir.Var("v")),
+    ir.SimdStoreLane(0, 64, ir.Var("a"), 0, 1, ir.Var("v")),
+    ir.SimdStoreLane(1, 8, ir.Var("a"), 0, 4, ir.Var("v")),
+    // shuffle: a full 16-index list and an empty list (parser does not length-check)
+    ir.SimdShuffle(
+      [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23],
+      ir.Var("a"),
+      ir.Var("b"),
+    ),
+    ir.SimdShuffle([], ir.Var("a"), ir.Var("b")),
+    // call_import: several slots/signatures, incl. empty arg/result lists
+    ir.CallImport(0, ir.FuncType([ir.TI32], [ir.TI32]), [ir.Var("a")]),
+    ir.CallImport(5, ir.FuncType([ir.TV128, ir.TF64], []), [
+      ir.Var("a"),
+      ir.Var("b"),
+    ]),
+    ir.CallImport(2, ir.FuncType([], []), []),
+    // a v128-result mem.load (the vestigial valtype position — the token must be legal)
+    ir.MemLoad(0, ir.MemAccess(16, False), ir.Var("a"), 0, ir.TV128),
+  ]
+}
+
+pub fn simd_expr_surface_roundtrip_test() {
+  list.each(simd_expr_corpus(), fn(e) { check_roundtrip(expr_module("se", e)) })
+}
+
+/// The SIMD-memory memory-index decorator is NOT dropped: a `simd.load` at memory 0 vs memory 1
+/// (else identical) are DISTINCT modules and each round-trips.
+pub fn simd_mem_index_discrimination_test() {
+  let m0 = expr_module("sm", ir.SimdLoad(0, ir.LoadV128, ir.Var("a"), 0))
+  let m1 = expr_module("sm", ir.SimdLoad(1, ir.LoadV128, ir.Var("a"), 0))
+  assert module_equal(m0, m1) == False
+  check_roundtrip(m0)
+  check_roundtrip(m1)
+}
+
+/// The `SimdLoadKind` bit width is NOT dropped: `load8_splat` vs `load16_splat` (bits 8 vs 16)
+/// are DISTINCT, and a signed vs unsigned extend load are DISTINCT — each round-trips.
+pub fn simd_loadkind_discrimination_test() {
+  let s8 = expr_module("lk", ir.SimdLoad(0, ir.LoadSplat(8), ir.Var("a"), 0))
+  let s16 = expr_module("lk", ir.SimdLoad(0, ir.LoadSplat(16), ir.Var("a"), 0))
+  let es =
+    expr_module("lk", ir.SimdLoad(0, ir.LoadExtend(8, True), ir.Var("a"), 0))
+  let eu =
+    expr_module("lk", ir.SimdLoad(0, ir.LoadExtend(8, False), ir.Var("a"), 0))
+  assert module_equal(s8, s16) == False
+  assert module_equal(es, eu) == False
+  check_roundtrip(s8)
+  check_roundtrip(s16)
+  check_roundtrip(es)
+  check_roundtrip(eu)
+}
+
+/// The `lane=` immediate and the access `width` are NOT dropped: two `load_lane`s differing only
+/// in lane, and two differing only in width, are DISTINCT and each round-trips.
+pub fn simd_lane_and_width_discrimination_test() {
+  let l1 =
+    expr_module("ll", ir.SimdLoadLane(0, 32, ir.Var("a"), 0, 1, ir.Var("v")))
+  let l2 =
+    expr_module("ll", ir.SimdLoadLane(0, 32, ir.Var("a"), 0, 2, ir.Var("v")))
+  let w8 =
+    expr_module("ll", ir.SimdLoadLane(0, 8, ir.Var("a"), 0, 1, ir.Var("v")))
+  let w16 =
+    expr_module("ll", ir.SimdLoadLane(0, 16, ir.Var("a"), 0, 1, ir.Var("v")))
+  assert module_equal(l1, l2) == False
+  assert module_equal(w8, w16) == False
+  check_roundtrip(l1)
+  check_roundtrip(l2)
+  check_roundtrip(w8)
+  check_roundtrip(w16)
+}
+
+/// The `TV128` valtype is legal — and round-trips — in EVERY valtype position: a param, a local, a
+/// function result, a `FuncType` (via `call_indirect`), an imported global's type, and a module
+/// global's declared type (with a `v128.const` initialiser).
+fn v128_valtype_module() -> ir.Module {
+  ir.Module(
+    name: "v128pos",
+    uses_numerics: True,
+    memories: [],
+    globals: [
+      ir.GlobalDecl(
+        "gv",
+        ir.TV128,
+        True,
+        ir.Values([ir.ConstV128(v128_nan_neg0_inf_one())]),
+      ),
+    ],
+    imports: [ir.ImportGlobal("env", "iv", ir.TV128, False)],
+    functions: [
+      ir.Function(
+        name: "f",
+        params: [ir.Local("a", ir.TV128)],
+        result: [ir.TV128],
+        locals: [ir.Local("l", ir.TV128)],
+        body: ir.Let(
+          ["x"],
+          ir.CallIndirect(
+            "t",
+            ir.Var("i"),
+            ir.FuncType([ir.TV128], [ir.TV128]),
+            [ir.Var("a")],
+          ),
+          ir.Return([ir.Var("a")]),
+        ),
+      ),
+    ],
+    exports: [],
+    data_segments: [],
+    tables: [ir.TableDecl("t", ir.FuncRef, 1, None)],
+    elements: [],
+    start: None,
+  )
+}
+
+pub fn v128_valtype_positions_roundtrip_test() {
+  check_roundtrip(v128_valtype_module())
+}
+
+/// A `funcref` where a reftype is required rejects `v128` (`v128` is NOT a reftype): a `table`
+/// declared `v128` must error (never panic), proving `parse_reftype` does not admit `v128`.
+pub fn v128_is_not_a_reftype_test() {
+  assert rejects("module @m { table @t v128 min 1 }")
+}
+
+// ─── memory64 & cross-module import — confirmed unchanged from Phase-5 (§A.7) ───
+
+/// A memory64 memory + an `i64`-addressed load/store still round-trips — the `.ir` spelling of
+/// `Idx64` is UNCHANGED (Phase 6 unfreezes only the memory64 RUNTIME, 05/08). A regression here
+/// would surface only at conformance, so confirm it at the text layer.
+pub fn memory64_ir_unchanged_roundtrip_test() {
+  let m =
+    ir.Module(
+      ..expr_module("m64", ir.Return([])),
+      memories: [ir.MemoryDecl(1, None, ir.Idx64)],
+      functions: [
+        ir.Function(
+          name: "f",
+          params: [ir.Local("a", ir.TI64)],
+          result: [],
+          locals: [],
+          body: ir.Let(
+            ["v"],
+            ir.MemLoad(0, ir.MemAccess(8, False), ir.Var("a"), 0, ir.TI64),
+            ir.Let(
+              [],
+              ir.MemStore(
+                0,
+                ir.MemAccess(8, False),
+                ir.Var("a"),
+                ir.Var("v"),
+                0,
+              ),
+              ir.Return([]),
+            ),
+          ),
+        ),
+      ],
+    )
+  check_roundtrip(m)
+}
+
+/// A cross-module function import prints BYTE-IDENTICALLY to a host import (`import "A" "f" :
+/// (…) -> (…)`) — the linker-built dispatch closure is a `runtime/link.gleam` value, not an IR
+/// field, so there is no `.ir` change for cross-module linking (§A.7). A module that both imports
+/// a function AND calls it via `CallImport` round-trips.
+pub fn cross_module_import_and_callimport_roundtrip_test() {
+  let m =
+    ir.Module(
+      name: "xmod",
+      uses_numerics: True,
+      memories: [],
+      globals: [],
+      imports: [ir.ImportFn("A", "f", ir.FuncType([ir.TI32], [ir.TI32]))],
+      functions: [
+        ir.Function(
+          name: "caller",
+          params: [ir.Local("p", ir.TI32)],
+          result: [ir.TI32],
+          locals: [],
+          body: ir.Let(
+            ["r"],
+            ir.CallImport(0, ir.FuncType([ir.TI32], [ir.TI32]), [ir.Var("p")]),
+            ir.Return([ir.Var("r")]),
+          ),
+        ),
+      ],
+      exports: [ir.ExportFn("caller", "caller")],
+      data_segments: [],
+      tables: [],
+      elements: [],
+      start: None,
+    )
+  // Byte-identity of the import DECL spelling (the A.7 invariant).
+  assert printer.print_module(m)
+    == "module @xmod {\n"
+    <> "  numerics true\n"
+    <> "  memory none\n"
+    <> "  import \"A\" \"f\" : (i32) -> (i32)\n"
+    <> "  export \"caller\" = @caller\n"
+    <> "  func @caller (%p:i32) -> (i32) {\n"
+    <> "    let (%r) = call_import 0 : (i32) -> (i32) (%p)\n"
+    <> "    return (%r)\n"
+    <> "  }\n"
+    <> "}\n"
+  check_roundtrip(m)
+}
+
+// ─── the hand-authored Phase-6 golden (independent oracle) ───
+
+/// Expected `Module` for the Phase-6 golden `golden/simd.ir` (hand-built, independent of the
+/// printer). Exercises `v128.const` (NaN-payload / `-0.0` / `+Inf` / normal lanes), a spread of
+/// `SimdOp`s, a `SimdShuffle`, the v128-memory family, and a `CallImport` in one module.
+fn simd_module() -> ir.Module {
+  ir.Module(
+    name: "simd",
+    uses_numerics: True,
+    memories: [ir.MemoryDecl(1, None, ir.Idx32)],
+    globals: [],
+    imports: [ir.ImportFn("env", "sink", ir.FuncType([ir.TV128], []))],
+    functions: [
+      ir.Function(
+        name: "run",
+        params: [ir.Local("p", ir.TI32)],
+        result: [ir.TV128],
+        locals: [],
+        body: ir.Let(
+          ["k"],
+          ir.Values([ir.ConstV128(v128_nan_neg0_inf_one())]),
+          ir.Let(
+            ["spl"],
+            ir.Simd(ir.SSplat(ir.I32x4), [ir.Var("p")]),
+            ir.Let(
+              ["sum"],
+              ir.Simd(ir.SAdd(ir.I32x4), [ir.Var("spl"), ir.Var("k")]),
+              ir.Let(
+                ["prod"],
+                ir.Simd(ir.SFMul(ir.F32x4), [ir.Var("k"), ir.Var("k")]),
+                ir.Let(
+                  ["lane"],
+                  ir.Simd(ir.SExtractLaneS(ir.I8x16, 3), [ir.Var("sum")]),
+                  ir.Let(
+                    ["wide"],
+                    ir.Simd(ir.SExtend(ir.I8x16, ir.Low, True), [ir.Var("sum")]),
+                    ir.Let(
+                      ["narr"],
+                      ir.Simd(ir.SNarrow(ir.I16x8, True), [
+                        ir.Var("sum"),
+                        ir.Var("prod"),
+                      ]),
+                      ir.Let(
+                        ["sel"],
+                        ir.Simd(ir.VBitselect, [
+                          ir.Var("sum"),
+                          ir.Var("prod"),
+                          ir.Var("k"),
+                        ]),
+                        ir.Let(
+                          ["dot"],
+                          ir.Simd(ir.SDotI16x8S, [ir.Var("sum"), ir.Var("prod")]),
+                          ir.Let(
+                            ["swz"],
+                            ir.Simd(ir.SSwizzle, [ir.Var("sum"), ir.Var("narr")]),
+                            ir.Let(
+                              ["shuf"],
+                              ir.SimdShuffle(
+                                [
+                                  0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6,
+                                  22, 7, 23,
+                                ],
+                                ir.Var("sum"),
+                                ir.Var("swz"),
+                              ),
+                              ir.Let(
+                                ["ld"],
+                                ir.SimdLoad(0, ir.LoadV128, ir.Var("p"), 0),
+                                ir.Let(
+                                  ["splatld"],
+                                  ir.SimdLoad(
+                                    0,
+                                    ir.LoadSplat(32),
+                                    ir.Var("p"),
+                                    4,
+                                  ),
+                                  ir.Let(
+                                    [],
+                                    ir.SimdStore(
+                                      0,
+                                      ir.Var("p"),
+                                      ir.Var("ld"),
+                                      16,
+                                    ),
+                                    ir.Let(
+                                      ["ldl"],
+                                      ir.SimdLoadLane(
+                                        0,
+                                        32,
+                                        ir.Var("p"),
+                                        0,
+                                        1,
+                                        ir.Var("ld"),
+                                      ),
+                                      ir.Let(
+                                        [],
+                                        ir.SimdStoreLane(
+                                          0,
+                                          8,
+                                          ir.Var("p"),
+                                          0,
+                                          2,
+                                          ir.Var("ldl"),
+                                        ),
+                                        ir.Let(
+                                          [],
+                                          ir.CallImport(
+                                            0,
+                                            ir.FuncType([ir.TV128], []),
+                                            [ir.Var("shuf")],
+                                          ),
+                                          ir.Return([ir.Var("ldl")]),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ],
+    exports: [ir.ExportFn("run", "run")],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
+  )
+}
+
+/// The Phase-6 golden parses to its hand-built expected `Module` — the INDEPENDENT oracle proving
+/// the printer and parser agree on the IR4 grammar delta (`v128.const`, the `SimdOp` mnemonics,
+/// `SimdShuffle`, the v128-memory forms, and `CallImport`), not merely with each other (D7).
+pub fn golden_simd_parses_to_expected_test() {
+  assert parser.parse_module(read_golden("simd.ir")) == Ok(simd_module())
+}
+
+/// The Phase-6 golden's parsed `Module` re-prints + re-parses stably (`parse(print(m)) == m`).
+pub fn golden_simd_reprint_stably_test() {
+  check_roundtrip(simd_module())
+}
+
+// ─── Phase-6 negative corpus (totality, D4) ───
+
+/// A `v128.const` whose payload is not EXACTLY 16 bytes is rejected `BadNumberLiteral` (the
+/// structural well-formedness check, §A.2) — both too short and too long, and an odd-length hex
+/// (rejected earlier by `hex_to_bytes`).
+pub fn negative_v128_const_wrong_length_test() {
+  let short =
+    parser.parse_module(
+      "module @m { func @f () -> () { values (v128.const 0x00) } }",
+    )
+  assert case short {
+    Error(parser.BadNumberLiteral(_, _, _)) -> True
+    _ -> False
+  }
+  let long =
+    parser.parse_module(
+      "module @m { func @f () -> () { values (v128.const 0x000000000000000000000000000000000000) } }",
+    )
+  assert case long {
+    Error(parser.BadNumberLiteral(_, _, _)) -> True
+    _ -> False
+  }
+  // odd-length hex → BadNumberLiteral (via hex_to_bytes), never a panic
+  assert rejects("module @m { func @f () -> () { values (v128.const 0xabc) } }")
+}
+
+/// An unrecognised SIMD mnemonic is `UnknownOp` (via `string_to_simdop` Error) — a bad shape, a
+/// bad op suffix, and a bad half/sign each surface as `UnknownOp`, never a panic.
+pub fn negative_simd_unknown_op_test() {
+  let r =
+    parser.parse_module(
+      "module @m { func @f () -> () { simd i32x4.bogus (%a) } }",
+    )
+  assert case r {
+    Error(parser.UnknownOp(_, _, "i32x4.bogus")) -> True
+    _ -> False
+  }
+  assert rejects("module @m { func @f () -> () { simd bogus.i32x4 (%a) } }")
+  assert rejects(
+    "module @m { func @f () -> () { simd extend.i8x16.sideways.s (%a) } }",
+  )
+  assert rejects("module @m { func @f () -> () { simd narrow.i16x8.q (%a) } }")
+}
+
+/// A battery of malformed SIMD / `call_import` forms: each returns a typed `Error` (never a
+/// panic). Reaching the end without crashing the runner IS the totality proof for the new surface.
+pub fn negative_simd_garbage_never_panic_test() {
+  let garbage = [
+    "module @m { func @f () -> () { simd } }",
+    "module @m { func @f () -> () { simd i32x4.add } }",
+    "module @m { func @f () -> () { simd i32x4.add ( } }",
+    "module @m { func @f () -> () { simd.shuffle %a %b } }",
+    "module @m { func @f () -> () { simd.shuffle [0, 1 %a %b } }",
+    "module @m { func @f () -> () { simd.shuffle [0] %a } }",
+    "module @m { func @f () -> () { simd.load } }",
+    "module @m { func @f () -> () { simd.load bogus %a offset=0 } }",
+    "module @m { func @f () -> () { simd.load v128 %a } }",
+    "module @m { func @f () -> () { simd.load v128 %a offset= } }",
+    "module @m { func @f () -> () { simd.load splat %a offset=0 } }",
+    "module @m { func @f () -> () { simd.load extend 8 %a offset=0 } }",
+    "module @m { func @f () -> () { simd.load extend 8 x %a offset=0 } }",
+    "module @m { func @f () -> () { simd.store %a offset=0 } }",
+    "module @m { func @f () -> () { simd.store %a %v } }",
+    "module @m { func @f () -> () { simd.load_lane 32 %a offset=0 %v } }",
+    "module @m { func @f () -> () { simd.load_lane 32 %a offset=0 lane= %v } }",
+    "module @m { func @f () -> () { simd.load_lane %a offset=0 lane=0 %v } }",
+    "module @m { func @f () -> () { simd.store_lane 8 %a offset=0 lane=0 } }",
+    "module @m { func @f () -> () { call_import } }",
+    "module @m { func @f () -> () { call_import 0 } }",
+    "module @m { func @f () -> () { call_import 0 : } }",
+    "module @m { func @f () -> () { call_import 0 : (i32) -> (i32) } }",
+    "module @m { func @f () -> () { call_import x : (i32) -> () (%a) } }",
+  ]
+  assert list.all(garbage, rejects)
+}
+
 pub fn negative_garbage_inputs_never_panic_test() {
   // A battery of malformed inputs: each must return Error (never panic). Reaching the
   // end of this list without crashing the runner IS the totality proof.

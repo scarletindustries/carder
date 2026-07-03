@@ -1,5 +1,8 @@
 # `.ir` grammar delta — Phase-5 (IR3 surface)
 
+> **Next delta:** the Phase-6 IR4 growth (SIMD + `call_import`) is in
+> `specs/phase-6/ir-grammar-delta.md` — additive on top of this one.
+>
 > The **additions** to the canonical `.ir` textual form (`specs/phase-1/ir-grammar.md`, plus
 > the Phase-2 delta `specs/phase-2/ir2-grammar-delta.md`) made by the Phase-5 IR growth (H7).
 > Every Phase-1/2 spelling is **unchanged**; a Phase-1..4-shaped module prints byte-identically

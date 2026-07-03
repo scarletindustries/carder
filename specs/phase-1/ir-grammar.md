@@ -23,6 +23,9 @@
 >   `null.<reftype>` literal, the reference/table/bulk-memory expressions, the memory-index
 >   decorator, multi-memory + memory64, the import/export state variants, and the
 >   passive/declarative segment forms).
+> - `specs/phase-6/ir-grammar-delta.md` — Phase-6 IR4 (the `v128` valtype + `v128.const`
+>   literal, the `simd <simdop> (args)` op family, `simd.shuffle`, the four SIMD-memory nodes,
+>   and the cross-module `call_import` call).
 
 ## Design rules (from D7)
 
