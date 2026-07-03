@@ -1,0 +1,10 @@
+{
+  "name": "2core-vendor-porffor",
+  "private": true,
+  "type": "module",
+  "description": "Vendored Porffor + self-hosting build pipeline for the in-BEAM JS frontend (see README.md).",
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "esbuild": "^0.21.0"
+  }
+}

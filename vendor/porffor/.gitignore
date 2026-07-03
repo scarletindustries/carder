@@ -1,0 +1,7 @@
+# build-time tooling (installed on demand by build.sh) — NOT vendored
+/node_modules/
+package-lock.json
+# build artifacts (top-level only; NOT acorn's own dist/)
+/dist/
+/*.wasm
+/*.bundle.js

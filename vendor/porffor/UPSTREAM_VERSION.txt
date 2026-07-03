@@ -1,0 +1,7 @@
+porffor 0.61.13
+source: npm porffor@0.61.13 (compiler/ + node_modules/acorn), vendored 2026-07-03
+acorn: 8.17.0
+
+Licenses (vendored code is redistributed under its original terms):
+- Porffor: MIT — Copyright (c) 2023-2025 Oliver Medhurst — see upstream/LICENSE
+- acorn:   MIT — see upstream/node_modules/acorn/LICENSE
