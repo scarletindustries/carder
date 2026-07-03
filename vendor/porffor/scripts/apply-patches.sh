@@ -89,29 +89,22 @@ if '_nas2core' not in s:
 PY
 done
 
-# 7. codegen.js — empty string literals must NOT be the null pointer 0. Upstream `makeString`
-#    returns `[ number(0) ]` for `''` (relying on "memory at 0 is 0 anyway"). But reading a
-#    bytestring/string at address 0 returns whatever is at the START of linear memory, which in a
-#    large program (the self-hosted compiler) is NON-ZERO — so an empty regex-flags string `''`
-#    reads a garbage length and throws `SyntaxError: Regex parse: Invalid flag` (and similar for any
-#    empty-string byte read). Fix: point empty strings at a reserved, statically-zero slot via
-#    `allocStr` instead of 0. This is a genuine Porffor self-compile bug (see FINDINGS §7); we fix
-#    it in BOTH the vendored compiler (here -> porffor.wasm compiles user '' correctly) and the
-#    build tool (scripts/patch-build-tool.sh -> the tool compiles the bundle's '' correctly).
-python3 - "$DIR/compiler/codegen.js" <<'PY'
-import sys
-p = sys.argv[1]; s = open(p).read()
-old = 'if (str.length === 0) return [ number(0) ];'
-new = "if (str.length === 0) return [ number(allocStr(scope, '', bytestring)) ]; // [2core] empty string -> reserved zero slot, not null ptr 0 (FINDINGS §7)"
-if '[2core] empty string' not in s and old in s:
-    s = s.replace(old, new, 1)
-    open(p, 'w').write(s)
-    print("[apply-patches] codegen.js: empty string -> reserved zero slot (not null ptr 0)")
-elif '[2core] empty string' in s:
-    print("[apply-patches] codegen.js: empty-string fix already present")
-else:
-    print("[apply-patches] WARNING codegen.js: makeString empty-string line not found (Porffor changed?)")
-PY
+# 7. Porffor codegen/assemble self-compile fixes (empty-string null-ptr, func-lut sizing, func-lut
+#    offset collision) — applied to the vendored compiler here so porffor.wasm compiles user code
+#    correctly. The SAME fixes are applied to the npx build tool by scripts/patch-build-tool.sh (both
+#    delegate to scripts/porffor-codegen-fixes.sh; FINDINGS §6, §7, §7b).
+bash "$(dirname "$0")/porffor-codegen-fixes.sh" "$DIR"
 
-echo "[apply-patches] stripped node:fs / execSync / 2c-eval + static-acorn + lazy-wide-regex + empty-string-fix in $DIR"
-grep -n "\[2core\]" "$DIR/compiler/index.js" "$DIR/compiler/wrap.js" "$DIR/compiler/codegen.js" || true
+# 8. acorn — `wordsRegexp` uses `words.replace(/ /g, "|")`, but Porffor has NO String.prototype.replace
+#    (native `typeof "x".replace` is undefined). `.split`/`.join` DO work, so rewrite to the equivalent
+#    `words.split(" ").join("|")`. Without this the parser's unicode-property tables can't be built
+#    (acorn init calls buildUnicodeData -> wordsRegexp). Patch both acorn builds. (FINDINGS §8)
+for _acorn_f in "$DIR/node_modules/acorn/dist/acorn.mjs" "$DIR/node_modules/acorn/dist/acorn.js"; do
+  if grep -q 'words.replace(/ /g, "|")' "$_acorn_f" 2>/dev/null; then
+    perl -i -pe 's/words\.replace\(\/ \/g, "\|"\)/words.split(" ").join("|")/' "$_acorn_f"
+    echo "[apply-patches] acorn: wordsRegexp .replace -> .split/.join ($(basename "$_acorn_f"))"
+  fi
+done
+
+echo "[apply-patches] stripped node:fs / execSync / 2c-eval + static-acorn + lazy-wide-regex + codegen-fixes + wordsRegexp in $DIR"
+grep -n "\[2core\]" "$DIR/compiler/index.js" "$DIR/compiler/wrap.js" "$DIR/compiler/codegen.js" "$DIR/compiler/assemble.js" || true
