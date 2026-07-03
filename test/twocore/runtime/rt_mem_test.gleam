@@ -21,14 +21,19 @@
 
 import gleam/dict
 import gleam/dynamic
+import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/set
 import gleeunit/should
+import twocore/frontend/wasm/validate
 import twocore/ir.{MemoryOutOfBounds}
+import twocore/runtime/instance
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_meter
-import twocore/runtime/rt_state.{type InstanceState, InstanceState, StateDecl}
+import twocore/runtime/rt_state.{
+  type InstanceState, FullDecl, InstanceState, StateDecl,
+}
 
 // Page byte length; one fresh page = 65536 bytes.
 const page: Int = 65_536
@@ -1173,4 +1178,375 @@ pub fn cell_threaded_fill_metered_parity_test() {
 
   cell_fuel |> should.equal(20)
   threaded_fuel |> should.equal(cell_fuel)
+}
+
+// ───────────────────────────── 18. memory64 (P6-08, S4/S9) — page cap, large addresses, byte seam ─────────────────────────────
+//
+// Asserts memory64 SEMANTICS (spec valid/types `2^(|addrtype|-16)` page range; exec/instructions
+// `ea = i + offset`, trap iff `ea + N > |mem.data|`; memory.grow may fail returning -1) and, at
+// affordable size, the flat oracle. The byte machinery is already bignum-64-bit-correct, so a
+// 64-bit memory addresses past 2^32 through the SAME core; the deltas are the page cap + the ctors.
+
+/// 2^32 — the memory64 runtime page cap (in pages) and the first byte address past the i32 range.
+const two_pow_32: Int = 4_294_967_296
+
+/// A canonical 16-byte v128 image (bytes 0..15 in address order) for the byte-seam tests.
+fn sample16() -> BitArray {
+  <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>
+}
+
+// ── the documented page cap: the constant + the cross-unit invariants (§C / §E.3, Verification #3) ──
+
+// The runtime cap is a documented, spec-cited constant, NOT a guess: 2^32 pages = 2^48 bytes =
+// 256 TiB. It sits strictly between the i32 hard cap (65_536) and the DECLARABLE type-level max
+// (validate's 2^48-page `memory64_page_limit`), and the Binding single-sources it.
+pub fn mem64_hard_max_pages_constant_test() {
+  // 2^32 pages, exactly.
+  rt_mem.mem64_hard_max_pages |> should.equal(4_294_967_296)
+  rt_mem.mem64_hard_max_pages |> should.equal(bsl(1, 32))
+  // A 64-bit memory can exceed the i32 range (else it is indistinguishable from i32).
+  { rt_mem.mem64_hard_max_pages > rt_mem.hard_max_pages } |> should.be_true
+  // The runtime cap is <= the DECLARABLE spec type max (2^32 <= 2^48) — the two must not conflate.
+  { rt_mem.mem64_hard_max_pages <= validate.memory64_page_limit }
+  |> should.be_true
+  validate.memory64_page_limit |> should.equal(bsl(1, 48))
+  // The single-source seam: safe_default's Binding field == this unit's pinned constant.
+  let binding = instance.safe_default()
+  binding.mem64_max_pages |> should.equal(rt_mem.mem64_hard_max_pages)
+}
+
+// ── the page-cap boundary via an injected small cap (§E.3): grow to the cap, then -1 beyond it ──
+
+// With a small injected cap the grow→-1 boundary is deterministically testable (the real 2^32 cap
+// is not directly reachable). fresh_mem64(1, None, 4) folds max = min(4, 2^32) = 4.
+pub fn mem64_grow_cap_boundary_paged_test() {
+  let m = rt_mem.fresh_mem64(1, None, 4, rt_mem.default_chunk_bytes)
+  // grow 3 pages: 1 → 4 (== cap), returns old size 1.
+  let #(r1, m) = rt_mem.mem_grow(m, 3)
+  r1 |> should.equal(1)
+  rt_mem.mem_size(m) |> should.equal(4)
+  // A further grow of 1 would be 5 > cap → -1, allocating nothing, size unchanged.
+  let #(r2, m) = rt_mem.mem_grow(m, 1)
+  r2 |> should.equal(-1)
+  rt_mem.mem_size(m) |> should.equal(4)
+}
+
+pub fn mem64_grow_cap_boundary_oracle_test() {
+  let o = rt_mem.o_fresh64(1, None, 4)
+  let #(r1, o) = rt_mem.o_grow(o, 3)
+  r1 |> should.equal(1)
+  let #(r2, o) = rt_mem.o_grow(o, 1)
+  r2 |> should.equal(-1)
+  rt_mem.o_size(o) |> should.equal(4)
+}
+
+// A declared max on a 64-bit memory binds below the cap exactly as for i32.
+pub fn mem64_declared_max_binds_test() {
+  let m = rt_mem.fresh_mem64(1, Some(2), two_pow_32, rt_mem.default_chunk_bytes)
+  let #(r1, m) = rt_mem.mem_grow(m, 1)
+  r1 |> should.equal(1)
+  let #(r2, m) = rt_mem.mem_grow(m, 1)
+  r2 |> should.equal(-1)
+  rt_mem.mem_size(m) |> should.equal(2)
+}
+
+// A 64-bit memory grows PAST the i32 range (2^16 pages) — impossible for an Idx32 memory (whose
+// max folds to <= 65_536) — sparsely, with no allocation.
+pub fn mem64_grow_beyond_i32_range_test() {
+  let m =
+    rt_mem.fresh_mem64(
+      1,
+      None,
+      rt_mem.mem64_hard_max_pages,
+      rt_mem.default_chunk_bytes,
+    )
+  // 1 → 2^16 + 2 pages (65538) — past the i32 4 GiB ceiling. O(1) watermark move.
+  let #(old, m) = rt_mem.mem_grow(m, 65_537)
+  old |> should.equal(1)
+  rt_mem.mem_size(m) |> should.equal(65_538)
+  // The freshly-grown region past 2^32 reads as zero without allocation.
+  rt_mem.mem_load(m, 8, False, 64, two_pow_32 + 1000, 0) |> should.equal(Ok(0))
+}
+
+// ── large-address behaviour (§E.2, sparse paged, NO flat oracle): the point of memory64 ──
+
+/// A 64-bit memory grown to 65538 pages (byte_len ≈ 4 GiB + 128 KiB), sparse.
+fn big_mem64() -> rt_mem.Mem {
+  let m =
+    rt_mem.fresh_mem64(
+      1,
+      None,
+      rt_mem.mem64_hard_max_pages,
+      rt_mem.default_chunk_bytes,
+    )
+  let #(_old, m) = rt_mem.mem_grow(m, 65_537)
+  m
+}
+
+// Round-trip an i64 value at byte 2^32 + 40: load8/16/32/64_u read back the exact little-endian
+// bytes (D5); overwriting one byte changes it and NOT its neighbours. Only touched chunks live.
+pub fn mem64_large_address_roundtrip_test() {
+  let m = big_mem64()
+  let base = two_pow_32 + 40
+  let assert Ok(m) = rt_mem.mem_store(m, 8, base, 0x0123456789ABCDEF, 0)
+  // Little-endian: bytes EF CD AB 89 67 45 23 01 at base..base+7.
+  rt_mem.mem_load(m, 8, False, 64, base, 0)
+  |> should.equal(Ok(0x0123456789ABCDEF))
+  rt_mem.mem_load(m, 4, False, 64, base, 0) |> should.equal(Ok(0x89ABCDEF))
+  rt_mem.mem_load(m, 2, False, 64, base, 0) |> should.equal(Ok(0xCDEF))
+  rt_mem.mem_load(m, 1, False, 64, base, 0) |> should.equal(Ok(0xEF))
+  // Overwrite one byte (base+2, was 0xAB) → 0xFF; neighbours base+1 (0xCD) / base+3 (0x89) hold.
+  let assert Ok(m) = rt_mem.mem_store(m, 1, base + 2, 0xFF, 0)
+  rt_mem.mem_load(m, 1, False, 32, base + 2, 0) |> should.equal(Ok(0xFF))
+  rt_mem.mem_load(m, 1, False, 32, base + 1, 0) |> should.equal(Ok(0xCD))
+  rt_mem.mem_load(m, 1, False, 32, base + 3, 0) |> should.equal(Ok(0x89))
+}
+
+// i64 offset equivalence: store(addr=0, offset=2^32+40) and store(addr=2^32+40, offset=0) address
+// the SAME byte — the offset is a u64, not truncated to 32 bits (memory64 proposal).
+pub fn mem64_i64_offset_equivalence_test() {
+  let m = big_mem64()
+  let assert Ok(m) =
+    rt_mem.mem_store(m, 8, 0, 0xDEADBEEFCAFEF00D, two_pow_32 + 40)
+  // Read back with the offset folded into addr instead — same byte.
+  rt_mem.mem_load(m, 8, False, 64, two_pow_32 + 40, 0)
+  |> should.equal(Ok(0xDEADBEEFCAFEF00D))
+}
+
+// No-wrap trap at the 64-bit boundary: an 8-byte access at byte_len-8 is Ok, at byte_len-7 traps,
+// at byte_len traps; an addr near 2^64 plus an offset produces a huge ea that traps (never wraps).
+pub fn mem64_no_wrap_trap_boundary_test() {
+  let m = big_mem64()
+  let byte_len = 65_538 * page
+  rt_mem.mem_load(m, 8, False, 64, byte_len - 8, 0) |> should.be_ok
+  rt_mem.mem_load(m, 8, False, 64, byte_len - 7, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_load(m, 8, False, 64, byte_len, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // addr = 0xFFFF_FFFF_FFFF_FFF8 (near 2^64) + offset 16 → ea > 2^64, a huge bignum → trap.
+  rt_mem.mem_load(m, 8, False, 64, 0xFFFFFFFFFFFFFFF8, 16)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // A store at the boundary traps BEFORE writing (all-or-nothing), leaving the prefix intact.
+  let assert Ok(m) = rt_mem.mem_store(m, 8, byte_len - 8, 0x1122334455667788, 0)
+  rt_mem.mem_store(m, 8, byte_len - 7, 0, 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_load(m, 8, False, 64, byte_len - 8, 0)
+  |> should.equal(Ok(0x1122334455667788))
+}
+
+// Bulk ops past 2^32 are memmove-correct with a small count; eager bounds at the > 4 GiB boundary
+// trap with zero mutation (a d + n that overflows a 32-bit register but not the bignum byte_len
+// does NOT wrap).
+pub fn mem64_bulk_ops_past_2_32_test() {
+  let m = big_mem64()
+  let base = two_pow_32 + 40
+  let byte_len = 65_538 * page
+  // fill 4 bytes 0x55.
+  let assert Ok(m) = rt_mem.mem_fill(m, base, 0x55, 4)
+  rt_mem.mem_load(m, 4, False, 64, base, 0) |> should.equal(Ok(0x55555555))
+  // copy those 4 bytes to base+8.
+  let assert Ok(m) = rt_mem.mem_copy(m, m, base + 8, base, 4)
+  rt_mem.mem_load(m, 4, False, 64, base + 8, 0) |> should.equal(Ok(0x55555555))
+  // init 3 bytes from a segment at base+16.
+  let assert Ok(m) = rt_mem.mem_init(m, <<0xDE, 0xAD, 0xBE>>, base + 16, 0, 3)
+  rt_mem.mem_load(m, 1, False, 32, base + 16, 0) |> should.equal(Ok(0xDE))
+  // Eager bounds past byte_len trap with zero mutation.
+  rt_mem.mem_fill(m, byte_len - 2, 0x00, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_copy(m, m, byte_len - 2, base, 4)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// ── 32-bit byte-identity (§A.3, Verification #4): the mem_grow conjunct-drop is behaviour-preserving ──
+
+/// Reference: the OLD two-conjunct `mem_grow` rule for an `Idx32` memory (`new <= eff && new <=
+/// 65_536`, where `eff = min(declared ?? min(safe, 65_536), min(safe, 65_536))`). The NEW rule
+/// drops the second conjunct; for `Idx32` `eff <= 65_536`, so they agree — asserted below.
+fn eff_max32_ref(max: Option(Int), safe: Int) -> Int {
+  let cap = int.min(safe, 65_536)
+  case max {
+    Some(d) -> int.min(d, cap)
+    None -> cap
+  }
+}
+
+fn grow32_ref(old: Int, delta: Int, max: Option(Int), safe: Int) -> Int {
+  let new = old + delta
+  case delta >= 0 && new <= eff_max32_ref(max, safe) && new <= 65_536 {
+    True -> old
+    False -> -1
+  }
+}
+
+// For a battery of Idx32 (min, max, safe, delta) spanning the 65_536 boundary, the NEW `mem_grow`
+// returns EXACTLY the old two-conjunct result — so a 32-bit memory is byte-identical (H7).
+pub fn mem_grow_idx32_byte_identity_test() {
+  let mins = [1, 65_534, 65_535, 65_536]
+  let maxes = [None, Some(3), Some(65_536), Some(70_000)]
+  let safes = [5, 65_536, 100_000]
+  let deltas = [-1, 0, 1, 2, 3]
+  list.each(mins, fn(min) {
+    list.each(maxes, fn(max) {
+      list.each(safes, fn(safe) {
+        list.each(deltas, fn(delta) {
+          let m = rt_mem.fresh_mem(min, max, safe, rt_mem.default_chunk_bytes)
+          let #(got, _m) = rt_mem.mem_grow(m, delta)
+          got |> should.equal(grow32_ref(min, delta, max, safe))
+        })
+      })
+    })
+  })
+}
+
+// ── the small-memory differential (§E.1): a bounded 64-bit memory — paged ≡ oracle over op streams ──
+
+/// Drive paged64 and oracle64 through the same `count` random ops (reusing the §11 harness) on a
+/// SMALL bounded 64-bit memory (max 4 pages, so the flat oracle is affordable); assert identical
+/// results+traps at every step and an identical final flat byte image. Proves the i64 cap fold +
+/// the bulk ops are 64-bit-correct and agree with the trivially-correct flat reference.
+fn run_differential64(chunk: Int, count: Int, seed: Int) -> Nil {
+  let m = rt_mem.fresh_mem64(1, Some(4), rt_mem.mem64_hard_max_pages, chunk)
+  let o = rt_mem.o_fresh64(1, Some(4), rt_mem.mem64_hard_max_pages)
+  let #(m, o) = diff_loop(m, o, seed, count)
+  rt_mem.mem_flat(m) |> should.equal(rt_mem.o_flat(o))
+}
+
+pub fn differential64_chunk_default_test() {
+  run_differential64(rt_mem.default_chunk_bytes, 250, 0x64A)
+}
+
+pub fn differential64_chunk_65_test() {
+  run_differential64(65, 250, 0x64B)
+}
+
+pub fn differential64_chunk_4096_test() {
+  run_differential64(4096, 300, 0x64C)
+}
+
+// ───────────────────────────── 19. the v128-memory BitArray seam (S4) — load_bytes/store_bytes ─────────────────────────────
+//
+// `load_bytes`/`store_bytes` are the checked wrappers 06 composes with rt_simd for the v128 memory
+// family. `v128.load`: the 16 bytes at `ea` ARE the vector; `load8x8`/`load32_zero`: load 8/4 bytes
+// then extend in rt_simd. Same no-wrap bignum bounds → MemoryOutOfBounds trap-before-write.
+
+// 16-byte round-trip on the pure core; the in-memory bytes match a byte-by-byte scalar read (the
+// little-endian in-memory layout); the oracle agrees.
+pub fn load_store_bytes_16_roundtrip_test() {
+  let m = rt_mem.fresh_mem(1, Some(1), big_cap, rt_mem.default_chunk_bytes)
+  let assert Ok(m) = rt_mem.mem_store_bytes(m, 16, sample16(), 0)
+  rt_mem.mem_load_bytes(m, 16, 0, 16) |> should.equal(Ok(sample16()))
+  // Byte-by-byte layout: address 16 holds sample[0]=0, address 31 holds sample[15]=15.
+  rt_mem.mem_load(m, 1, False, 32, 16, 0) |> should.equal(Ok(0))
+  rt_mem.mem_load(m, 1, False, 32, 31, 0) |> should.equal(Ok(15))
+  // Oracle agrees byte-for-byte.
+  let o = rt_mem.o_fresh(1, Some(1), big_cap)
+  let assert Ok(o) = rt_mem.o_store_bytes(o, 16, sample16(), 0)
+  rt_mem.o_load_bytes(o, 16, 0, 16) |> should.equal(Ok(sample16()))
+}
+
+// 8-byte (load8x8/load64_zero) and 4-byte (load32_zero) slices are exact little-endian sub-slices.
+pub fn load_bytes_8_and_4_slices_test() {
+  let m = rt_mem.fresh_mem(1, Some(1), big_cap, rt_mem.default_chunk_bytes)
+  let assert Ok(m) =
+    rt_mem.mem_store_bytes(
+      m,
+      0,
+      <<0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22>>,
+      0,
+    )
+  rt_mem.mem_load_bytes(m, 0, 0, 8)
+  |> should.equal(Ok(<<0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22>>))
+  rt_mem.mem_load_bytes(m, 0, 0, 4)
+  |> should.equal(Ok(<<0xAA, 0xBB, 0xCC, 0xDD>>))
+  // The offset folds into ea: load 4 bytes at addr=2 reads bytes [2..5].
+  rt_mem.mem_load_bytes(m, 0, 2, 4)
+  |> should.equal(Ok(<<0xCC, 0xDD, 0xEE, 0xFF>>))
+}
+
+// store_bytes bounds-checks the WHOLE run first → trap BEFORE any write (all-or-nothing); the exact
+// 16-byte boundary; a no-wrap probe near 2^32 traps; load_bytes OOB traps.
+pub fn store_bytes_oob_trap_before_write_test() {
+  let m = rt_mem.fresh_mem(1, Some(1), big_cap, rt_mem.default_chunk_bytes)
+  // Seed a marker at the tail so a partial write would be observable.
+  let assert Ok(m) = rt_mem.mem_store(m, 4, page - 16, 0xAABBCCDD, 0)
+  // Exact boundary: 16 bytes at page-16 fit; at page-15 they straddle byte_len → trap.
+  rt_mem.mem_store_bytes(m, page - 16, sample16(), 0) |> should.be_ok
+  rt_mem.mem_store_bytes(m, page - 15, sample16(), 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+  // A straddling store traps with ZERO mutation (the input m is untouched).
+  rt_mem.mem_store_bytes(m, page - 8, sample16(), 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_load(m, 4, False, 32, page - 16, 0) |> should.equal(Ok(0xAABBCCDD))
+  // load_bytes OOB traps; the no-wrap probe near 2^32 must trap (never wrap).
+  rt_mem.mem_load_bytes(m, page - 8, 0, 16)
+  |> should.equal(Error(MemoryOutOfBounds))
+  rt_mem.mem_load_bytes(m, 0xFFFFFFFF, 8, 16)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// The cell-backed byte seam (index 0): a store persists across a separate load; OOB via the cell
+// traps.
+pub fn cell_load_store_bytes_roundtrip_test() {
+  rt_state.seed(StateDecl(
+    mem: rt_mem.fresh(1, Some(1), big_cap),
+    globals: [],
+    table: dynamic.nil(),
+  ))
+  rt_mem.store_bytes(32, sample16(), 0) |> should.equal(Ok(Nil))
+  rt_mem.load_bytes(32, 0, 16) |> should.equal(Ok(sample16()))
+  rt_mem.load_bytes(page - 8, 0, 16)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// The index-routed cell byte seam: store into memory 1, read it back, memory 0 untouched (16 zero
+// bytes).
+pub fn cell_load_store_bytes_at_index_test() {
+  rt_state.seed_full(
+    FullDecl(
+      mems: [
+        rt_mem.fresh(1, Some(1), big_cap),
+        rt_mem.fresh(1, Some(1), big_cap),
+      ],
+      globals: [],
+      tables: [],
+      ref_globals: [],
+    ),
+  )
+  rt_mem.store_bytes_at(1, 0, sample16(), 0) |> should.equal(Ok(Nil))
+  rt_mem.load_bytes_at(1, 0, 0, 16) |> should.equal(Ok(sample16()))
+  // load_bytes_at(0, …) is the byte-identical index-0 path; memory 0 is all zero.
+  rt_mem.load_bytes_at(0, 0, 0, 16) |> should.equal(Ok(<<0:size(128)>>))
+}
+
+// The threaded byte seam: t_store_bytes rebinds immutably (the pre-store record still reads zero);
+// OOB traps.
+pub fn threaded_load_store_bytes_test() {
+  let st = paged_threaded_state()
+  let assert Ok(st2) = rt_mem.t_store_bytes(st, 0, sample16(), 0)
+  rt_mem.t_load_bytes(st2, 0, 0, 16) |> should.equal(Ok(sample16()))
+  // Immutable: the pre-store record is untouched.
+  rt_mem.t_load_bytes(st, 0, 0, 16) |> should.equal(Ok(<<0:size(128)>>))
+  rt_mem.t_store_bytes(st, page - 8, sample16(), 0)
+  |> should.equal(Error(MemoryOutOfBounds))
+}
+
+// The threaded index-routed byte seam: touches only the named memory.
+pub fn threaded_load_store_bytes_at_test() {
+  let st = two_mem_state()
+  let assert Ok(st) = rt_mem.t_store_bytes_at(st, 1, 0, sample16(), 0)
+  rt_mem.t_load_bytes_at(st, 1, 0, 0, 16) |> should.equal(Ok(sample16()))
+  rt_mem.t_load_bytes_at(st, 0, 0, 0, 16)
+  |> should.equal(Ok(<<0:size(128)>>))
+}
+
+// The byte seam past 2^32 (memory64 × v128 memory): a 16-byte store/load round-trips at a > 4 GiB
+// address, and the i64 offset (which alone exceeds 2^32) folds into ea identically.
+pub fn mem64_load_store_bytes_past_2_32_test() {
+  let m = big_mem64()
+  let assert Ok(m) = rt_mem.mem_store_bytes(m, two_pow_32 + 40, sample16(), 0)
+  rt_mem.mem_load_bytes(m, two_pow_32 + 40, 0, 16)
+  |> should.equal(Ok(sample16()))
+  // The same bytes via a u64 offset that itself exceeds 2^32.
+  rt_mem.mem_load_bytes(m, 0, two_pow_32 + 40, 16)
+  |> should.equal(Ok(sample16()))
 }

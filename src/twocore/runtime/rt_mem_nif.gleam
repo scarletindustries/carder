@@ -66,6 +66,26 @@ pub fn fresh(min_pages: Int, max_pages: Option(Int), safe_cap: Int) -> Dynamic {
   rt_mem.fresh(min_pages, max_pages, safe_cap)
 }
 
+/// Build a FRESH tier-N 64-bit (`Idx64`, memory64) memory, delegating to `rt_mem.fresh64` (P6-08,
+/// §D). Only ever emitted for a TINY BOUNDED 64-bit memory: unit 09's `validate_binding` calls
+/// `rt_mem_atomics.reservation64` on the same rule as `atomics` and FAIL-CLOSED REJECTS an over-cap
+/// / unbounded 64-bit `nif` binding at LINK time — because the deferred native tier's C impl
+/// RESERVES (it cannot back a 256 TiB sparse memory), so the tier's classification (not this
+/// skeleton's sparse delegate) governs. A tiny bounded one delegates to the sparse paged core.
+///
+/// - `min_pages`/`max_pages`/`mem64_cap`: see `rt_mem.fresh64`.
+/// - Returns the fresh memory as `Dynamic` (a paged `Mem`; NOT the native ceiling). Total.
+///
+/// Coercion soundness holds unchanged: under `mem_tier == Nif` the `mem` slot is produced solely by
+/// this module's `fresh`/`fresh64` (→ `rt_mem.fresh`/`fresh64`), so it is always a paged `Mem`.
+pub fn fresh64(
+  min_pages: Int,
+  max_pages: Option(Int),
+  mem64_cap: Int,
+) -> Dynamic {
+  rt_mem.fresh64(min_pages, max_pages, mem64_cap)
+}
+
 /// Load `bytes` bytes (1/2/4/8) little-endian at `ea = addr(unsigned i32) + offset`, normalised
 /// to `result_width` bits (`signed` ⇒ sign-extend, else zero-extend). Reads the handle from the
 /// cell.

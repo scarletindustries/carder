@@ -1108,3 +1108,87 @@ pub fn threaded_fill_init_second_memory_test() {
   rma.t_load_at(st, 0, 1, False, 32, 8, 0) |> should.equal(Ok(1))
   rma.t_load_at(st, 0, 1, False, 32, 11, 0) |> should.equal(Ok(4))
 }
+
+// ───────────────────────────── 19. memory64 (P6-08, §D) — fail-closed gate + the tiny bounded edge ─────────────────────────────
+//
+// A 64-bit memory's effective max almost always vastly exceeds the node-safe reserve cap, so an
+// over-cap / unbounded 64-bit atomics binding is FAIL-CLOSED REJECTED at link time (never a silent
+// 256 TiB pre-alloc, never a silent paged degrade). A TINY BOUNDED 64-bit memory IS admitted and
+// runs byte-identically to paged/oracle — a 64-bit TYPE does not imply a huge SIZE (§D).
+
+// `reservation64` is the idx-aware SINGLE source unit 09 uses to admit-or-reject a 64-bit binding:
+// reserve = max(min, effective_max64) must be <= reserve_cap. A tiny bounded 64-bit memory engages.
+pub fn reservation64_tiny_bounded_engages_test() {
+  rma.reservation64(1, Some(8), rt_mem.mem64_hard_max_pages, reserve_cap)
+  |> should.equal(Ok(8))
+  // reserve = max(min, eff): min dominates when larger.
+  rma.reservation64(10, Some(8), rt_mem.mem64_hard_max_pages, reserve_cap)
+  |> should.equal(Ok(10))
+  // Exactly at the reserve cap is admissible.
+  rma.reservation64(
+    1,
+    Some(reserve_cap),
+    rt_mem.mem64_hard_max_pages,
+    reserve_cap,
+  )
+  |> should.equal(Ok(reserve_cap))
+}
+
+// An unbounded / over-cap 64-bit memory is fail-closed rejected (never degraded, never pre-alloc'd).
+pub fn reservation64_over_cap_rejected_test() {
+  // Unbounded: eff folds min(mem64_cap, 2^32) >> reserve_cap → REJECT.
+  rma.reservation64(1, None, rt_mem.mem64_hard_max_pages, reserve_cap)
+  |> should.equal(Error(Nil))
+  // A bounded-but-too-large declared max is also rejected.
+  rma.reservation64(1, Some(5000), rt_mem.mem64_hard_max_pages, reserve_cap)
+  |> should.equal(Error(Nil))
+  // A huge declared max within the 2^48-page type range is still over the reserve cap.
+  rma.reservation64(
+    1,
+    Some(1_000_000),
+    rt_mem.mem64_hard_max_pages,
+    reserve_cap,
+  )
+  |> should.equal(Error(Nil))
+}
+
+// `a_fresh64` reached with an over-cap reservation (unreachable post-validation) FAILS CLOSED (a
+// node-safe panic) — never a silent 256 TiB pre-allocation.
+pub fn a_fresh64_over_cap_panics_test() {
+  catch_thunk(fn() {
+    rma.a_fresh64(1, None, rt_mem.mem64_hard_max_pages, reserve_cap)
+  })
+  |> result.is_error
+  |> should.be_true
+}
+
+// A tiny bounded 64-bit memory engages AtomicsBacked and runs correctly (load/store/grow) — the
+// §D admitted edge: its addresses are all within word range, gather/scatter is bignum-safe.
+pub fn a_fresh64_tiny_bounded_runs_test() {
+  let a = rma.a_fresh64(1, Some(8), rt_mem.mem64_hard_max_pages, reserve_cap)
+  let assert Ok(a) = rma.a_store(a, 8, 100, 0x0123456789ABCDEF, 0)
+  rma.a_load(a, 8, False, 64, 100, 0) |> should.equal(Ok(0x0123456789ABCDEF))
+  // grow within the tiny bound (1 → 8), then -1 beyond it (would be 9 > 8).
+  let #(r1, a) = rma.a_grow(a, 7)
+  r1 |> should.equal(1)
+  let #(r2, _a) = rma.a_grow(a, 1)
+  r2 |> should.equal(-1)
+}
+
+// The small-memory differential over a TINY BOUNDED 64-bit memory: atomics ≡ paged ≡ oracle after
+// every op AND byte-for-byte flat image — proving a 64-bit memory runs correctly on atomics (§E.1).
+fn run_differential64(count: Int, seed: Int) -> Nil {
+  let cap = rt_mem.mem64_hard_max_pages
+  let a = rma.a_fresh64(1, Some(2), cap, reserve_cap)
+  let m = rt_mem.fresh_mem64(1, Some(2), cap, rt_mem.default_chunk_bytes)
+  let o = rt_mem.o_fresh64(1, Some(2), cap)
+  diff_loop(a, m, o, seed, count)
+}
+
+pub fn differential64_seed_a_test() {
+  run_differential64(150, 0x640)
+}
+
+pub fn differential64_seed_b_test() {
+  run_differential64(200, 0x641)
+}

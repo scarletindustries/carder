@@ -53,9 +53,17 @@
 //// - **Data-segment payload (R2):** `mem_init`/`init` take the segment's CURRENT bytes as a
 ////   `BitArray` argument (ε when dropped) — `emit_core` (06) projects them and does the drop-check;
 ////   `rt_mem` stays a pure byte-mover and never reads `rt_state` drop-state.
-//// - **memory64 (R12):** the runtime is DEFERRED to Phase 6 — `lower` rejects `Idx64`, so only
-////   32-bit memories reach here; no i64 page cap / `fresh64` is implemented (it would slot into
-////   `fresh`/`effective_max` as a per-width `hard_cap`).
+//// - **memory64 (P6-08, S4/S9):** a 64-bit-indexed (`Idx64`) memory now RUNS. The byte machinery
+////   is ALREADY bignum-64-bit-correct (`ea = addr + offset` and `in_bounds` are never masked mod
+////   2³²; `byte_len = pages * 65536` is a bignum), so `fresh64`/`fresh_mem64`/`o_fresh64` differ
+////   from the 32-bit ctors ONLY in the page cap folded into `max`:
+////   `effective_max_for(max, mem64_cap, mem64_hard_max_pages)` with the documented runtime cap
+////   `mem64_hard_max_pages = 2³² pages = 256 TiB` (S9 — a sparse trap boundary, never allocated).
+////   `mem_grow`/`o_grow` drop the now-redundant `&& new <= hard_max_pages` conjunct (folded into
+////   `max`; behaviour-preserving for `Idx32` since `m.max <= 65_536` there). The
+////   `load_bytes`/`store_bytes`/`_at`/`t_*` family (the BitArray v128-memory seam, S4) is the
+////   checked wrapper unit 06 composes with `rt_simd`'s lane assembly for `v128.load`/`store`/
+////   `loadNxM`/`loadN_zero`. A 32-bit memory stays BYTE-IDENTICAL — the frozen heads are untouched.
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
@@ -76,6 +84,21 @@ pub const page_bytes: Int = 65_536
 /// (`4 GiB`). `grow` enforces this regardless of the declared/Safe max.
 pub const hard_max_pages: Int = 65_536
 
+/// The documented RUNTIME page cap for a 64-bit (`Idx64`) memory (memory64, S9/§C): `2^32` pages
+/// = `2^48` bytes = **256 TiB**. The i64 analogue of `hard_max_pages` (the frozen 32-bit cap).
+///
+/// This is a **sparse trap boundary, NOT a reservation**: the paged backend grows on demand
+/// (O(1) grow, absent chunks read as zero), so a 64-bit memory with `pages = 2^32` costs nothing
+/// until written. `grow` beyond the baked `max` (which folds this cap) returns `-1`; an access
+/// beyond the current size traps `MemoryOutOfBounds`. Cited (§C) against the spec's grow-may-fail
+/// licence (`exec/instructions`, `memory.grow` "failure can occur … depending on the resources
+/// available to the embedder") + the 48-bit hardware VA ceiling; strictly BELOW the spec's
+/// `2^48`-PAGE type-level maximum (validate's `memory64_page_limit = 281_474_976_710_656`), which
+/// governs what a `(memory i64 …)` may DECLARE. Invariant: `hard_max_pages (65_536) <
+/// mem64_hard_max_pages <= validate.memory64_page_limit`. Tunable per deployment via
+/// `Binding.mem64_max_pages` (single-sourced to this value in `safe_default`).
+pub const mem64_hard_max_pages: Int = 4_294_967_296
+
 /// The default physical chunk size in bytes used by the cell-backed `fresh`. Chosen `> 64`
 /// so chunks are off-heap REFC binaries (structurally shared across `Mem` versions); `4096`
 /// is the 4–8 KiB sweet spot. Correctness is chunk-size-independent (the oracle proves it),
@@ -88,8 +111,10 @@ pub const default_chunk_bytes: Int = 4096
 /// cell holds the latest. Opaque: callers go through the pure core / cell-backed API.
 ///
 /// - `pages`: current size in 64 KiB WASM pages (the `memory.size` source).
-/// - `max`: the EFFECTIVE max in pages baked at `fresh` time, `min(declared_max, safe_cap,
-///   65536)` — `grow` never exceeds it.
+/// - `max`: the EFFECTIVE max in pages baked at `fresh` time — `min(declared_max, cap)` where the
+///   per-width `cap` is `min(safe_cap, hard_max_pages)` for a 32-bit memory (`fresh`) or
+///   `min(mem64_cap, mem64_hard_max_pages)` for a 64-bit one (`fresh64`). `grow` never exceeds it,
+///   so `in_bounds`/`mem_grow`/every bulk op read ONLY `max` and stay width-agnostic (S9 §A.3).
 /// - `chunk`: physical chunk size in bytes (`> 64`); decoupled from the 64 KiB page.
 /// - `data`: SPARSE map `chunk_idx -> chunk-sized binary`; an ABSENT chunk is all-zero.
 pub opaque type Mem {
@@ -120,6 +145,34 @@ fn dynamic_to_mem(value: Dynamic) -> Mem
 ///   `min(min_pages-declared-or-safe_cap, safe_cap, 65536)`.
 pub fn fresh(min_pages: Int, max_pages: Option(Int), safe_cap: Int) -> Dynamic {
   mem_to_dynamic(fresh_mem(min_pages, max_pages, safe_cap, default_chunk_bytes))
+}
+
+/// Build a FRESH opaque 64-bit (`Idx64`, memory64) paged memory of `min_pages` zero-filled 64 KiB
+/// pages — the constructor `emit_core` (06) emits for a module declaring/importing a 64-bit
+/// memory (S4/S9 §A.2). The byte machinery is shared verbatim with `fresh`; only the page cap
+/// differs.
+///
+/// - `min_pages`: the initial page count (a `u64`; may exceed `2^16`). The sparse map starts
+///   empty, so a large `min` allocates nothing.
+/// - `max_pages`: the module's declared maximum in pages (a `u64`), or `None` for "unbounded"
+///   (still subject to `mem64_cap`).
+/// - `mem64_cap`: the deployment 64-bit page cap (`Binding.mem64_max_pages`, default
+///   `mem64_hard_max_pages`). The baked effective max is
+///   `min(declared ?? cap, cap)` where `cap = min(mem64_cap, mem64_hard_max_pages)` (§C).
+/// - Returns the fresh memory as `Dynamic` (opaque, ready for `rt_state.seed`/`seed_full`). Total
+///   — never fails. `grow` past the baked max returns `-1`; an access past the current size traps
+///   `MemoryOutOfBounds`.
+pub fn fresh64(
+  min_pages: Int,
+  max_pages: Option(Int),
+  mem64_cap: Int,
+) -> Dynamic {
+  mem_to_dynamic(fresh_mem64(
+    min_pages,
+    max_pages,
+    mem64_cap,
+    default_chunk_bytes,
+  ))
 }
 
 /// Load `bytes` bytes (little-endian) from `addr + offset` in this process's memory,
@@ -638,6 +691,31 @@ pub fn fresh_mem(
   )
 }
 
+/// Build a fresh 64-bit (`Idx64`) `Mem` of `min_pages` zero pages with a caller-chosen physical
+/// `chunk` size — the pure constructor `fresh64` wraps (with `default_chunk_bytes`) and the
+/// differential suite drives across several chunk sizes. Identical to `fresh_mem` except the
+/// baked `max` folds the 64-bit cap `mem64_hard_max_pages` instead of `hard_max_pages` (§A.3).
+///
+/// - `min_pages`: initial pages (zero-filled — the sparse map starts empty, so no allocation even
+///   for `min > 2^16`).
+/// - `max_pages`/`mem64_cap`: see `fresh64`; the baked `max` is
+///   `min(declared ?? cap, cap)` with `cap = min(mem64_cap, mem64_hard_max_pages)`.
+/// - `chunk`: physical chunk size in bytes; keep `> 64` for off-heap REFC chunks.
+/// - Returns the fresh `Mem`. Total.
+pub fn fresh_mem64(
+  min_pages: Int,
+  max_pages: Option(Int),
+  mem64_cap: Int,
+  chunk: Int,
+) -> Mem {
+  Mem(
+    pages: min_pages,
+    max: effective_max_for(max_pages, mem64_cap, mem64_hard_max_pages),
+    chunk: chunk,
+    data: dict.new(),
+  )
+}
+
 /// Pure load against an explicit `Mem`. Same contract as `load` but threads `m` instead of
 /// reading the cell. Returns `Ok(bits)` or `Error(MemoryOutOfBounds)`.
 pub fn mem_load(
@@ -685,12 +763,17 @@ pub fn mem_size(m: Mem) -> Int {
 
 /// Pure `memory.grow`. NO fuel charge (the cell-backed `grow` adds it). Returns
 /// `#(old_pages, new_mem)` on success (pages += delta; new pages read as zero for free via
-/// the sparse map), or `#(-1, m)` if `delta < 0`, or `pages + delta` would exceed the baked
-/// `max` or the 65536-page hard cap — allocating nothing.
+/// the sparse map), or `#(-1, m)` if `delta < 0` or `pages + delta` would exceed the baked `max`
+/// — allocating nothing.
+///
+/// `max` already folds the per-width cap (`hard_max_pages` for `Idx32` via `fresh_mem`,
+/// `mem64_hard_max_pages` for `Idx64` via `fresh_mem64`), so the check reads ONLY `max` and is
+/// width-agnostic (§A.3). Behaviour-preserving for `Idx32`: `m.max <= hard_max_pages = 65_536`
+/// there, so `new <= m.max` already implies the dropped `&& new <= hard_max_pages` conjunct.
 pub fn mem_grow(m: Mem, delta: Int) -> #(Int, Mem) {
   let old = m.pages
   let new = old + delta
-  case delta >= 0 && new <= m.max && new <= hard_max_pages {
+  case delta >= 0 && new <= m.max {
     True -> #(old, Mem(..m, pages: new))
     False -> #(-1, m)
   }
@@ -836,6 +919,23 @@ pub fn o_fresh(min_pages: Int, max_pages: Option(Int), safe_cap: Int) -> OMem {
   >>)
 }
 
+/// Fresh 64-bit (`Idx64`) oracle of `min_pages` zero pages, baking the same effective `max` as
+/// `fresh_mem64` (folding the 64-bit cap `mem64_hard_max_pages`) — the differential reference for
+/// a SMALL bounded 64-bit memory (§E.1). The flat binary is O(byte_len), so this is for SMALL
+/// sizes ONLY; the large-address (> 2³²) behaviour is proved by direct spec-corner assertions on
+/// the sparse paged core (§E.2), NEVER by materialising this oracle.
+pub fn o_fresh64(
+  min_pages: Int,
+  max_pages: Option(Int),
+  mem64_cap: Int,
+) -> OMem {
+  OMem(
+    pages: min_pages,
+    max: effective_max_for(max_pages, mem64_cap, mem64_hard_max_pages),
+    data: <<0:size({ min_pages * page_bytes * 8 })>>,
+  )
+}
+
 /// Oracle load (same contract as `mem_load`) — `binary` slice + the shared LE codec.
 pub fn o_load(
   o: OMem,
@@ -880,11 +980,13 @@ pub fn o_store(
   }
 }
 
-/// Oracle `memory.grow`: append `delta * page_bytes` zero bytes, same caps as `mem_grow`.
+/// Oracle `memory.grow`: append `delta * page_bytes` zero bytes, same cap as `mem_grow` (reads
+/// ONLY the baked `max`, which folds the per-width cap; the redundant `&& new <= hard_max_pages`
+/// conjunct is dropped, behaviour-preserving for `Idx32` — §A.3).
 pub fn o_grow(o: OMem, delta: Int) -> #(Int, OMem) {
   let old = o.pages
   let new = old + delta
-  case delta >= 0 && new <= o.max && new <= hard_max_pages {
+  case delta >= 0 && new <= o.max {
     True -> #(
       old,
       OMem(..o, pages: new, data: <<
@@ -1001,6 +1103,209 @@ pub fn o_flat(o: OMem) -> BitArray {
   o.data
 }
 
+// ───────────────────────────── the v128-memory BitArray seam (S4, owner unit 08) ─────────────────────────────
+//
+// `load_bytes`/`store_bytes` are the PUBLIC checked wrappers over the private `read_bytes`/
+// `write_bytes` (below): they move a whole `BitArray` slice/run rather than a scalar, so `emit_core`
+// (06) can compose them with `rt_simd`'s lane-assembly helpers for the v128 memory family — `v128.
+// load`/`store` (the 16 raw bytes ARE the vector), `v128.load{8x8,16x4,32x2}_{s,u}` /
+// `v128.load{32,64}_zero` (load 8/4 bytes then extend/zero-pad in `rt_simd`). The bounds check is
+// the SAME no-wrap bignum `in_bounds` the scalar path uses → `MemoryOutOfBounds` trap-BEFORE-write
+// (the security boundary). The family mirrors the scalar `load`/`store`/`_at`/`t_*` structure
+// exactly so 06 emits against it identically. Bytes are moved in ascending-address order (the
+// little-endian in-memory layout); `rt_simd` interprets lanes. NO fuel charge (a single access,
+// like the scalar `load`/`store`).
+
+/// Pure v128-slice load against an explicit `Mem`: read exactly `n` bytes at `ea = addr + offset`
+/// in ascending-address (little-endian) order. Threads `m` instead of the cell.
+///
+/// - `addr`/`offset`: the base address and static offset; `ea` is a BIGNUM, never masked (no-wrap,
+///   so a 64-bit address/offset past 2³² is compared exactly — the memory64 property).
+/// - `n`: the byte width to read (16 for `v128.load`, 8 for `load8x8`/`load64_zero`, 4 for
+///   `load32_zero`).
+/// - Returns `Ok(bytes)` — an exactly-`n`-byte `BitArray` (absent chunks contribute zero bytes) —
+///   or `Error(MemoryOutOfBounds)` iff `ea < 0` or `ea + n > byte_len`. Read-only.
+pub fn mem_load_bytes(
+  m: Mem,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  let ea = addr + offset
+  case in_bounds(m, ea, n) {
+    False -> Error(MemoryOutOfBounds)
+    True -> Ok(read_bytes(m, ea, n))
+  }
+}
+
+/// Pure v128-run store against an explicit `Mem`: bounds-check the WHOLE `[ea, ea+len(bytes))`
+/// range FIRST (trap-before-write, all-or-nothing — ZERO mutation on trap), then write `bytes` in
+/// ascending-address order, rebuilding only the touched chunk(s).
+///
+/// - `addr`/`offset`: the base and static offset; `ea = addr + offset` is a bignum (no-wrap).
+/// - `bytes`: the run to write (16 bytes for `v128.store`; `rt_simd` produced the exact bytes).
+/// - Returns `Ok(new_mem)` or `Error(MemoryOutOfBounds)` (the input `Mem` returned untouched).
+pub fn mem_store_bytes(
+  m: Mem,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Mem, TrapReason) {
+  let ea = addr + offset
+  case in_bounds(m, ea, bit_array.byte_size(bytes)) {
+    False -> Error(MemoryOutOfBounds)
+    True -> Ok(write_bytes(m, ea, bytes))
+  }
+}
+
+/// `load_bytes` on THIS process's cell memory (index 0). The v128-slice twin of `load`; reads the
+/// `Mem` from the cell. Returns `Ok(n_bytes)` or `Error(MemoryOutOfBounds)`. See `mem_load_bytes`.
+pub fn load_bytes(
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  mem_load_bytes(current_mem(), addr, offset, n)
+}
+
+/// `store_bytes` on THIS process's cell memory (index 0). Bounds-checks first (trap-before-write);
+/// on success writes the new `Mem` back to the cell and returns `Ok(Nil)`, else
+/// `Error(MemoryOutOfBounds)` (zero mutation). The v128-run twin of `store`. See `mem_store_bytes`.
+pub fn store_bytes(
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  case mem_store_bytes(current_mem(), addr, bytes, offset) {
+    Ok(updated) -> {
+      rt_state.mem_put(mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `load_bytes` on memory `mem_idx` (read-only). The index-routed twin of `load_bytes`;
+/// `load_bytes_at(0, …)` is byte-identical to `load_bytes(…)`. See `mem_load_bytes`.
+pub fn load_bytes_at(
+  mem_idx: Int,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  mem_load_bytes(current_mem_at(mem_idx), addr, offset, n)
+}
+
+/// `store_bytes` on memory `mem_idx`. Bounds-checks first; on success rebinds slot `mem_idx` to the
+/// new `Mem` and returns `Ok(Nil)`, else `Error(MemoryOutOfBounds)` (zero mutation). The
+/// index-routed twin of `store_bytes`. See `mem_store_bytes`.
+pub fn store_bytes_at(
+  mem_idx: Int,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  case mem_store_bytes(current_mem_at(mem_idx), addr, bytes, offset) {
+    Ok(updated) -> {
+      rt_state.with_mem_at(mem_idx, mem_to_dynamic(updated))
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `load_bytes` (read-only): projects `st.mem`, drives `mem_load_bytes`, leaves `st`
+/// UNCHANGED. Returns `Ok(n_bytes)` or `Error(MemoryOutOfBounds)`. See `mem_load_bytes`.
+pub fn t_load_bytes(
+  st: rt_state.InstanceState,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  mem_load_bytes(from_dynamic(rt_state.mem(st)), addr, offset, n)
+}
+
+/// Threaded `store_bytes`. Bounds-checks first (trap-before-write), then rebinds `st.mem` to the
+/// new `Mem` — returning `Ok(st')` (paged memory is immutable → a NEW handle), or
+/// `Error(MemoryOutOfBounds)` with `st` untouched (zero mutation). See `mem_store_bytes`.
+pub fn t_store_bytes(
+  st: rt_state.InstanceState,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_store_bytes(from_dynamic(rt_state.mem(st)), addr, bytes, offset) {
+    Ok(updated) -> Ok(rt_state.with_mem(st, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `load_bytes` on memory `mem_idx` (read-only): `st` unchanged. The index-routed twin of
+/// `t_load_bytes`. See `mem_load_bytes`.
+pub fn t_load_bytes_at(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  mem_load_bytes(project_mem_at(st, mem_idx), addr, offset, n)
+}
+
+/// Threaded `store_bytes` on memory `mem_idx`. Bounds-checks first; on success returns `Ok(st')`
+/// with slot `mem_idx` rebound to the new `Mem`, else `Error(MemoryOutOfBounds)` (`st` untouched,
+/// zero mutation). The index-routed twin of `t_store_bytes`. See `mem_store_bytes`.
+pub fn t_store_bytes_at(
+  st: rt_state.InstanceState,
+  mem_idx: Int,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(rt_state.InstanceState, TrapReason) {
+  case mem_store_bytes(project_mem_at(st, mem_idx), addr, bytes, offset) {
+    Ok(updated) ->
+      Ok(rt_state.t_with_mem_at(st, mem_idx, mem_to_dynamic(updated)))
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Oracle v128-slice load (same contract as `mem_load_bytes`): `binary` slice at `ea`. The
+/// differential reference for `load_bytes` on a SMALL bounded memory (§E.1).
+pub fn o_load_bytes(
+  o: OMem,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  let ea = addr + offset
+  let limit = o.pages * page_bytes
+  case ea >= 0 && ea + n <= limit {
+    False -> Error(MemoryOutOfBounds)
+    True -> Ok(take(o.data, ea, n))
+  }
+}
+
+/// Oracle v128-run store (same contract as `mem_store_bytes`): bounds-check, then rebuild the whole
+/// binary with `bytes` spliced at `ea`. The differential reference for `store_bytes` (§E.1).
+pub fn o_store_bytes(
+  o: OMem,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(OMem, TrapReason) {
+  let ea = addr + offset
+  let n = bit_array.byte_size(bytes)
+  let limit = o.pages * page_bytes
+  case ea >= 0 && ea + n <= limit {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      let pre = take(o.data, 0, ea)
+      let post = take(o.data, ea + n, limit - ea - n)
+      Ok(OMem(..o, data: <<pre:bits, bytes:bits, post:bits>>))
+    }
+  }
+}
+
 // ───────────────────────────── shared helpers ─────────────────────────────
 
 /// `2^n` as a BEAM bignum (used for sign-extension widths beyond 62 bits).
@@ -1027,17 +1332,33 @@ fn repeat_double(acc: BitArray, count: Int) -> BitArray {
   }
 }
 
-/// The effective max in pages baked at `fresh` time: the smallest of the declared max (when
-/// present), the Safe `safe_cap`, and the 65536-page hard cap. Dropping the declared max when
-/// `None` gives `min(safe_cap, 65536)`. This NEVER lets untrusted code allocate past
-/// `safe_cap` (E3), and reduces to the spec's `min(declared_max, 65536)` whenever
-/// `safe_cap >= 65536`.
-fn effective_max(max_pages: Option(Int), safe_cap: Int) -> Int {
-  let cap = int.min(safe_cap, hard_max_pages)
+/// The effective max in pages baked at `fresh` time, parameterised by the per-width HARD cap
+/// (§A.3). Returns `min(declared ?? cap, cap)` where `cap = min(safe_cap, hard_cap)`. Never lets
+/// untrusted code allocate past `safe_cap` (E3) or the architectural `hard_cap`. The single fold
+/// both widths delegate to: `Idx32` passes `hard_cap = hard_max_pages` (65_536), `Idx64` passes
+/// `hard_cap = mem64_hard_max_pages` (2^32).
+///
+/// - `max_pages`: the module's declared maximum in pages, or `None` for "unbounded".
+/// - `safe_cap`: the deployment cap (`safe_max_pages` for i32, `mem64_max_pages` for i64).
+/// - `hard_cap`: the architectural per-width ceiling.
+/// - Returns the baked `max` (a non-negative page count). Total.
+fn effective_max_for(
+  max_pages: Option(Int),
+  safe_cap: Int,
+  hard_cap: Int,
+) -> Int {
+  let cap = int.min(safe_cap, hard_cap)
   case max_pages {
     Some(declared) -> int.min(declared, cap)
     None -> cap
   }
+}
+
+/// The 32-bit (`Idx32`) effective max: `effective_max_for` with `hard_cap = hard_max_pages`
+/// (65_536). Byte-identical to the frozen Phase-2 body (same computation), so every `Idx32`
+/// caller (`fresh_mem`/`o_fresh`) bakes the SAME `max` as before (§A.3, Verification #4).
+fn effective_max(max_pages: Option(Int), safe_cap: Int) -> Int {
+  effective_max_for(max_pages, safe_cap, hard_max_pages)
 }
 
 /// `byte_len = pages * 65536`, the current (possibly-grown) length the bounds-check uses.

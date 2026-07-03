@@ -38,10 +38,14 @@
 //// memmove-correct in either direction and cross-memory-correct (a distinct `ref`), byte-identical
 //// to the `paged`/oracle result (the differential proves it). Eager bounds (trap-before-write,
 //// R10) → ZERO mutation on trap; each bulk-op wrapper charges `count` fuel on success (R9/§F). The
-//// index-0 `_at` heads are byte-identical to the frozen heads (H7). **memory64 + atomics:** a
-//// 64-bit memory's effective max almost always exceeds `atomics_reserve_cap_pages`, so it is
-//// fail-closed rejected at link time — the runtime is deferred to Phase 6 (R12), so only 32-bit
-//// memories reach here regardless.
+//// index-0 `_at` heads are byte-identical to the frozen heads (H7). **memory64 + atomics (P6-08,
+//// §D):** a 64-bit memory's effective max almost always exceeds `atomics_reserve_cap_pages`, so an
+//// over-cap 64-bit binding is FAIL-CLOSED REJECTED at link time (unit 09's `validate_binding`
+//// calls `reservation64`) — never a silent 256 TiB pre-alloc, never a silent `paged` degrade. A
+//// TINY BOUNDED 64-bit memory (`(memory i64 1 8)`, reserve `<= reserve_cap`) IS admitted and runs
+//// correctly: its addresses are all `< 8 * 64 KiB`, the byte↔word gather/scatter is bignum-safe,
+//// and the differential proves it byte-for-byte against paged/oracle (§E.1). Everything larger
+//// ships only on `paged`/`portable` (S9).
 
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
@@ -146,6 +150,34 @@ pub fn reservation(
   }
 }
 
+/// The idx-aware fail-closed gate for a 64-bit (`Idx64`, memory64) `atomics` binding (§D). Whether
+/// a tiny bounded 64-bit memory can be node-safely reserved: the physical reservation `reserve =
+/// max(min_pages, effective_max64)` pages (folding the 64-bit cap `mem64_hard_max_pages`, NOT the
+/// i32 cap) must be `=<` `reserve_cap`. This is the SINGLE source unit 09's `validate_binding`
+/// calls to FAIL-CLOSED REJECT an over-cap / unbounded 64-bit `atomics` binding at LINK time —
+/// never a silent `paged` degrade, never a 256 TiB pre-allocation (I4/S9).
+///
+/// - `min_pages`: the module's declared 64-bit memory minimum in pages (a `u64`).
+/// - `max_pages`: the declared maximum in pages, or `None` for "unbounded".
+/// - `mem64_cap`: the deployment 64-bit page cap (`Binding.mem64_max_pages`).
+/// - `reserve_cap`: the node-safe reservation ceiling (normally `atomics_reserve_cap_pages`).
+/// - Returns `Ok(reserve_pages)` for a tiny bounded 64-bit memory (`atomics` engages O(1)), or
+///   `Error(Nil)` when `reserve > reserve_cap` (the caller MUST reject → `paged`/`portable`; NEVER
+///   degrade). An unbounded 64-bit memory (`max = None`) folds to `min(mem64_cap, 2^32)` pages,
+///   vastly over `reserve_cap`, so it is always rejected.
+pub fn reservation64(
+  min_pages: Int,
+  max_pages: Option(Int),
+  mem64_cap: Int,
+  reserve_cap: Int,
+) -> Result(Int, Nil) {
+  let reserve = int.max(min_pages, effective_max64(max_pages, mem64_cap))
+  case reserve <= reserve_cap {
+    True -> Ok(reserve)
+    False -> Error(Nil)
+  }
+}
+
 /// Build a fresh tier-O memory of `min_pages` zero pages, pre-reserving `reserve =
 /// max(min_pages, eff)` pages of `atomics` words up front.
 ///
@@ -172,6 +204,44 @@ pub fn a_fresh(
   case reserve <= reserve_cap {
     False ->
       panic as "rt_mem_atomics.a_fresh: atomics requires a bounded max/cap <= the reserve cap (over-cap reservation, unreachable post-validation)"
+    True -> {
+      let arity = int.max(1, reserve * words_per_page)
+      AtomicsBacked(
+        ref: atomics_new(arity),
+        pages: min_pages,
+        max: eff,
+        reserve: reserve,
+      )
+    }
+  }
+}
+
+/// Build a fresh TINY BOUNDED 64-bit (`Idx64`, memory64) tier-O memory (§D). Identical to
+/// `a_fresh` except the effective max folds the 64-bit cap `mem64_hard_max_pages` (via
+/// `effective_max64`) instead of the i32 cap. REQUIRES `reserve = max(min_pages, eff) =<
+/// reserve_cap`: unit 09's `validate_binding` calls `reservation64` first and fail-closed rejects
+/// an over-cap / unbounded 64-bit binding at LINK time, so this is only ever reached with an
+/// admissible reservation.
+///
+/// - `min_pages`/`max_pages`/`mem64_cap`: see `reservation64`.
+/// - `reserve_cap`: the node-safe reservation ceiling (`atomics_reserve_cap_pages`).
+/// - Returns the fresh `AtomicsBacked`. Reached with an OVER-CAP `reserve` (unreachable
+///   post-validation) it FAILS CLOSED — a node-safe `panic` — never silently pre-allocating 256
+///   TiB and never degrading to `paged` (§D). A tiny bounded 64-bit memory's addresses are all
+///   within word range, so the frozen `a_load`/`a_store`/`a_grow`/bulk heads run it correctly
+///   verbatim (its `max <= reserve_cap < hard_max_pages`, so `a_grow`'s retained i32 conjunct is
+///   inert).
+pub fn a_fresh64(
+  min_pages: Int,
+  max_pages: Option(Int),
+  mem64_cap: Int,
+  reserve_cap: Int,
+) -> Atomics {
+  let eff = effective_max64(max_pages, mem64_cap)
+  let reserve = int.max(min_pages, eff)
+  case reserve <= reserve_cap {
+    False ->
+      panic as "rt_mem_atomics.a_fresh64: atomics requires a tiny bounded 64-bit memory (reserve <= the reserve cap; over-cap reservation unreachable post-validation)"
     True -> {
       let arity = int.max(1, reserve * words_per_page)
       AtomicsBacked(
@@ -822,6 +892,18 @@ fn mask(b: Int) -> Int {
 /// `safe_cap` (E3).
 fn effective_max(max_pages: Option(Int), safe_cap: Int) -> Int {
   let cap = int.min(safe_cap, rt_mem.hard_max_pages)
+  case max_pages {
+    Some(declared) -> int.min(declared, cap)
+    None -> cap
+  }
+}
+
+/// The 64-bit (`Idx64`) effective max in pages: like `effective_max` but folding the 64-bit cap
+/// `rt_mem.mem64_hard_max_pages` (2^32) instead of the i32 cap. Re-derived here from `rt_mem`'s
+/// frozen `effective_max_for` formula; agrees with `rt_mem.fresh_mem64`'s baked `max` (the
+/// differential proves it). The gate for `reservation64`/`a_fresh64` (§D).
+fn effective_max64(max_pages: Option(Int), mem64_cap: Int) -> Int {
+  let cap = int.min(mem64_cap, rt_mem.mem64_hard_max_pages)
   case max_pages {
     Some(declared) -> int.min(declared, cap)
     None -> cap

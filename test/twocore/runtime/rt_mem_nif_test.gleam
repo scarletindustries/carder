@@ -25,7 +25,7 @@
 
 import gleam/dynamic
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleeunit/should
 import twocore/ir.{MemoryOutOfBounds}
 import twocore/runtime/instance.{type Binding, Nif}
@@ -710,4 +710,26 @@ pub fn head_compatibility_with_paged_test() {
 
   nif.t_load(sn, 4, False, 32, page, 0)
   |> should.equal(rt_mem.t_load(sp, 4, False, 32, page, 0))
+}
+
+// ───────────────────────────── memory64 (P6-08, §D): fresh64 delegates to the sparse paged core ─────────────────────────────
+//
+// The nif skeleton's `fresh64` delegates to `rt_mem.fresh64` (a paged `Mem`; NOT the native
+// ceiling). The over-cap fail-closed gate lives in unit 09's `validate_binding` (mirroring atomics
+// via `reservation64`); a TINY BOUNDED 64-bit memory delegates to the sparse paged core, which is
+// already 64-bit-correct — so an address past 2^32 round-trips through the delegated `Mem`.
+pub fn fresh64_delegates_to_paged_large_address_test() {
+  let cap = rt_mem.mem64_hard_max_pages
+  // fresh64 builds a paged Mem; coerce it back via rt_mem.from_dynamic to drive the pure core.
+  let m = rt_mem.from_dynamic(nif.fresh64(1, None, cap))
+  // Grow past the i32 range (1 → 2^16 + 2 pages), sparse — then round-trip an i64 past 2^32.
+  let #(old, m) = rt_mem.mem_grow(m, 65_537)
+  old |> should.equal(1)
+  let base = 4_294_967_296 + 40
+  let assert Ok(m) = rt_mem.mem_store(m, 8, base, 0x0123456789ABCDEF, 0)
+  rt_mem.mem_load(m, 8, False, 64, base, 0)
+  |> should.equal(Ok(0x0123456789ABCDEF))
+  // The delegating fresh64 and rt_mem.fresh64 build a byte-identical handle.
+  rt_mem.to_flat(nif.fresh64(2, Some(3), cap))
+  |> should.equal(rt_mem.to_flat(rt_mem.fresh64(2, Some(3), cap)))
 }
