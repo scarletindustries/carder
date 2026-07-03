@@ -108,8 +108,10 @@ import twocore/ir
 /// - `StackUnderflow`: the operand stack lacked an expected operand — only reachable
 ///   on a module that bypassed validation (fail-closed defence).
 /// - `Malformed(detail)`: a structural inconsistency (e.g. an `else` with no `if`).
-/// - `UnknownLocalIndex(i)`/`UnknownTypeIndex(i)`/`UnknownFuncIndex(i)`: an index out
-///   of range (validation should have caught it; kept so lowering is total).
+/// - `UnknownLocalIndex(i)`/`UnknownTypeIndex(i)`/`UnknownFuncIndex(i)`/`UnknownTagIndex(i)`:
+///   an index out of range (validation should have caught it; kept so lowering is total).
+///   `UnknownTagIndex` is the Phase-7 EH addition — a `throw x` / catch clause / `ExportTag`
+///   whose (absolute) tagidx has no entry in the tag index space (imports ++ defined).
 /// - `NonConstInitExpr(detail)`: a global init / element-item / element-or-data offset
 ///   constant expression outside the admissible const-expr grammar. Phase 5 accepts a
 ///   single `t.const` / `v128.const` / `ref.func` / `ref.null` / `global.get` (of an
@@ -127,6 +129,7 @@ pub type LowerError {
   UnknownLocalIndex(index: Int)
   UnknownTypeIndex(index: Int)
   UnknownFuncIndex(index: Int)
+  UnknownTagIndex(index: Int)
   NonConstInitExpr(detail: String)
 }
 
@@ -145,6 +148,17 @@ pub type LowerError {
 /// - `table_types`: the element **reference type** of each table by absolute tableidx
 ///   (imports ++ defined; from `TypedModule.table_types`). Drives the result type of
 ///   `table.get` (a `table.get`'s result is the table's element reftype) — Phase 5.
+/// - `tag_types` (Phase 7): the operand `ValType`s carried by each exception tag, indexed
+///   by **absolute tagidx** (imports ++ defined; from `TypedModule.tag_types`, mapped to IR
+///   types). A `throw x` / `try_table catch x` recovers the payload count/types from
+///   `tag_types[x]` — the one EH typing fact lower cannot re-derive (a `throw x` names only
+///   `x`), exactly as `global_types` serves `global.set`. Empty for a tag-free module.
+/// - `catch_refs` (Phase 7): the `exnref` names of the LEXICALLY-ENCLOSING legacy catch
+///   handlers, innermost at the head, used to lower a legacy `rethrow l` (which re-raises
+///   the caught exception of an enclosing handler) to `ThrowRef(Var(<enclosing exnref>))`.
+///   A handler that contains a `rethrow` captures an `exnref` name and pushes it here for
+///   its body's walk; empty at function entry (a `rethrow` outside any handler is malformed,
+///   rejected by validate — lower fails closed).
 type LCtx {
   LCtx(
     types: List(ast.FuncType),
@@ -153,6 +167,8 @@ type LCtx {
     local_types: List(ir.ValType),
     global_types: List(ir.ValType),
     table_types: List(ir.RefType),
+    tag_types: List(List(ir.ValType)),
+    catch_refs: List(String),
   )
 }
 
@@ -252,10 +268,10 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
         ast.ExportTable -> Ok(ir.ExportTable(e.name, tname(e.index)))
         ast.ExportGlobal -> Ok(ir.ExportGlobal(e.name, gname(e.index)))
         ast.ExportMemory -> Ok(ir.ExportMemory(e.name, e.index))
-        // A tag export («WASM-AST5», Phase 7) — fail closed; real tag-export lowering
-        // is P7-05's (validate already rejects it, so this is unreachable for a valid
-        // module, but stays fail-closed rather than silently dropping the export).
-        ast.ExportTag -> Error(Unsupported("tag export (P7-05)"))
+        // A tag export («WASM-AST5», Phase 7). `e.index` is the ABSOLUTE tagidx (imports ++
+        // defined); it names the same build-controlled exception class as `throw`/`catch`
+        // (`tag<idx>`). Measured: Porffor emits `(export "0" (tag 0))`.
+        ast.ExportTag -> Ok(ir.ExportTag(e.name, tagname(e.index)))
       }
     }),
   )
@@ -263,6 +279,7 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
   use globals <- result.try(lower_globals(module, typed.imported_global_count))
   use elements <- result.try(lower_elements(module))
   use data_segments <- result.try(lower_data(module))
+  use tags <- result.try(lower_tags(module, typed.imported_tag_count))
   Ok(ir.Module(
     name: "twocore@wasm@" <> module_base(module),
     uses_numerics: True,
@@ -275,9 +292,10 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
     tables: lower_tables(module, typed.imported_table_count),
     elements: elements,
     start: lower_start(module),
-    // Phase-7 exception tags (J2/T2). Empty until P7-05 lowers the WASM tag section →
-    // `Module.tags`; a tag-free module is byte-identical to Phase-6.
-    tags: [],
+    // Phase-7 exception tags (J2/T2). The module's DEFINED tags → `TagDecl`s (imported tags
+    // live in `imports` as `ImportTag`). A tag-free module lowers `[]`, byte-identical to
+    // Phase-6.
+    tags: tags,
   ))
 }
 
@@ -380,6 +398,11 @@ fn lower_func(
       local_types: local_types,
       global_types: list.map(typed.global_types, to_ir_vt),
       table_types: list.map(typed.table_types, to_ir_reftype),
+      // Phase-7 EH: the operand types of every tag (imports ++ defined), mapped to IR
+      // types (`exnref` → `TExnRef`), so `throw`/`catch` recover their payload arity. No
+      // legacy catch handler is active at function entry, so `catch_refs` starts empty.
+      tag_types: list.map(typed.tag_types, fn(ts) { list.map(ts, to_ir_vt) }),
+      catch_refs: [],
     )
   let st0 =
     LState(
@@ -486,6 +509,12 @@ fn go(
         ast.Loop(bt) -> lower_loop(bt, tail, ctx, st)
         ast.If(bt) -> lower_if(bt, tail, ctx, st)
 
+        // exception handling — try regions (Phase 7, T1/T2). BOTH wire encodings structure
+        // into the ONE inline-handler `ir.Try`: the LEGACY flat-stream `try…catch…end`
+        // (Porffor) via `lower_try_legacy`, the MODERN `try_table` via `lower_try_table`.
+        ast.TryLegacy(bt) -> lower_try_legacy(bt, tail, ctx, st)
+        ast.TryTable(bt, catches) -> lower_try_table(bt, catches, tail, ctx, st)
+
         // branches ------------------------------------------------------------------
         ast.Br(l) -> {
           use transfer <- result.try(build_transfer(l, st))
@@ -508,6 +537,18 @@ fn go(
           use #(marker, rest) <- result.try(consume_dead(tail, 0))
           Ok(end_or_else(marker, ir.Trap(ir.Unreachable), rest, st.counter))
         }
+
+        // exception raises — all BOTTOM transfers (like `Return`/`Unreachable`): build the
+        // node, then consume the unreachable tail to the frame's closing marker (Phase 7).
+        ast.Throw(x) -> lower_throw(x, tail, ctx, st)
+        ast.ThrowRef -> lower_throw_ref(tail, st)
+        ast.Rethrow(l) -> lower_rethrow(l, tail, ctx, st)
+
+        // Legacy in-stream handler markers are consumed structurally by `lower_try_legacy`
+        // (which splits the flat try/catch stream at them); `go` never reaches one in a
+        // well-formed module. Fail closed rather than mis-lower.
+        ast.LegacyCatch(_) | ast.LegacyCatchAll | ast.LegacyDelegate(_) ->
+          Error(Malformed("legacy EH handler marker outside a try region"))
 
         // linear-memory loads (pop addr, push the load's result-typed value) --------
         // `MemAccess(bytes, signed)`: bytes = access width, signed = sub-word sign-extend.
@@ -1919,6 +1960,11 @@ fn expr_breaks_to(expr: ir.Expr, label: String) -> Bool {
     ir.Block(_, _, body) -> expr_breaks_to(body, label)
     ir.Loop(_, _, _, body) -> expr_breaks_to(body, label)
     ir.Charge(_, body) -> expr_breaks_to(body, label)
+    // A `Try` region's body and every handler are sub-expressions a `Break` may live in
+    // (Phase 7) — recurse so an outer construct detects a break resolved to its label.
+    ir.Try(_, body, handlers) ->
+      expr_breaks_to(body, label)
+      || list.any(handlers, fn(h) { expr_breaks_to(h.handler, label) })
     _ -> False
   }
 }
@@ -2035,6 +2081,480 @@ fn fallthrough(cur: LFrame, st: LState) -> Result(ir.Expr, LowerError) {
   let stack_vals = take_push_order(st.stack, cur.out_arity)
   use carried_v <- result.try(get_locals(st, cur.carried))
   Ok(ir.Values(list.append(stack_vals, carried_v)))
+}
+
+// ───────────────────── exception-handling lowering (Phase 7, T1/T2) ─────────────────────
+//
+// BOTH wire encodings structure into the ONE inline-handler `ir.Try(result, body,
+// handlers)` (T1): the LEGACY `try…catch…end` maps 1:1 (the inline handler `H` is the
+// `CatchHandler.handler` expression, the tag operands bound to fresh `payload` names); the
+// MODERN `try_table catch* … end` maps each label-branch clause to a `CatchHandler` whose
+// `handler` is the TRANSFER to the resolved enclosing frame (`Break`/`Continue`/`Return`),
+// so lower picks the transfer from the target frame kind (resolving M4 without a scope
+// limit). lower installs no runtime handler and raises nothing — the Core Erlang
+// `try…catch` + the `{wasm_exn,…}` term shape + the tag match/payload binding/re-raise are
+// emit_core (P7-06) + rt_exn (P7-07)'s.
+
+/// Lower `throw x` → `ir.Throw(tagname(x), args)` (a BOTTOM transfer, spec §control `throw`:
+/// the rest of the block is unreachable). Pops the tag's operands (deepest-first, i.e.
+/// tag-param order) recovered from `ctx.tag_types`, builds the node, then consumes the
+/// unreachable tail to the frame's closing marker — exactly like `Return`/`Unreachable`.
+/// `Error(UnknownTagIndex(x))` on an out-of-range tagidx, `Error(StackUnderflow)` on an
+/// under-deep stack (both only reachable on an unvalidated module).
+fn lower_throw(
+  x: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use operands <- result.try(nth_err(ctx.tag_types, x, UnknownTagIndex(x)))
+  let pcount = list.length(operands)
+  let args = take_push_order(st.stack, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      use #(marker, rest) <- result.try(consume_dead(tail, 0))
+      Ok(end_or_else(marker, ir.Throw(tagname(x), args), rest, st.counter))
+    }
+  }
+}
+
+/// Lower `throw_ref` → `ir.ThrowRef(exnref)` — re-raise the exception the top-of-stack
+/// `exnref` handle refers to. A BOTTOM transfer (spec §control `throw_ref`); lower forwards
+/// the `exnref` value unchanged — the null-exnref trap + the re-raise are rt_exn's (P7-07).
+/// Pops one value, builds the node, consumes the dead tail. `Error(StackUnderflow)` on an
+/// empty stack.
+fn lower_throw_ref(
+  tail: List(ast.Instr),
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(exnref, _stack1) <- result.try(pop1(st.stack))
+  use #(marker, rest) <- result.try(consume_dead(tail, 0))
+  Ok(end_or_else(marker, ir.ThrowRef(exnref), rest, st.counter))
+}
+
+/// Lower a legacy `rethrow l` → `ir.ThrowRef(Var(e))` re-raising the exception captured by
+/// the enclosing legacy catch handler (T1: `rethrow` is the legacy analogue of `throw_ref`).
+/// `e` is the innermost active handler's captured `exnref` name (`ctx.catch_refs` head — the
+/// handler that lexically encloses the `rethrow` always captures, since it contains one). A
+/// BOTTOM transfer, so the dead tail is consumed. The label `l` (which selects WHICH
+/// enclosing handler) is currently approximated to the innermost — precise `l > 0` routing
+/// is deferred (a documented deviation; Porffor emits no `rethrow`). `Error(Malformed)` if
+/// no handler is active (a `rethrow` outside any handler — validate rejects it upstream).
+fn lower_rethrow(
+  _l: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  case ctx.catch_refs {
+    [e, ..] -> {
+      use #(marker, rest) <- result.try(consume_dead(tail, 0))
+      Ok(end_or_else(marker, ir.ThrowRef(ir.Var(e)), rest, st.counter))
+    }
+    [] -> Error(Malformed("rethrow outside a catch handler"))
+  }
+}
+
+// ── legacy `try…catch…end` structuring ──
+
+/// The kind of a legacy in-stream handler section: `catch x` (matches tag `x`) or
+/// `catch_all` (matches any exception).
+type LegacyKind {
+  LKCatch(tag: Int)
+  LKCatchAll
+}
+
+/// How a legacy `try` region is terminated: a plain `end`, or a `delegate l` that closes
+/// the `try` and forwards uncaught exceptions to the enclosing region (label `l`).
+type LegacyTerm {
+  LTEnd
+  LTDelegate(label: Int)
+}
+
+/// Lower a legacy `try bt B (catch x Hₓ | catch_all Hₐ)* end` (or `try bt B delegate l`)
+/// into the one inline-handler `ir.Try` (T1). It structures the flat stream exactly as
+/// `lower_block`/`lower_if` do — a labelled block whose body AND every handler are
+/// alternatives yielding the try's result — resolving the interspersed `catch`/`catch_all`/
+/// `delegate` markers by SPLITTING the stream first (`split_legacy_try`), then lowering each
+/// segment (body + handlers) as its own block-body.
+///
+/// The IR produced: `Try(result_types, lower(B), [CatchHandler(OnTag(tagname(x)), names,
+/// None, lower(Hₓ)) | CatchHandler(OnAll, [], None, lower(Hₐ))])`, where each handler's
+/// `names` are fresh bindings for the tag's operands the handler consumes off its incoming
+/// stack (spec: legacy `catch x` pushes the tag operands; `catch_all` pushes nothing). A
+/// `delegate l` becomes a single `CatchHandler(OnAll, [], Some(e), ThrowRef(Var(e)))` —
+/// catch-and-re-raise, forwarding to the enclosing region (§A.4).
+///
+/// `result_types` = blocktype results ++ the construct's carried locals (locals assigned
+/// anywhere in the body or a handler, threaded out as extra results — the block discipline).
+/// A handler runs with `locals` as of the try SITE (the SSA names in scope there) — the
+/// pragmatic resolution of the "WASM locals persist across a throw but 2core threads them as
+/// SSA" seam (§D); precise per-throw-point local values are 01/06's to refine. The whole
+/// `Try` is wrapped in `ir.Block(label, …)` only when the body or a handler `br`s to the
+/// try's own label (arity-transparent, exactly like `finish_if`).
+fn lower_try_legacy(
+  bt: ast.BlockType,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(in_ir, out_ir) <- result.try(blocktype_io(bt, ctx))
+  let in_n = list.length(in_ir)
+  let out_n = list.length(out_ir)
+  // Carried locals span the WHOLE construct (body + every handler), so the body's and each
+  // handler's fall-through agree on the result shape (like an `if`'s two arms).
+  let carried = scan_modified(tail, 0, set.new())
+  use carried_ts <- result.try(carried_types(carried, ctx.local_types))
+  let result_types = list.append(out_ir, carried_ts)
+
+  use #(segments, term, rest) <- result.try(split_legacy_try(tail))
+  use #(body_seg, handler_segs) <- result.try(case segments {
+    [#(None, body), ..hs] -> Ok(#(body, hs))
+    _ -> Error(Malformed("legacy try without a body segment"))
+  })
+
+  // Lower the body under the try's own block-like frame (its label hosts a `br` out).
+  let inner_stack = list.take(st.stack, in_n)
+  let below = list.drop(st.stack, in_n)
+  let #(label, c1) = fresh_label(st.counter)
+  let frame = LFrame(label, FBlock, out_n, out_n, result_types, carried)
+  let child =
+    LState(inner_stack, st.locals, c1, [frame, ..st.frames], st.var_types)
+  use body_res <- result.try(go(list.append(body_seg, [ast.End]), ctx, child))
+  use #(body_expr, _, c2) <- result.try(expect_end(body_res))
+
+  // Handlers (or, for `delegate`, one catch-all re-raise).
+  use #(handlers, c3) <- result.try(case term {
+    LTEnd -> lower_legacy_handlers(handler_segs, frame, ctx, st, c2)
+    LTDelegate(_l) -> {
+      let #(e, c_d) = fresh(c2)
+      Ok(#(
+        [ir.CatchHandler(ir.OnAll, [], Some(e), ir.ThrowRef(ir.Var(e)))],
+        c_d,
+      ))
+    }
+  })
+
+  let node = ir.Try(result_types, body_expr, handlers)
+  let breaks =
+    expr_breaks_to(body_expr, label)
+    || list.any(handlers, fn(h) { expr_breaks_to(h.handler, label) })
+  let construct = case breaks {
+    True -> ir.Block(label, result_types, node)
+    False -> node
+  }
+  finish_construct(
+    construct,
+    result_types,
+    out_n,
+    carried,
+    below,
+    rest,
+    c3,
+    ctx,
+    st,
+  )
+}
+
+/// Split a legacy `try` region's flat stream (the instructions AFTER the `try` opener) into
+/// its body + handler segments, its terminator, and the instructions after it. Walks with a
+/// nesting `depth` (openers `block`/`loop`/`if`/`try`/`try_table` +1; `end` and `delegate`
+/// −1) so only the try's OWN depth-0 `catch`/`catch_all`/`end`/`delegate` markers split it.
+///
+/// Returns `#(segments, term, rest)` where `segments` is `[#(None, body), #(Some(kind),
+/// handler)…]` — the first segment (marker `None`) is the try body, each following segment
+/// is a handler tagged with its `LegacyKind` — `term` is `LTEnd` | `LTDelegate(l)`, and
+/// `rest` is the stream after the construct. `Error(Malformed)` if the stream ends before a
+/// depth-0 `end`/`delegate` closes the try.
+fn split_legacy_try(
+  instrs: List(ast.Instr),
+) -> Result(
+  #(List(#(Option(LegacyKind), List(ast.Instr))), LegacyTerm, List(ast.Instr)),
+  LowerError,
+) {
+  do_split_legacy(instrs, 0, None, [], [])
+}
+
+/// The `split_legacy_try` accumulator loop. `depth` is the nesting depth; `cur_kind`/
+/// `cur_rev` are the current segment's leading marker + its instructions (reversed);
+/// `finished` is the completed segments (most-recent first). On a depth-0 `catch`/
+/// `catch_all` the current segment closes and a new handler segment opens; on a depth-0
+/// `end`/`delegate` the construct closes.
+fn do_split_legacy(
+  instrs: List(ast.Instr),
+  depth: Int,
+  cur_kind: Option(LegacyKind),
+  cur_rev: List(ast.Instr),
+  finished: List(#(Option(LegacyKind), List(ast.Instr))),
+) -> Result(
+  #(List(#(Option(LegacyKind), List(ast.Instr))), LegacyTerm, List(ast.Instr)),
+  LowerError,
+) {
+  case instrs {
+    [] -> Error(Malformed("unterminated legacy try region"))
+    [i, ..t] ->
+      case i, depth {
+        ast.Block(_), _
+        | ast.Loop(_), _
+        | ast.If(_), _
+        | ast.TryLegacy(_), _
+        | ast.TryTable(_, _), _
+        -> do_split_legacy(t, depth + 1, cur_kind, [i, ..cur_rev], finished)
+        ast.End, 0 ->
+          Ok(#(close_segment(cur_kind, cur_rev, finished), LTEnd, t))
+        ast.End, _ ->
+          do_split_legacy(t, depth - 1, cur_kind, [i, ..cur_rev], finished)
+        ast.LegacyDelegate(l), 0 ->
+          Ok(#(close_segment(cur_kind, cur_rev, finished), LTDelegate(l), t))
+        ast.LegacyDelegate(_), _ ->
+          do_split_legacy(t, depth - 1, cur_kind, [i, ..cur_rev], finished)
+        ast.LegacyCatch(x), 0 ->
+          do_split_legacy(t, 0, Some(LKCatch(x)), [], [
+            #(cur_kind, list.reverse(cur_rev)),
+            ..finished
+          ])
+        ast.LegacyCatchAll, 0 ->
+          do_split_legacy(t, 0, Some(LKCatchAll), [], [
+            #(cur_kind, list.reverse(cur_rev)),
+            ..finished
+          ])
+        _, _ -> do_split_legacy(t, depth, cur_kind, [i, ..cur_rev], finished)
+      }
+  }
+}
+
+/// Close the current segment (reversing its accumulated instructions) and append it to
+/// `finished`, returning the full segment list in SOURCE order (body first, handlers after).
+fn close_segment(
+  cur_kind: Option(LegacyKind),
+  cur_rev: List(ast.Instr),
+  finished: List(#(Option(LegacyKind), List(ast.Instr))),
+) -> List(#(Option(LegacyKind), List(ast.Instr))) {
+  list.reverse([#(cur_kind, list.reverse(cur_rev)), ..finished])
+}
+
+/// Lower each legacy handler segment to a `CatchHandler`, threading the gensym `counter`.
+/// A malformed segment (a handler without a `catch`/`catch_all` marker) fails closed.
+fn lower_legacy_handlers(
+  segs: List(#(Option(LegacyKind), List(ast.Instr))),
+  frame: LFrame,
+  ctx: LCtx,
+  st: LState,
+  counter: Int,
+) -> Result(#(List(ir.CatchHandler), Int), LowerError) {
+  case segs {
+    [] -> Ok(#([], counter))
+    [#(Some(kind), seg), ..rest_segs] -> {
+      use #(h, c1) <- result.try(lower_one_legacy_handler(
+        kind,
+        seg,
+        frame,
+        ctx,
+        st,
+        counter,
+      ))
+      use #(hs, c2) <- result.try(lower_legacy_handlers(
+        rest_segs,
+        frame,
+        ctx,
+        st,
+        c1,
+      ))
+      Ok(#([h, ..hs], c2))
+    }
+    [#(None, _), ..] ->
+      Error(Malformed("legacy handler segment without a catch marker"))
+  }
+}
+
+/// Lower one legacy handler segment `H` to a `CatchHandler`. The handler runs under the
+/// try's own block frame (`frame` — so a `br 0` in `H` exits the try), starting with the
+/// tag's operands on its incoming stack (bound to fresh `payload` names; `catch_all` starts
+/// empty), and `locals` as of the try site. `on` = `OnTag(tagname(x))` for `catch x`,
+/// `OnAll` for `catch_all`. An `exnref` is captured (and threaded into `ctx.catch_refs`) IFF
+/// the handler contains a `rethrow` that would reference it — otherwise `None`, matching the
+/// common legacy shape (T1). `Error(UnknownTagIndex)` on an out-of-range tag.
+fn lower_one_legacy_handler(
+  kind: LegacyKind,
+  seg: List(ast.Instr),
+  frame: LFrame,
+  ctx: LCtx,
+  st: LState,
+  counter: Int,
+) -> Result(#(ir.CatchHandler, Int), LowerError) {
+  use #(on, payload_types) <- result.try(case kind {
+    LKCatch(x) -> {
+      use ops <- result.try(nth_err(ctx.tag_types, x, UnknownTagIndex(x)))
+      Ok(#(ir.OnTag(tagname(x)), ops))
+    }
+    LKCatchAll -> Ok(#(ir.OnAll, []))
+  })
+  let pcount = list.length(payload_types)
+  let #(payload_names, c1) = fresh_n(counter, pcount)
+  // Capture an `exnref` only if the handler contains a `rethrow` (which re-raises the caught
+  // exception) — keeping the common no-rethrow handler `exnref = None` (T1).
+  let #(exnref_opt, c2, child_catch_refs) = case seg_has_rethrow(seg) {
+    True -> {
+      let #(e, c) = fresh(c1)
+      #(Some(e), c, [e, ..ctx.catch_refs])
+    }
+    False -> #(None, c1, ctx.catch_refs)
+  }
+  // The handler's incoming stack is the tag operands (top = last operand, push order).
+  let payload_vars = list.map(payload_names, ir.Var)
+  let inner_stack = list.reverse(payload_vars)
+  let vt1 = insert_types(st.var_types, list.zip(payload_names, payload_types))
+  let vt2 = case exnref_opt {
+    Some(e) -> insert_types(vt1, [#(e, ir.TExnRef)])
+    None -> vt1
+  }
+  let hctx = LCtx(..ctx, catch_refs: child_catch_refs)
+  let child = LState(inner_stack, st.locals, c2, [frame, ..st.frames], vt2)
+  use hres <- result.try(go(list.append(seg, [ast.End]), hctx, child))
+  use #(hexpr, _, c3) <- result.try(expect_end(hres))
+  Ok(#(ir.CatchHandler(on, payload_names, exnref_opt, hexpr), c3))
+}
+
+/// Whether a legacy handler segment (a flat instruction list) contains a `rethrow` — the
+/// signal that the handler must capture an `exnref` so `lower_rethrow` can re-raise it.
+fn seg_has_rethrow(seg: List(ast.Instr)) -> Bool {
+  list.any(seg, fn(i) {
+    case i {
+      ast.Rethrow(_) -> True
+      _ -> False
+    }
+  })
+}
+
+// ── modern `try_table` structuring ──
+
+/// Lower a modern `try_table bt catch* B end` into the one inline-handler `ir.Try` (T1). The
+/// body `B` is lowered under the try_table's OWN block-like frame (exactly like `lower_block`
+/// — its label hosts a `br` out of the try_table), and each catch clause becomes a
+/// `CatchHandler` whose `handler` is the TRANSFER to the clause's target label, resolved in
+/// the ENCLOSING context (`st.frames`, BEFORE the body frame is pushed — spec typing) to the
+/// enclosing frame's kind: `Break` for a block/if, `Continue` for a loop, `Return` for the
+/// function frame. The payload (the tag operands, plus the `exnref` for a `_ref` clause) is
+/// delivered as the transfer's branch values. `result_types` = blocktype results ++ carried
+/// locals (the body's normal-completion result). The `Try` is `Block`-wrapped only when `B`
+/// `br`s to the try_table's own label (catches target ENCLOSING labels, never this one).
+fn lower_try_table(
+  bt: ast.BlockType,
+  catches: List(ast.Catch),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(in_ir, out_ir) <- result.try(blocktype_io(bt, ctx))
+  let in_n = list.length(in_ir)
+  let out_n = list.length(out_ir)
+  let carried = scan_modified(tail, 0, set.new())
+  use carried_ts <- result.try(carried_types(carried, ctx.local_types))
+  let result_types = list.append(out_ir, carried_ts)
+
+  // Resolve every catch clause against the ENCLOSING frames (the parent context).
+  use #(handlers, c_h) <- result.try(lower_trytable_catches(
+    catches,
+    ctx,
+    st,
+    st.counter,
+  ))
+
+  // Lower the body under the try_table's own block-like frame (like `lower_block`).
+  let inner_stack = list.take(st.stack, in_n)
+  let below = list.drop(st.stack, in_n)
+  let #(label, c1) = fresh_label(c_h)
+  let frame = LFrame(label, FBlock, out_n, out_n, result_types, carried)
+  let child =
+    LState(inner_stack, st.locals, c1, [frame, ..st.frames], st.var_types)
+  use body_res <- result.try(go(tail, ctx, child))
+  use #(body_expr, rest, c2) <- result.try(expect_end(body_res))
+
+  let node = ir.Try(result_types, body_expr, handlers)
+  let construct = case expr_breaks_to(body_expr, label) {
+    True -> ir.Block(label, result_types, node)
+    False -> node
+  }
+  finish_construct(
+    construct,
+    result_types,
+    out_n,
+    carried,
+    below,
+    rest,
+    c2,
+    ctx,
+    st,
+  )
+}
+
+/// Lower every `try_table` catch clause to a `CatchHandler`, threading the gensym `counter`.
+fn lower_trytable_catches(
+  catches: List(ast.Catch),
+  ctx: LCtx,
+  st: LState,
+  counter: Int,
+) -> Result(#(List(ir.CatchHandler), Int), LowerError) {
+  case catches {
+    [] -> Ok(#([], counter))
+    [c, ..rest] -> {
+      use #(h, c1) <- result.try(lower_one_trytable_catch(c, ctx, st, counter))
+      use #(hs, c2) <- result.try(lower_trytable_catches(rest, ctx, st, c1))
+      Ok(#([h, ..hs], c2))
+    }
+  }
+}
+
+/// Lower one `try_table` catch clause to a `CatchHandler(on, payload, exnref?, transfer)`.
+/// The four clause kinds map exactly: `catch x l` → `OnTag(tagname(x))`, no exnref;
+/// `catch_ref x l` → `OnTag`, an exnref; `catch_all l` → `OnAll`, no exnref; `catch_all_ref
+/// l` → `OnAll`, an exnref. The `payload` names bind the tag operands (empty for `catch_all`);
+/// the `transfer` delivers `[payload (++ exnref)]` to the enclosing label `l` — built by
+/// `build_transfer` over a synthetic stack of exactly those values, so it picks
+/// `Break`/`Continue`/`Return` from the resolved frame's kind and appends that frame's
+/// carried locals (as of the try site). `Error(UnknownTagIndex)` / `Error(Malformed)` on an
+/// out-of-range tag / label (only on an unvalidated module).
+fn lower_one_trytable_catch(
+  c: ast.Catch,
+  ctx: LCtx,
+  st: LState,
+  counter: Int,
+) -> Result(#(ir.CatchHandler, Int), LowerError) {
+  use #(on, payload_types, capture, l) <- result.try(case c {
+    ast.Catch(x, l) -> {
+      use ops <- result.try(nth_err(ctx.tag_types, x, UnknownTagIndex(x)))
+      Ok(#(ir.OnTag(tagname(x)), ops, False, l))
+    }
+    ast.CatchRef(x, l) -> {
+      use ops <- result.try(nth_err(ctx.tag_types, x, UnknownTagIndex(x)))
+      Ok(#(ir.OnTag(tagname(x)), ops, True, l))
+    }
+    ast.CatchAll(l) -> Ok(#(ir.OnAll, [], False, l))
+    ast.CatchAllRef(l) -> Ok(#(ir.OnAll, [], True, l))
+  })
+  let pcount = list.length(payload_types)
+  let #(payload_names, c1) = fresh_n(counter, pcount)
+  let #(exnref_opt, c2) = case capture {
+    True -> {
+      let #(e, c) = fresh(c1)
+      #(Some(e), c)
+    }
+    False -> #(None, c1)
+  }
+  let payload_vars = list.map(payload_names, ir.Var)
+  let delivered = case exnref_opt {
+    Some(e) -> list.append(payload_vars, [ir.Var(e)])
+    None -> payload_vars
+  }
+  // Deliver the payload (+exnref) as a `br l` at the try_table site: a synthetic stack of
+  // exactly those values (validate proved `l`'s arity matches) resolves the transfer against
+  // the enclosing frames + that frame's carried locals.
+  use transfer <- result.try(build_transfer(
+    l,
+    LState(..st, stack: list.reverse(delivered)),
+  ))
+  Ok(#(ir.CatchHandler(on, payload_names, exnref_opt, transfer), c2))
 }
 
 // ─────────────────────────────── small helpers ───────────────────────────────
@@ -2162,6 +2682,17 @@ fn consume_dead(
     [ast.Block(_), ..t] -> consume_dead(t, depth + 1)
     [ast.Loop(_), ..t] -> consume_dead(t, depth + 1)
     [ast.If(_), ..t] -> consume_dead(t, depth + 1)
+    // Phase-7 EH block-openers: `try`/`try_table` open like `block` (depth +1); `delegate`
+    // CLOSES an enclosing `try` (depth −1, like `end`), so a nested `try…delegate` in dead
+    // code balances. (`catch`/`catch_all` are in-block markers — no depth change; they fall
+    // to the default skip.)
+    [ast.TryLegacy(_), ..t] -> consume_dead(t, depth + 1)
+    [ast.TryTable(_, _), ..t] -> consume_dead(t, depth + 1)
+    [ast.LegacyDelegate(l), ..t] ->
+      case depth {
+        0 -> Ok(#(ast.LegacyDelegate(l), t))
+        _ -> consume_dead(t, depth - 1)
+      }
     [ast.Else, ..t] ->
       case depth {
         0 -> Ok(#(ast.Else, t))
@@ -2189,12 +2720,24 @@ fn scan_modified(
     [ast.Block(_), ..t] -> scan_modified(t, depth + 1, acc)
     [ast.Loop(_), ..t] -> scan_modified(t, depth + 1, acc)
     [ast.If(_), ..t] -> scan_modified(t, depth + 1, acc)
+    // Phase-7 EH openers/closers: `try`/`try_table` open like `block`; `delegate` closes an
+    // enclosing `try` (like `end`); `catch`/`catch_all` are in-block markers (like `else` —
+    // no depth change), so a legacy try's whole body+handlers is scanned in one pass.
+    [ast.TryLegacy(_), ..t] -> scan_modified(t, depth + 1, acc)
+    [ast.TryTable(_, _), ..t] -> scan_modified(t, depth + 1, acc)
+    [ast.LegacyDelegate(_), ..t] ->
+      case depth {
+        0 -> set_to_sorted(acc)
+        _ -> scan_modified(t, depth - 1, acc)
+      }
     [ast.End, ..t] ->
       case depth {
         0 -> set_to_sorted(acc)
         _ -> scan_modified(t, depth - 1, acc)
       }
     [ast.Else, ..t] -> scan_modified(t, depth, acc)
+    [ast.LegacyCatch(_), ..t] -> scan_modified(t, depth, acc)
+    [ast.LegacyCatchAll, ..t] -> scan_modified(t, depth, acc)
     [ast.LocalSet(i), ..t] -> scan_modified(t, depth, set.insert(acc, i))
     [ast.LocalTee(i), ..t] -> scan_modified(t, depth, set.insert(acc, i))
     [_, ..t] -> scan_modified(t, depth, acc)
@@ -2243,12 +2786,15 @@ fn to_ir_vt(t: ast.ValType) -> ir.ValType {
   }
 }
 
-/// Map a WASM reference type (the `FuncRef`/`ExternRef` subset of `ast.ValType`) to the
-/// IR's distinct `RefType`. A non-reftype value type never appears in reftype position
-/// (validate guarantees it); it defaults to `FuncRef` fail-closed so this stays total.
+/// Map a WASM reference type (the `FuncRef`/`ExternRef`/`ExnRef` subset of `ast.ValType`)
+/// to the IR's distinct `RefType`. `ExnRef` (Phase-7 EH — `ref.null exn`) maps 1:1 onto
+/// `ir.ExnRef`, so `ref.null exn` lowers through the existing `ast.RefNull` arm to
+/// `ConstNull(ExnRef)`. A non-reftype value type never appears in reftype position (validate
+/// guarantees it); it defaults to `FuncRef` fail-closed so this stays total.
 fn to_ir_reftype(t: ast.ValType) -> ir.RefType {
   case t {
     ast.ExternRef -> ir.ExternRef
+    ast.ExnRef -> ir.ExnRef
     _ -> ir.FuncRef
   }
 }
@@ -2388,6 +2934,14 @@ fn tname(i: Int) -> String {
   "t" <> int.to_string(i)
 }
 
+/// The stable IR tag name for ABSOLUTE tagidx `i` (`tag<idx>`; Phase 7). The single naming
+/// convention shared by `TagDecl.name`, `ImportTag`'s slot, `Throw`/`CatchTag.OnTag`, and
+/// `ExportTag.tag_name`, so a tag resolves to the same build-controlled exception class
+/// across the module — mirroring `f<idx>`/`g<idx>`/`t<idx>` (D6).
+fn tagname(i: Int) -> String {
+  "tag" <> int.to_string(i)
+}
+
 /// The declared IR value type of global `i`, for SSA type tracking of `global.get`. Falls
 /// back to `TI32` for an out-of-range index (only reachable on an unvalidated module —
 /// validation rejects an out-of-range global, so the lowered `GlobalGet` name is still valid).
@@ -2462,6 +3016,30 @@ fn lower_tables(
       t.limits.max,
     )
   })
+}
+
+/// Lower the tag section to `TagDecl`s (J2/T2). Defined tag `j` is named at its ABSOLUTE
+/// tagidx `imported_tag_count + j` (`tag<abs>`) — the same imports-first index space and
+/// `tag<idx>` naming a `throw`/`catch`/`ExportTag` references — and carries the exception's
+/// operand types (`types[type_idx].params`; the tag's results are `[]`, proven empty by
+/// validate). `Error(UnknownTypeIndex(_))` on an out-of-range `type_idx` (only reachable on
+/// an unvalidated module). Byte-identical when there is no tag section (`Module.tags = []`).
+fn lower_tags(
+  module: ast.Module,
+  imported_tag_count: Int,
+) -> Result(List(ir.TagDecl), LowerError) {
+  list.index_map(module.tags, fn(t, i) {
+    use sig <- result.try(nth_err(
+      module.types,
+      t.type_idx,
+      UnknownTypeIndex(t.type_idx),
+    ))
+    Ok(ir.TagDecl(
+      tagname(imported_tag_count + i),
+      list.map(sig.params, to_ir_vt),
+    ))
+  })
+  |> result.all
 }
 
 /// Lower every element segment (active | passive | declarative), preserving its mode and
@@ -2563,9 +3141,18 @@ fn lower_imports(
           mt.limits.max,
           to_ir_idxtype(mt.idx_type),
         ))
-      // An imported tag («WASM-AST5», Phase 7) — fail closed; real imported-tag
-      // lowering (into `Module.tags`/the tag index space) is P7-05's.
-      ast.ImportTag(_) -> Error(Unsupported("imported tag (P7-05)"))
+      // An imported exception tag («WASM-AST5», Phase 7). Provided state keyed on the
+      // `(module, name)` link key (like `ImportGlobal`); `params` is the tag's operand
+      // signature (the exception payload types), resolved from `types[tyidx]` and mapped to
+      // IR types. Imported tags occupy the LOW tagidx range (before defined tags).
+      ast.ImportTag(tyidx) -> {
+        use sig <- result.try(nth_err(
+          module.types,
+          tyidx,
+          UnknownTypeIndex(tyidx),
+        ))
+        Ok(ir.ImportTag(imp.module, imp.name, list.map(sig.params, to_ir_vt)))
+      }
     }
   })
 }

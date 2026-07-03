@@ -1828,3 +1828,643 @@ const ref_local_wasm: BitArray = <<
   0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 112, 3, 2, 1, 0, 7, 7, 1, 3,
   108, 111, 99, 0, 0, 10, 8, 1, 6, 1, 1, 112, 32, 0, 11,
 >>
+
+// ═══════════════════════════════ Phase 7 — exception handling ═══════════════════════════════
+//
+// Spec-cited against the WebAssembly exception-handling proposal (legacy `try`/`catch`/
+// `catch_all`/`delegate`/`rethrow` + modern `throw`/`throw_ref`/`try_table`), NOT the code.
+// BOTH wire encodings must structure into the ONE inline-handler `ir.Try` (T1): a legacy
+// `try…catch` maps 1:1 (the handler is the `CatchHandler.handler`), a modern `try_table`
+// clause maps to a TRANSFER (`Break`/`Continue`/`Return`) to the resolved enclosing frame.
+// Fixtures are hand-built well-typed `ast.Module`s (each validated first, exactly as the
+// P7-04 acceptance fixtures) plus the MEASURED 331-byte real Porffor 0.61.13 module.
+
+/// A function type `params -> results`.
+fn eh_ft(
+  params: List(ast.ValType),
+  results: List(ast.ValType),
+) -> ast.FuncType {
+  ast.FuncType(params, results)
+}
+
+/// A defined function of `types[type_idx]`, with declared `locals` and `body`.
+fn eh_func(
+  type_idx: Int,
+  locals: List(ast.ValType),
+  body: List(ast.Instr),
+) -> ast.Func {
+  ast.Func(type_idx: type_idx, locals: locals, body: body)
+}
+
+/// An otherwise-empty EH module (only the fields the EH tests exercise).
+fn eh_module(
+  types types: List(ast.FuncType),
+  imports imports: List(ast.Import),
+  tags tags: List(ast.Tag),
+  funcs funcs: List(ast.Func),
+  exports exports: List(ast.Export),
+) -> ast.Module {
+  ast.Module(
+    imported_func_count: 0,
+    types: types,
+    imports: imports,
+    tables: [],
+    memories: [],
+    globals: [],
+    tags: tags,
+    funcs: funcs,
+    start: option.None,
+    elements: [],
+    data: [],
+    data_count: option.None,
+    exports: exports,
+  )
+}
+
+/// Validate + lower an EH module (both must succeed — these are valid fixtures).
+fn eh_lower(m: ast.Module) -> ir.Module {
+  let assert Ok(typed) = validate.validate(m)
+  let assert Ok(irm) = lower.lower(typed)
+  irm
+}
+
+/// Every sub-expression of `e`, recursing THROUGH `Try` bodies AND handlers (the base
+/// `all_exprs` stops at `Try`, which has no non-EH sub-expressions).
+fn all_exprs_eh(e: ir.Expr) -> List(ir.Expr) {
+  let nested = case e {
+    ir.Let(_, rhs, body) -> list.append(all_exprs_eh(rhs), all_exprs_eh(body))
+    ir.Block(_, _, body) -> all_exprs_eh(body)
+    ir.Loop(_, _, _, body) -> all_exprs_eh(body)
+    ir.If(_, _, t, el) -> list.append(all_exprs_eh(t), all_exprs_eh(el))
+    ir.Switch(_, _, arms, default) ->
+      list.append(
+        list.flat_map(arms, fn(a) { all_exprs_eh(a.body) }),
+        all_exprs_eh(default),
+      )
+    ir.Charge(_, body) -> all_exprs_eh(body)
+    ir.Try(_, body, handlers) ->
+      list.append(
+        all_exprs_eh(body),
+        list.flat_map(handlers, fn(h) { all_exprs_eh(h.handler) }),
+      )
+    _ -> []
+  }
+  [e, ..nested]
+}
+
+/// The first `Try` node in function `name`.
+fn find_try(irm: ir.Module, name: String) -> ir.Expr {
+  let assert Ok(t) =
+    list.find(all_exprs_eh(func(irm, name).body), fn(e) {
+      case e {
+        ir.Try(_, _, _) -> True
+        _ -> False
+      }
+    })
+  t
+}
+
+/// The label of the first `Block` node in function `name`.
+fn first_block_label(irm: ir.Module, name: String) -> String {
+  let assert Ok(ir.Block(label, _, _)) =
+    list.find(all_exprs_eh(func(irm, name).body), fn(e) {
+      case e {
+        ir.Block(_, _, _) -> True
+        _ -> False
+      }
+    })
+  label
+}
+
+/// Every sub-expression across every defined function of `irm`.
+fn all_module_exprs(irm: ir.Module) -> List(ir.Expr) {
+  list.flat_map(irm.functions, fn(f) { all_exprs_eh(f.body) })
+}
+
+// ── the tag section → Module.tags / ImportTag / ExportTag (spec: tag section id 13) ──
+
+/// A defined `(tag (param f64 i32))` lowers to `TagDecl("tag0", [TF64, TI32])` — the tag's
+/// PARAMS are the exception operand types (its results are `[]`, so `TagDecl` stores only
+/// params). The Porffor-ABI tag shape.
+pub fn tag_section_lowers_to_tagdecl_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([ast.F64, ast.I32], [])],
+        imports: [],
+        tags: [ast.Tag(0)],
+        funcs: [],
+        exports: [],
+      ),
+    )
+  irm.tags |> should.equal([ir.TagDecl("tag0", [ir.TF64, ir.TI32])])
+}
+
+/// An IMPORTED tag lowers to `ImportTag(module, name, params)` at the low tagidx; the
+/// module then declares NO defined tags (`Module.tags == []`). (Imports precede defined
+/// tags in the index space, exactly like globals.)
+pub fn imported_tag_lowers_to_importtag_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([ast.F64, ast.I32], [])],
+        imports: [ast.Import("host", "e", ast.ImportTag(0))],
+        tags: [],
+        funcs: [],
+        exports: [],
+      ),
+    )
+  irm.tags |> should.equal([])
+  irm.imports
+  |> list.contains(ir.ImportTag("host", "e", [ir.TF64, ir.TI32]))
+  |> should.equal(True)
+}
+
+/// An exported tag lowers to `ExportTag(export_name, "tag<idx>")` — measured: Porffor emits
+/// `(export "0" (tag 0))`.
+pub fn exported_tag_lowers_to_exporttag_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [])],
+        imports: [],
+        tags: [ast.Tag(0)],
+        funcs: [],
+        exports: [ast.Export("0", ast.ExportTag, 0)],
+      ),
+    )
+  irm.exports
+  |> list.contains(ir.ExportTag("0", "tag0"))
+  |> should.equal(True)
+}
+
+/// The NEGATIVE obligation (J6): a module with no tag section lowers `Module.tags = []` —
+/// conformance-neutral, byte-identical to Phase-6.
+pub fn tag_free_module_has_no_tags_test() {
+  build(add_wasm).tags |> should.equal([])
+}
+
+// ── throw → ir.Throw (a bottom transfer; spec exec §control `throw`) ──
+
+/// `(tag $e (param i32)) … i32.const 7 (throw $e)` lowers to `Throw("tag0", [ConstI32(7)])`,
+/// and — being a bottom transfer — is the function body VERBATIM (no `Let` binds a throw
+/// result, and the code after it is consumed as dead, exactly like `Return`/`Unreachable`).
+pub fn throw_lowers_to_throw_node_test() {
+  let irm =
+    eh_lower(eh_module(
+      types: [eh_ft([ast.I32], []), eh_ft([], [])],
+      imports: [],
+      tags: [ast.Tag(0)],
+      funcs: [
+        eh_func(1, [], [
+          ast.I32Const(7),
+          ast.Throw(0),
+          // dead code after a bottom `throw` — must NOT survive
+          ast.I32Const(99),
+          ast.Drop,
+          ast.End,
+        ]),
+      ],
+      exports: [],
+    ))
+  func(irm, "f0").body |> should.equal(ir.Throw("tag0", [ir.ConstI32(7)]))
+}
+
+/// A multi-operand `throw` carries its operands in TAG-PARAM order (deepest-first push
+/// order): `(param i32 i64) … i32.const 1 i64.const 2 throw` → `Throw("tag0", [ConstI32(1),
+/// ConstI64(2)])` — the payload list is built in the tag's declared operand order.
+pub fn throw_multi_operand_order_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([ast.I32, ast.I64], []), eh_ft([], [])],
+        imports: [],
+        tags: [ast.Tag(0)],
+        funcs: [
+          eh_func(1, [], [
+            ast.I32Const(1),
+            ast.I64Const(2),
+            ast.Throw(0),
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  func(irm, "f0").body
+  |> should.equal(ir.Throw("tag0", [ir.ConstI32(1), ir.ConstI64(2)]))
+}
+
+// ── LEGACY try/catch → the inline-handler ir.Try (T1; Porffor's headline path) ──
+
+/// `try (result i32) (i32.const 10) catch $e (drop) (i32.const 20) end` lowers 1:1 to
+/// `Try([TI32], Values([ConstI32(10)]), [CatchHandler(OnTag("tag0"), [name], None,
+/// Values([ConstI32(20)]))])`: the body and the inline handler are alternatives yielding the
+/// try's result; the handler binds the tag's operand to a fresh `payload` name it consumes;
+/// `exnref = None` (no `rethrow`). This is the exact legacy → IR shape 06 emits against.
+pub fn legacy_try_catch_lowers_to_try_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([ast.I32], []), eh_ft([], [ast.I32])],
+        imports: [],
+        tags: [ast.Tag(0)],
+        funcs: [
+          eh_func(1, [], [
+            ast.TryLegacy(ast.BlockVal(ast.I32)),
+            ast.I32Const(10),
+            ast.LegacyCatch(0),
+            ast.Drop,
+            ast.I32Const(20),
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  let assert ir.Try(result, body, handlers) = find_try(irm, "f0")
+  result |> should.equal([ir.TI32])
+  body |> should.equal(ir.Values([ir.ConstI32(10)]))
+  let assert [ir.CatchHandler(on, payload, exnref, handler)] = handlers
+  on |> should.equal(ir.OnTag("tag0"))
+  list.length(payload) |> should.equal(1)
+  exnref |> should.equal(option.None)
+  handler |> should.equal(ir.Values([ir.ConstI32(20)]))
+}
+
+/// Legacy `try [] catch_all end` → `CatchHandler(OnAll, [], None, …)`: a `catch_all` matches
+/// ANY exception and binds no payload (spec: it pushes no operands).
+pub fn legacy_catch_all_lowers_to_onall_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [])],
+        imports: [],
+        tags: [],
+        funcs: [
+          eh_func(0, [], [
+            ast.TryLegacy(ast.BlockEmpty),
+            ast.LegacyCatchAll,
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  let assert ir.Try(result, body, [handler]) = find_try(irm, "f0")
+  result |> should.equal([])
+  body |> should.equal(ir.Values([]))
+  handler
+  |> should.equal(ir.CatchHandler(ir.OnAll, [], option.None, ir.Values([])))
+}
+
+/// Legacy `delegate` → a catch-and-re-raise handler (`CatchHandler(OnAll, [], Some(e),
+/// ThrowRef(Var(e)))`), forwarding an uncaught exception to the enclosing region (§A.4).
+pub fn legacy_delegate_lowers_to_reraise_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [])],
+        imports: [],
+        tags: [],
+        funcs: [
+          eh_func(0, [], [
+            ast.Block(ast.BlockEmpty),
+            ast.TryLegacy(ast.BlockEmpty),
+            ast.LegacyDelegate(0),
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  let assert ir.Try(_, _, [ir.CatchHandler(on, payload, exnref, handler)]) =
+    find_try(irm, "f0")
+  on |> should.equal(ir.OnAll)
+  payload |> should.equal([])
+  let assert option.Some(e) = exnref
+  handler |> should.equal(ir.ThrowRef(ir.Var(e)))
+}
+
+// ── MODERN try_table → ir.Try with a TRANSFER to the resolved enclosing label (spec:
+//    catch labels are resolved in the ENCLOSING context) ──
+
+/// `block $h (result i32 i64) { try_table (catch $e $h) end  i32.const  i64.const }`: the
+/// `catch $e $h` clause resolves `$h` to the ENCLOSING BLOCK's label (the parent frame, NOT
+/// the try_table's own body label), so its handler is `Break(<block-label>, [payload…])`
+/// carrying the tag operands. Proves the frame resolution + Break/Continue/Return-by-kind.
+pub fn modern_try_table_catch_resolves_enclosing_label_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [
+          eh_ft([ast.I32, ast.I64], []),
+          eh_ft([], [ast.I32, ast.I64]),
+          eh_ft([], [ast.I32, ast.I64]),
+        ],
+        imports: [],
+        tags: [ast.Tag(0)],
+        funcs: [
+          eh_func(1, [], [
+            ast.Block(ast.BlockTypeIdx(2)),
+            ast.TryTable(ast.BlockEmpty, [ast.Catch(0, 0)]),
+            ast.End,
+            ast.I32Const(0),
+            ast.I64Const(0),
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  let assert ir.Try(_, _, [ir.CatchHandler(on, payload, exnref, handler)]) =
+    find_try(irm, "f0")
+  on |> should.equal(ir.OnTag("tag0"))
+  list.length(payload) |> should.equal(2)
+  exnref |> should.equal(option.None)
+  // the handler is a Break to the ENCLOSING block's label, carrying the payload
+  let assert ir.Break(brk_label, brk_vals) = handler
+  brk_label |> should.equal(first_block_label(irm, "f0"))
+  brk_vals |> should.equal(list.map(payload, ir.Var))
+}
+
+/// `catch_ref $e $h` → `CatchHandler(OnTag(...), [payload…], Some(exnref), Break(L, [payload…
+/// ++ exnref]))`: the ref-capturing form binds an `exnref` AND delivers it (after the
+/// operands) to the label (spec: operands then exnref on top).
+pub fn modern_try_table_catch_ref_captures_exnref_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [
+          eh_ft([ast.I32, ast.I64], []),
+          eh_ft([], [ast.I32, ast.I64, ast.ExnRef]),
+          eh_ft([], [ast.I32, ast.I64, ast.ExnRef]),
+        ],
+        imports: [],
+        tags: [ast.Tag(0)],
+        funcs: [
+          eh_func(1, [], [
+            ast.Block(ast.BlockTypeIdx(2)),
+            ast.TryTable(ast.BlockEmpty, [ast.CatchRef(0, 0)]),
+            ast.End,
+            ast.I32Const(0),
+            ast.I64Const(0),
+            ast.RefNull(ast.ExnRef),
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  let assert ir.Try(_, _, [ir.CatchHandler(on, payload, exnref, handler)]) =
+    find_try(irm, "f0")
+  on |> should.equal(ir.OnTag("tag0"))
+  list.length(payload) |> should.equal(2)
+  let assert option.Some(e) = exnref
+  let assert ir.Break(_, brk_vals) = handler
+  // Break carries [payload ++ exnref]
+  brk_vals
+  |> should.equal(list.append(list.map(payload, ir.Var), [ir.Var(e)]))
+}
+
+/// `catch_all $l` → `CatchHandler(OnAll, [], None, Break(L, []))` — matches any exception,
+/// no payload, no exnref.
+pub fn modern_try_table_catch_all_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [])],
+        imports: [],
+        tags: [],
+        funcs: [
+          eh_func(0, [], [
+            ast.Block(ast.BlockEmpty),
+            ast.TryTable(ast.BlockEmpty, [ast.CatchAll(0)]),
+            ast.End,
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  let assert ir.Try(_, _, [ir.CatchHandler(on, payload, exnref, _handler)]) =
+    find_try(irm, "f0")
+  on |> should.equal(ir.OnAll)
+  payload |> should.equal([])
+  exnref |> should.equal(option.None)
+}
+
+/// A `try_table` whose BODY `br`s to its own label is `Block`-wrapped (arity-transparent),
+/// exactly like a branched-to `if` — so the body's `Break` has a home. `try_table (result
+/// i32) { i32.const 5  br 0 }`.
+pub fn modern_try_table_body_break_is_block_wrapped_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [ast.I32])],
+        imports: [],
+        tags: [],
+        funcs: [
+          eh_func(0, [], [
+            ast.TryTable(ast.BlockVal(ast.I32), []),
+            ast.I32Const(5),
+            ast.Br(0),
+            ast.End,
+            ast.End,
+          ]),
+        ],
+        exports: [],
+      ),
+    )
+  // Some Block directly wraps a Try, and the Try's body breaks to that block's label.
+  let wrapped =
+    list.any(all_module_exprs(irm), fn(e) {
+      case e {
+        ir.Block(label, _, ir.Try(_, body, _)) -> expr_body_breaks(body, label)
+        _ -> False
+      }
+    })
+  wrapped |> should.equal(True)
+}
+
+/// True iff `body` is (directly) a `Break` to `label` — a tiny local check for the wrapper.
+fn expr_body_breaks(body: ir.Expr, label: String) -> Bool {
+  case body {
+    ir.Break(l, _) -> l == label
+    _ -> False
+  }
+}
+
+// ── throw_ref / exnref (spec exec §control `throw_ref`; the exnref reference layer) ──
+
+/// `(param exnref) (result i32) local.get 0 throw_ref` → `ThrowRef(Var("p0"))` — a bottom
+/// transfer forwarding the exnref value unchanged (the null-exnref trap + re-raise are 07's).
+pub fn throw_ref_lowers_to_throwref_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([ast.ExnRef], [ast.I32])],
+        imports: [],
+        tags: [],
+        funcs: [eh_func(0, [], [ast.LocalGet(0), ast.ThrowRef, ast.End])],
+        exports: [],
+      ),
+    )
+  func(irm, "f0").body |> should.equal(ir.ThrowRef(ir.Var("p0")))
+}
+
+/// `ref.null exn` lowers to the `ConstNull(ExnRef)` VALUE (R1c — like any null literal), and
+/// an `exnref` function param/result maps to `ir.TExnRef`.
+pub fn ref_null_exn_and_exnref_valtype_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [ast.ExnRef])],
+        imports: [],
+        tags: [],
+        funcs: [eh_func(0, [], [ast.RefNull(ast.ExnRef), ast.End])],
+        exports: [],
+      ),
+    )
+  let f = func(irm, "f0")
+  f.result |> should.equal([ir.TExnRef])
+  f.body |> should.equal(ir.Values([ir.ConstNull(ir.ExnRef)]))
+}
+
+/// A declared `exnref` LOCAL zero-initialises to `ConstNull(ExnRef)` (spec: a reftype local
+/// inits to its null) — the same discipline as funcref/externref locals.
+pub fn exnref_local_zero_inits_to_null_test() {
+  let irm =
+    eh_lower(
+      eh_module(
+        types: [eh_ft([], [ast.ExnRef])],
+        imports: [],
+        tags: [],
+        funcs: [eh_func(0, [ast.ExnRef], [ast.LocalGet(0), ast.End])],
+        exports: [],
+      ),
+    )
+  let assert ir.Let([name], init, _body) = func(irm, "f0").body
+  init |> should.equal(ir.Values([ir.ConstNull(ir.ExnRef)]))
+  // the body then forwards that zero-initialised local
+  name |> should.not_equal("")
+}
+
+// ── fail-closed (no panic; validation is the real boundary — this is insurance) ──
+
+/// An out-of-range tagidx in `throw` (only reachable on an UNVALIDATED module) fails closed
+/// with `Error(UnknownTagIndex(_))`, never a panic. Built directly as a `TypedModule` with an
+/// empty tag space so validate's rejection is bypassed.
+pub fn throw_unknown_tag_fails_closed_test() {
+  let m =
+    ast.Module(
+      imported_func_count: 0,
+      types: [ast.FuncType([], [])],
+      imports: [],
+      tables: [],
+      memories: [],
+      globals: [],
+      tags: [],
+      funcs: [ast.Func(0, [], [ast.Throw(0), ast.End])],
+      start: option.None,
+      elements: [],
+      data: [],
+      data_count: option.None,
+      exports: [],
+    )
+  let tm =
+    validate.TypedModule(
+      module: m,
+      imported_func_count: 0,
+      imported_global_count: 0,
+      imported_table_count: 0,
+      imported_memory_count: 0,
+      func_types: [ast.FuncType([], [])],
+      func_locals: [[]],
+      global_types: [],
+      table_types: [],
+      memory_idx_types: [],
+      elem_types: [],
+      refs: set.new(),
+      imported_tag_count: 0,
+      // empty tag space → tagidx 0 is out of range
+      tag_types: [],
+    )
+  lower.lower(tm) |> should.equal(Error(lower.UnknownTagIndex(0)))
+}
+
+// ── the MEASURED real Porffor module lowers to Try IR (§A.4; the headline) ──
+
+/// The FULL 331-byte `npx porffor wasm trycatch.js` (Porffor 0.61.13) output — legacy
+/// `try`/`catch`/`throw` + `(tag (param f64 i32))` + `(export "0" (tag 0))` — decodes,
+/// validates AND LOWERS: `Module.tags = [TagDecl("tag0", [TF64, TI32])]`, an `ExportTag`, at
+/// least one inline-handler `Try` with an `OnTag("tag0")` handler, and a `Throw("tag0", _)`
+/// site. The measured proof that the real Porffor legacy path structures into the Try IR.
+pub fn real_porffor_legacy_module_lowers_to_try_test() {
+  let irm = build(to_bytes(porffor_legacy_eh_module))
+  irm.tags |> should.equal([ir.TagDecl("tag0", [ir.TF64, ir.TI32])])
+  irm.exports
+  |> list.contains(ir.ExportTag("0", "tag0"))
+  |> should.equal(True)
+  let exprs = all_module_exprs(irm)
+  // an inline-handler Try catching the module's tag
+  list.any(exprs, fn(e) {
+    case e {
+      ir.Try(_, _, handlers) ->
+        list.any(handlers, fn(h) { h.on == ir.OnTag("tag0") })
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+  // a throw of the module's tag
+  list.any(exprs, fn(e) {
+    case e {
+      ir.Throw("tag0", _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal(True)
+}
+
+/// A raw byte list → `BitArray`.
+fn to_bytes(xs: List(Int)) -> BitArray {
+  list.fold(xs, <<>>, fn(acc, b) { <<acc:bits, b:size(8)>> })
+}
+
+// The FULL 331-byte output of `npx porffor wasm trycatch.js` (Porffor 0.61.13), a JS
+// `try { throw } catch {}` — legacy `try`/`catch`/`throw` + `(tag (param f64 i32))` + tag
+// export. Copied verbatim from the P7-03/P7-04 decode/validate fixtures (measured bytes).
+const porffor_legacy_eh_module: List(Int) = [
+  0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x1C, 0x04, 0x60, 0x00,
+  0x02, 0x7C, 0x7F, 0x60, 0x06, 0x7C, 0x7F, 0x7C, 0x7F, 0x7C, 0x7F, 0x02, 0x7C,
+  0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x02, 0x7C, 0x7F, 0x00, 0x03,
+  0x04, 0x03, 0x00, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x0D, 0x03, 0x01,
+  0x00, 0x03, 0x07, 0x0D, 0x03, 0x01, 0x24, 0x02, 0x00, 0x01, 0x30, 0x04, 0x00,
+  0x01, 0x6D, 0x00, 0x00, 0x0A, 0x80, 0x02, 0x03, 0x29, 0x01, 0x01, 0x7F, 0x44,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x44, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x14, 0x40, 0x41, 0x01, 0x10, 0x01, 0x22, 0x00, 0x0B, 0xB0, 0x01,
+  0x06, 0x01, 0x7C, 0x01, 0x7F, 0x01, 0x7C, 0x01, 0x7F, 0x01, 0x7C, 0x01, 0x7F,
+  0x06, 0x40, 0x20, 0x04, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x64, 0xB8, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x04,
+  0x40, 0x20, 0x04, 0x20, 0x05, 0x08, 0x00, 0x1A, 0x0B, 0x44, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0xF0, 0x3F, 0x21, 0x06, 0x41, 0x01, 0x21, 0x07, 0x20, 0x00,
+  0xFC, 0x03, 0x04, 0x40, 0x20, 0x06, 0xFC, 0x02, 0x20, 0x07, 0x10, 0x02, 0x45,
+  0x04, 0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B, 0x0B, 0x20, 0x06, 0x20, 0x07,
+  0x0F, 0x1A, 0x07, 0x00, 0x21, 0x09, 0x22, 0x08, 0x21, 0x0A, 0x20, 0x09, 0x21,
+  0x0B, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x21, 0x06, 0x41,
+  0x01, 0x21, 0x07, 0x20, 0x00, 0xFC, 0x03, 0x04, 0x40, 0x20, 0x06, 0xFC, 0x02,
+  0x20, 0x07, 0x10, 0x02, 0x45, 0x04, 0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B,
+  0x0B, 0x20, 0x06, 0x20, 0x07, 0x0F, 0x1A, 0x0B, 0x20, 0x00, 0xFC, 0x03, 0x04,
+  0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x41, 0x00, 0x0F, 0x0B, 0x22, 0x01, 0x01, 0x7F, 0x20, 0x01,
+  0x21, 0x02, 0x20, 0x00, 0x41, 0x00, 0x47, 0x20, 0x02, 0x41, 0x05, 0x4A, 0x71,
+  0x20, 0x02, 0x41, 0xC3, 0x00, 0x47, 0x71, 0x20, 0x02, 0x41, 0xC3, 0x01, 0x47,
+  0x71, 0x0F, 0x0B, 0x0B, 0x01, 0x00,
+]
