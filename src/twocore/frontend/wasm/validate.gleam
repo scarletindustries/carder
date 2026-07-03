@@ -142,6 +142,17 @@ pub const table_entry_limit: Int = 4_294_967_295
 /// - `refs` (Phase 5): `C.refs`, the set of function indices *declared* in the module
 ///   (element segments of any mode, global inits, and function exports) — the funcs a
 ///   body may legally `ref.func`. Lowering reads it for the `ref.func` lowering guard.
+/// - `imported_tag_count` (Phase 7): the number of *imported* tags — the offset at which
+///   *defined* tags begin in the tag index space (imports precede definitions). `0` for a
+///   module with no imported tags (byte-identical to Phase 6). Lowering (P7-05) reads it
+///   to route a `throw`/catch tagidx into the imports-first tag space; the linker binds
+///   `list.take(tag_types, imported_tag_count)` to the provided runtime tags.
+/// - `tag_types` (Phase 7): the **operand types** of every tag by **tagidx** (imports ++
+///   defined), each resolved from its `type_idx` and verified `[t*] -> []` (empty
+///   results). Lowering reads it to build the exception term's payload shape and to bind
+///   a caught tag's operands onto a catch label's values — the one EH typing fact lower
+///   cannot trivially re-derive (a `throw x` names only `x`), so it is carried here,
+///   exactly as `global_types` is for `global.set`. Empty for a tag-free module.
 pub type TypedModule {
   TypedModule(
     module: Module,
@@ -156,6 +167,8 @@ pub type TypedModule {
     memory_idx_types: List(IdxType),
     elem_types: List(ValType),
     refs: Set(Int),
+    imported_tag_count: Int,
+    tag_types: List(List(ValType)),
   )
 }
 
@@ -251,6 +264,17 @@ pub type TypedModule {
 ///   space its kind selects, where no more specific `Unknown*` fits, or a **duplicate
 ///   export name** (spec `valid/modules` forbids duplicate export names). Carries a
 ///   human-readable detail.
+/// - `UnknownTag(index)` (Phase 7): a `throw`/`try_table` catch / legacy `catch` /
+///   `tag`-export tagidx out of range of the module's tag index space (imports ++
+///   defined) — spec: the EH proposal requires `C.tags[x]` to exist. Analogous to
+///   `UnknownFunc`/`UnknownMemory`. Distinct from `UnknownType` (a *tag declaration*'s
+///   out-of-range typeidx at module setup, a declaration error, versus a *use-site*
+///   out-of-range tagidx). Carries the offending index.
+/// - `BadTagType` (Phase 7): a tag (defined or imported) whose referenced `FuncType`
+///   has a **non-empty result list** — the EH proposal requires a tag's type to be
+///   `[t*] -> []` (an exception carries operands but never returns). Analogous to
+///   `BadStartType` (the `[] -> []` start rule); carries no index (message text is not
+///   asserted by the conformance runner, only the variant).
 pub type ValidateError {
   TypeMismatch
   Underflow
@@ -281,6 +305,8 @@ pub type ValidateError {
   BadSelectType
   UnknownImportKind(detail: String)
   BadLaneIndex(index: Int)
+  UnknownTag(index: Int)
+  BadTagType
 }
 
 // ─────────────────────────────── validation context ───────────────────────────────
@@ -311,6 +337,10 @@ pub type ValidateError {
 ///   and reftype for `table.init`/`elem.drop`).
 /// - `refs`: `C.refs`, the module's declared function references (`ref.func x` is valid
 ///   only if `x ∈ refs`).
+/// - `tags` (Phase 7): the **operand types** of every tag by `tagidx` (imports ++
+///   defined), each resolved from its `type_idx` at module setup and verified to have
+///   empty results (§D). A `throw x` / `catch x l` / legacy `catch x` reads `ctx.tags[x]`
+///   for the tag's operands. Empty for a tag-free module (byte-identical to Phase 6).
 /// - `locals`: the current function's expanded local types (`params ++ declared`).
 type Ctx {
   Ctx(
@@ -323,6 +353,7 @@ type Ctx {
     data_count: Int,
     elem_types: List(ValType),
     refs: Set(Int),
+    tags: List(List(ValType)),
     locals: List(ValType),
   )
 }
@@ -339,12 +370,28 @@ type StackType {
 
 /// The opcode that opened a control frame — selects how the frame's label is typed
 /// and whether an else-less `if` needs the params==results check.
+///
+/// Phase 7 adds three LEGACY exception-handling frame kinds. All three are typed exactly
+/// like `KBlock` (their label targets the frame's RESULT types, `label_types` returns
+/// `end_types`, and their `end` produces the results) — they exist only so the legacy
+/// handler markers (`LegacyCatch`/`LegacyCatchAll`/`LegacyDelegate`) can dispatch on the
+/// kind of frame they close/re-open (a `catch`/`catch_all` handler may only follow the
+/// try body or a preceding `catch`, never a `catch_all`; a `delegate` may only close the
+/// bare try body). The MODERN `try_table` reuses `KBlock` directly (its body/label/`end`
+/// semantics are a block's), so it needs no new kind.
+///
+/// - `KTry`: an open legacy `try` body (`TryLegacy`), before any handler marker.
+/// - `KCatch`: a legacy `catch x` handler region (the tag's operands were pushed).
+/// - `KCatchAll`: a legacy `catch_all` handler region (no operands pushed).
 type FrameKind {
   KFunc
   KBlock
   KLoop
   KIf
   KElse
+  KTry
+  KCatch
+  KCatchAll
 }
 
 /// One control frame (spec appendix `ctrl_frame`).
@@ -578,6 +625,15 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
   let elem_types = list.map(module.elements, fn(e) { e.ref_ty })
   let data_count = list.length(module.data)
 
+  // The tag index space (Phase 7, EH proposal): imported tags occupy the low tagidx
+  // slots, defined tags follow. Each tag's `type_idx` is resolved against the type
+  // section and its type verified `[t*] -> []` (empty results, §D) — the single choke
+  // where an ill-typed tag is rejected. Empty for a tag-free module (byte-identical).
+  use imp_tags <- result.try(imported_tag_types(module))
+  use def_tags <- result.try(defined_tag_types(module))
+  let tags = list.append(imp_tags, def_tags)
+  let imported_tag_count = list.length(imp_tags)
+
   // Module-level structural checks (spec `valid/modules` / `valid/types`). Multi-
   // memory / multi-table caps are LIFTED (H3): every memory/table limit is validated.
   use _ <- result.try(list.try_each(all_memtypes, check_memory))
@@ -601,6 +657,7 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
       data_count: data_count,
       elem_types: elem_types,
       refs: refs,
+      tags: tags,
       locals: [],
     )
 
@@ -629,6 +686,8 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
     memory_idx_types: memories,
     elem_types: elem_types,
     refs: refs,
+    imported_tag_count: imported_tag_count,
+    tag_types: tags,
   ))
 }
 
@@ -692,6 +751,57 @@ fn resolve_func_types(module: Module) -> Result(List(FuncType), ValidateError) {
       Error(_) -> Error(UnknownType(f.type_idx))
     }
   })
+}
+
+/// The operand types of every **imported** tag, in import order (Phase 7, EH proposal).
+/// Each `ImportTag(type_idx)` is resolved against the type section (`Error(UnknownType(_))`
+/// if the typeidx is out of range) and its type verified `[t*] -> []` (`Error(BadTagType)`
+/// if the referenced type has non-empty results, §D); its **params** are collected as the
+/// tag's operand types. Non-tag imports are skipped. Imported tags occupy the low tagidx
+/// slots (spec `valid/modules`). Mirrors `imported_func_types`.
+fn imported_tag_types(
+  module: Module,
+) -> Result(List(List(ValType)), ValidateError) {
+  list.try_fold(module.imports, [], fn(acc, imp) {
+    case imp.desc {
+      ast.ImportTag(type_idx) -> {
+        use ops <- result.try(resolve_tag_type(module.types, type_idx))
+        Ok([ops, ..acc])
+      }
+      _ -> Ok(acc)
+    }
+  })
+  |> result.map(list.reverse)
+}
+
+/// The operand types of every **defined** tag (`Module.tags`), in section order (Phase 7).
+/// Each `Tag(type_idx)` is resolved + empty-results-checked identically to an imported tag
+/// (`resolve_tag_type`). Mirrors `resolve_func_types`.
+fn defined_tag_types(
+  module: Module,
+) -> Result(List(List(ValType)), ValidateError) {
+  list.try_map(module.tags, fn(t) { resolve_tag_type(module.types, t.type_idx) })
+}
+
+/// Resolve one tag's `type_idx` to its **operand types** (the referenced functype's
+/// params), enforcing the EH proposal's tag rule that a tag's type is `[t*] -> []`
+/// (spec `valid/modules`; `tag.wast`). `Error(UnknownType(type_idx))` if the typeidx is
+/// out of range; `Error(BadTagType)` if the referenced type has a **non-empty result
+/// list** (an exception carries operands but never returns). This is the single choke
+/// where a malformed tag is rejected — every use site then trusts `ctx.tags[x]` is a
+/// well-formed operand list.
+fn resolve_tag_type(
+  types: List(FuncType),
+  type_idx: Int,
+) -> Result(List(ValType), ValidateError) {
+  case nth(types, type_idx) {
+    Error(_) -> Error(UnknownType(type_idx))
+    Ok(ast.FuncType(params, results)) ->
+      case results {
+        [] -> Ok(params)
+        _ -> Error(BadTagType)
+      }
+  }
 }
 
 /// Validate one memory's address-width-relative limits: a 32-bit (`Idx32`) memory's
@@ -1167,20 +1277,98 @@ fn validate_instr(
         simd_lane_count(width),
       )
 
-    // exception handling («WASM-AST5», Phase 7). Every EH `Instr` constructor is
-    // intercepted HERE, BEFORE the `validate_numeric` fallthrough, so none reaches
-    // `numeric_sig`'s fail-OPEN `_ -> #([], [])` catch-all (T2 — the fail-closed
-    // security invariant; a genuinely-unsupported EH form must be a typed error, never
-    // a silent no-op). Real EH typing (both encodings) is P7-04's job; until then every
-    // arm fails closed with `Unsupported`.
-    ast.Throw(_)
-    | ast.ThrowRef
-    | ast.TryTable(_, _)
-    | ast.TryLegacy(_)
-    | ast.LegacyCatch(_)
-    | ast.LegacyCatchAll
-    | ast.LegacyDelegate(_)
-    | ast.Rethrow(_) -> Error(Unsupported("exception handling (P7-04)"))
+    // exception handling («WASM-AST5», Phase 7). Every EH `Instr` constructor — the
+    // three MODERN ops and the five LEGACY ops — is intercepted HERE with REAL typing,
+    // BEFORE the `validate_numeric` fallthrough, so none reaches `numeric_sig`'s
+    // fail-OPEN `_ -> #([], [])` catch-all (T2 — the fail-closed-COMPLETE security
+    // invariant: an ill-typed / mis-nested EH form is a typed `Error`, never a silent
+    // no-op). Both encodings are fully typed (they are the headline Porffor path); the
+    // spec-conformance-only modern surface (`throw_ref`/`try_table` catch-`_ref`) is
+    // typed uniformly through the same abstract stack.
+    // `throw x` (0x08): pop the tag's operand types (spec `[t1* t*] -> [t2*]`) then
+    // stack-polymorphic — a bottom, does NOT push (spec `throw` rule; §E.1).
+    ast.Throw(x) -> {
+      use operands <- result.try(tag_operands(ctx, x))
+      use st2 <- result.try(pop_vals(st, operands))
+      mark_unreachable(st2)
+    }
+    // `throw_ref` (0x0A): pop one `exnref` (spec `[t1* exnref] -> [t2*]`) then
+    // stack-polymorphic (§E.2). The null-`exnref` trap is RUNTIME, not validation.
+    ast.ThrowRef -> {
+      use st2 <- result.try(pop_expect(st, ast.ExnRef))
+      mark_unreachable(st2)
+    }
+    // `try_table bt catch*` (0x1F): a block-like structured opener whose body is typed
+    // against the blocktype (label targets its RESULT types, like `block`, so `KBlock`).
+    // Each catch clause constrains a target label to the catch-type — validated against
+    // the CURRENT label context, BEFORE the try_table's own frame is pushed (§F.2, a
+    // load-bearing timing: `catch x 0` targets the innermost ENCLOSING block).
+    ast.TryTable(bt, catches) -> {
+      use #(in_t, out_t) <- result.try(blocktype_types(bt, ctx.types))
+      use _ <- result.try(
+        list.try_each(catches, fn(c) { check_catch(st, ctx, c) }),
+      )
+      use st2 <- result.try(pop_vals(st, in_t))
+      Ok(push_ctrl(st2, KBlock, in_t, out_t))
+    }
+
+    // ── legacy EH (MEASURED: what Porffor 0.61.13 emits — the legacy exception-handling
+    // proposal's validation). `try` is a block-structured construct: the body region is
+    // typed against the blocktype, then each `catch`/`catch_all` handler region is typed
+    // with the tag's operands (resp. nothing) pushed against the SAME result types. The
+    // handler markers are the flat-stream analogue of `if`/`else`: `pop_ctrl` the current
+    // region (checking it produced the results), then `push_ctrl` a new region. ──
+    // `try bt` (0x06): open a `KTry` body region (label targets its results, like a
+    // block). Consumes the blocktype params, produces its results on a normal exit.
+    ast.TryLegacy(bt) -> {
+      use #(in_t, out_t) <- result.try(blocktype_types(bt, ctx.types))
+      use st2 <- result.try(pop_vals(st, in_t))
+      Ok(push_ctrl(st2, KTry, in_t, out_t))
+    }
+    // `catch x` (0x07): end the preceding region (the try body or an earlier `catch`) —
+    // which must have produced the try's result types — and begin the handler for tag
+    // `x` with the tag's OPERAND types pushed, typed against the same results. A `catch`
+    // may not follow a `catch_all` (spec grammar `catch* catch_all?`).
+    ast.LegacyCatch(x) -> {
+      use ops <- result.try(tag_operands(ctx, x))
+      use #(frame, st2) <- result.try(pop_ctrl(st))
+      use _ <- result.try(require_try_region(frame))
+      Ok(push_ctrl(st2, KCatch, ops, frame.end_types))
+    }
+    // `catch_all` (0x19): as `catch` but the handler receives NO operands. It is the last
+    // handler (nothing may follow it but `end`), so the region it closes must be a `KTry`
+    // body or a `KCatch` (never another `KCatchAll`).
+    ast.LegacyCatchAll -> {
+      use #(frame, st2) <- result.try(pop_ctrl(st))
+      use _ <- result.try(require_try_region(frame))
+      Ok(push_ctrl(st2, KCatchAll, [], frame.end_types))
+    }
+    // `delegate l` (0x18): closes the enclosing `try` body (REPLACING its `end`) and
+    // forwards an uncaught exception to the `l`-th enclosing construct. Value-stack
+    // effect is a block's (produce the results on normal exit); the frame it closes must
+    // be the bare `try` body (`KTry`, no handlers), and `l` must name an enclosing frame
+    // (resolved in the context OUTSIDE the try — `mis-nested`/out-of-range → UnknownLabel).
+    ast.LegacyDelegate(l) -> {
+      use #(frame, st2) <- result.try(pop_ctrl(st))
+      use _ <- result.try(case frame.kind {
+        KTry -> Ok(Nil)
+        _ -> Error(UnexpectedEnd)
+      })
+      use _ <- result.try(label_frame(st2, l))
+      Ok(push_vals(st2, frame.end_types))
+    }
+    // `rethrow l` (0x09): re-raise the exception caught by the `l`-th enclosing handler —
+    // stack-polymorphic (a bottom, like `throw`). `l` must name an enclosing `catch`/
+    // `catch_all` handler frame; a label that is out of range OR does not denote a catch
+    // handler is `UnknownLabel` (there is no catch label at that depth).
+    ast.Rethrow(l) -> {
+      use frame <- result.try(label_frame(st, l))
+      use _ <- result.try(case frame.kind {
+        KCatch | KCatchAll -> Ok(Nil)
+        _ -> Error(UnknownLabel(l))
+      })
+      mark_unreachable(st)
+    }
 
     // numeric / comparison / conversion / float leaves --------------------------
     _ -> validate_numeric(st, instr)
@@ -1605,12 +1793,95 @@ fn check_simd_store_lane(
 
 // ─────────────────────────────── reference / index-space helpers ───────────────────────────────
 
-/// `True` iff `vt` is one of the two MVP reference types (`FuncRef`/`ExternRef`). Used
-/// by `ref.is_null`/untyped-`select` (which are reference-polymorphic / number-only).
+/// `True` iff `vt` is a reference type — the two MVP reftypes (`FuncRef`/`ExternRef`)
+/// plus, Phase 7, `ExnRef` (`exnref` IS a reference type per the EH proposal). Used by
+/// `ref.is_null`/untyped-`select` (reference-polymorphic / number-only). Adding `ExnRef`
+/// here (the ONE load-bearing predicate edit) makes both spec-correct for `exnref` with
+/// no further code: untyped `select` of two `exnref`s is rejected (`BadSelectType`, a
+/// reftype is not number/vector-typed, §C.3) and `ref.is_null` on an `exnref` is accepted
+/// (`exnref` is nullable, §C.4). `V128` stays a NON-reference (it is a vector type).
 fn is_reftype(vt: ValType) -> Bool {
   case vt {
-    ast.FuncRef | ast.ExternRef -> True
+    ast.FuncRef | ast.ExternRef | ast.ExnRef -> True
     _ -> False
+  }
+}
+
+/// The operand types of tag `tagidx` (Phase 7): `ctx.tags[tagidx]` (imports ++ defined),
+/// or `Error(UnknownTag(tagidx))` if out of range of the module's tag index space (spec:
+/// the EH proposal requires `C.tags[x]` to exist). Read by `throw`, `try_table`'s catch
+/// clauses, and legacy `catch`.
+fn tag_operands(ctx: Ctx, tagidx: Int) -> Result(List(ValType), ValidateError) {
+  case nth(ctx.tags, tagidx) {
+    Ok(ops) -> Ok(ops)
+    Error(_) -> Error(UnknownTag(tagidx))
+  }
+}
+
+/// A legacy `catch`/`catch_all` handler may only follow the try body (`KTry`) or an
+/// earlier `catch` (`KCatch`) — never a `catch_all` (`KCatchAll`) or a non-try frame
+/// (spec grammar `try bt instr* (catch x instr*)* (catch_all instr*)? end`). Any other
+/// frame kind is a mis-nested handler → `Error(UnexpectedEnd)`.
+fn require_try_region(frame: CtrlFrame) -> Result(Nil, ValidateError) {
+  case frame.kind {
+    KTry | KCatch -> Ok(Nil)
+    _ -> Error(UnexpectedEnd)
+  }
+}
+
+/// Type one `try_table` catch clause (Phase 7, EH proposal; §F.1): the clause's target
+/// label must accept the *catch-type* — the values the handler receives — resolved in the
+/// CURRENT label context (`st`, before the try_table's own frame is pushed, §F.2):
+///
+/// | clause          | catch-type (`required` label types)        |
+/// |-----------------|--------------------------------------------|
+/// | `catch x l`     | `[t*]` (tag x's operands)                  |
+/// | `catch_ref x l` | `[t* exnref]` (operands, then `exnref` on top) |
+/// | `catch_all l`   | `[]`                                       |
+/// | `catch_all_ref l` | `[exnref]`                               |
+///
+/// `Error(UnknownTag(x))` if a tag is out of range; the label check is `check_catch_label`.
+fn check_catch(
+  st: VState,
+  ctx: Ctx,
+  c: ast.Catch,
+) -> Result(Nil, ValidateError) {
+  case c {
+    ast.Catch(x, l) -> {
+      use ops <- result.try(tag_operands(ctx, x))
+      check_catch_label(st, l, ops)
+    }
+    ast.CatchRef(x, l) -> {
+      use ops <- result.try(tag_operands(ctx, x))
+      check_catch_label(st, l, list.append(ops, [ast.ExnRef]))
+    }
+    ast.CatchAll(l) -> check_catch_label(st, l, [])
+    ast.CatchAllRef(l) -> check_catch_label(st, l, [ast.ExnRef])
+  }
+}
+
+/// A `try_table` catch clause's target label must have types EXACTLY equal to `required`
+/// (the catch-type). Because the 2core MVP has no GC subtyping (the value types are
+/// pairwise-incomparable), the match is structural equality — a supertype rule is
+/// unnecessary (§F.1). `Error(UnknownLabel(label))` if the label is out of range; a wrong
+/// **arity** → `BranchArityMismatch` (as `br_table`); a wrong **element type** →
+/// `TypeMismatch` (the caught values are branched to the label, so a label disagreement
+/// IS a branch-target arity/type mismatch — the spec-honest reuse of the existing
+/// vocabulary, §B.1 D3).
+fn check_catch_label(
+  st: VState,
+  label: Int,
+  required: List(ValType),
+) -> Result(Nil, ValidateError) {
+  use frame <- result.try(label_frame(st, label))
+  let lt = label_types(frame)
+  case list.length(lt) == list.length(required) {
+    False -> Error(BranchArityMismatch)
+    True ->
+      case lt == required {
+        True -> Ok(Nil)
+        False -> Error(TypeMismatch)
+      }
   }
 }
 
@@ -1936,16 +2207,14 @@ fn check_data(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
 fn check_exports(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
   use _ <- result.try(check_export_names_unique(module.exports))
   list.try_each(module.exports, fn(ex) {
-    // A tag export (`ExportTag`, Phase 7) has no wired index space yet, so `count`
-    // is 0 → the range check always fails → the fail-closed `Unsupported` arm below.
-    // Real tag-export typing is P7-04's; no current fixture exports a tag, so this is
-    // byte-identical.
+    // A tag export (`ExportTag`, Phase 7) range-checks its index against the tag index
+    // space (imports ++ defined); the link-time tag *satisfaction* is downstream (§G).
     let count = case ex.kind {
       ast.ExportFunc -> list.length(ctx.func_types)
       ast.ExportTable -> list.length(ctx.tables)
       ast.ExportMemory -> list.length(ctx.memories)
       ast.ExportGlobal -> list.length(ctx.globals)
-      ast.ExportTag -> 0
+      ast.ExportTag -> list.length(ctx.tags)
     }
     case ex.index >= 0 && ex.index < count {
       True -> Ok(Nil)
@@ -1955,7 +2224,7 @@ fn check_exports(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
           ast.ExportTable -> Error(UnknownTable(ex.index))
           ast.ExportMemory -> Error(UnknownMemory(ex.index))
           ast.ExportGlobal -> Error(UnknownGlobal(ex.index))
-          ast.ExportTag -> Error(Unsupported("tag export (P7-04)"))
+          ast.ExportTag -> Error(UnknownTag(ex.index))
         }
     }
   })

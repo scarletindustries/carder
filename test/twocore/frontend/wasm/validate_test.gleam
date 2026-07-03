@@ -12,9 +12,13 @@
 //// validation). Each invalid module decodes successfully — the failure is a typing
 //// fault, exactly what `validate` must catch.
 
+import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/set
+import gleam/string
 import gleeunit/should
+import simplifile
 import twocore/frontend/wasm/ast
 import twocore/frontend/wasm/decode
 import twocore/frontend/wasm/validate
@@ -2934,3 +2938,828 @@ const select_i32_wasm: BitArray = <<
   27,
   11,
 >>
+
+// ═══════════════════════ Phase 7 (unit P7-04) exception-handling typing ═══════════════════════
+// Assertions target the WebAssembly EXCEPTION-HANDLING proposal's validation rules
+// (https://github.com/WebAssembly/exception-handling/blob/main/proposals/exception-handling/Exceptions.md
+// — the MODERN surface: tags, `throw`, `throw_ref`, `try_table`; and the LEGACY surface
+// Porffor 0.61.13 actually emits: `try`/`catch`/`catch_all`/`delegate`/`rethrow`), plus
+// the core-spec parametric/reference rules for `exnref`. Never change-detector tests:
+// each cites the rule it encodes. Modules are hand-built (decode of EH is P7-03's; here
+// we exercise the *typing rule* directly), except the real-Porffor acceptance proof which
+// decodes measured bytes end-to-end.
+
+/// An EH-module builder exposing the fields the exception-handling tests exercise
+/// (types, imports, tags, funcs, exports); the plain `module` helper fixes them empty.
+fn eh_mod(
+  types types: List(ast.FuncType),
+  imports imports: List(ast.Import),
+  tags tags: List(ast.Tag),
+  funcs funcs: List(ast.Func),
+  exports exports: List(ast.Export),
+) -> ast.Module {
+  ast.Module(
+    imported_func_count: 0,
+    types: types,
+    imports: imports,
+    tables: [],
+    memories: [],
+    globals: [],
+    tags: tags,
+    funcs: funcs,
+    start: None,
+    elements: [],
+    data: [],
+    data_count: None,
+    exports: exports,
+  )
+}
+
+/// A raw byte list → `BitArray` (for the measured-Porffor module).
+fn to_bytes(xs: List(Int)) -> BitArray {
+  list.fold(xs, <<>>, fn(acc, b) { <<acc:bits, b:size(8)>> })
+}
+
+// ── acceptance (must be Ok, carrying a correct TypedModule) ──
+
+/// A tag whose type is `[i32 i64] -> []` is well-typed; the `TypedModule` carries
+/// `tag_types = [[i32, i64]]`, `imported_tag_count = 0` (spec tag rule; `tag.wast`).
+pub fn accept_tag_decl_test() {
+  let assert Ok(tm) =
+    eh_mod(
+      types: [ft([ast.I32, ast.I64], [])],
+      imports: [],
+      tags: [ast.Tag(0)],
+      funcs: [],
+      exports: [],
+    )
+    |> validate.validate()
+  tm.tag_types
+  |> should.equal([[ast.I32, ast.I64]])
+  tm.imported_tag_count
+  |> should.equal(0)
+}
+
+/// `throw x` pops the tag's operands then is STACK-POLYMORPHIC (a bottom): a function
+/// `(param i32 i64) (result f64)` whose body is `local.get 0; local.get 1; throw 0` is
+/// accepted — the missing `f64` result is fine because `throw` never falls through
+/// (spec `throw` rule; `throw.wast`).
+pub fn accept_throw_polymorphic_test() {
+  eh_mod(
+    types: [ft([ast.I32, ast.I64], []), ft([ast.I32, ast.I64], [ast.F64])],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [ast.LocalGet(0), ast.LocalGet(1), ast.Throw(0), ast.End]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// `try_table (catch 0 $l)` where `$l` is an enclosing `block (result i32 i64)` (tag 0's
+/// operands) is accepted — the catch clause's target label accepts the tag operands (spec
+/// `try_table` rule; `try_table.wast`). Structure: `block[]->[i32 i64] { try_table[]->[]
+/// (catch 0 label0) end  i32.const  i64.const } → [i32 i64]`.
+pub fn accept_try_table_catch_test() {
+  // type 0 = tag [i32 i64]->[]; type 1 = fn []->[i32 i64]; type 2 = block []->[i32 i64]
+  eh_mod(
+    types: [
+      ft([ast.I32, ast.I64], []),
+      ft([], [ast.I32, ast.I64]),
+      ft([], [ast.I32, ast.I64]),
+    ],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.Block(ast.BlockTypeIdx(2)),
+        ast.TryTable(ast.BlockEmpty, [ast.Catch(0, 0)]),
+        ast.End,
+        ast.I32Const(0),
+        ast.I64Const(0),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// `catch_ref 0 $l` where `$l` is a `block (result i32 i64 exnref)` — the operands THEN an
+/// `exnref` on top — is accepted (the operand-then-exnref catch-type order; `try_table.wast`).
+pub fn accept_try_table_catch_ref_test() {
+  eh_mod(
+    types: [
+      ft([ast.I32, ast.I64], []),
+      ft([], [ast.I32, ast.I64, ast.ExnRef]),
+      ft([], [ast.I32, ast.I64, ast.ExnRef]),
+    ],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.Block(ast.BlockTypeIdx(2)),
+        ast.TryTable(ast.BlockEmpty, [ast.CatchRef(0, 0)]),
+        ast.End,
+        ast.I32Const(0),
+        ast.I64Const(0),
+        ast.RefNull(ast.ExnRef),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// `catch_all $l` where `$l` is a `block` with empty result, and `catch_all_ref $l` where
+/// `$l` is a `block (result exnref)` — both accepted (`try_table.wast`).
+pub fn accept_try_table_catch_all_test() {
+  // catch_all → empty-result block (label 0)
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.Block(ast.BlockEmpty),
+        ast.TryTable(ast.BlockEmpty, [ast.CatchAll(0)]),
+        ast.End,
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+pub fn accept_try_table_catch_all_ref_test() {
+  // catch_all_ref → block (result exnref) (label 0)
+  eh_mod(
+    types: [ft([], []), ft([], [ast.ExnRef]), ft([], [ast.ExnRef])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.Block(ast.BlockTypeIdx(1)),
+        ast.TryTable(ast.BlockEmpty, [ast.CatchAllRef(0)]),
+        ast.End,
+        ast.RefNull(ast.ExnRef),
+        ast.End,
+        ast.Drop,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// `throw_ref` pops an `exnref` then is stack-polymorphic: `(param exnref) (result i32)`
+/// with body `local.get 0; throw_ref` is accepted — the missing `i32` result is fine
+/// (spec `throw_ref` rule; `throw_ref.wast`).
+pub fn accept_throw_ref_polymorphic_test() {
+  eh_mod(
+    types: [ft([ast.ExnRef], [ast.I32])],
+    imports: [],
+    tags: [],
+    funcs: [func_(0, [ast.LocalGet(0), ast.ThrowRef, ast.End])],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// `exnref` is a first-class value type: a function `(param exnref) (result exnref)` that
+/// returns its parameter type-checks through the generic abstract stack (no EH machinery).
+pub fn accept_exnref_valtype_test() {
+  eh_mod(
+    types: [ft([ast.ExnRef], [ast.ExnRef])],
+    imports: [],
+    tags: [],
+    funcs: [func_(0, [ast.LocalGet(0), ast.End])],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// Typed `select (ref null exn)` of two `exnref`s is accepted — a reference type is legal
+/// for the TYPED select form (spec parametric rule; `select.wast`).
+pub fn accept_select_t_exnref_test() {
+  eh_mod(
+    types: [ft([ast.ExnRef, ast.ExnRef, ast.I32], [ast.ExnRef])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.LocalGet(0),
+        ast.LocalGet(1),
+        ast.LocalGet(2),
+        ast.SelectT([ast.ExnRef]),
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// `ref.is_null` on an `exnref` is accepted — `exnref` is nullable, so a null-test is
+/// meaningful (spec `ref.is_null` rule; §C.4).
+pub fn accept_ref_is_null_exnref_test() {
+  eh_mod(
+    types: [ft([ast.ExnRef], [ast.I32])],
+    imports: [],
+    tags: [],
+    funcs: [func_(0, [ast.LocalGet(0), ast.RefIsNull, ast.End])],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// An IMPORTED tag `(import "" "e" (tag (param f64 i32)))` used by `throw 0` types into
+/// the low tagidx slot; `throw` checks against the declared `[f64 i32]` (spec imports; the
+/// Porffor-ABI `(tag (param f64 i32))` shape). `imported_tag_count = 1`.
+pub fn accept_imported_tag_throw_test() {
+  let assert Ok(tm) =
+    eh_mod(
+      types: [ft([ast.F64, ast.I32], []), ft([ast.F64, ast.I32], [])],
+      imports: [ast.Import("", "e", ast.ImportTag(0))],
+      tags: [],
+      funcs: [
+        func_(1, [ast.LocalGet(0), ast.LocalGet(1), ast.Throw(0), ast.End]),
+      ],
+      exports: [],
+    )
+    |> validate.validate()
+  tm.imported_tag_count
+  |> should.equal(1)
+  tm.tag_types
+  |> should.equal([[ast.F64, ast.I32]])
+}
+
+/// A nested `try_table` whose `catch` targets an OUTER block's label is accepted — the
+/// catch label resolves in the enclosing label context (§F.2). Structure: `block[]->[i32
+/// i64] { try_table[]->[] (catch 0 label1 = outer block) end  i32.const  i64.const }`.
+pub fn accept_nested_try_table_outer_label_test() {
+  eh_mod(
+    types: [
+      ft([ast.I32, ast.I64], []),
+      ft([], [ast.I32, ast.I64]),
+      ft([], [ast.I32, ast.I64]),
+    ],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.Block(ast.BlockTypeIdx(2)),
+        // inner block (label 0), try_table's catch targets label 1 = the OUTER block
+        ast.Block(ast.BlockEmpty),
+        ast.TryTable(ast.BlockEmpty, [ast.Catch(0, 1)]),
+        ast.End,
+        ast.End,
+        ast.I32Const(0),
+        ast.I64Const(0),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// A well-typed LEGACY `try [] catch 0 end` validates: the body produces `[]`, the handler
+/// receives tag 0's operands `[i32 i64]` and must consume them to produce `[]` (legacy EH
+/// proposal — `catch x` pushes the tag operands). Porffor's headline path.
+pub fn accept_legacy_try_catch_test() {
+  eh_mod(
+    types: [ft([ast.I32, ast.I64], []), ft([], [])],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.TryLegacy(ast.BlockEmpty),
+        // body: [] -> []
+        ast.LegacyCatch(0),
+        // handler starts with [i32 i64] on the stack; drop both → []
+        ast.Drop,
+        ast.Drop,
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// A well-typed legacy `try [] catch_all end`: the catch-all handler receives NO operands
+/// and produces `[]` (legacy EH proposal — `catch_all` pushes nothing).
+pub fn accept_legacy_try_catch_all_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.TryLegacy(ast.BlockEmpty),
+        ast.LegacyCatchAll,
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// A legacy `try [] delegate 0` inside an enclosing block delegates an uncaught exception
+/// to the enclosing construct; the value-stack effect is a block's (legacy EH proposal).
+pub fn accept_legacy_delegate_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.Block(ast.BlockEmpty),
+        ast.TryLegacy(ast.BlockEmpty),
+        ast.LegacyDelegate(0),
+        // delegate closes the try (label 0 = the enclosing block)
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// A legacy `rethrow 0` inside a `catch` handler re-raises the caught exception — it is
+/// stack-polymorphic and its label names the enclosing `catch` handler (legacy EH proposal).
+pub fn accept_legacy_rethrow_test() {
+  eh_mod(
+    types: [ft([], []), ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(1, [
+        ast.TryLegacy(ast.BlockEmpty),
+        ast.LegacyCatchAll,
+        // inside the catch_all handler, rethrow 0 targets THIS handler frame
+        ast.Rethrow(0),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+/// The REAL measured Porffor 0.61.13 `try { throw } catch {}` module (the full 331-byte
+/// `npx porffor wasm trycatch.js` output — legacy `try`/`catch`/`throw` + a `(tag (param
+/// f64 i32))` + tag export) VALIDATES: it is a valid module, so the security boundary must
+/// ACCEPT it (the headline Porffor legacy path).
+pub fn accept_real_porffor_legacy_module_test() {
+  let assert Ok(m) = decode.decode(to_bytes(porffor_legacy_eh_module))
+  m
+  |> validate.validate()
+  |> result.is_ok()
+  |> should.equal(True)
+}
+
+// ── rejection (must be the cited Error) ──
+
+/// A tag whose type is `[i32] -> [i32]` (non-empty results) is rejected `BadTagType` —
+/// the EH proposal requires `[t*] -> []` (spec tag rule; `tag.wast` assert_invalid).
+pub fn reject_tag_with_results_test() {
+  eh_mod(
+    types: [ft([ast.I32], [ast.I32])],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BadTagType))
+}
+
+/// A tag whose `type_idx` is out of range is rejected `UnknownType` (a DECLARATION error,
+/// distinct from a use-site `UnknownTag`; spec tag rule).
+pub fn reject_tag_unknown_type_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [ast.Tag(9)],
+    funcs: [],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownType(9)))
+}
+
+/// `throw 5` with only one tag declared is rejected `UnknownTag(5)` — the tagidx must be
+/// in range of the tag index space (spec: `C.tags[x]` must exist; `throw.wast`).
+pub fn reject_throw_unknown_tag_test() {
+  eh_mod(
+    types: [ft([], []), ft([], [])],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [func_(1, [ast.Throw(5), ast.End])],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownTag(5)))
+}
+
+/// `throw 0` fed the WRONG operand types (tag wants `[i32 i64]`, given `[f32 f64]`) is
+/// rejected `TypeMismatch` (spec `throw` operand-match rule; `throw.wast`).
+pub fn reject_throw_wrong_operands_test() {
+  eh_mod(
+    types: [ft([ast.I32, ast.I64], []), ft([ast.F32, ast.F64], [])],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [ast.LocalGet(0), ast.LocalGet(1), ast.Throw(0), ast.End]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// `throw 0` for a tag `[i32 i64]` fed its operands REVERSED (i64 then i32) is rejected
+/// `TypeMismatch` — the tag operands are popped last-declared-first (top-of-stack), so a
+/// reversed feed mis-matches (guards a reversed `pop_vals`; spec `throw` rule).
+pub fn reject_throw_operand_order_test() {
+  eh_mod(
+    types: [ft([ast.I32, ast.I64], []), ft([ast.I64, ast.I32], [])],
+    imports: [],
+    tags: [ast.Tag(0)],
+    // params are (i64 i32); pushing local.get 0 (i64) then local.get 1 (i32) puts i32 on
+    // top — but the tag wants i64 on top (its last operand), so this is a mismatch.
+    funcs: [
+      func_(1, [ast.LocalGet(0), ast.LocalGet(1), ast.Throw(0), ast.End]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// `throw_ref` fed a non-`exnref` (an `i32`) is rejected `TypeMismatch` (spec `throw_ref`
+/// rule; `throw_ref.wast`).
+pub fn reject_throw_ref_non_exnref_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.ThrowRef, ast.End])],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// A `catch 0 $l` whose label `$l` has the WRONG ARITY for the tag's operands (label
+/// `[i32]` for a tag `[i32 i64]`) is rejected `BranchArityMismatch` (spec `try_table`
+/// catch-type rule; `try_table.wast`).
+pub fn reject_catch_wrong_arity_test() {
+  eh_mod(
+    types: [
+      ft([ast.I32, ast.I64], []),
+      ft([], [ast.I32]),
+      ft([], [ast.I32]),
+    ],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.Block(ast.BlockTypeIdx(2)),
+        ast.TryTable(ast.BlockEmpty, [ast.Catch(0, 0)]),
+        ast.End,
+        ast.I32Const(0),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BranchArityMismatch))
+}
+
+/// A `catch_ref 0 $l` whose label is MISSING the `exnref` (label `[i32 i64]` where `[i32
+/// i64 exnref]` is required) is rejected `BranchArityMismatch` (spec `try_table` catch-type
+/// rule; `try_table.wast`).
+pub fn reject_catch_ref_missing_exnref_test() {
+  eh_mod(
+    types: [
+      ft([ast.I32, ast.I64], []),
+      ft([], [ast.I32, ast.I64]),
+      ft([], [ast.I32, ast.I64]),
+    ],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.Block(ast.BlockTypeIdx(2)),
+        ast.TryTable(ast.BlockEmpty, [ast.CatchRef(0, 0)]),
+        ast.End,
+        ast.I32Const(0),
+        ast.I64Const(0),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BranchArityMismatch))
+}
+
+/// A `catch_ref 0 $l` whose label ELEMENT TYPES disagree (label `[i32 f64 exnref]` for a
+/// tag `[i32 i64]`) is rejected `TypeMismatch` (right arity, wrong type; `try_table.wast`).
+pub fn reject_catch_ref_wrong_types_test() {
+  eh_mod(
+    types: [
+      ft([ast.I32, ast.I64], []),
+      ft([], [ast.I32, ast.F64, ast.ExnRef]),
+      ft([], [ast.I32, ast.F64, ast.ExnRef]),
+    ],
+    imports: [],
+    tags: [ast.Tag(0)],
+    funcs: [
+      func_(1, [
+        ast.Block(ast.BlockTypeIdx(2)),
+        ast.TryTable(ast.BlockEmpty, [ast.CatchRef(0, 0)]),
+        ast.End,
+        ast.I32Const(0),
+        ast.F64Const(0),
+        ast.RefNull(ast.ExnRef),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// A `catch_all $l` whose label is non-empty (`[i32]`) is rejected `BranchArityMismatch`
+/// — a `catch_all` catch-type is `[]` (spec `try_table` rule; `try_table.wast`).
+pub fn reject_catch_all_nonempty_label_test() {
+  eh_mod(
+    types: [ft([], [ast.I32]), ft([], [ast.I32])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.Block(ast.BlockTypeIdx(1)),
+        ast.TryTable(ast.BlockEmpty, [ast.CatchAll(0)]),
+        ast.End,
+        ast.I32Const(0),
+        ast.End,
+        ast.Drop,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BranchArityMismatch))
+}
+
+/// A `try_table` catch clause naming an out-of-range tag (`catch 5`) is rejected
+/// `UnknownTag(5)` (spec `try_table` rule; `try_table.wast`).
+pub fn reject_try_table_unknown_tag_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.Block(ast.BlockEmpty),
+        ast.TryTable(ast.BlockEmpty, [ast.Catch(5, 0)]),
+        ast.End,
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownTag(5)))
+}
+
+/// A `try_table` catch clause whose label exceeds the enclosing control depth is rejected
+/// `UnknownLabel` (spec `try_table` — the label must exist in `C`; `try_table.wast`).
+pub fn reject_try_table_unknown_label_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.TryTable(ast.BlockEmpty, [ast.CatchAll(9)]),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownLabel(9)))
+}
+
+/// An UNTYPED `select` of two `exnref`s is rejected `BadSelectType` — a reference type is
+/// invalid for untyped select (spec parametric rule; `select.wast`-style assert_invalid).
+pub fn reject_untyped_select_exnref_test() {
+  eh_mod(
+    types: [ft([ast.ExnRef, ast.ExnRef, ast.I32], [ast.ExnRef])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.LocalGet(0),
+        ast.LocalGet(1),
+        ast.LocalGet(2),
+        ast.Select,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.BadSelectType))
+}
+
+/// A legacy `catch` naming an out-of-range tag is rejected `UnknownTag` (legacy EH — the
+/// handler's tag must exist).
+pub fn reject_legacy_catch_unknown_tag_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.TryLegacy(ast.BlockEmpty),
+        ast.LegacyCatch(3),
+        ast.End,
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownTag(3)))
+}
+
+/// A legacy `delegate` whose label is out of range of the enclosing control frames is
+/// rejected `UnknownLabel` (a mis-nested delegate; legacy EH proposal — the delegate
+/// target must exist).
+pub fn reject_legacy_delegate_bad_label_test() {
+  eh_mod(
+    types: [ft([], [])],
+    imports: [],
+    tags: [],
+    funcs: [
+      func_(0, [
+        ast.TryLegacy(ast.BlockEmpty),
+        ast.LegacyDelegate(9),
+        ast.End,
+      ]),
+    ],
+    exports: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownLabel(9)))
+}
+
+// ── properties ──
+
+/// Conformance-neutral (J6): a Phase-1..6 module (no tag section, no EH instruction)
+/// validates with `imported_tag_count = 0` and `tag_types = []` — the EH path is never
+/// entered (the headline neutrality proof).
+pub fn conformance_neutral_no_eh_test() {
+  let assert Ok(tm) = validated(add_wasm)
+  tm.imported_tag_count
+  |> should.equal(0)
+  tm.tag_types
+  |> should.equal([])
+}
+
+/// AST-only boundary: `validate.gleam` imports NO `twocore/ir` — its conformance gates
+/// independently of the backend, `rt_exn`, and the Porffor shim (§Properties).
+pub fn validate_has_no_ir_import_test() {
+  let assert Ok(src) =
+    simplifile.read("src/twocore/frontend/wasm/validate.gleam")
+  string.contains(src, "twocore/ir")
+  |> should.equal(False)
+}
+
+/// Fail-closed-COMPLETE (T2 / §H): every EH `Instr` constructor is intercepted with a real
+/// typing arm BEFORE the `numeric_sig` fail-OPEN fallthrough — grep-assert that all eight
+/// EH constructor arms (`Throw`/`ThrowRef`/`TryTable` + legacy `TryLegacy`/`LegacyCatch`/
+/// `LegacyCatchAll`/`LegacyDelegate`/`Rethrow`) appear in `validate_instr` BEFORE the
+/// `_ -> validate_numeric(st, instr)` fallthrough, so none can be waved through as a no-op.
+pub fn eh_arms_precede_numeric_fallthrough_test() {
+  let assert Ok(src) =
+    simplifile.read("src/twocore/frontend/wasm/validate.gleam")
+  // Strip comment-only lines so prose naming an op does not confuse the ordering check.
+  let code =
+    src
+    |> string.split("\n")
+    |> list.filter(fn(line) {
+      !string.starts_with(string.trim_start(line), "//")
+    })
+    |> string.join("\n")
+  let assert Ok(#(before, _after)) =
+    string.split_once(code, "_ -> validate_numeric(st, instr)")
+  // The placeholder P7-03 stub must be gone (real arms replaced it).
+  string.contains(code, "exception handling (P7-04)")
+  |> should.equal(False)
+  // Each EH constructor's real arm precedes the numeric fallthrough.
+  list.each(
+    [
+      "ast.Throw(x) ->",
+      "ast.ThrowRef ->",
+      "ast.TryTable(bt, catches) ->",
+      "ast.TryLegacy(bt) ->",
+      "ast.LegacyCatch(x) ->",
+      "ast.LegacyCatchAll ->",
+      "ast.LegacyDelegate(l) ->",
+      "ast.Rethrow(l) ->",
+    ],
+    fn(arm) {
+      string.contains(before, arm)
+      |> should.equal(True)
+    },
+  )
+}
+
+// The FULL 331-byte output of `npx porffor wasm trycatch.js` (Porffor 0.61.13), a JS
+// `try { throw } catch {}` — legacy `try`/`catch`/`throw` + `(tag (param f64 i32))` + tag
+// export. A VALID module: `validate` must accept it (the measured Porffor legacy path).
+const porffor_legacy_eh_module: List(Int) = [
+  0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x1C, 0x04, 0x60, 0x00,
+  0x02, 0x7C, 0x7F, 0x60, 0x06, 0x7C, 0x7F, 0x7C, 0x7F, 0x7C, 0x7F, 0x02, 0x7C,
+  0x7F, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F, 0x60, 0x02, 0x7C, 0x7F, 0x00, 0x03,
+  0x04, 0x03, 0x00, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01, 0x0D, 0x03, 0x01,
+  0x00, 0x03, 0x07, 0x0D, 0x03, 0x01, 0x24, 0x02, 0x00, 0x01, 0x30, 0x04, 0x00,
+  0x01, 0x6D, 0x00, 0x00, 0x0A, 0x80, 0x02, 0x03, 0x29, 0x01, 0x01, 0x7F, 0x44,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x44, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x14, 0x40, 0x41, 0x01, 0x10, 0x01, 0x22, 0x00, 0x0B, 0xB0, 0x01,
+  0x06, 0x01, 0x7C, 0x01, 0x7F, 0x01, 0x7C, 0x01, 0x7F, 0x01, 0x7C, 0x01, 0x7F,
+  0x06, 0x40, 0x20, 0x04, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x64, 0xB8, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x04,
+  0x40, 0x20, 0x04, 0x20, 0x05, 0x08, 0x00, 0x1A, 0x0B, 0x44, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0xF0, 0x3F, 0x21, 0x06, 0x41, 0x01, 0x21, 0x07, 0x20, 0x00,
+  0xFC, 0x03, 0x04, 0x40, 0x20, 0x06, 0xFC, 0x02, 0x20, 0x07, 0x10, 0x02, 0x45,
+  0x04, 0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B, 0x0B, 0x20, 0x06, 0x20, 0x07,
+  0x0F, 0x1A, 0x07, 0x00, 0x21, 0x09, 0x22, 0x08, 0x21, 0x0A, 0x20, 0x09, 0x21,
+  0x0B, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x21, 0x06, 0x41,
+  0x01, 0x21, 0x07, 0x20, 0x00, 0xFC, 0x03, 0x04, 0x40, 0x20, 0x06, 0xFC, 0x02,
+  0x20, 0x07, 0x10, 0x02, 0x45, 0x04, 0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B,
+  0x0B, 0x20, 0x06, 0x20, 0x07, 0x0F, 0x1A, 0x0B, 0x20, 0x00, 0xFC, 0x03, 0x04,
+  0x40, 0x20, 0x02, 0x20, 0x03, 0x0F, 0x0B, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x41, 0x00, 0x0F, 0x0B, 0x22, 0x01, 0x01, 0x7F, 0x20, 0x01,
+  0x21, 0x02, 0x20, 0x00, 0x41, 0x00, 0x47, 0x20, 0x02, 0x41, 0x05, 0x4A, 0x71,
+  0x20, 0x02, 0x41, 0xC3, 0x00, 0x47, 0x71, 0x20, 0x02, 0x41, 0xC3, 0x01, 0x47,
+  0x71, 0x0F, 0x0B, 0x0B, 0x01, 0x00,
+]

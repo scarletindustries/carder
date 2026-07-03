@@ -577,6 +577,8 @@ pub fn nonconst_init_fail_closed_test() {
       memory_idx_types: [],
       elem_types: [],
       refs: set.new(),
+      imported_tag_count: 0,
+      tag_types: [],
     )
   case lower.lower(tm) {
     Error(lower.NonConstInitExpr(_)) -> True
