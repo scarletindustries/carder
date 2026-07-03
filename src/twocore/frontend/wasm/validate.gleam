@@ -39,6 +39,26 @@
 //// widths, the per-kind imported counts, and `C.refs`, so lowering (P5-05) never
 //// re-derives them.
 ////
+//// Phase 6 (unit P6-04) closes the last gap in the standardized surface — again
+//// keeping the polymorphic-stack / label machinery verbatim. It types the
+//// **fixed-width SIMD** instruction set (`«WASM-AST4»`): `v128` as a vector value
+//// type on the abstract stack (permitted by untyped `select`, rejected by
+//// `ref.is_null` — it is NOT a reference type), the pure lane-wise ops
+//// (`ast.Simd(op)`, exhaustive on `SimdOp`) with their spec abstract-stack
+//// signatures (comparisons yield a `v128` lane **mask**, not `i32`), the lane-immediate
+//// bounds (`extract_lane`/`replace_lane` `lane < dim`, `i8x16.shuffle` indices `< 32`,
+//// `load/store{N}_lane` `lane < 128/N`) as `BadLaneIndex`, and the v128 memory family
+//// (`SimdLoad`/`SimdStore`/`SimdLoadLane`/`SimdStoreLane`) routed through the SAME
+//// `mem_addr_type`/`check_align`/`check_offset` seam as scalar loads (so `v128.load` on
+//// a 64-bit memory pops an `i64` address — the memory64 seam). Every SIMD `Instr` is
+//// intercepted BEFORE the `numeric_sig` fallthrough (S1 — the fail-closed security
+//// invariant): an ill-typed / out-of-range-lane / over-aligned SIMD program is
+//// REJECTED, never silently accepted. memory64 typing (P5) is re-confirmed spec-complete
+//// (its runtime now lands in Phase 6), and cross-module function-import typing is
+//// unchanged — a `call` to an imported function type-checks against its declared
+//// `FuncType` in the imports-first func space (the link-time satisfaction is P6-09's).
+//// A module with no `v128` validates **byte-identically** to Phase 5 (I7).
+////
 //// Strength: **`full`** (the only Phase-1 strength — required for untrusted input;
 //// `subset`/`assume_valid` are deferred and are NOT a default, D9).
 
@@ -192,10 +212,19 @@ pub type TypedModule {
 /// - `UnexpectedEnd`: an `end`/`else` with no matching open control frame, or a body
 ///   that did not close cleanly.
 /// - `TooManyLocals(count)`: the function's local count exceeds `max_locals`.
-/// - `Unsupported(detail)`: a construct outside the validation surface. Phase 5 types
-///   the whole standardized surface (minus SIMD), so this is now reserved for a genuine
-///   out-of-scope construct (a `v128`/SIMD leaf, a GC-proposal reftype) — never a
-///   Phase-5-in-scope op. Rejected fail-closed rather than waved through.
+/// - `Unsupported(detail)`: a construct outside the validation surface. Phase 6 types
+///   the whole standardized surface INCLUDING SIMD, so this is now reserved for the
+///   genuinely-deferred constructs — relaxed-SIMD (if one ever decodes) and GC-proposal
+///   reftypes — and for a `(SimdOp, SimdShape)` combo that denotes no standardized SIMD
+///   instruction (e.g. `i8x16.mul`, `i64x2.min_s`; the AST enum is shape-permissive but
+///   decode never emits such a combo — this arm keeps the validator total + fail-closed).
+///   Rejected fail-closed rather than waved through.
+/// - `BadLaneIndex(index)`: a static SIMD lane immediate out of range (spec vector-
+///   instruction lane rule) — `extract_lane`/`replace_lane` with `lane >= dim(shape)`,
+///   an `i8x16.shuffle` index `>= 32`, or a `load/store{8,16,32,64}_lane` with
+///   `lane >= 128/N`. Carries the offending index. Distinct from `TypeMismatch` (this is
+///   an immediate, not an operand-type disagreement). Routed from the `simd_lane.wast` /
+///   `simd_*_lane.wast` `assert_invalid` corpora.
 /// - `OffsetOutOfRange`: a load/store memarg static offset `>= 2^32` on a **32-bit**
 ///   (`Idx32`) memory (spec `valid/instructions` memarg). Reachable now that decode
 ///   reads the offset as a `u64` (P5-03); routed from `align.wast`'s "offset out of
@@ -251,6 +280,7 @@ pub type ValidateError {
   RefTypeMismatch
   BadSelectType
   UnknownImportKind(detail: String)
+  BadLaneIndex(index: Int)
 }
 
 // ─────────────────────────────── validation context ───────────────────────────────
@@ -1100,22 +1130,42 @@ fn validate_instr(
       Ok(push_val(st2, at))
     }
 
-    // SIMD («WASM-AST4», the 0xFD family) — FAIL-CLOSED (S1). SIMD typing is P6-04's
-    // job; until it lands, every SIMD `Instr` constructor is intercepted HERE, BEFORE the
-    // `validate_numeric` catch-all, so none can reach `numeric_sig`'s fail-OPEN `_ ->
-    // #([], [])` fallthrough (which would silently accept a SIMD op as a typed no-op).
-    // Rejecting with `Unsupported` keeps the module security boundary closed.
-    ast.V128Const(_) -> Error(Unsupported("simd: v128.const (typing is P6-04)"))
-    ast.Simd(_) -> Error(Unsupported("simd: lane op (typing is P6-04)"))
-    ast.I8x16Shuffle(_) ->
-      Error(Unsupported("simd: i8x16.shuffle (typing is P6-04)"))
-    ast.SimdLoad(_, _) ->
-      Error(Unsupported("simd: v128 load (typing is P6-04)"))
-    ast.SimdStore(_) -> Error(Unsupported("simd: v128.store (typing is P6-04)"))
-    ast.SimdLoadLane(_, _, _) ->
-      Error(Unsupported("simd: v128.loadN_lane (typing is P6-04)"))
-    ast.SimdStoreLane(_, _, _) ->
-      Error(Unsupported("simd: v128.storeN_lane (typing is P6-04)"))
+    // SIMD («WASM-AST4», the 0xFD family) — real typing (P6-04). Every SIMD `Instr`
+    // constructor is intercepted HERE, BEFORE the `validate_numeric` fallthrough, so
+    // none can reach `numeric_sig`'s fail-OPEN `_ -> #([], [])` catch-all (S1 — the
+    // fail-closed security invariant). `v128.const` pushes a `v128`; the pure lane ops
+    // route to the exhaustive `validate_simd`; `i8x16.shuffle` bounds its 16 indices
+    // (`< 32`) then `[v128 v128] → [v128]`; the four v128 memory ops route through the
+    // SAME `mem_addr_type`/`check_align`/`check_offset` seam as scalar loads (the
+    // memory64 seam — a 64-bit memory pops an `i64` address).
+    ast.V128Const(_) -> Ok(push_val(st, ast.V128))
+    ast.Simd(op) -> validate_simd(st, op)
+    ast.I8x16Shuffle(lanes) -> {
+      use _ <- result.try(list.try_each(lanes, fn(x) { check_lane(x, 32) }))
+      use st2 <- result.try(pop_vals(st, [ast.V128, ast.V128]))
+      Ok(push_val(st2, ast.V128))
+    }
+    ast.SimdLoad(kind, arg) ->
+      check_simd_load(st, ctx, arg, simd_load_max_align(kind))
+    ast.SimdStore(arg) -> check_simd_store(st, ctx, arg, 4)
+    ast.SimdLoadLane(width, arg, lane) ->
+      check_simd_load_lane(
+        st,
+        ctx,
+        arg,
+        bits_max_align(width),
+        lane,
+        simd_lane_count(width),
+      )
+    ast.SimdStoreLane(width, arg, lane) ->
+      check_simd_store_lane(
+        st,
+        ctx,
+        arg,
+        bits_max_align(width),
+        lane,
+        simd_lane_count(width),
+      )
 
     // numeric / comparison / conversion / float leaves --------------------------
     _ -> validate_numeric(st, instr)
@@ -1185,6 +1235,357 @@ fn check_offset(memarg: MemArg, at: ValType) -> Result(Nil, ValidateError) {
       }
     _ -> Ok(Nil)
   }
+}
+
+// ─────────────────────────────── SIMD typing («WASM-AST4», Phase 6) ───────────────────────────────
+// Spec: <https://webassembly.github.io/spec/core/valid/instructions.html#vector-instructions>.
+// The abstract stack absorbs `v128` generically (it is just another `ValType`); these
+// helpers add the SIMD-specific typing rules — per-op operand/result signatures, static
+// lane-immediate bounds, and the v128 memory family — all fail-closed (S1 / §H). SIMD
+// lane ops never trap (I3): the only SIMD trap surface is a memory-bounds trap, a
+// RUNTIME check (P6-07/08), not validation.
+
+/// The lane count `dim(shape)` of a SIMD shape (spec vector conventions): the number of
+/// lanes the 128-bit vector is divided into — `i8x16 = 16`, `i16x8 = 8`, `i32x4 = 4`,
+/// `i64x2 = 2`, `f32x4 = 4`, `f64x2 = 2`. Bounds `extract_lane`/`replace_lane` lane
+/// immediates (`lane < dim`).
+fn simd_dim(shape: ast.SimdShape) -> Int {
+  case shape {
+    ast.I8x16 -> 16
+    ast.I16x8 -> 8
+    ast.I32x4 -> 4
+    ast.I64x2 -> 2
+    ast.F32x4 -> 4
+    ast.F64x2 -> 2
+  }
+}
+
+/// The scalar value type a shape's lane packs/unpacks to (spec `unpacked(shape)`): a
+/// lane narrower than 32 bits unpacks to `i32` (`i8x16`/`i16x8 → i32`, hence the
+/// sign-choosing `extract_lane_s`/`_u`), a 32-bit-and-wider lane to its own width
+/// (`i32x4 → i32`, `i64x2 → i64`, `f32x4 → f32`, `f64x2 → f64`). Drives `splat` /
+/// `extract_lane` / `replace_lane` typing.
+fn simd_unpacked(shape: ast.SimdShape) -> ValType {
+  case shape {
+    ast.I8x16 -> ast.I32
+    ast.I16x8 -> ast.I32
+    ast.I32x4 -> ast.I32
+    ast.I64x2 -> ast.I64
+    ast.F32x4 -> ast.F32
+    ast.F64x2 -> ast.F64
+  }
+}
+
+/// A static lane immediate `lane` is valid iff `0 <= lane < dim` (spec vector-
+/// instruction lane rule: "the lane index must be smaller than `dim`"). An out-of-range
+/// (or, defensively, negative) index is `Error(BadLaneIndex(lane))` — the fail-closed
+/// rejection that lets `rt_simd` (P6-07) decode the lane with no bounds re-check (§H).
+fn check_lane(lane: Int, dim: Int) -> Result(Nil, ValidateError) {
+  case lane >= 0 && lane < dim {
+    True -> Ok(Nil)
+    False -> Error(BadLaneIndex(lane))
+  }
+}
+
+/// Type-check a pure lane-wise SIMD op (`ast.Simd(op)`) against the abstract stack
+/// (spec vector instructions). Two fail-closed steps: (1) bound any static lane
+/// immediate (`extract_lane`/`replace_lane`, `lane < dim`) via `check_simd_lane_imm`;
+/// (2) apply the op's fixed operand→result signature (`simd_sig`), which also rejects a
+/// shape the op has no standardized instruction for. NOTE comparisons yield a `v128`
+/// lane MASK (`[v128 v128] → [v128]`), NOT `i32` (the spec `vrelop` rule — a classic
+/// pitfall). Never traps.
+fn validate_simd(st: VState, op: ast.SimdOp) -> Result(VState, ValidateError) {
+  use _ <- result.try(check_simd_lane_imm(op))
+  use #(ins, outs) <- result.try(simd_sig(op))
+  use st2 <- result.try(pop_vals(st, ins))
+  Ok(push_vals(st2, outs))
+}
+
+/// Bound the static lane immediate of a lane-access SIMD op (spec: `extract_lane` /
+/// `replace_lane` require `lane < dim(shape)`); every other `SimdOp` carries no lane
+/// immediate and passes through `Ok(Nil)`. `Error(BadLaneIndex(lane))` on a violation.
+fn check_simd_lane_imm(op: ast.SimdOp) -> Result(Nil, ValidateError) {
+  case op {
+    ast.SExtractLane(shape, lane)
+    | ast.SExtractLaneS(shape, lane)
+    | ast.SExtractLaneU(shape, lane)
+    | ast.SReplaceLane(shape, lane) -> check_lane(lane, simd_dim(shape))
+    _ -> Ok(Nil)
+  }
+}
+
+/// `Ok(sig)` iff `shape` is one of `allowed`, else a fail-closed reject: the `(op,
+/// shape)` pair denotes no standardized SIMD instruction (e.g. `i8x16.mul`,
+/// `i64x2.min_s`, `i64x2.lt_u`, `i16x8.popcnt`). The AST `SimdOp` enum is
+/// shape-permissive (one constructor tags all applicable shapes) but decode never emits
+/// an illegal combo, so this arm is unreachable from decoded input — it exists only to
+/// keep the validator TOTAL + fail-closed over any `SimdOp` value.
+fn require_shape(
+  shape: ast.SimdShape,
+  allowed: List(ast.SimdShape),
+  sig: #(List(ValType), List(ValType)),
+) -> Result(#(List(ValType), List(ValType)), ValidateError) {
+  case list.contains(allowed, shape) {
+    True -> Ok(sig)
+    False -> Error(Unsupported("simd: no instruction for this (op, shape)"))
+  }
+}
+
+/// The `#(operands, results)` abstract-stack signature of a pure lane-wise `SimdOp`
+/// (spec vector instructions), or a fail-closed `Error` for an illegal `(op, shape)`
+/// combo (`require_shape`). Signature classes: vector unary `[v128] → [v128]`; vector
+/// binary / comparison(→mask) / swizzle / dot / q15 / extmul / narrow `[v128 v128] →
+/// [v128]`; shift `[v128 i32] → [v128]` (the count is an `i32`, whatever the lane
+/// width); test / bitmask `[v128] → [i32]`; bitselect `[v128 v128 v128] → [v128]`;
+/// splat `[unpacked(shape)] → [v128]`; extract `[v128] → [unpacked(shape)]`; replace
+/// `[v128 unpacked(shape)] → [v128]` (the scalar is on top). The lane-immediate BOUND
+/// is `check_simd_lane_imm`; this gives only the type signature. Exhaustive on `SimdOp`
+/// (the compiler enforces it — the fail-closed guarantee, §H).
+fn simd_sig(
+  op: ast.SimdOp,
+) -> Result(#(List(ValType), List(ValType)), ValidateError) {
+  let v128 = ast.V128
+  let i32 = ast.I32
+  let unop = #([v128], [v128])
+  let binop = #([v128, v128], [v128])
+  let shiftop = #([v128, i32], [v128])
+  let testop = #([v128], [i32])
+  let ternop = #([v128, v128, v128], [v128])
+  // legal-shape sets per op family (spec §9.1 / the standardized SIMD opcode set)
+  let ints = [ast.I8x16, ast.I16x8, ast.I32x4, ast.I64x2]
+  let ints_no64 = [ast.I8x16, ast.I16x8, ast.I32x4]
+  let small_ints = [ast.I8x16, ast.I16x8]
+  let mul_shapes = [ast.I16x8, ast.I32x4, ast.I64x2]
+  let floats = [ast.F32x4, ast.F64x2]
+  case op {
+    // ── integer arithmetic (integer shapes) ──
+    ast.SAdd(s) -> require_shape(s, ints, binop)
+    ast.SSub(s) -> require_shape(s, ints, binop)
+    // no `i8x16.mul` in the standard — i16x8/i32x4/i64x2 only
+    ast.SMul(s) -> require_shape(s, mul_shapes, binop)
+    ast.SNeg(s) -> require_shape(s, ints, unop)
+    ast.SAbs(s) -> require_shape(s, ints, unop)
+    // saturating add/sub is i8x16/i16x8 only
+    ast.SAddSatS(s) -> require_shape(s, small_ints, binop)
+    ast.SAddSatU(s) -> require_shape(s, small_ints, binop)
+    ast.SSubSatS(s) -> require_shape(s, small_ints, binop)
+    ast.SSubSatU(s) -> require_shape(s, small_ints, binop)
+    // min/max is i8x16/i16x8/i32x4 (no i64x2)
+    ast.SMinS(s) -> require_shape(s, ints_no64, binop)
+    ast.SMinU(s) -> require_shape(s, ints_no64, binop)
+    ast.SMaxS(s) -> require_shape(s, ints_no64, binop)
+    ast.SMaxU(s) -> require_shape(s, ints_no64, binop)
+    ast.SAvgrU(s) -> require_shape(s, small_ints, binop)
+    // shifts: the count is a single i32 regardless of lane width
+    ast.SShl(s) -> require_shape(s, ints, shiftop)
+    ast.SShrS(s) -> require_shape(s, ints, shiftop)
+    ast.SShrU(s) -> require_shape(s, ints, shiftop)
+    ast.SPopcnt(s) -> require_shape(s, [ast.I8x16], unop)
+    // ── integer comparisons → v128 mask ──
+    ast.SEq(s) -> require_shape(s, ints, binop)
+    ast.SNe(s) -> require_shape(s, ints, binop)
+    ast.SLtS(s) -> require_shape(s, ints, binop)
+    ast.SLeS(s) -> require_shape(s, ints, binop)
+    ast.SGtS(s) -> require_shape(s, ints, binop)
+    ast.SGeS(s) -> require_shape(s, ints, binop)
+    // i64x2 has NO unsigned lt/le/gt/ge
+    ast.SLtU(s) -> require_shape(s, ints_no64, binop)
+    ast.SLeU(s) -> require_shape(s, ints_no64, binop)
+    ast.SGtU(s) -> require_shape(s, ints_no64, binop)
+    ast.SGeU(s) -> require_shape(s, ints_no64, binop)
+    // ── v128 bitwise (shape-agnostic) + boolean reductions ──
+    ast.VNot -> Ok(unop)
+    ast.VAnd -> Ok(binop)
+    ast.VOr -> Ok(binop)
+    ast.VXor -> Ok(binop)
+    ast.VAndNot -> Ok(binop)
+    ast.VBitselect -> Ok(ternop)
+    ast.VAnyTrue -> Ok(testop)
+    ast.SAllTrue(s) -> require_shape(s, ints, testop)
+    ast.SBitmask(s) -> require_shape(s, ints, testop)
+    // ── lane access / build ──
+    ast.SSplat(s) -> Ok(#([simd_unpacked(s)], [v128]))
+    // extract_lane (no sign) is the 32-bit-and-wider shapes; the s/u variants are the
+    // narrow shapes (which unpack to i32). Result = unpacked(shape).
+    ast.SExtractLane(s, _) ->
+      require_shape(
+        s,
+        [ast.I32x4, ast.I64x2, ast.F32x4, ast.F64x2],
+        #([v128], [simd_unpacked(s)]),
+      )
+    ast.SExtractLaneS(s, _) -> require_shape(s, small_ints, #([v128], [i32]))
+    ast.SExtractLaneU(s, _) -> require_shape(s, small_ints, #([v128], [i32]))
+    // replace_lane: [v128 unpacked(shape)] → [v128] (scalar on top), all six shapes
+    ast.SReplaceLane(s, _) -> Ok(#([v128, simd_unpacked(s)], [v128]))
+    // ── float-lane ops (f32x4 / f64x2) ──
+    ast.FAdd(s) -> require_shape(s, floats, binop)
+    ast.FSub(s) -> require_shape(s, floats, binop)
+    ast.FMul(s) -> require_shape(s, floats, binop)
+    ast.FDiv(s) -> require_shape(s, floats, binop)
+    ast.FMin(s) -> require_shape(s, floats, binop)
+    ast.FMax(s) -> require_shape(s, floats, binop)
+    ast.FPMin(s) -> require_shape(s, floats, binop)
+    ast.FPMax(s) -> require_shape(s, floats, binop)
+    ast.FNeg(s) -> require_shape(s, floats, unop)
+    ast.FAbs(s) -> require_shape(s, floats, unop)
+    ast.FSqrt(s) -> require_shape(s, floats, unop)
+    ast.FCeil(s) -> require_shape(s, floats, unop)
+    ast.FFloor(s) -> require_shape(s, floats, unop)
+    ast.FTrunc(s) -> require_shape(s, floats, unop)
+    ast.FNearest(s) -> require_shape(s, floats, unop)
+    // float comparisons → v128 mask
+    ast.FEq(s) -> require_shape(s, floats, binop)
+    ast.FNe(s) -> require_shape(s, floats, binop)
+    ast.FLt(s) -> require_shape(s, floats, binop)
+    ast.FLe(s) -> require_shape(s, floats, binop)
+    ast.FGt(s) -> require_shape(s, floats, binop)
+    ast.FGe(s) -> require_shape(s, floats, binop)
+    // ── widen / narrow / extended-multiply / pairwise (`from` = SOURCE shape) ──
+    // narrow i16x8→i8x16 / i32x4→i16x8 (saturating): [v128 v128] → [v128]
+    ast.SNarrow(from, _) -> require_shape(from, [ast.I16x8, ast.I32x4], binop)
+    // extend low/high from a narrower source (i8x16/i16x8/i32x4): [v128] → [v128]
+    ast.SExtend(from, _, _) -> require_shape(from, ints_no64, unop)
+    // extmul low/high from a narrower source: [v128 v128] → [v128]
+    ast.SExtMul(from, _, _) -> require_shape(from, ints_no64, binop)
+    // extadd_pairwise from i8x16/i16x8: [v128] → [v128]
+    ast.SExtAddPairwise(from, _) -> require_shape(from, small_ints, unop)
+    // ── conversions (singular; all [v128] → [v128]) ──
+    ast.STruncSatF32x4S -> Ok(unop)
+    ast.STruncSatF32x4U -> Ok(unop)
+    ast.STruncSatF64x2SZero -> Ok(unop)
+    ast.STruncSatF64x2UZero -> Ok(unop)
+    ast.SConvertF32x4I32x4S -> Ok(unop)
+    ast.SConvertF32x4I32x4U -> Ok(unop)
+    ast.SConvertF64x2LowI32x4S -> Ok(unop)
+    ast.SConvertF64x2LowI32x4U -> Ok(unop)
+    ast.SDemoteF64x2Zero -> Ok(unop)
+    ast.SPromoteLowF32x4 -> Ok(unop)
+    // ── dot / q15 / swizzle (singular; [v128 v128] → [v128]) ──
+    ast.SDotI16x8S -> Ok(binop)
+    ast.SQ15MulrSatS -> Ok(binop)
+    // swizzle: dynamic byte indices in a v128 (OOB→0 is a RUNTIME semantics, not typing)
+    ast.SSwizzle -> Ok(binop)
+  }
+}
+
+// ─────────────────────────────── SIMD memory family ───────────────────────────────
+// Every v128 memory op reuses the SCALAR `mem_addr_type`/`check_align`/`check_offset`
+// seam (D2): the memarg alignment cap `2^align <= N/8`, the offset ceiling, and the
+// `i32`/`i64` address typing are the SAME rules as scalar loads/stores, with a per-op
+// access width N (in BITS — S2). So `v128.load` on a 64-bit memory pops an `i64`
+// address exactly as a scalar load does (the memory64 seam, §F).
+
+/// The maximum memarg alignment exponent for a v128 LOAD, from its access width in BITS
+/// (spec memarg rule `2^align <= N/8`; RECONCILIATION S2 — widths are bits):
+/// `v128.load` accesses 128 bits (`align <= 4`); an extending `load{8x8,16x4,32x2}`
+/// accesses 8 bytes = 64 bits (`align <= 3`); a `load{N}_splat`/`load{N}_zero` accesses
+/// `N` bits.
+fn simd_load_max_align(kind: ast.SimdLoadKind) -> Int {
+  case kind {
+    ast.LoadV128 -> 4
+    ast.LoadSplat(bits) -> bits_max_align(bits)
+    // every extending load reads 8 bytes (64 bits) regardless of the source lane width
+    ast.LoadExtend(_, _) -> 3
+    ast.LoadZero(bits) -> bits_max_align(bits)
+  }
+}
+
+/// The memarg alignment cap `log2(bits / 8)` for a natural access of `bits` BITS
+/// (∈ {8,16,32,64,128} — S2), so `2^align <= bits/8`. A non-standard width falls to `0`
+/// (the most conservative cap — fail-closed; unreachable from decoded input).
+fn bits_max_align(bits: Int) -> Int {
+  case bits {
+    8 -> 0
+    16 -> 1
+    32 -> 2
+    64 -> 3
+    128 -> 4
+    _ -> 0
+  }
+}
+
+/// The lane count `128 / width` for a v128 `load{N}_lane`/`store{N}_lane` of `width`
+/// BITS (∈ {8,16,32,64} — S2): the valid lane index range is `[0, 128/width)`, i.e.
+/// `8 → 16`, `16 → 8`, `32 → 4`, `64 → 2`. A non-standard width falls to `0` (rejects
+/// every lane — fail-closed; unreachable from decoded input; avoids a division-by-zero).
+fn simd_lane_count(width: Int) -> Int {
+  case width {
+    8 -> 16
+    16 -> 8
+    32 -> 4
+    64 -> 2
+    _ -> 0
+  }
+}
+
+/// Type a v128 LOAD (`v128.load`, the splat/extend/zero loads): resolve the memory +
+/// address width, check the memarg alignment (`max_align`) + offset ceiling, pop the
+/// address (`i32`/`i64` per the memory), push `v128`. `[at] → [v128]`.
+fn check_simd_load(
+  st: VState,
+  ctx: Ctx,
+  memarg: MemArg,
+  max_align: Int,
+) -> Result(VState, ValidateError) {
+  use at <- result.try(mem_addr_type(ctx, memarg.mem))
+  use _ <- result.try(check_align(memarg, max_align))
+  use _ <- result.try(check_offset(memarg, at))
+  use st2 <- result.try(pop_expect(st, at))
+  Ok(push_val(st2, ast.V128))
+}
+
+/// Type `v128.store`: resolve the memory + address width, check alignment + offset, pop
+/// the `v128` value (top of stack) then the address, push nothing. `[at v128] → []`.
+fn check_simd_store(
+  st: VState,
+  ctx: Ctx,
+  memarg: MemArg,
+  max_align: Int,
+) -> Result(VState, ValidateError) {
+  use at <- result.try(mem_addr_type(ctx, memarg.mem))
+  use _ <- result.try(check_align(memarg, max_align))
+  use _ <- result.try(check_offset(memarg, at))
+  use st2 <- result.try(pop_expect(st, ast.V128))
+  pop_expect(st2, at)
+}
+
+/// Type a v128 `load{N}_lane`: resolve the memory + address width, check alignment +
+/// offset, bound the lane (`lane < dim = 128/N`), pop the `v128` operand (top) then the
+/// address, push the updated `v128`. `[at v128] → [v128]`.
+fn check_simd_load_lane(
+  st: VState,
+  ctx: Ctx,
+  memarg: MemArg,
+  max_align: Int,
+  lane: Int,
+  dim: Int,
+) -> Result(VState, ValidateError) {
+  use at <- result.try(mem_addr_type(ctx, memarg.mem))
+  use _ <- result.try(check_align(memarg, max_align))
+  use _ <- result.try(check_offset(memarg, at))
+  use _ <- result.try(check_lane(lane, dim))
+  use st2 <- result.try(pop_expect(st, ast.V128))
+  use st3 <- result.try(pop_expect(st2, at))
+  Ok(push_val(st3, ast.V128))
+}
+
+/// Type a v128 `store{N}_lane`: resolve the memory + address width, check alignment +
+/// offset, bound the lane (`lane < dim = 128/N`), pop the `v128` operand (top) then the
+/// address, push nothing. `[at v128] → []`.
+fn check_simd_store_lane(
+  st: VState,
+  ctx: Ctx,
+  memarg: MemArg,
+  max_align: Int,
+  lane: Int,
+  dim: Int,
+) -> Result(VState, ValidateError) {
+  use at <- result.try(mem_addr_type(ctx, memarg.mem))
+  use _ <- result.try(check_align(memarg, max_align))
+  use _ <- result.try(check_offset(memarg, at))
+  use _ <- result.try(check_lane(lane, dim))
+  use st2 <- result.try(pop_expect(st, ast.V128))
+  pop_expect(st2, at)
 }
 
 // ─────────────────────────────── reference / index-space helpers ───────────────────────────────
@@ -1377,9 +1778,10 @@ fn validate_br_table(
 /// is valid iff it is a single producing instruction from the Phase-5 constant grammar
 /// (spec `valid/instructions`, constant expressions):
 ///
-/// - `t.const c` → `t`; `ref.null t` → the reftype `t`; `ref.func x` → `funcref`
-///   (valid iff `x` is a funcidx in range AND `x ∈ C.refs`); `global.get x` →
-///   `globals[x].0` (valid ONLY when `x` is an **imported, immutable** global).
+/// - `t.const c` → `t` (including `v128.const` → `v128`, Phase 6); `ref.null t` → the
+///   reftype `t`; `ref.func x` → `funcref` (valid iff `x` is a funcidx in range AND
+///   `x ∈ C.refs`); `global.get x` → `globals[x].0` (valid ONLY when `x` is an
+///   **imported, immutable** global).
 ///
 /// Everything else — extended-const `i32.add`/… chains, a `global.get` of a *defined*
 /// or *mutable* global — is `Error(NonConstantExpr)`. The produced type must equal
@@ -1395,6 +1797,10 @@ fn validate_const_expr(
     [ast.I64Const(_)] -> expect_const_type(ast.I64, expected)
     [ast.F32Const(_)] -> expect_const_type(ast.F32, expected)
     [ast.F64Const(_)] -> expect_const_type(ast.F64, expected)
+    // `v128.const c` is a valid constant instruction (spec constant expressions list
+    // `t.const`, which includes `v128.const`); no other SIMD op is constant, so any
+    // other `Simd(_)`/`SimdLoad`/… in a const-expr falls to `NonConstantExpr` below.
+    [ast.V128Const(_)] -> expect_const_type(ast.V128, expected)
     [ast.RefNull(rt)] -> expect_const_type(rt, expected)
     [ast.RefFunc(x)] -> {
       use _ <- result.try(check_ref_declared(ctx, x))

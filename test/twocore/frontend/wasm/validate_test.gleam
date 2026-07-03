@@ -1680,6 +1680,778 @@ pub fn reject_export_out_of_range_test() {
   |> should.equal(Error(validate.UnknownMemory(0)))
 }
 
+// ═════════════════════════ Phase-6 (unit P6-04) SIMD typing ═════════════════════════
+// Spec: <https://webassembly.github.io/spec/core/valid/instructions.html#vector-instructions>.
+// Modules are hand-built (decode of SIMD is P6-03's; here we exercise the *typing rule*
+// directly). `v128` flows through the abstract stack as an ordinary value type; the
+// SIMD-specific rules under test are the per-op signatures (comparisons → v128 MASK),
+// the static lane-immediate bounds (`BadLaneIndex`), and the v128 memory family's memarg
+// alignment (`BadAlignment`) / offset (`OffsetOutOfRange`) / address-width (memory64)
+// checks. SIMD lane ops never trap (I3) — every check here is a static validation rule.
+
+/// Sixteen opaque bytes for a `v128.const` immediate (validate never inspects lanes —
+/// D5). Any 16-byte value serves the typing tests.
+fn v128b() -> BitArray {
+  <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>
+}
+
+/// A single-function module with one 32-bit memory (index 0): type `ty`, body `body`.
+fn simd_mod(ty: ast.FuncType, body: List(ast.Instr)) -> ast.Module {
+  module(
+    types: [ty],
+    tables: [],
+    memories: [mem(1, None)],
+    globals: [],
+    funcs: [func_(0, body)],
+    start: None,
+    elements: [],
+    data: [],
+  )
+}
+
+/// Assert a hand-built module validates (well-typed).
+fn accept_mod(m: ast.Module) {
+  validate.validate(m)
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// Assert a hand-built module is rejected with exactly `err`.
+fn reject_mod(m: ast.Module, err: validate.ValidateError) {
+  validate.validate(m)
+  |> should.equal(Error(err))
+}
+
+// ── acceptance: v128 as a value type + const ──
+
+/// `v128.const` has type `[] → [v128]` (spec `t.const`; `simd_const.wast`).
+pub fn accept_v128_const_test() {
+  accept_mod(simd_mod(ft([], [ast.V128]), [ast.V128Const(v128b()), ast.End]))
+}
+
+/// A `v128` global initialized by `v128.const` is valid (`v128.const` is a constant
+/// instruction — spec constant expressions; `simd_const.wast`).
+pub fn accept_v128_global_init_test() {
+  module(
+    types: [],
+    tables: [],
+    memories: [],
+    globals: [
+      ast.Global(ty: ast.V128, mutable: False, init: [
+        ast.V128Const(v128b()),
+      ]),
+    ],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> accept_mod()
+}
+
+/// `v128` flows through params, results, and declared locals like any value type (spec
+/// value types — §C.1/§C.2): `(func (param v128) (local v128) (result v128) local.get 1)`.
+pub fn accept_v128_params_locals_test() {
+  module(
+    types: [ft([ast.V128], [ast.V128])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      ast.Func(type_idx: 0, locals: [ast.V128], body: [
+        ast.LocalGet(1),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> accept_mod()
+}
+
+// ── acceptance: one op per signature class (spec vector-instruction signatures) ──
+
+/// `i32x4.add : [v128 v128] → [v128]` (vector binary; `simd_i32x4_arith.wast`).
+pub fn accept_i32x4_add_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SAdd(ast.I32x4)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `f64x2.sqrt : [v128] → [v128]` (vector unary; `simd_f64x2.wast`).
+pub fn accept_f64x2_sqrt_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.FSqrt(ast.F64x2)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i16x8.shl : [v128 i32] → [v128]` — the shift count is an `i32`, not a v128 (spec
+/// `vshiftop`; `simd_bit_shift.wast`).
+pub fn accept_i16x8_shl_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.I32Const(3),
+      ast.Simd(ast.SShl(ast.I16x8)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.any_true : [v128] → [i32]` (vector test; `simd_boolean.wast`).
+pub fn accept_v128_any_true_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.I32]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.VAnyTrue),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i8x16.bitmask : [v128] → [i32]` (bitmask; `simd_boolean.wast`).
+pub fn accept_i8x16_bitmask_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.I32]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SBitmask(ast.I8x16)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.bitselect : [v128 v128 v128] → [v128]` (vector ternary; `simd_bitwise.wast`).
+pub fn accept_v128_bitselect_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.Simd(ast.VBitselect),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i32x4.splat : [i32] → [v128]` (spec `shape.splat`; `simd_splat.wast`).
+pub fn accept_i32x4_splat_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.Simd(ast.SSplat(ast.I32x4)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i64x2.splat : [i64] → [v128]` — a 64-bit lane splats from an `i64` (`simd_splat.wast`).
+pub fn accept_i64x2_splat_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I64Const(0),
+      ast.Simd(ast.SSplat(ast.I64x2)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `f32x4.splat : [f32] → [v128]` — a float lane splats from an `f32` (`simd_splat.wast`).
+pub fn accept_f32x4_splat_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.F32Const(0),
+      ast.Simd(ast.SSplat(ast.F32x4)),
+      ast.End,
+    ]),
+  )
+}
+
+/// A comparison yields a `v128` lane MASK, not `i32`: `i8x16.eq : [v128 v128] → [v128]`
+/// (spec `vrelop`; `simd_i8x16_cmp.wast`). Accepting it with a `v128` result pins the
+/// mask typing; the companion reject test (`reject_cmp_not_i32_test`) proves it is NOT
+/// `i32`.
+pub fn accept_i8x16_eq_mask_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SEq(ast.I8x16)),
+      ast.End,
+    ]),
+  )
+}
+
+// ── acceptance: lane-access at a valid lane (spec lane rule `lane < dim`) ──
+
+/// `i8x16.extract_lane_s 15 : [v128] → [i32]`, lane 15 < 16 (`simd_lane.wast`).
+pub fn accept_extract_lane_s_valid_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.I32]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SExtractLaneS(ast.I8x16, 15)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i64x2.extract_lane 1 : [v128] → [i64]`, lane 1 < 2 (`simd_lane.wast`).
+pub fn accept_extract_lane_i64_valid_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.I64]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SExtractLane(ast.I64x2, 1)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `f32x4.replace_lane 3 : [v128 f32] → [v128]`, lane 3 < 4, consuming an `f32`
+/// (`simd_lane.wast`).
+pub fn accept_replace_lane_f32_valid_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.F32Const(0),
+      ast.Simd(ast.SReplaceLane(ast.F32x4, 3)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i8x16.shuffle` with 16 indices all `< 32` is valid (spec `i8x16.shuffle`;
+/// `simd_lane.wast`). `[v128 v128] → [v128]`.
+pub fn accept_shuffle_valid_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.I8x16Shuffle([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 31]),
+      ast.End,
+    ]),
+  )
+}
+
+/// `i8x16.swizzle : [v128 v128] → [v128]` (dynamic indices; OOB→0 is runtime, not
+/// validation — §D.6; `simd_lane.wast`).
+pub fn accept_swizzle_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SSwizzle),
+      ast.End,
+    ]),
+  )
+}
+
+// ── acceptance: the v128 memory family at a valid alignment (spec `2^align ≤ N/8`) ──
+
+/// `v128.load align=4 : [i32] → [v128]` (128-bit access, `2^4 = 16` bytes; `simd_load.wast`).
+pub fn accept_v128_load_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(ast.LoadV128, ast.MemArg(align: 4, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.load32_splat align=2 : [i32] → [v128]` (32-bit access; `simd_load_splat.wast`).
+pub fn accept_v128_load32_splat_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(ast.LoadSplat(32), ast.MemArg(align: 2, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.load8x8_s align=3 : [i32] → [v128]` (8-byte access; `simd_load_extend.wast`).
+pub fn accept_v128_load8x8_s_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(
+        ast.LoadExtend(8, True),
+        ast.MemArg(align: 3, offset: 0, mem: 0),
+      ),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.load64_zero align=3 : [i32] → [v128]` (64-bit access; `simd_load_zero.wast`).
+pub fn accept_v128_load64_zero_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(ast.LoadZero(64), ast.MemArg(align: 3, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.store align=4 : [i32 v128] → []` (address deeper, value on top; `simd_store.wast`).
+pub fn accept_v128_store_test() {
+  accept_mod(
+    simd_mod(ft([], []), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdStore(ast.MemArg(align: 4, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.load32_lane align=2 lane=3 : [i32 v128] → [v128]`, lane 3 < 4
+/// (`simd_load32_lane.wast`).
+pub fn accept_v128_load32_lane_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdLoadLane(32, ast.MemArg(align: 2, offset: 0, mem: 0), 3),
+      ast.End,
+    ]),
+  )
+}
+
+/// `v128.store8_lane align=0 lane=15 : [i32 v128] → []`, lane 15 < 16
+/// (`simd_store8_lane.wast`).
+pub fn accept_v128_store8_lane_test() {
+  accept_mod(
+    simd_mod(ft([], []), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdStoreLane(8, ast.MemArg(align: 0, offset: 0, mem: 0), 15),
+      ast.End,
+    ]),
+  )
+}
+
+/// Untyped `select` of two `v128`s is valid — `v128` is a *vector* type, accepted by
+/// untyped select (spec parametric rule: `t` is a number OR vector type; `simd_select.wast`).
+pub fn accept_select_v128_test() {
+  accept_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.I32Const(1),
+      ast.Select,
+      ast.End,
+    ]),
+  )
+}
+
+// ── acceptance: memory64 (v128 memory ops share the mem_addr_type seam) ──
+
+/// `v128.load` on a **64-bit** memory pops an `i64` address (memory64 seam — §E/§F;
+/// `memory64.wast`). The identical op on a 32-bit memory pops `i32` (accept_v128_load_test).
+pub fn accept_v128_load_mem64_test() {
+  module(
+    types: [ft([], [ast.V128])],
+    tables: [],
+    memories: [mem64(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I64Const(0),
+        ast.SimdLoad(ast.LoadV128, ast.MemArg(align: 4, offset: 0, mem: 0)),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> accept_mod()
+}
+
+/// A 64-bit memory whose limit is exactly `2^48` pages validates (the spec/memory64
+/// abstract limit range for an `i64` memory — §F; `memory64.wast`). The smaller *runtime*
+/// cap (P6-08) is NOT a validation rejection.
+pub fn accept_mem64_limit_max_test() {
+  module(
+    types: [],
+    tables: [],
+    memories: [mem64(281_474_976_710_656, None)],
+    globals: [],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> accept_mod()
+}
+
+// ── acceptance: cross-module function-import typing (declared FuncType — §G) ──
+
+/// A module importing `(func (param i32) (result i32))` and calling it type-checks the
+/// `call` against the import's DECLARED signature (imports occupy the low funcidx range —
+/// spec imports; `linking.wast`). The link-time *satisfaction* is P6-09's, not validate's.
+pub fn accept_imported_func_call_test() {
+  ast.Module(
+    imported_func_count: 1,
+    types: [ft([ast.I32], [ast.I32]), ft([], [])],
+    imports: [ast.Import("env", "f", ast.ImportFunc(0))],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      ast.Func(type_idx: 1, locals: [], body: [
+        ast.I32Const(0),
+        ast.Call(0),
+        ast.Drop,
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+    data_count: None,
+    exports: [],
+  )
+  |> accept_mod()
+}
+
+// ── rejection: comparison mask is NOT i32 ──
+
+/// `i8x16.eq` yields a `v128` mask, so declaring the function `-> i32` and leaving the
+/// mask leaves a `v128` where the result wants `i32` → `TypeMismatch`. Guards against the
+/// classic mis-typing of a SIMD comparison to `i32` (spec `vrelop`; `simd_i8x16_cmp.wast`).
+pub fn reject_cmp_not_i32_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.I32]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SEq(ast.I8x16)),
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+// ── rejection: BadLaneIndex (static lane immediate out of range) ──
+
+/// `i8x16.extract_lane_s 16` — lane `16 ≥ dim = 16` (spec lane rule `x < dim`;
+/// `simd_lane.wast`).
+pub fn reject_extract_lane_oob_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.I32]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SExtractLaneS(ast.I8x16, 16)),
+      ast.End,
+    ]),
+    validate.BadLaneIndex(16),
+  )
+}
+
+/// `i32x4.replace_lane 4` — lane `4 ≥ dim = 4` (`simd_lane.wast`).
+pub fn reject_replace_lane_oob_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.I32Const(0),
+      ast.Simd(ast.SReplaceLane(ast.I32x4, 4)),
+      ast.End,
+    ]),
+    validate.BadLaneIndex(4),
+  )
+}
+
+/// `i64x2.extract_lane 2` — lane `2 ≥ dim = 2` (`simd_lane.wast`).
+pub fn reject_extract_lane_i64_oob_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.I64]), [
+      ast.V128Const(v128b()),
+      ast.Simd(ast.SExtractLane(ast.I64x2, 2)),
+      ast.End,
+    ]),
+    validate.BadLaneIndex(2),
+  )
+}
+
+/// `i8x16.shuffle` with an index `≥ 32` — the shuffle indices select bytes from the
+/// 32-byte concatenation, so each must be `< 32` (spec `i8x16.shuffle`; `simd_lane.wast`).
+pub fn reject_shuffle_oob_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.V128Const(v128b()),
+      ast.I8x16Shuffle([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 32]),
+      ast.End,
+    ]),
+    validate.BadLaneIndex(32),
+  )
+}
+
+/// `v128.load8_lane lane=16` — lane `16 ≥ 128/8 = 16` (spec vector memory lane rule
+/// `lane < 128/N`; `simd_load8_lane.wast`).
+pub fn reject_load_lane_oob_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdLoadLane(8, ast.MemArg(align: 0, offset: 0, mem: 0), 16),
+      ast.End,
+    ]),
+    validate.BadLaneIndex(16),
+  )
+}
+
+/// `v128.store64_lane lane=2` — lane `2 ≥ 128/64 = 2` (`simd_store64_lane.wast`).
+pub fn reject_store_lane_oob_test() {
+  reject_mod(
+    simd_mod(ft([], []), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdStoreLane(64, ast.MemArg(align: 0, offset: 0, mem: 0), 2),
+      ast.End,
+    ]),
+    validate.BadLaneIndex(2),
+  )
+}
+
+// ── rejection: BadAlignment (memarg alignment > natural access width) ──
+
+/// `v128.load align=5` — `2^5 = 32 > 16` bytes (spec memarg `2^align ≤ N/8`;
+/// `simd_align.wast`).
+pub fn reject_v128_load_overalign_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(ast.LoadV128, ast.MemArg(align: 5, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+    validate.BadAlignment,
+  )
+}
+
+/// `v128.load32_splat align=3` — `2^3 = 8 > 4` bytes for a 32-bit access
+/// (`simd_align.wast`).
+pub fn reject_load32_splat_overalign_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(ast.LoadSplat(32), ast.MemArg(align: 3, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+    validate.BadAlignment,
+  )
+}
+
+/// `v128.load8_lane align=1` — `2^1 = 2 > 1` byte for an 8-bit access (`simd_align.wast`).
+pub fn reject_load8_lane_overalign_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdLoadLane(8, ast.MemArg(align: 1, offset: 0, mem: 0), 0),
+      ast.End,
+    ]),
+    validate.BadAlignment,
+  )
+}
+
+/// `v128.store align=5` — `2^5 = 32 > 16` bytes (`simd_align.wast`).
+pub fn reject_v128_store_overalign_test() {
+  reject_mod(
+    simd_mod(ft([], []), [
+      ast.I32Const(0),
+      ast.V128Const(v128b()),
+      ast.SimdStore(ast.MemArg(align: 5, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+    validate.BadAlignment,
+  )
+}
+
+// ── rejection: TypeMismatch (wrong operand type) ──
+
+/// `i32x4.add` fed non-`v128` operands (two `f32`s) → `TypeMismatch` (spec vector-binary
+/// typing; `simd_i32x4_arith.wast`).
+pub fn reject_add_wrong_operand_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.F32Const(0),
+      ast.F32Const(0),
+      ast.Simd(ast.SAdd(ast.I32x4)),
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+/// `i64x2.splat` fed an `i32` (wants `i64`) → `TypeMismatch` (spec `shape.splat`;
+/// `simd_splat.wast`).
+pub fn reject_splat_wrong_scalar_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.Simd(ast.SSplat(ast.I64x2)),
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+/// `i8x16.replace_lane` fed an `i64` (wants `i32`, the unpacked type) → `TypeMismatch`
+/// (spec `shape.replace_lane`; `simd_lane.wast`).
+pub fn reject_replace_lane_wrong_scalar_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.I64Const(0),
+      ast.Simd(ast.SReplaceLane(ast.I8x16, 0)),
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+/// `f32x4.replace_lane` fed an `i32` (wants `f32`) → `TypeMismatch` (`simd_lane.wast`).
+pub fn reject_replace_lane_wrong_float_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.V128Const(v128b()),
+      ast.I32Const(0),
+      ast.Simd(ast.SReplaceLane(ast.F32x4, 0)),
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+/// `ref.is_null` on a `v128` → `TypeMismatch` — `v128` is NOT a reference type
+/// (`ref.is_null` accepts only references; spec reference instructions — §C.4).
+pub fn reject_ref_is_null_v128_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.I32]), [
+      ast.V128Const(v128b()),
+      ast.RefIsNull,
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+/// `v128.store` whose value operand is an `i32`, not a `v128` → `TypeMismatch` (spec
+/// vector store typing; `simd_store.wast`).
+pub fn reject_store_wrong_value_test() {
+  reject_mod(
+    simd_mod(ft([], []), [
+      ast.I32Const(0),
+      ast.I32Const(0),
+      ast.SimdStore(ast.MemArg(align: 4, offset: 0, mem: 0)),
+      ast.End,
+    ]),
+    validate.TypeMismatch,
+  )
+}
+
+/// A scalar `i32.load` on a **64-bit** memory has an `i32` address but wants `i64` →
+/// `TypeMismatch` (memory64 address typing — §F; `memory64.wast`).
+pub fn reject_scalar_load_mem64_wrong_addr_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [mem64(1, None)],
+    globals: [],
+    funcs: [
+      func_(0, [
+        ast.I32Const(0),
+        ast.I32Load(ast.MemArg(align: 2, offset: 0, mem: 0)),
+        ast.End,
+      ]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> reject_mod(validate.TypeMismatch)
+}
+
+// ── rejection: memory / limit / const-expr ──
+
+/// `v128.load` with a `memidx` past the module's memories → `UnknownMemory` (spec
+/// `C.mems[memidx]`; `simd_memory-multi.wast`).
+pub fn reject_v128_load_bad_memidx_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(ast.LoadV128, ast.MemArg(align: 4, offset: 0, mem: 1)),
+      ast.End,
+    ]),
+    validate.UnknownMemory(1),
+  )
+}
+
+/// A v128 memory op with a static offset `≥ 2^32` on a 32-bit memory → `OffsetOutOfRange`
+/// (spec memarg offset rule; `simd_address.wast`).
+pub fn reject_v128_load_offset_oob_test() {
+  reject_mod(
+    simd_mod(ft([], [ast.V128]), [
+      ast.I32Const(0),
+      ast.SimdLoad(
+        ast.LoadV128,
+        ast.MemArg(align: 4, offset: 4_294_967_296, mem: 0),
+      ),
+      ast.End,
+    ]),
+    validate.OffsetOutOfRange,
+  )
+}
+
+/// A 64-bit memory whose limit exceeds `2^48` pages (`2^48 + 1`) → `BadLimits` (spec/
+/// memory64 limit range; `memory64.wast`).
+pub fn reject_mem64_limit_over_test() {
+  module(
+    types: [],
+    tables: [],
+    memories: [mem64(281_474_976_710_657, None)],
+    globals: [],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> reject_mod(validate.BadLimits)
+}
+
+/// A `v128` global initialized by a non-const SIMD op (`i32x4.add`) → `NonConstantExpr`
+/// — only `v128.const` is a constant SIMD instruction (spec constant expressions — §C.4).
+pub fn reject_v128_global_nonconst_test() {
+  module(
+    types: [],
+    tables: [],
+    memories: [],
+    globals: [
+      ast.Global(ty: ast.V128, mutable: False, init: [
+        ast.V128Const(v128b()),
+        ast.V128Const(v128b()),
+        ast.Simd(ast.SAdd(ast.I32x4)),
+      ]),
+    ],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> reject_mod(validate.NonConstantExpr)
+}
+
 /// `True` if a `Result` is `Ok`, discarding both payloads (for acceptance asserts on
 /// hand-built modules where the exact `TypedModule` is not under test).
 fn is_ok(r: Result(a, b)) -> Bool {
