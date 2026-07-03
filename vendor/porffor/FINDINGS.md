@@ -210,9 +210,20 @@ codegen helpers over `scope`/`func`), so self-hosting cannot get much past here 
 closure support. **This is the real reason upstream Porffor self-hosting is unsolved** — the earlier
 items (§6–§8) were a tractable sequence of bugs/missing-builtins; this is a foundational gap.
 
-Options for the next agent (all large): (a) wait for / port upstream Porffor closure support and
-re-vendor; (b) implement closure capture in the vendored Porffor codegen (heap-allocated environments —
-substantial); (c) a codemod that lambda-lifts capturing callbacks (see below). There is no quick patch.
+Options for the next agent (all large): (a) ~~wait for / port upstream Porffor closure support and
+re-vendor~~ — **EXHAUSTED (checked 2026-07): 0.61.13 is terminal for closures.** npm's latest is
+0.61.13; the git `main` HEAD's newest commit IS the `publish: 0.61.13` (2026-04-23) with a byte-identical
+`semantic.js`; the only other branch is `test262-cluster-runner` (a test harness); there are no
+closure/capture PRs. Porffor's `semantic.js` only *renames* variables (scope disambiguation) — the actual
+capture is unimplemented, `Prefs.closures` (on by default) does nothing useful, and `.bind` is a
+documented no-op (function.ts: "no good way to bind without … closure yet"). So there is no newer Porffor
+to pull; don't re-check. (b) implement closure capture in the vendored Porffor codegen — substantial: it
+needs a scope-parent chain + capture analysis, heap-allocated environments (captured locals moved off
+wasm locals, mutable ones boxed), a NEW function-*value* representation (a capturing function's value
+becomes a `{funcIndex, envPtr}` heap object / `TYPES.closure`, replacing the bare index at EVERY function
+value + call site + the indirect wrapper + func-lut), and env threading through the call path. Multi-day,
+high blast radius. (c) a codemod that lambda-lifts capturing callbacks (see below) — partial only. There
+is no quick patch; the real fix is (b).
 
 ### 8b.1 Lambda-lift experiment (`lambda-lift/`) — advances the frontier, but has a hard ceiling
 

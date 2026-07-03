@@ -44,9 +44,18 @@ Init now advances from statement ~54 to **~470** (of 733). Fixed since the last 
   repro: `(a)=>{ var g=()=>a+1; return g() }` throws "a is not defined"). The Porffor compiler uses
   capturing closures everywhere (`.map`/`.reduce`/`.filter` callbacks, nested `scope` helpers), so
   this is a **major compiler feature**, not a patch. **This is the real reason upstream self-hosting is
-  unsolved.** Options (all large): wait for/port upstream Porffor closure support; implement closure
-  capture in the vendored codegen; or lambda-lift capturing callbacks via codemod. Full detail +
-  the boundary table: **FINDINGS §8b.**
+  unsolved.**
+  - **Re-vendoring is EXHAUSTED (checked 2026-07): 0.61.13 is terminal for closures** — npm's latest and
+    git `main` HEAD are the same 0.61.13 (byte-identical `semantic.js`), the only other branch is a test
+    harness, and there are no closure/capture PRs. Porffor's `semantic.js` only *renames* variables; the
+    capture itself is unimplemented and `.bind` is a documented no-op. **Do not re-check for a newer
+    Porffor.** (FINDINGS §8b option a.)
+  - **Two viable paths, both large:** (b) implement closures in the vendored codegen — a new
+    `{funcIndex, envPtr}` function value (`TYPES.closure`) replacing the bare index at every value + call
+    site + the indirect wrapper + func-lut, plus heap environments and env threading (multi-day, high
+    blast radius; the real fix); or (c) the opt-in `lambda-lift/` codemod, which globalizes NON-escaping
+    captures and advances `[run]` past `keyMap` into `compileJS`, but can't handle escaping closures
+    (property-descriptor setters, stored callbacks). Full detail + the boundary table: **FINDINGS §8b, §8b.1.**
 
 ## Reproduce in 2 commands
 
