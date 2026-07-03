@@ -97,10 +97,14 @@ string is being **corrupted by a self-compile miscompilation** (Porffor mis-comp
 acorn's — dynamic `new RegExp(src, flags)` / flag-string handling). Like §5's original symptom this is
 a *semantic* self-compile bug, but much narrower now (a specific regex-flag path, not the whole parser).
 
-Approaches to localize: (a) shrink the input to `''`/`1` to see if it's parser-init vs input-driven;
-(b) grep acorn + codegen for `new RegExp(` with a computed flags argument and test each in isolation
-via `porffor run`; (c) build with `-d`, trap-trace to the constructing function. This is why upstream
-Porffor self-hosting is unsolved — the semantic layer is a sequence of these.
+Localized so far: it is **input-independent** (compiling `''` triggers it too → it fires at
+compiler/acorn *init*, not while parsing our input). The suspect is the one dynamic-flags call in the
+bundle — **`new RegExp(pattern, flags)`** (a *variable* `flags`, vs the literal-flag calls like
+`new RegExp(lineBreak.source, "g")` which are fine) — i.e. the self-compiled code corrupts the `flags`
+string it passes. Next: isolate that call (acorn's regexp validator vs a Porffor builtin), reproduce
+it standalone with `porffor wasm` (a tiny `new RegExp(p, f)` where `f` is built dynamically), and codemod
+the flag-string construction into a form Porffor compiles faithfully. This is why upstream Porffor
+self-hosting is unsolved — the semantic layer is a sequence of these.
 
 **Progress ladder:** won't-validate → **[validate] GREEN** (§4 codemod) → memory-trap → **parser runs**
 (§5 acorn-inline) → regex-flag (§6, here). **Downstream (porffor.beam, `fe_js`, CLI `.js` dispatch) is
