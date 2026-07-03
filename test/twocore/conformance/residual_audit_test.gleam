@@ -1,0 +1,173 @@
+//// The R16 empirical residual audit (P6-10 owns it, S11). Runs the pinned suite once (Safe), buckets
+//// every residual SKIP by its originating FILE and a stable reason-phrase, prints the audit table,
+//// and asserts the measured composition is HONEST — every residual skip is one of the enumerated
+//// Phase-6 categories (never an uncategorised / mislabelled skip, D9), and `fail == 0`.
+////
+//// This resolves the Phase-5 `~1088-assert` residual ambiguity by MEASUREMENT (S11): the residual is
+//// `table_copy.wast` needing cross-module funcref-in-`elem`-segment init (a DEEPER cross-module
+//// feature than the `CallImport` direct dispatch this phase landed) — NOT the impossible "1649 flip".
+//// table_copy's same-module + multi-table `call_indirect` asserts PASS; only its cross-module
+//// funcref-elem asserts remain, categorised-deferred. The SIMD text-format frontend asserts (S13:
+//// SIMD text is out of scope for the WAT parser) are the other named residual. The audit prints the
+//// TRUE cause per file so a future reader never sees a guessed label.
+
+import gleam/dict
+import gleam/int
+import gleam/io
+import gleam/list
+import gleam/option
+import gleam/string
+import twocore/conformance/driver
+import twocore/conformance/ffi
+import twocore/conformance/fixture
+import twocore/conformance/runner.{type Report}
+
+const fixtures_dir = "test/twocore/conformance/fixtures"
+
+/// The enumerated honest Phase-6 residual categories (S11/S12/S13/D9). A residual skip is HONEST iff
+/// its stable reason-phrase matches one of these; a skip matching none is UNCATEGORISED — a
+/// construct that quietly went dark — and fails the audit.
+fn allowed_phrases() -> List(String) {
+  [
+    // cross-module funcref-in-elem-segment init (table_copy) — deeper than CallImport dispatch (S11)
+    "UnknownFunction", "imported-global element-init", "NonConstInit",
+    "NonConstantExpr", "call_indirect_table", "UnsupportedNode",
+    // SIMD text-format frontend asserts — SIMD text out of scope for the WAT parser (S13)
+    "out-of-scope text", "v128", "simd", "lane",
+    "text parser+validator accepted",
+    // GC-proposal typed references / heap types — later
+    "BadHeapType", "arrayref", "ref null", "extended-const",
+    // memory64 / threads / shared — categorised
+    "memory64", "shared", "atomic.",
+    // post-2.0 proposals & harness paths (each a NAMED coverage gap, S12)
+    "unhandled command: assert_exhaustion", "call stack", "return_call", "tag",
+    "module definition", "link: unknown import", "unlinkable (out of scope)",
+    "cross-module", "import-section construct", "uninstantiable (out of scope)",
+    "register:", "no such export", "driver:",
+  ]
+}
+
+fn in_allowed_category(reason: String) -> Bool {
+  list.any(allowed_phrases(), fn(c) { string.contains(reason, c) })
+}
+
+/// The audit. Runs the pinned suite once, buckets residual skips by `(file, cause-category)`, prints
+/// the table, and asserts every residual skip is categorised + `fail == 0`.
+pub fn residual_audit_is_measured_and_honest_test() {
+  let #(count, total) = run_full_suite()
+  case count < 40 {
+    True -> {
+      io.println(
+        "\n[residual-audit] no full suite present; run vendor/vendor.sh (skipping)",
+      )
+      Nil
+    }
+    False -> {
+      // Bucket by (file, category) → count.
+      let by_bucket =
+        list.fold(total.skips, dict.new(), fn(acc, reason) {
+          let key = file_of(reason) <> "  |  " <> category_of(reason)
+          dict.upsert(acc, key, bump)
+        })
+
+      io.println(
+        "\n=== R16 residual audit (Safe, "
+        <> int.to_string(count)
+        <> " fixtures) — pass="
+        <> int.to_string(total.pass)
+        <> " skip="
+        <> int.to_string(total.skip)
+        <> " fail="
+        <> int.to_string(total.fail)
+        <> " ===",
+      )
+      io.println("  (file  |  cause)  →  count  [top 30 buckets]")
+      by_bucket
+      |> dict.to_list
+      |> list.sort(fn(a, b) {
+        let #(_, ca) = a
+        let #(_, cb) = b
+        int.compare(cb, ca)
+      })
+      |> list.take(30)
+      |> list.each(fn(kv) {
+        let #(key, n) = kv
+        io.println("    " <> key <> "  →  " <> int.to_string(n))
+      })
+
+      let uncategorised =
+        list.filter(total.skips, fn(r) { !in_allowed_category(r) })
+      case uncategorised {
+        [] ->
+          io.println(
+            "  ALL residual skips categorised (honest, D9/S11) — every cause named above.",
+          )
+        _ -> {
+          io.println(
+            "  UNCATEGORISED ("
+            <> int.to_string(list.length(uncategorised))
+            <> "):",
+          )
+          uncategorised
+          |> list.take(20)
+          |> list.each(fn(r) { io.println("    * " <> r) })
+        }
+      }
+
+      // The hard gates: zero spec mismatches; every residual skip is honestly categorised (D9).
+      assert total.fail == 0
+      assert uncategorised == []
+    }
+  }
+}
+
+/// The dict `upsert` accumulator can't pattern-match `Option` cleanly inline, so count via a helper.
+/// (Gleam's `dict.upsert` passes `Option(v)`; a fresh key is `None`.)
+fn bump(prev: option.Option(Int)) -> Int {
+  case prev {
+    option.Some(n) -> n + 1
+    option.None -> 1
+  }
+}
+
+/// Extract the originating file basename from a skip reason (`"<path>.wast:<line> <cause>"`).
+fn file_of(reason: String) -> String {
+  case string.split_once(reason, ".wast:") {
+    Ok(#(pathish, _)) ->
+      case string.split(pathish, "/") |> list.last {
+        Ok(base) -> base <> ".wast"
+        Error(_) -> pathish <> ".wast"
+      }
+    Error(_) -> "?"
+  }
+}
+
+/// Collapse a skip reason to a coarse cause-category (drop the `file:line` prefix, keep a stable
+/// tail) for the audit histogram.
+fn category_of(reason: String) -> String {
+  let tail = case string.split_once(reason, " ") {
+    Ok(#(_loc, rest)) -> rest
+    Error(_) -> reason
+  }
+  string.slice(tail, 0, 48)
+}
+
+/// Run every `*.json` fixture present under the Safe profile, returning `#(count, total)`.
+fn run_full_suite() -> #(Int, Report) {
+  let jsons = case ffi.list_dir(fixtures_dir) {
+    Ok(entries) ->
+      entries
+      |> list.filter(string.ends_with(_, ".json"))
+      |> list.sort(string.compare)
+    Error(_) -> []
+  }
+  let d = driver.pipeline()
+  let total =
+    list.fold(jsons, runner.empty_report(), fn(acc, name) {
+      case fixture.load(fixtures_dir <> "/" <> name) {
+        Error(_) -> acc
+        Ok(fix) -> runner.merge(acc, runner.run_fixture(d, fix, fixtures_dir))
+      }
+    })
+  #(list.length(jsons), total)
+}

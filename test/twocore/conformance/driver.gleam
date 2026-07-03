@@ -41,7 +41,7 @@ import twocore/backend/build_beam
 import twocore/conformance/ffi
 import twocore/conformance/fixture.{
   type SpecValue, ExternRefTag, ExternRefVal, F32Bits, F32Nan, F64Bits, F64Nan,
-  FuncRefTag, FuncRefVal, I32Val, I64Val, NullRef,
+  FuncRefTag, FuncRefVal, I32Val, I64Val, LaneI8, NullRef, V128Val,
 }
 import twocore/conformance/runner.{
   type Driver, type ImportEnv, type Instance, type InvokeResult, ImportEnv,
@@ -206,10 +206,35 @@ fn instantiate_typed(
   let irmod = ir.Module(..irmod0, name: uniquify(irmod0.name))
   // Fail-closed link (H6, spec §4.5.4): resolve every non-function import against `spectest` +
   // the `(register)`ed providers BEFORE compiling; a link failure is the `assert_unlinkable` case.
-  use provided <- result.try(
+  use state_provided <- result.try(
     link.link_imports(irmod, env.providers)
     |> result.map_error(fn(e) { "link: " <> link.import_error_phrase(e) }),
   )
+  // The function-import dispatch vector (S5/P6-09). emit_core weaves the function-import closures
+  // into the positional `Imports` list — AFTER the state imports — exactly when the module CALLS an
+  // imported function (`needs_func_imports`); the driver must match that arity byte-for-byte.
+  //
+  // We weave the closures (→ `instantiate/1`) only when the module calls an import AND EVERY
+  // function import resolves to a REAL provider — the whitelisted `spectest` host module or a
+  // `(register)`ed instance. A GENERIC host capability (e.g. `env`/`wasi`) under the deny-all Safe
+  // host is UNSATISFIED: the module is rejected fail-closed at link, exactly as the Phase-1..5
+  // acceptance corpus (`hostimport`) expects — so the corpus + the Safe≡Unsafe differential stay
+  // byte-identical (conformance-neutral, I7). Cross-module `linking.wast`/`table_copy.wast` imports
+  // resolve to registered providers, so THEY light up.
+  use provided <- result.try(case module_calls_import(irmod) {
+    False -> Ok(state_provided)
+    True ->
+      case func_imports_all_provided(irmod, env.providers) {
+        False ->
+          Error(
+            "link: unknown import (host capability not provided under the deny-all host)",
+          )
+        True ->
+          link.link_func_imports(irmod, env.providers)
+          |> result.map(fn(fp) { list.append(state_provided, fp) })
+          |> result.map_error(fn(e) { "link: " <> link.import_error_phrase(e) })
+      }
+  })
   use core_text <- result.try(
     pipeline.ir_to_core(irmod, binding)
     |> result.map_error(pipeline.describe),
@@ -226,15 +251,99 @@ fn instantiate_typed(
     _ -> ffi.start_instance_with(mod_atom, to_dynamic(provided))
   }
   case started {
-    Ok(proc) -> Ok(runner.Instance(proc: proc, exports: export_types(irmod)))
+    Ok(proc) ->
+      Ok(runner.Instance(
+        proc: proc,
+        exports: export_types(irmod),
+        func_sigs: export_func_sigs(irmod),
+      ))
     Error(trap) -> Error("instantiate: " <> trap)
   }
+}
+
+/// Build `export name → FuncType` for the module's exported FUNCTIONS (P6-10 / S5). Used to publish
+/// a `(register)`ed instance's functions as cross-module capabilities: the `FuncType` (params +
+/// results) drives fail-closed function-import matching. Non-function exports (globals/tables/
+/// memories) contribute no entry. An `ExportFn` whose target is an IMPORTED function is skipped (its
+/// signature lives in the import, and re-exporting an import across modules is out of this unit's
+/// scope — a categorized edge).
+fn export_func_sigs(m: ir.Module) -> Dict(String, ir.FuncType) {
+  let by_fn =
+    list.fold(m.functions, dict.new(), fn(acc, f) {
+      dict.insert(acc, f.name, ir.signature(f))
+    })
+  list.fold(m.exports, dict.new(), fn(acc, e) {
+    case e {
+      ir.ExportFn(export_name, fn_name) ->
+        case dict.get(by_fn, fn_name) {
+          Ok(sig) -> dict.insert(acc, export_name, sig)
+          Error(_) -> acc
+        }
+      _ -> acc
+    }
+  })
 }
 
 /// Append a process-unique suffix to a module name so concurrent fixtures' modules do
 /// not share a single BEAM module name (which `code:load_binary` would overwrite).
 fn uniquify(name: String) -> String {
   name <> "_" <> int.to_string(ffi.unique_int())
+}
+
+/// True iff EVERY function import of `module` resolves to a REAL provider — the whitelisted
+/// `spectest` host module or a `(register)`ed instance in `providers`. A function import to a
+/// generic host capability (`env`, `wasi`, …) is NOT a real provider under the deny-all Safe host,
+/// so a module calling one is rejected fail-closed (see `instantiate_typed`), preserving the
+/// Phase-1..5 corpus's `hostimport` rejection. A module with no function imports is vacuously True.
+fn func_imports_all_provided(
+  module: ir.Module,
+  providers: List(link.Provider),
+) -> Bool {
+  list.all(module.imports, fn(imp) {
+    case imp {
+      ir.ImportFn(capability, _name, _ty) ->
+        capability == "spectest" || is_registered(capability, providers)
+      _ -> True
+    }
+  })
+}
+
+/// True iff some `Registered` provider carries the link-name `capability`.
+fn is_registered(capability: String, providers: List(link.Provider)) -> Bool {
+  list.any(providers, fn(p) {
+    let link.Registered(link_name, _exports) = p
+    link_name == capability
+  })
+}
+
+/// True iff `module` CALLS an imported function anywhere (its IR contains a `CallImport` node) —
+/// the exact condition emit_core (`needs_func_imports`) uses to decide whether the generated
+/// `instantiate` seeds the function-import dispatch vector. The driver mirrors it so it appends the
+/// function-import closures to the positional `Imports` list on exactly the modules that expect
+/// them (a module that merely imports a function without calling it stays byte-neutral — no
+/// `CallImport` ⇒ no closures woven ⇒ `instantiate/0`, I7).
+fn module_calls_import(module: ir.Module) -> Bool {
+  list.any(module.functions, fn(f) { expr_calls_import(f.body) })
+}
+
+/// True iff `expr` (recursively, through the control-flow containers that hold sub-`Expr`s) contains
+/// a `CallImport` node. Mirrors emit_core's private `expr_has_call_import`.
+fn expr_calls_import(expr: ir.Expr) -> Bool {
+  case expr {
+    ir.CallImport(..) -> True
+    ir.Let(_, rhs, body) -> expr_calls_import(rhs) || expr_calls_import(body)
+    ir.If(_, _, t, e) -> expr_calls_import(t) || expr_calls_import(e)
+    ir.Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) {
+        let ir.SwitchArm(_, b) = a
+        expr_calls_import(b)
+      })
+      || expr_calls_import(default)
+    ir.Block(_, _, body) -> expr_calls_import(body)
+    ir.Loop(_, _, _, body) -> expr_calls_import(body)
+    ir.Charge(_, body) -> expr_calls_import(body)
+    _ -> False
+  }
 }
 
 /// Build the `export name → result value-types` table from the lowered IR module. Function
@@ -353,14 +462,16 @@ fn invoke_terms(
   }
 }
 
-/// Whether the reference / multi-value TERM ABI is required (else the integer fast-path). True iff
-/// any argument is a reference, any result is a reference type, or there is more than one result.
+/// Whether the reference / v128 / multi-value TERM ABI is required (else the integer fast-path).
+/// True iff any argument is a reference or a `v128`, any result is a reference type or `v128`, or
+/// there is more than one result. A `v128` is a BEAM binary (`<<_:128>>`, S14) — a term, not an
+/// integer — so it rides the SAME term ABI as references. A pure numeric call stays byte-identical.
 fn use_term_abi(args: List(SpecValue), results: List(ir.ValType)) -> Bool {
-  let ref_arg = list.any(args, is_ref_value)
-  let ref_result =
+  let term_arg = list.any(args, is_term_value)
+  let term_result =
     list.any(results, fn(ty) {
       case ty {
-        ir.TFuncRef | ir.TExternRef -> True
+        ir.TFuncRef | ir.TExternRef | ir.TV128 -> True
         _ -> False
       }
     })
@@ -368,12 +479,14 @@ fn use_term_abi(args: List(SpecValue), results: List(ir.ValType)) -> Bool {
     [] | [_] -> False
     _ -> True
   }
-  ref_arg || ref_result || multi
+  term_arg || term_result || multi
 }
 
-fn is_ref_value(v: SpecValue) -> Bool {
+/// True iff `v` must ride the term ABI as an argument — a reference (null/externref/funcref) or a
+/// `v128` (16-byte binary), none of which is an Erlang integer.
+fn is_term_value(v: SpecValue) -> Bool {
   case v {
-    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> True
+    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) | V128Val(_, _) -> True
     _ -> False
   }
 }
@@ -385,6 +498,8 @@ fn spec_to_raw(v: SpecValue) -> Int {
     I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
     F32Nan(_) | F64Nan(_) -> 0
     NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> 0
+    // A v128 argument never reaches the integer path (it forces the term ABI, S14).
+    V128Val(_, _) -> 0
   }
 }
 
@@ -400,6 +515,10 @@ fn spec_to_term(v: SpecValue) -> Dynamic {
     NullRef(_) -> rt_ref.null_ref()
     ExternRefVal(id) -> rt_ref.extern_of(id)
     FuncRefVal(_) -> rt_ref.null_ref()
+    // A v128 argument IS its 16 raw little-endian bytes (S14): pack the lanes into the 128-bit
+    // image, emit the 16-byte binary the generated code consumes as a `<<_:128>>` operand.
+    V128Val(lane, lanes) ->
+      ffi.mk_v128(fixture.v128_bytes_le(fixture.v128_pack(lanes, lane)))
   }
 }
 
@@ -414,8 +533,8 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
     ir.TF64 -> F64Bits(raw)
     ir.TTerm -> I32Val(raw)
     ir.TFuncRef | ir.TExternRef -> I32Val(raw)
-    // A `v128` result is 16 raw little-endian bytes (S14) — its result-tagging is P6-10's; no
-    // SIMD conformance runs at the keystone, so this arm is unreachable. Defensive fallback.
+    // A `v128` result forces the term ABI (`use_term_abi`), so the integer path never tags one.
+    // Defensive fallback keeps this total.
     ir.TV128 -> I32Val(raw)
   }
 }
@@ -433,9 +552,27 @@ fn tag_term(ty: ir.ValType, term: Dynamic) -> SpecValue {
     ir.TTerm -> I32Val(term_to_int(term))
     ir.TFuncRef -> tag_ref(term, FuncRefTag)
     ir.TExternRef -> tag_ref(term, ExternRefTag)
-    // A `v128` result is 16 raw little-endian bytes (S14) — P6-10's result ABI; unreachable at
-    // the keystone (no SIMD conformance runs). Defensive fallback keeps this total.
-    ir.TV128 -> I32Val(term_to_int(term))
+    // A `v128` result is the 16 raw little-endian bytes the generated code returned (S14). Read the
+    // binary back, decode to its 128-bit image, and tag it at the finest lane (`LaneI8`); the oracle
+    // re-decodes at the EXPECTED's lane type for the lane-wise comparison (M3). The load-bearing
+    // fact is that the 16 bytes round-trip byte-exact — a differing lane fails the assert.
+    ir.TV128 ->
+      V128Val(
+        LaneI8,
+        fixture.v128_unpack(
+          fixture.v128_from_bytes(term_to_bytes(term)),
+          LaneI8,
+        ),
+      )
+  }
+}
+
+/// Read a returned `v128` term as its 16-byte binary. A non-binary term (never expected for a
+/// `v128` result) yields empty bytes, which decode to an all-zero image.
+fn term_to_bytes(term: Dynamic) -> BitArray {
+  case dyn_decode.run(term, dyn_decode.bit_array) {
+    Ok(b) -> b
+    Error(_) -> <<>>
   }
 }
 

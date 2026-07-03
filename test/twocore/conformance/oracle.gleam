@@ -24,7 +24,7 @@
 import gleam/int
 import twocore/conformance/fixture.{
   type NanKind, type SpecValue, Arithmetic, Canonical, ExternRefVal, F32Bits,
-  F32Nan, F64Bits, F64Nan, FuncRefVal, I32Val, I64Val, NullRef,
+  F32Nan, F64Bits, F64Nan, FuncRefVal, I32Val, I64Val, NullRef, V128Val,
 }
 
 // IEEE-754 binary32 field masks (sign|exp[8]|payload[23]).
@@ -84,6 +84,25 @@ pub fn matches(actual: SpecValue, expected: SpecValue) -> Bool {
         FuncRefVal(_) -> True
         _ -> False
       }
+    // v128 comparison (P6-10 / M3), per the spec vector value model
+    // (<https://webassembly.github.io/spec/core/syntax/values.html#vectors>) + vector-instruction
+    // semantics. A `v128` is correct iff EVERY lane is correct at the EXPECTED's lane
+    // interpretation — this CANNOT be a raw 16-byte `==`, because a float-lane result may be a NaN
+    // whose payload bits are implementation-chosen but spec-legal (canonical/arithmetic), matched
+    // by CLASS not bit pattern. So we reconstruct the actual's 16-byte image, re-decode it at the
+    // expected's `lane_type`, and compare each lane with the SAME scalar `matches` used for scalar
+    // floats (integer lanes by exact bit-equality, f32/f64 lanes by bit-equality OR NaN-class).
+    // Both `nan:canonical` and `nan:arithmetic` accept the canonical NaN rt_num/rt_simd produce
+    // (canonical ⊂ arithmetic — see `nan_class`).
+    V128Val(exp_lane, exp_lanes) ->
+      case actual {
+        V128Val(act_lane, act_lanes) -> {
+          let image = fixture.v128_pack(act_lanes, act_lane)
+          let reinterpreted = fixture.v128_unpack(image, exp_lane)
+          matches_all(reinterpreted, exp_lanes)
+        }
+        _ -> False
+      }
   }
 }
 
@@ -111,6 +130,8 @@ fn raw_bits(v: SpecValue) -> Int {
     F32Nan(_) | F64Nan(_) -> 0
     // Reference values carry no numeric bits (they are compared as references, never as bits).
     NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> 0
+    // A v128 is compared lane-wise (see `matches`), never as a single scalar bit pattern.
+    V128Val(_, _) -> 0
   }
 }
 

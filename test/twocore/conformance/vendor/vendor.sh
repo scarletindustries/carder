@@ -88,6 +88,20 @@ while IFS= read -r raw || [ -n "$raw" ]; do
   fi
 done < "$here/ALLOWLIST"
 
+# --- copy the WAT-route target files (P6-10) -----------------------------------
+# `memory64.wast` and `linking.wast` are UN-`wast2json`-able at the pin (a `(module definition …)`
+# module-linking form; GC typed-ref globals). Per R16 they are driven from OUR WAT parser
+# (wat_fixture.gleam): copy the RAW `.wast` text into fixtures/ so the WAT-route tests can read them
+# (they degrade to a categorized parse-skip at this pin — the parser cannot handle their out-of-scope
+# constructs — but the route is exercised + the residual measured honestly, never a silent drop).
+for wat_target in memory64 linking; do
+  src="$clone_dir/$wat_target.wast"
+  if [ -f "$src" ]; then
+    cp "$src" "$fixtures_dir/$wat_target.wast"
+    echo "vendor: copied $wat_target.wast (WAT-route target, un-wast2json-able at pin)"
+  fi
+done
+
 echo "vendor: converted +validated:$converted"
 [ -n "$skipped" ] && echo "vendor: skipped (un-convertible at pin):$skipped"
 if [ "$fail" != "0" ]; then echo "vendor: one or more CONVERTIBLE fixtures failed validation" >&2; exit 1; fi

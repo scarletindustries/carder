@@ -47,21 +47,29 @@ type State {
 pub fn run_wat_fixture(driver: Driver, path: String) -> Report {
   case read_text(path) {
     Error(e) -> one_skip("wat read: " <> e)
-    Ok(text) ->
-      case wat.parse_script(text) {
-        Error(wat.Unsupported(_, _, detail)) ->
-          one_skip("wat parse: out-of-scope text (" <> detail <> ")")
-        Error(err) -> one_skip("wat parse: " <> string.inspect(err))
-        Ok(script) -> {
-          let state =
-            list.fold(
-              script,
-              State(registry.new(), ImportEnv(providers: []), empty()),
-              fn(st, cmd) { run_command(driver, st, cmd) },
-            )
-          reverse_reasons(state.rep)
-        }
-      }
+    Ok(text) -> run_wat_text(driver, text)
+  }
+}
+
+/// Drive an in-memory `.wast` `text` through `wat.parse_script` + the adapter (the path-free core of
+/// `run_wat_fixture`). Exposed so a caller can PRE-FILTER out-of-scope module groups the parser's
+/// whole-script `try_map` would otherwise abort on (S13/R16 — e.g. memory64's single `(module
+/// definition …)`), routing what the parser CAN handle and categorizing the rest. A whole-script
+/// parse failure is a single categorised skip (never a panic, never a false green).
+pub fn run_wat_text(driver: Driver, text: String) -> Report {
+  case wat.parse_script(text) {
+    Error(wat.Unsupported(_, _, detail)) ->
+      one_skip("wat parse: out-of-scope text (" <> detail <> ")")
+    Error(err) -> one_skip("wat parse: " <> string.inspect(err))
+    Ok(script) -> {
+      let state =
+        list.fold(
+          script,
+          State(registry.new(), ImportEnv(providers: []), empty()),
+          fn(st, cmd) { run_command(driver, st, cmd) },
+        )
+      reverse_reasons(state.rep)
+    }
   }
 }
 
@@ -73,7 +81,21 @@ fn run_command(driver: Driver, st: State, cmd: wat.Command) -> State {
     }
     wat.Register(name, module) ->
       case registry.register(st.reg, name, module) {
-        Ok(reg2) -> State(..st, reg: reg2)
+        // Publish the registered instance's exported functions as cross-module capabilities in
+        // `env.providers` (the P6-10 flip, S5) so `linking.wast`'s later modules dispatch into it.
+        Ok(reg2) ->
+          case resolve(reg2, module) {
+            Ok(inst) ->
+              State(
+                ..st,
+                reg: reg2,
+                env: ImportEnv(providers: [
+                  runner.provider_from_instance(name, inst),
+                  ..st.env.providers
+                ]),
+              )
+            Error(_) -> State(..st, reg: reg2)
+          }
         Error(e) -> skip(st, "register: " <> e)
       }
     wat.AssertReturn(action, expected) ->

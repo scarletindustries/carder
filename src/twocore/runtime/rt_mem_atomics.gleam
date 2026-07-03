@@ -507,6 +507,145 @@ pub fn init_data(offset: Int, bytes: BitArray) -> Result(Nil, TrapReason) {
   }
 }
 
+// ── the v128-memory BitArray seam (S4) — the atomics twin of `rt_mem.load_bytes`/`store_bytes` ──
+//
+// `v128.load`/`store` (and the extend/zero/lane families' byte moves) route through these
+// bounds-checked BitArray wrappers so the ATOMICS tier runs the SIMD-memory `.wast` files under the
+// full `(state_strategy × mem_tier)` matrix (§G.1) — a mis-endianned atomics `v128.store` diverges
+// on the exact file. Trap-before-write (no-wrap bignum bounds → `MemoryOutOfBounds`, ZERO mutation),
+// composed from the existing `gather_bytes` (address-order read) / `write_data_loop` (address-order
+// write) primitives, so the byte image is byte-identical to the paged `rt_mem` seam.
+
+/// Pure v128-slice load: bounds-check the WHOLE `[ea, ea+n)` range, then gather `n` address-order
+/// bytes into a `BitArray`. `Ok(bytes)` or `Error(MemoryOutOfBounds)`. Read-only. The atomics twin
+/// of `rt_mem.mem_load_bytes`.
+fn a_load_bytes(
+  a: Atomics,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  let ea = addr + offset
+  case in_bounds(a, ea, n) {
+    False -> Error(MemoryOutOfBounds)
+    True -> Ok(gather_bytes(a, ea, n))
+  }
+}
+
+/// Pure v128-slice store: bounds-check the WHOLE `[ea, ea+len)` range FIRST (trap-before-write,
+/// all-or-nothing), then scatter the `bytes` in address order (the `ref` is mutated in place, so the
+/// handle is unchanged — like `a_store`). `Ok(a)` or `Error(MemoryOutOfBounds)` (zero mutation).
+fn a_store_bytes(
+  a: Atomics,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Atomics, TrapReason) {
+  let ea = addr + offset
+  case in_bounds(a, ea, bit_array.byte_size(bytes)) {
+    False -> Error(MemoryOutOfBounds)
+    True -> {
+      write_data_loop(a, ea, bytes)
+      Ok(a)
+    }
+  }
+}
+
+/// `load_bytes` on THIS process's cell memory (index 0) — the atomics twin of `rt_mem.load_bytes`.
+pub fn load_bytes(
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  a_load_bytes(current_atomics(), addr, offset, n)
+}
+
+/// `store_bytes` on THIS process's cell memory (index 0). In-place mutation → NO `mem_put` (like
+/// `store`). `Ok(Nil)` or `Error(MemoryOutOfBounds)` (zero mutation).
+pub fn store_bytes(
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  case a_store_bytes(current_atomics(), addr, bytes, offset) {
+    Ok(_a) -> Ok(Nil)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `load_bytes` on memory `mem_idx` (read-only). Index-routed twin of `load_bytes`.
+pub fn load_bytes_at(
+  mem_idx: Int,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  a_load_bytes(current_atomics_at(mem_idx), addr, offset, n)
+}
+
+/// `store_bytes` on memory `mem_idx`. In-place (no `mem_put`). Index-routed twin of `store_bytes`.
+pub fn store_bytes_at(
+  mem_idx: Int,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  case a_store_bytes(current_atomics_at(mem_idx), addr, bytes, offset) {
+    Ok(_a) -> Ok(Nil)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `load_bytes` (read-only; `st` unchanged). Projects the record's default memory.
+pub fn t_load_bytes(
+  st: InstanceState,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  a_load_bytes(project(st), addr, offset, n)
+}
+
+/// Threaded `store_bytes`. In-place `ref` mutation → returns the SAME `st` (the handle value is
+/// unchanged), or `Error(MemoryOutOfBounds)` (zero mutation). Mirrors `t_store`.
+pub fn t_store_bytes(
+  st: InstanceState,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(InstanceState, TrapReason) {
+  case a_store_bytes(project(st), addr, bytes, offset) {
+    Ok(_a) -> Ok(st)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `load_bytes` on memory `mem_idx` (read-only). Index-routed twin of `t_load_bytes`.
+pub fn t_load_bytes_at(
+  st: InstanceState,
+  mem_idx: Int,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  a_load_bytes(project_at(st, mem_idx), addr, offset, n)
+}
+
+/// Threaded `store_bytes` on memory `mem_idx`. In-place → returns the SAME `st`. Index-routed twin
+/// of `t_store_bytes`.
+pub fn t_store_bytes_at(
+  st: InstanceState,
+  mem_idx: Int,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(InstanceState, TrapReason) {
+  case a_store_bytes(project_at(st, mem_idx), addr, bytes, offset) {
+    Ok(_a) -> Ok(st)
+    Error(reason) -> Error(reason)
+  }
+}
+
 /// Read THIS process's current `Atomics` out of the cell. Fail-closed: `rt_state.mem_get`
 /// `panic`s on an un-seeded cell (it never returns garbage), which propagates here.
 fn current_atomics() -> Atomics {

@@ -110,6 +110,21 @@ pub fn extern_payload(ref: Dynamic) -> Dynamic
 @external(erlang, "twocore_conformance_ffi", "result_list")
 pub fn result_list(arity: Int, package: Dynamic) -> List(Dynamic)
 
+/// Raise `reason` as a BEAM error so a cross-module call PROPAGATES the callee instance's trap (S5 /
+/// P6-10). When module B calls module A's exported function through the register-seam routing closure
+/// and A traps, `call_instance_terms` returns `Error(rendered_reason)`; the routing closure re-raises
+/// it here so B's own invoke surfaces a `Trapped` with A's phrase (a cross-module trap is a trap, not
+/// a silent wrong value). Never returns (the type var unifies with the closure's result list).
+@external(erlang, "erlang", "error")
+pub fn raise_reason(reason: String) -> a
+
+/// Construct the 16-byte binary a `v128` argument carries across the term ABI (P6-10 / S14).
+/// Identity over the `BitArray` at runtime — a 16-byte Gleam `BitArray` IS the Erlang `<<_:128>>`
+/// binary the generated code consumes as a `v128` operand, little-endian lane layout (lane 0 = the
+/// low bytes). No decode/copy: the `Dynamic` is the same term.
+@external(erlang, "gleam_stdlib", "identity")
+pub fn mk_v128(bytes: BitArray) -> Dynamic
+
 /// Stop an instance's owned process; its process-dictionary cell is GC'd with it.
 @external(erlang, "twocore_conformance_ffi", "stop_instance")
 pub fn stop_instance(proc: Pid) -> Nil

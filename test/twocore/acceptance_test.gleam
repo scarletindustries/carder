@@ -160,7 +160,13 @@ fn instantiate_safe(bytes: BitArray) -> Result(Instance, String) {
     ffi.start_instance(mod_atom)
     |> result.map_error(fn(t) { "instantiate: " <> t }),
   )
-  Ok(runner.Instance(proc: proc, exports: export_types(m)))
+  // The acceptance corpus is single-module (no cross-module `(register)`), so it publishes no
+  // function capabilities — an empty `func_sigs` (P6-10).
+  Ok(runner.Instance(
+    proc: proc,
+    exports: export_types(m),
+    func_sigs: dict.new(),
+  ))
 }
 
 /// Check one `.expected` line against the running instance via 07's oracle / trap matcher.
@@ -247,6 +253,8 @@ fn spec_to_raw(v: SpecValue) -> Int {
     F32Nan(_) | F64Nan(_) -> 0
     // Reference values carry no raw bits (the acceptance corpus is numeric); 0 stays total.
     fixture.NullRef(_) | fixture.ExternRefVal(_) | fixture.FuncRefVal(_) -> 0
+    // A v128 is compared lane-wise, never as a scalar; the acceptance corpus is numeric.
+    fixture.V128Val(_, _) -> 0
   }
 }
 

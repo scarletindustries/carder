@@ -18,8 +18,10 @@
 ////    `.wasm` we can feed the decoder/validator; `"text"` references a `.wat` we cannot
 ////    — there is no Phase-1 WAT parser, so the runner skips text cases).
 
+import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import twocore/conformance/ffi
@@ -43,6 +45,19 @@ pub type NanKind {
 pub type RefTypeTag {
   FuncRefTag
   ExternRefTag
+}
+
+/// Which lane shape a `v128` expectation is decoded at (the wast2json `lane_type` field, P6-10 /
+/// S14). Determines the lane count and each lane's scalar type for the lane-wise oracle:
+/// `i8`→16 lanes, `i16`→8, `i32`→4, `i64`→2, `f32`→4, `f64`→2. The 16 raw bytes are chunked
+/// little-endian (lane 0 = the low-order bytes).
+pub type V128Lane {
+  LaneI8
+  LaneI16
+  LaneI32
+  LaneI64
+  LaneF32
+  LaneF64
 }
 
 /// A single WebAssembly value as it appears in a fixture. Integers and concrete floats
@@ -70,6 +85,14 @@ pub type SpecValue {
   NullRef(ty: RefTypeTag)
   ExternRefVal(id: Int)
   FuncRefVal(index: Option(Int))
+  /// A `v128` value (P6-10 / S14). `lane` is the wast2json `lane_type` (how the 16 bytes are
+  /// chunked); `lanes` is one scalar `SpecValue` per lane in **lane order 0..N-1** (== little-endian
+  /// byte order, lane 0 = the low bytes). Integer lanes are `I32Val`/`I64Val`; float lanes are
+  /// `F32Bits`/`F64Bits` (a concrete pattern) or `F32Nan`/`F64Nan` (a per-lane `nan:canonical` /
+  /// `nan:arithmetic` token). The raw 16-byte binary is reconstructible via `v128_pack` +
+  /// `v128_bytes_le`; a returned v128 is decoded back into this shape at the EXPECTED's lane type
+  /// for lane-wise comparison (see `oracle.matches`).
+  V128Val(lane: V128Lane, lanes: List(SpecValue))
 }
 
 /// Which on-disk form a rejected-module command references.
@@ -260,8 +283,66 @@ fn action_decoder() -> decode.Decoder(Action) {
 
 fn spec_value_decoder() -> decode.Decoder(SpecValue) {
   use ty <- decode.field("type", decode.string)
-  use value <- decode.optional_field("value", "", decode.string)
-  decode.success(parse_spec_value(ty, value))
+  case ty {
+    // A `v128` value's `value` is an ARRAY of per-lane decimal-of-bits strings (with an optional
+    // `lane_type`), NOT a single string — decode it separately so the scalar path is unchanged.
+    "v128" -> {
+      use lane_type <- decode.optional_field("lane_type", "i32", decode.string)
+      use lanes <- decode.optional_field(
+        "value",
+        [],
+        decode.list(decode.string),
+      )
+      decode.success(parse_v128(lane_type, lanes))
+    }
+    _ -> {
+      use value <- decode.optional_field("value", "", decode.string)
+      decode.success(parse_spec_value(ty, value))
+    }
+  }
+}
+
+/// Build a `V128Val` from the wast2json `lane_type` + the per-lane `value` strings. Each lane
+/// string is run through the EXISTING scalar parse at the lane's scalar type (so per-lane NaN
+/// tokens and decimal-of-bits are handled by the already-tested scalar path). An absent `value`
+/// (a placeholder in an `assert_trap`) yields an empty lane list, never compared.
+fn parse_v128(lane_type: String, values: List(String)) -> SpecValue {
+  let lane = string_to_lane(lane_type)
+  V128Val(lane, list.map(values, fn(s) { parse_lane_scalar(lane, s) }))
+}
+
+/// Map one lane's decimal-of-unsigned-bits string to its scalar `SpecValue` at the lane's type.
+/// `i8`/`i16`/`i32` lanes → `I32Val` (their unsigned pattern fits in 32 bits); `i64` → `I64Val`;
+/// `f32`/`f64` → a NaN class (`nan:canonical`/`nan:arithmetic`) or a concrete `F32Bits`/`F64Bits`.
+fn parse_lane_scalar(lane: V128Lane, value: String) -> SpecValue {
+  case lane {
+    LaneI8 | LaneI16 | LaneI32 -> I32Val(parse_bits(value))
+    LaneI64 -> I64Val(parse_bits(value))
+    LaneF32 ->
+      case nan_kind(value) {
+        Some(k) -> F32Nan(k)
+        None -> F32Bits(parse_bits(value))
+      }
+    LaneF64 ->
+      case nan_kind(value) {
+        Some(k) -> F64Nan(k)
+        None -> F64Bits(parse_bits(value))
+      }
+  }
+}
+
+/// Map the wast2json `lane_type` string to a `V128Lane`. An unrecognised type defaults to `LaneI8`
+/// (the finest chunking) — a defensive default; wabt 1.0.41 only emits the six known lane types.
+fn string_to_lane(s: String) -> V128Lane {
+  case s {
+    "i8" -> LaneI8
+    "i16" -> LaneI16
+    "i32" -> LaneI32
+    "i64" -> LaneI64
+    "f32" -> LaneF32
+    "f64" -> LaneF64
+    _ -> LaneI8
+  }
 }
 
 /// Build a `SpecValue` from the JSON `type` tag and the `value` STRING. Integers and
@@ -335,5 +416,111 @@ fn blank_to_none(s: String) -> Option(String) {
   case s {
     "" -> None
     other -> Some(other)
+  }
+}
+
+// ─────────────────────────────── the v128 lane codec (S14) ───────────────────────────────
+//
+// A `v128` crosses the harness as 16 raw little-endian bytes (S14). These pure helpers convert
+// between the `V128Val` lane list and that byte image, treating the 16 bytes as one 128-bit
+// little-endian integer (lane 0 = low bits). Shared by `driver.gleam` (arg/result ABI marshalling)
+// and `oracle.gleam` (re-decode a returned v128 at the expected's lane type).
+
+/// The bit-width of one lane of `lane` (`8`/`16`/`32`/`64`). Multiply the count `128 / width` to
+/// get the lane count.
+pub fn v128_lane_bits(lane: V128Lane) -> Int {
+  case lane {
+    LaneI8 -> 8
+    LaneI16 -> 16
+    LaneI32 -> 32
+    LaneI64 -> 64
+    LaneF32 -> 32
+    LaneF64 -> 64
+  }
+}
+
+/// Pack a lane list into the 128-bit little-endian integer it represents. Lane `i`'s raw bits (its
+/// unsigned pattern, masked to the lane width) occupy bits `[width*i, width*(i+1))` — lane 0 lowest.
+/// A NaN-class lane carries no concrete bits (it is only ever an EXPECTED, never packed as an
+/// actual) and contributes `0`.
+pub fn v128_pack(lanes: List(SpecValue), lane: V128Lane) -> Int {
+  let width = v128_lane_bits(lane)
+  let mask = pow2(width) - 1
+  let #(acc, _shift) =
+    list.fold(lanes, #(0, 0), fn(state, v) {
+      let #(acc, shift) = state
+      let bits = int.bitwise_and(lane_raw_bits(v), mask)
+      #(acc + int.bitwise_shift_left(bits, shift), shift + width)
+    })
+  acc
+}
+
+/// Decode a 128-bit little-endian integer into `128 / width` lanes at `lane`. Integer lanes become
+/// `I32Val`/`I64Val`; float lanes become `F32Bits`/`F64Bits` (a returned float lane is a concrete
+/// bit pattern — the oracle matches it against a concrete OR a NaN-class expectation). Used by both
+/// the driver (tag a returned v128) and the oracle (re-decode at the expected's lane type).
+pub fn v128_unpack(n: Int, lane: V128Lane) -> List(SpecValue) {
+  let width = v128_lane_bits(lane)
+  let mask = pow2(width) - 1
+  let count = 128 / width
+  seq(count)
+  |> list.map(fn(i) {
+    let bits = int.bitwise_and(int.bitwise_shift_right(n, width * i), mask)
+    case lane {
+      LaneI8 | LaneI16 | LaneI32 -> I32Val(bits)
+      LaneI64 -> I64Val(bits)
+      LaneF32 -> F32Bits(bits)
+      LaneF64 -> F64Bits(bits)
+    }
+  })
+}
+
+/// Encode a 128-bit integer as its 16 raw little-endian bytes (a `BitArray` == the runtime
+/// `<<_:128>>`). Byte `i` is `(n >> 8i) & 0xFF`.
+pub fn v128_bytes_le(n: Int) -> BitArray {
+  seq(16)
+  |> list.map(fn(i) {
+    <<{ int.bitwise_and(int.bitwise_shift_right(n, 8 * i), 0xFF) }:size(8)>>
+  })
+  |> bit_array.concat
+}
+
+/// The list `[0, 1, …, n-1]` (a local range — this stdlib has no `list.range`). `n <= 0` → `[]`.
+fn seq(n: Int) -> List(Int) {
+  build_seq(n - 1, [])
+}
+
+fn build_seq(i: Int, acc: List(Int)) -> List(Int) {
+  case i < 0 {
+    True -> acc
+    False -> build_seq(i - 1, [i, ..acc])
+  }
+}
+
+/// Decode a 16-byte little-endian `BitArray` back into its 128-bit integer. A shorter/other input
+/// (never expected for a `v128` result) yields `0`.
+pub fn v128_from_bytes(bytes: BitArray) -> Int {
+  case bytes {
+    <<n:size(128)-little-unsigned>> -> n
+    _ -> 0
+  }
+}
+
+/// The raw unsigned bit pattern a concrete scalar lane carries (mirrors `oracle.raw_bits`, kept
+/// local so the codec is self-contained). NaN-class / reference lanes contribute `0`.
+fn lane_raw_bits(v: SpecValue) -> Int {
+  case v {
+    I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
+    _ -> 0
+  }
+}
+
+fn pow2(n: Int) -> Int {
+  case n {
+    8 -> 0x100
+    16 -> 0x10000
+    32 -> 0x100000000
+    64 -> 0x10000000000000000
+    _ -> 1
   }
 }

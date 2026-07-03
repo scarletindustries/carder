@@ -121,6 +121,31 @@ const matrix_skip_numeric: List(String) = [
 /// it imports the paged `spectest` memory — never for convenience.
 const matrix_skip_spectest_state: List(String) = ["data.json"]
 
+/// True iff `name` is a **pure-lane** SIMD fixture — a `simd_*.json` that exercises NO linear
+/// memory (arithmetic / comparison / bitwise / boolean / const / conversions / splat / lane-access /
+/// shuffle / extmul / dot / pairwise / extend / saturating / q15), so under any `(state_strategy ×
+/// mem_tier)` its functions are never state-reaching and emit byte-identical code to `cell × paged`
+/// (the threaded record threads through nothing; the memory tier is never linked). Like the bulk
+/// pure-NUMERIC files (`matrix_skip_numeric`), these ~24k-assert files run under the TWO full
+/// profiles (`spec_suite_safe`/`unsafe`) — where a lane-semantics or optimizer regression surfaces —
+/// but NOT ×5 across the matrix combos (that would prove nothing about the tier axis and OOM CI,
+/// §G.2). The SIMD-MEMORY files (`v128.load`/`store`/`*_lane`, `simd_address`/`simd_align`) DO touch
+/// memory, so they STAY in the ×5 matrix (a mis-endianned `atomics` `v128.store` diverges there).
+fn is_pure_lane_simd(name: String) -> Bool {
+  string.starts_with(name, "simd_") && !is_simd_memory_file(name)
+}
+
+/// True iff `name` is a SIMD fixture that reads/writes LINEAR MEMORY (so it is tier-touching and
+/// stays in the ×5 matrix): the `v128.load*`/`store*` families, the lane load/store, and the
+/// alignment/address files.
+fn is_simd_memory_file(name: String) -> Bool {
+  string.contains(name, "load")
+  || string.contains(name, "store")
+  || string.contains(name, "address")
+  || string.contains(name, "align")
+  || string.contains(name, "memory")
+}
+
 /// The spec suite under the fail-closed **Safe** profile (Baseline optimizer + enforcing fuel):
 /// `fail == 0 && pass > 0`. This is the Phase-1/2 green re-run through the Phase-3 full chain
 /// (`ir_lower → optimize → emit_core`), confirming the Baseline optimizer is conformance-neutral.
@@ -212,6 +237,9 @@ fn run_combo(c: Combo) -> Nil {
     fn(name) {
       !list.contains(matrix_skip_numeric, name)
       && !list.contains(paged_only, name)
+      // Pure-lane SIMD files are tier-invariant (no instance state) — cover them under the two full
+      // profiles, not ×5 (§G.2). The SIMD-MEMORY files stay in the matrix (tier-touching).
+      && !is_pure_lane_simd(name)
     },
   )
 }

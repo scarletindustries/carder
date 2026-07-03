@@ -22,10 +22,13 @@
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
+import gleam/dynamic.{type Dynamic}
+import gleam/erlang/atom
 import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/list
 import gleam/string
+import twocore/conformance/ffi
 import twocore/conformance/fixture.{
   type Action, type Command, type Fixture, type SpecValue, ActionCmd,
   AssertInvalid, AssertMalformed, AssertReturn, AssertTrap, AssertUninstantiable,
@@ -48,7 +51,15 @@ import twocore/runtime/link
 /// every invoke is routed INTO `proc` (via `ffi.call_instance`); cross-invoke state
 /// persists, and a (re)instantiation spawns a fresh `proc` with a fresh zeroed cell.
 pub type Instance {
-  Instance(proc: Pid, exports: Dict(String, List(ir.ValType)))
+  Instance(
+    proc: Pid,
+    exports: Dict(String, List(ir.ValType)),
+    /// Per exported FUNCTION name → its full `FuncType` (params + results). Used to publish this
+    /// instance's exported functions as cross-module `link.ProvidedFunc` capabilities on `(register)`
+    /// (P6-10) — the signature drives fail-closed function-import matching (spec §3.2.7). Empty for a
+    /// module with no function exports; a non-function export (global/table/memory) is absent.
+    func_sigs: Dict(String, ir.FuncType),
+  )
 }
 
 /// The outcome of invoking an export.
@@ -127,6 +138,50 @@ pub fn empty_report() -> Report {
   Report(pass: 0, fail: 0, skip: 0, fails: [], skips: [])
 }
 
+// ─────────────────────── cross-module `(register)` provider (P6-10 / S5) ───────────────────────
+
+/// Publish `inst`'s exported FUNCTIONS as cross-module `link.ProvidedFunc` capabilities under the
+/// link-name `name` (the `(register "name" $mod)` flip, S5/§C.2). A later module importing
+/// `#(name, field)` resolves to the routing closure this builds, which dispatches the call INTO the
+/// exporting instance's OWNING PROCESS (`inst.proc`) via the term run-ABI (so each `cell` instance's
+/// pdict never collides) and returns the callee's result value list. The exported function's
+/// `FuncType` drives fail-closed function-import matching (spec §3.2.7). Only FUNCTION exports are
+/// published — cross-module MUTABLE state (global/table/memory) import is the categorized §D.2 depth
+/// item, deliberately not provided (so such an import fails closed → a named skip, never a false
+/// green). D3a: the closure is a HANDED-IN capability the linker matches by signature; generated code
+/// never names the callee.
+pub fn provider_from_instance(name: String, inst: Instance) -> link.Provider {
+  let exports =
+    dict.fold(inst.func_sigs, dict.new(), fn(acc, field, sig) {
+      dict.insert(
+        acc,
+        field,
+        link.provided_func(sig, routing_closure(inst.proc, field, sig)),
+      )
+    })
+  link.Registered(name, exports)
+}
+
+/// The cross-module dispatch closure (`fn(List(Dynamic)) -> List(Dynamic)`, the S5 ABI): invoke
+/// exported function `field` on the exporting instance's process with the raw-term argument list,
+/// and return the callee's result value list (unpacked to `list.length(sig.results)` values). A
+/// callee trap is PROPAGATED — `call_instance_terms` returns `Error(reason)`, which is re-raised so
+/// the calling instance's invoke surfaces the trap (a cross-module trap is a trap).
+fn routing_closure(
+  proc: Pid,
+  field: String,
+  sig: ir.FuncType,
+) -> fn(List(Dynamic)) -> List(Dynamic) {
+  let n = list.length(sig.results)
+  let f = atom.create(field)
+  fn(args) {
+    case ffi.call_instance_terms(proc, f, args) {
+      Ok(package) -> ffi.result_list(n, package)
+      Error(reason) -> ffi.raise_reason(reason)
+    }
+  }
+}
+
 /// Sum two reports (for aggregating across fixtures). Reason lists are concatenated.
 pub fn merge(a: Report, b: Report) -> Report {
   Report(
@@ -199,10 +254,12 @@ fn run_command(
 
     Register(_line, as_name, module) ->
       case registry.register(reg, as_name, module) {
-        // Registry aliasing is enough for a cross-module INVOKE (`(invoke $reg "f")`); cross-module
-        // state IMPORT needs shared mutable state we do not thread (§D.2 depth honesty), so `env`
-        // is unchanged — a later import of a registered module's state fails closed → skip.
-        Ok(reg2) -> #(reg2, env, rep)
+        // Publish the registered instance's exported FUNCTIONS as cross-module `ProvidedFunc`
+        // capabilities in `env.providers` (P6-10 flip, S5): a later module importing `#(as_name,
+        // field)` now dispatches into the registered instance's process via the routing closure.
+        // Cross-module mutable STATE import stays the categorized §D.2 depth item (not published),
+        // so it still fails closed → a named skip (never a false green).
+        Ok(reg2) -> #(reg2, publish_provider(reg2, as_name, module, env), rep)
         Error(e) -> #(reg, env, skip(rep, at(src, 0) <> "register: " <> e))
       }
 
@@ -687,6 +744,27 @@ fn resolve_instance(reg: Reg, module) -> Result(Instance, String) {
     Error(e) -> Error(e)
     Ok(Error(why)) -> Error("module did not instantiate: " <> why)
     Ok(Ok(inst)) -> Ok(inst)
+  }
+}
+
+/// Prepend a cross-module provider for the just-registered instance to `env.providers` (the P6-10
+/// flip). Resolves `module` (the `(register)`'s target, `None` = current) to its instance; if it
+/// instantiated OK, publishes its exported functions under `as_name` (S5). If the module is unknown
+/// or failed to instantiate, `env` is UNCHANGED — a later import of it then fails closed (never a
+/// false green).
+fn publish_provider(
+  reg: Reg,
+  as_name: String,
+  module,
+  env: ImportEnv,
+) -> ImportEnv {
+  case resolve_instance(reg, module) {
+    Ok(inst) ->
+      ImportEnv(providers: [
+        provider_from_instance(as_name, inst),
+        ..env.providers
+      ])
+    Error(_) -> env
   }
 }
 

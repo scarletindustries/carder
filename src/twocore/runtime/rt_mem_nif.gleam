@@ -368,6 +368,89 @@ pub fn t_store_at(
   rt_mem.t_store_at(st, mem_idx, bytes, addr, value, offset)
 }
 
+// ── the v128-memory BitArray seam (S4) — delegated to the paged `rt_mem` core (the nif skeleton
+// delegates memory to `rt_mem`, so the SIMD-memory `.wast` files run under `cell × nif` too, §G.1).
+
+/// `load_bytes` on the cell memory (index 0). Delegates to `rt_mem.load_bytes`.
+pub fn load_bytes(
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  rt_mem.load_bytes(addr, offset, n)
+}
+
+/// `store_bytes` into the cell memory (index 0). Delegates to `rt_mem.store_bytes`.
+pub fn store_bytes(
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  rt_mem.store_bytes(addr, bytes, offset)
+}
+
+/// `load_bytes` on memory `mem_idx`. Delegates to `rt_mem.load_bytes_at`.
+pub fn load_bytes_at(
+  mem_idx: Int,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  rt_mem.load_bytes_at(mem_idx, addr, offset, n)
+}
+
+/// `store_bytes` on memory `mem_idx`. Delegates to `rt_mem.store_bytes_at`.
+pub fn store_bytes_at(
+  mem_idx: Int,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Nil, TrapReason) {
+  rt_mem.store_bytes_at(mem_idx, addr, bytes, offset)
+}
+
+/// Threaded `load_bytes` (read-only). Delegates to `rt_mem.t_load_bytes`.
+pub fn t_load_bytes(
+  st: InstanceState,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  rt_mem.t_load_bytes(st, addr, offset, n)
+}
+
+/// Threaded `store_bytes`. Delegates to `rt_mem.t_store_bytes`.
+pub fn t_store_bytes(
+  st: InstanceState,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_store_bytes(st, addr, bytes, offset)
+}
+
+/// Threaded `load_bytes` on memory `mem_idx`. Delegates to `rt_mem.t_load_bytes_at`.
+pub fn t_load_bytes_at(
+  st: InstanceState,
+  mem_idx: Int,
+  addr: Int,
+  offset: Int,
+  n: Int,
+) -> Result(BitArray, TrapReason) {
+  rt_mem.t_load_bytes_at(st, mem_idx, addr, offset, n)
+}
+
+/// Threaded `store_bytes` on memory `mem_idx`. Delegates to `rt_mem.t_store_bytes_at`.
+pub fn t_store_bytes_at(
+  st: InstanceState,
+  mem_idx: Int,
+  addr: Int,
+  bytes: BitArray,
+  offset: Int,
+) -> Result(InstanceState, TrapReason) {
+  rt_mem.t_store_bytes_at(st, mem_idx, addr, bytes, offset)
+}
+
 /// Threaded `memory.size` of memory `mem_idx`. Delegates to `rt_mem.t_size_at`.
 pub fn t_size_at(st: InstanceState, mem_idx: Int) -> Int {
   rt_mem.t_size_at(st, mem_idx)

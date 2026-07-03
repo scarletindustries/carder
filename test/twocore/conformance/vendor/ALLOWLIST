@@ -89,6 +89,75 @@ memory_copy          # memory.copy overlap-correct (memmove) — 4450 asserts
 memory_init          # memory.init + data.drop (dropped seg = length 0)
 data                 # active/passive data segments + data.drop
 
+# ── Phase-6 — FIXED-WIDTH SIMD (the v128 value + ~236 lane instructions). The single largest slice
+#    of the whole testsuite. All 58 below convert FLAGLESSLY at wabt 1.0.41 (SIMD is default-on);
+#    `simd_memory-multi` needs --enable-multi-memory. Empirically re-verified convertible at the pin
+#    (R16/S11): 58 flagless + 1 multi-memory, 0 un-convertible. Measured 24281 assert_return + 54
+#    assert_trap (execution) + 671 assert_invalid + 509 assert_malformed (frontend). The v128 rides
+#    the term invoke-ABI as 16 raw little-endian bytes (S14); the oracle judges v128 LANE-WISE
+#    (integer lanes exact, float lanes by bit-or-NaN-class — M3). SIMD TEXT-format frontend asserts
+#    (assert_malformed/invalid with a .wat module) are OUT OF SCOPE for the WAT parser (S13) → a
+#    categorized parse-skip; every BINARY SIMD assert runs.
+simd_address
+simd_align
+simd_bit_shift
+simd_bitwise
+simd_boolean
+simd_const
+simd_conversions
+simd_f32x4
+simd_f32x4_arith
+simd_f32x4_cmp
+simd_f32x4_pmin_pmax
+simd_f32x4_rounding
+simd_f64x2
+simd_f64x2_arith
+simd_f64x2_cmp
+simd_f64x2_pmin_pmax
+simd_f64x2_rounding
+simd_i16x8_arith
+simd_i16x8_arith2
+simd_i16x8_cmp
+simd_i16x8_extadd_pairwise_i8x16
+simd_i16x8_extmul_i8x16
+simd_i16x8_q15mulr_sat_s
+simd_i16x8_sat_arith
+simd_i32x4_arith
+simd_i32x4_arith2
+simd_i32x4_cmp
+simd_i32x4_dot_i16x8
+simd_i32x4_extadd_pairwise_i16x8
+simd_i32x4_extmul_i16x8
+simd_i32x4_trunc_sat_f32x4
+simd_i32x4_trunc_sat_f64x2
+simd_i64x2_arith
+simd_i64x2_arith2
+simd_i64x2_cmp
+simd_i64x2_extmul_i32x4
+simd_i8x16_arith
+simd_i8x16_arith2
+simd_i8x16_cmp
+simd_i8x16_sat_arith
+simd_int_to_int_extend
+simd_lane
+simd_linking          # structural: v128 globals across modules (register + import) — cross-module state
+simd_load
+simd_load16_lane
+simd_load32_lane
+simd_load64_lane
+simd_load8_lane
+simd_load_extend
+simd_load_splat
+simd_load_zero
+simd_memory-multi	--enable-multi-memory   # structural: multi-memory v128 access
+simd_select
+simd_splat
+simd_store
+simd_store16_lane
+simd_store32_lane
+simd_store64_lane
+simd_store8_lane
+
 # ── DEFERRED — honest, MEASURED categorized skips (R16); NOT added (would be false-green):
 #   GC-proposal reference types (typed function references / anyref / array) — un-wast2json-able at
 #   the pin AND out of our funcref/externref scope (H8):
@@ -99,8 +168,21 @@ data                 # active/passive data segments + data.drop
 #     table_init.wast — `(type $arr (array (mut arrayref)))`  (GC array)
 #   Exception-handling / module-linking / multi-memory syntax un-parseable at the pin:
 #     imports.wast    — `(tag …)` exception-handling proposal (EH)
-#     linking.wast    — typed-ref globals + full cross-module MUTABLE linking (§D.2 depth)
 #     memory.wast / table.wast — `(module definition …)` module-linking + 2^32 literals
 #     memory_grow.wast— 100% multi-memory at pin (spectest-interp 0/50; MVP grow is in memory_size)
 #   NOTE: the reftype/bulk files above import NO spectest; `global.wast` (already listed) now passes
 #   its previously-skipped externref/funcref get/set asserts via the reference value model.
+#
+# ── Phase-6 measured residual + the WAT-route target files (R16/S11/S12/S13) ──────────────────────
+#   * memory64.wast + linking.wast are UN-`wast2json`-able at the pin (measured): memory64 aborts at
+#     `(module definition …)` (module-linking, line 8); linking aborts at `(ref null func)` typed-ref
+#     globals (GC syntax, line 99). Per R16 they route through OUR WAT parser (P5-10) where the
+#     parser accepts the in-scope subset, categorizing the out-of-scope modules as parse-skips. Driven
+#     by wat_fixture.gleam (NOT this list) — kept OUT of the wast2json allowlist deliberately.
+#   * table_copy.wast (allowlisted above): 569 asserts PASS; ~1080 remain a CATEGORIZED residual —
+#     its verifier imports module `a`'s functions and inits `elem` segments with `ref.func` of those
+#     IMPORTED functions (cross-module funcref-in-elem-segment init), a DEEPER feature than the
+#     `CallImport` direct dispatch this phase landed. NOT the impossible "1649 flip" (S11).
+#   * Post-2.0 proposals — categorized-deferred (S12): return_call.wast / return_call_indirect.wast
+#     (tail-call), GC (typed refs / struct/array/i31), exception-handling, stack-switching, the
+#     component model, relaxed-SIMD. The Phase-6 close is "the complete WebAssembly 2.0 surface".
