@@ -1,0 +1,3 @@
+porffor 0.61.13
+source: npm porffor@0.61.13 (compiler/ + node_modules/acorn), vendored 2026-07-03
+acorn: 8.17.0
