@@ -12,7 +12,7 @@ in theory since this is just going to Core Erlang, and can operate without any [
 ## how?
 `wasm -> ir -> core erlang -> beam`
 
-the js path is `js -> wasm (via Porffor) -> core erlang -> beam` 
+the js path is `js -> wasm (via Porffor) -> ir -> core erlang -> beam` 
 
 memory is a little messy right now. there are a number of modes the compiler can run in which changes how memory is allocated and accessed. throughout the code and the cli
 you will see three modes referenced: (p, o, n). p = pure. runs anywhere. o = uses otp-specifics (atomics), n = custom nif (not built yet).
