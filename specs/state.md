@@ -396,9 +396,93 @@ WAT parser (S13); the **memory optimizer** (its own perf phase); the extended-co
 
 ---
 
+## Phase 7 — "JS on the BEAM via Porffor" (WASM exception handling + the Porffor-ABI shim + a JS harness)
+
+Goal & honest scope: see [`specs/phase-7/00-overview.md`](phase-7/00-overview.md) (decisions **J1–J8**),
+the MEASURED [`specs/phase-7/PORFFOR-ABI-FINDINGS.md`](phase-7/PORFFOR-ABI-FINDINGS.md), and the
+AUTHORITATIVE [`specs/phase-7/RECONCILIATION.md`](phase-7/RECONCILIATION.md) (decisions **T1–T14** —
+override the unit docs on conflict). Phases 1–6 built the **complete WASM 2.0 engine**; Phase 7 reaches
+the platform's stated goal (high-level §8.2): *any Porffor-compilable JS program runs via 2core on the
+BEAM*. EM homework **measured** real Porffor 0.61.13 output: everything it emits, 2core already runs
+after Phase 6 (multi-value, call_indirect/funcref, bulk memory, **v128/SIMD**) — **except WASM
+exception handling** (Porffor throws pervasively; JS `try/catch` → the **legacy** `try`/`catch` block
+form). So Phase 7 = **WASM exception handling** (→ BEAM-native `try`/`catch`/`throw`, the compile-to-
+Erlang elegance — inline-handler IR mapping legacy 1:1, modern via transfer, Core Erlang 1:1, T1) +
+the **Porffor-ABI `rt_host` shim** (its four `""`-module intrinsics a/b/c/d + the `(f64,i32)` typed-
+value ABI, T11) + a **JS-subset conformance harness** (Porffor → 2core → BEAM, differential vs `porf
+run`, T13), bounded by Porffor's ~⅓-ECMA coverage. Plan authored + adversarially critiqued (3 lenses,
+**7 blockers + 10 majors** caught) + reconciled (T1–T14).
+
+### Phase-7 freeze milestones (planned)
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«EH-IR-FROZEN»` — `ir.gleam` `Module.tags`/`TagDecl(name,params)` + the **inline-handler** `Try(result,body,handlers)`/`CatchHandler(on,payload,exnref,handler)` + `Throw(tag:String,args)`/`ThrowRef` + `TExnRef`/`RefKind.ExnRef` (T1/T9); no new TrapReason (T8) | P7-01 | **planned** | 02,03,05,06,07,09 |
+| `«RT-EXN-SIG»` — `runtime/rt_exn.gleam` heads (`throw_exn`/`match_tag`/`is_wasm_exn`/`reraise`/`capture_exnref`/`throw_ref`/`is_exnref`, T3), todo-free | P7-01 | **planned** | 06,07 |
+| `«BEAM-EXN-LOWERING»` — the `{wasm_exn,TagId,Payload}` 3-tuple term (Cell-only, T6) + `Try`→Core Erlang `try…of…catch` via the helper-call chokepoint (T7) + `RunResult.UncaughtException` (T8) + the `CTry` Core-AST node (owner P7-06, T5) | P7-01/06 | **planned** | 06,07,09 |
+| `«PORFFOR-ABI»` — the four intrinsics a/b/c/d + the `(f64,i32)` value ABI + entry `"m"`/mem `"$"`/tags `"0"…` + `porf run` oracle (T10–T13) | P7-01/08 | **planned** | 08,09 |
+| `«WASM-AST5»` — `frontend/wasm/ast.gleam` (`Tag(type_idx)`, `ImportTag`, `Throw(tag:Int)`, `Catch`, legacy + modern EH `Instr`s, T2) | P7-03 (day 1) | **planned** | 04,05 |
+
+### Phase-7 units (specs authored + critiqued + reconciled; implementation `unclaimed`)
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P7-01** Interface freeze (keystone) | [`01`](phase-7/01-interface-freeze.md) | **unclaimed** | — | EH-IR (inline-handler `Try`/tags/`Throw`/`ThrowRef`/`exnref`) + rt_exn sig heads + BEAM-lowering contract + Porffor-ABI head; lands green, byte-identical (tag-free). |
+| **P7-08** Porffor-ABI shim | [`08`](phase-7/08-porffor-shim.md) | **unclaimed** | `«PORFFOR-ABI»` | The four build-fixed intrinsics (D3a) + the `(f64,i32)` value ABI + console-drain FFI; **proves the EH-FREE JS subset e2e (T12 early headline)** — `console.log(42)`/`Math.sqrt` run on the BEAM. |
+| **P7-03** decode ext (+ `«WASM-AST5»`) | [`03`](phase-7/03-decode.md) | **unclaimed** | — | Tag section (id 13) + import/export-tag + legacy (`try`/`catch`/`catch_all`/`delegate`/`rethrow`) AND modern (`throw`/`throw_ref`/`try_table`/`exnref`) opcodes (T2). |
+| **P7-04** validate ext | [`04`](phase-7/04-validate.md) | **unclaimed** | `«WASM-AST5»` | EH typing for BOTH encodings, **fail-closed-complete** (every EH ctor intercepted, T2); `tag_types: List(List(ast.ValType))` + `imported_tag_count` (M3). |
+| **P7-05** lower ext | [`05`](phase-7/05-lower.md) | **unclaimed** | `«WASM-AST5»`, `«EH-IR»` | Structure legacy flat-stream + modern `try_table` into the ONE inline-handler `Try` IR (T1); tags → `Module.tags`; `Throw` name-keyed. |
+| **P7-07** rt_exn | [`07`](phase-7/07-rt-exn.md) | **unclaimed** | `«RT-EXN-SIG»` | The tagged-exception runtime over BEAM exceptions (Cell-only, T6): `throw_exn`/`match_tag`/`is_wasm_exn`/`reraise`/`throw_ref`; `exnref` forge-proof box + `classify_ref` ExnRef arm (T9). |
+| **P7-06** emit_core ext | [`06`](phase-7/06-emit-core.md) | **unclaimed** | `«EH-IR»`,`«RT-EXN-SIG»`,`«BEAM-EXN-LOWERING»`,05,07 | `Try`→Core Erlang `try…catch` via the CTry node (owner) + the rt_exn helper-call chokepoint (T7); `catch_all`≠trap; `UncaughtException` outcome (T8); constant-space preserved; extend D3a test. |
+| **P7-02** `.ir` printer/parser ext | [`02`](phase-7/02-ir-textual-form.md) | **unclaimed** | `«EH-IR»` | Round-trip tags + `Try`/`CatchHandler` + `Throw`/`ThrowRef` + `exnref`; legacy byte-identical. |
+| **P7-09** JS-subset conformance | [`09`](phase-7/09-js-conformance.md) | **unclaimed** | 06,08 | The JS corpus (EH-free + EH programs) Porffor→2core→BEAM, differential vs `porf run` (T13); measured coverage; entry `"m"` (T10). |
+| **P7-10** capstone | [`10`](phase-7/10-capstone.md) | **unclaimed** | all above | JS on the BEAM proven; EH green (Cell); measured JS coverage; SVG/docs; honest close (bounded by Porffor). |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §8.2 JS on the BEAM via Porffor (the GOAL) | P7-08/09/10 | the Porffor-ABI shim + the JS harness; *any Porffor-compilable JS runs on the BEAM*. |
+| WASM exception handling (proposal) | P7-01/03/04/05/06/07 | legacy + modern EH → BEAM-native try/catch/throw (Cell); the modern surface spec-conformance-only. |
+| §9.2 compiled + preemptive JS | P7-06/07 | JS reaches the BEAM as compiled Core Erlang; native exception unwinding; preemption preserved. |
+
+### Deferred to Phase 8+ (explicit)
+
+A **native** JS frontend (Porffor is the JS frontend); a broader-than-Porffor JS surface; GC-proposal
+reftypes (Porffor doesn't need them); the Erlang/Gleam frontend; Threaded+EH; cross-module tags;
+heap-typed run results; stack-switching / the component model; the single-`.beam` **B1** binding;
+tier-N; the memory optimizer; WASI as an `rt_host` impl.
+
+---
+
 ## Change log
 
-- **P6-11 landed (capstone) — PHASE 6 PROVEN.** The engine now executes the **complete standardized
+- **Phase-7 plan authored + adversarially critiqued + reconciled.** Scope decision (EM): **Phase 7 =
+  "JS on the BEAM via Porffor"** (the high-level goal, §8.2). EM homework MEASURED real Porffor 0.61.13
+  output — its ONLY missing WASM feature is exception handling (everything else runs after Phase 6). So
+  Phase 7 = **WASM exception handling** (→ BEAM-native try/catch/throw) + the **Porffor-ABI shim** + a
+  **JS-subset harness**. Authored `phase-7/00-overview.md` (**J1–J8**) + the MEASURED
+  `PORFFOR-ABI-FINDINGS.md`, then a 10-agent scoping fan-out + a **3-lens adversarial critique** (EH
+  spec-fidelity, BEAM-lowering coherence, Porffor/JS realism) that caught **7 blockers + 10 majors**,
+  all folded into the AUTHORITATIVE `phase-7/RECONCILIATION.md` (**T1–T14**):
+  - **RE-MEASURED: Porffor emits the LEGACY EH encoding** (try 0x06/catch 0x07/throw 0x08), not
+    try_table; and only ever one tag + throw + try/catch. Resolution (T1): freeze the EH IR
+    **inline-handler-shaped** — maps legacy 1:1, modern try_table via a transfer, AND Core Erlang's
+    try/catch 1:1 (no branch-renumbering; resolves the loop/function catch-target major too).
+  - **B: the legacy path had no coherent owner + validate failed OPEN on the EH ctors** → T2: decode +
+    validate + lower each handle BOTH encodings; validate intercepts every EH ctor before the
+    numeric_sig fallthrough (fail-closed-complete).
+  - **B: rt_exn ABI + IR Throw/Catch + tag-identity + CTry ownership + threaded-throw frozen 2–4 ways**
+    → T3 (07's rt_exn head set), T4 (module-local Int TagId), T5 (CTry owner = P7-06; core_erlang has
+    no try today), T6 (**EH is Cell-only**; Threaded+EH categorized), T7 (the catch term shape lives
+    only in rt_exn — the chokepoint), T8 (a distinct `UncaughtException` run outcome, no new TrapReason).
+  - **B: the Porffor entry export + intrinsic set were wrong** → T10 (entry = the fixed `"m"`, measured,
+    not the basename), T11 (**four** intrinsics a/b/c/d verified vs Porffor source; in-band ANSI output;
+    type tags). **T12: trivial JS is EH-FREE and runs on Phase-6 code TODAY** — the shim (08) proves
+    "JS on the BEAM" EARLY, independent of EH (de-risk). T13: `porf run` is the fair, non-circular
+    oracle. Implementation order: 01 → 08 (early headline) → 03/04/05/07/06 (EH) → 02 → 09 → 10.
+    Plan internally consistent; implementation next, keystone-first.
+
   WebAssembly 2.0 surface** — everything Phase 5 proved **plus** fixed-width SIMD, the memory64
   runtime, and cross-module function linking — proven under both modes and every shipped tier.
   Capstone deliverables: the extended `test/twocore/conformance/new_surface_test.gleam` (the
