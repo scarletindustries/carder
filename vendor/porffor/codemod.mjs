@@ -64,6 +64,56 @@ const optionalTypedAccessFix = ({ types: t }) => ({
 });
 
 /**
+ * Transform #3 (FINDINGS §8): optional CALL on a nullish base doesn't short-circuit in Porffor.
+ * `X?.m(args)` should be `undefined` when X is nullish, but Porffor evaluates `X?.m` to undefined and
+ * then CALLS it → `TypeError: undefined is not a function` (reproduces natively: `var u; u?.m()`).
+ * Plain optional MEMBER access (`X?.m`, `X?.m?.n`) works, so only optional CALLs need fixing. Rewrite
+ * to a single-eval guard that also preserves `this`:
+ *   X?.m(args)  -->  ((_t) => _t == null ? undefined : _t.m(args))(X)   // this = X
+ *   f?.(args)   -->  ((_t) => _t == null ? undefined : _t(args))(f)
+ * (Advanced init from statement ~470 to ~703 on the self-hosted bundle.)
+ */
+const optionalCallFix = ({ types: t }) => ({
+  name: '2core-porffor-optional-call',
+  visitor: {
+    OptionalCallExpression(path) {
+      const n = path.node;
+      const callee = n.callee;
+      const uid = path.scope.generateUidIdentifier('oc');
+      let inner;
+      let base;
+      if (
+        (callee.type === 'OptionalMemberExpression' || callee.type === 'MemberExpression') &&
+        callee.optional
+      ) {
+        // X?.method(args): guard the member's base, call the member on the temp (keeps `this`).
+        const member = callee.computed
+          ? t.memberExpression(uid, callee.property, true)
+          : t.memberExpression(uid, t.identifier(callee.property.name));
+        inner = t.callExpression(member, n.arguments);
+        base = callee.object;
+      } else if (n.optional) {
+        // f?.(args): the call itself is optional; guard the callee.
+        inner = t.callExpression(uid, n.arguments);
+        base = callee;
+      } else {
+        return; // a non-optional link inside a chain — leave it (member access short-circuits fine)
+      }
+      const arrow = t.arrowFunctionExpression(
+        [uid],
+        t.conditionalExpression(
+          t.binaryExpression('==', t.identifier(uid.name), t.nullLiteral()),
+          t.identifier('undefined'),
+          inner,
+        ),
+      );
+      path.replaceWith(t.callExpression(arrow, [base]));
+      path.skip();
+    },
+  },
+});
+
+/**
  * Transform #2 (FINDINGS §8): `globalThis.X = …` does NOT make bare `X` readable in Porffor
  * (native: `globalThis.Prefs = {}` then bare `Prefs` throws "Prefs is not defined" — Porffor doesn't
  * link a globalThis property to a global binding). Porffor's own code sets globals via `globalThis.X`
@@ -109,7 +159,7 @@ const rewriteGlobalThis = ({ types: t }) => ({
   },
 });
 
-const TRANSFORMS = [optionalTypedAccessFix, rewriteGlobalThis];
+const TRANSFORMS = [optionalTypedAccessFix, optionalCallFix, rewriteGlobalThis];
 
 const [, , inFile, outFile] = process.argv;
 if (!inFile || !outFile) {
