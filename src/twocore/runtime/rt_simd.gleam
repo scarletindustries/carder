@@ -1031,321 +1031,339 @@ pub fn f64x2_replace_lane(a: BitArray, lane: Int, x: Int) -> BitArray {
 }
 
 // ── float lanes — IEEE-754 (f32x4 single-rounding); no trap ─────────────────────────────────────────────
+//
+// PRIVATE 07c helpers. The float lanes + conversions reuse the 07a codec VERBATIM: a float lane
+// IS its raw 32/64-bit pattern (D5), so `decode_lanes(v, 32/64)` hands each lane straight to the
+// matching `rt_num` f32/f64 head — f32 single-rounding, the canonical-NaN lock, exact overflow→
+// ±Inf, and the WASM min/max NaN & -0.0 rules all live INSIDE `rt_num`, so per-lane reuse inherits
+// them (I3). `map1_lanes`/`map2_lanes` (07a) are the drivers; `cmp_mask` (07b) builds the compare
+// masks. The only genuinely-new primitives are the pseudo-min/max SELECT (`pmin_lane`/`pmax_lane`,
+// built from `rt_num`'s raw `f*_lt`), the compare→mask adapter (`fcmp`, bridging `rt_num`'s 1/0
+// truth into `cmp_mask`), and the two lane-count-changing conversion drivers (`convert_low2`
+// halves 4→2 lanes; `narrow_zero` doubles 2→4 with a zero top half).
+
+/// Pseudo-minimum of one lane pair (spec `fpmin`): `pmin(a,b) = (b < a) ? b : a` — a strict-`<`
+/// SELECT, NOT the min/max NaN rules. `lt` is `rt_num.f32_lt`/`f64_lt`, which returns `0` for ANY
+/// NaN operand, so if either operand is NaN the compare is false and `pmin` returns `a` VERBATIM
+/// (its raw bits — pmin/pmax do NOT canonicalise the NaN payload). Also asymmetric on signed zero:
+/// since `-0 < +0` is IEEE-false, `pmin(-0,+0) = -0` and `pmin(+0,-0) = +0`.
+fn pmin_lane(a: Int, b: Int, lt: fn(Int, Int) -> Int) -> Int {
+  case lt(b, a) {
+    1 -> b
+    _ -> a
+  }
+}
+
+/// Pseudo-maximum of one lane pair (spec `fpmax`): `pmax(a,b) = (a < b) ? b : a`. Same posture as
+/// `pmin_lane` — a NaN operand makes the compare false and returns `a` verbatim; `pmax(-0,+0)=+0`,
+/// `pmax(+0,-0)=-0` (asymmetric, since `-0 < +0` is false).
+fn pmax_lane(a: Int, b: Int, lt: fn(Int, Int) -> Int) -> Int {
+  case lt(a, b) {
+    1 -> b
+    _ -> a
+  }
+}
+
+/// Lane-wise float comparison → v128 mask: bridge `rt_num`'s `1`/`0` ordered-compare result
+/// (`rel`, e.g. `rt_num.f32_eq`) into 07b's `cmp_mask`, so each lane becomes `all_ones(w)` where
+/// the relation holds and `0` otherwise. NaN semantics are `rt_num`'s: `eq/lt/le/gt/ge` are `0`
+/// for any NaN operand (→ all-zeros lane); `ne` is `1` (→ all-ones lane).
+fn fcmp(
+  a: BitArray,
+  b: BitArray,
+  w: Int,
+  rel: fn(Int, Int) -> Int,
+) -> BitArray {
+  cmp_mask(a, b, w, fn(x, y) { rel(x, y) == 1 })
+}
+
+/// Widening lane-count-HALVING conversion driver (`convert_low_i32x4_*`, `promote_low_f32x4`):
+/// decode `a` into its four `from_w`-bit lanes, keep only the LOW 2 (the upper 2 are ignored per
+/// spec), apply `f` per lane, and re-encode as two `to_w`-bit lanes (a 16-byte v128).
+fn convert_low2(
+  a: BitArray,
+  from_w: Int,
+  to_w: Int,
+  f: fn(Int) -> Int,
+) -> BitArray {
+  encode_lanes(list.map(list.take(decode_lanes(a, from_w), 2), f), to_w)
+}
+
+/// Narrowing lane-count-DOUBLING `_zero` conversion driver (`trunc_sat_f64x2_*_zero`,
+/// `demote_f64x2_zero`): decode `a` into its two `from_w`-bit lanes, apply `f` per lane to fill
+/// result lanes 0,1, and force result lanes 2,3 to `0` (the `_zero` suffix — `+0.0` for f32 /
+/// `0x00000000` for i32, both the all-zero pattern), re-encoded as four `to_w`-bit lanes.
+fn narrow_zero(
+  a: BitArray,
+  from_w: Int,
+  to_w: Int,
+  f: fn(Int) -> Int,
+) -> BitArray {
+  encode_lanes(list.append(list.map(decode_lanes(a, from_w), f), [0, 0]), to_w)
+}
 
 /// `f32x4.add` — lane-wise IEEE-754 add.
 pub fn f32x4_add(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_add — implemented in P6-07"
+  map2_lanes(a, b, 32, rt_num.f32_add)
 }
 
 /// `f32x4.sub` — lane-wise IEEE-754 sub.
 pub fn f32x4_sub(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_sub — implemented in P6-07"
+  map2_lanes(a, b, 32, rt_num.f32_sub)
 }
 
 /// `f32x4.mul` — lane-wise IEEE-754 mul.
 pub fn f32x4_mul(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_mul — implemented in P6-07"
+  map2_lanes(a, b, 32, rt_num.f32_mul)
 }
 
 /// `f32x4.div` — lane-wise IEEE-754 div.
 pub fn f32x4_div(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_div — implemented in P6-07"
+  map2_lanes(a, b, 32, rt_num.f32_div)
 }
 
 /// `f32x4.neg` — lane-wise IEEE-754 neg.
 pub fn f32x4_neg(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_neg — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_neg)
 }
 
 /// `f32x4.abs` — lane-wise IEEE-754 abs.
 pub fn f32x4_abs(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_abs — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_abs)
 }
 
 /// `f32x4.sqrt` — lane-wise IEEE-754 sqrt.
 pub fn f32x4_sqrt(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_sqrt — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_sqrt)
 }
 
 /// `f32x4.min` — spec min (NaN- and -0.0-aware).
 pub fn f32x4_min(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_min — implemented in P6-07"
+  map2_lanes(a, b, 32, rt_num.f32_min)
 }
 
 /// `f32x4.max` — spec max (NaN- and -0.0-aware).
 pub fn f32x4_max(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_max — implemented in P6-07"
+  map2_lanes(a, b, 32, rt_num.f32_max)
 }
 
 /// `f32x4.pmin` — pseudo-min (`(b<a)?b:a`).
 pub fn f32x4_pmin(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_pmin — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { pmin_lane(x, y, rt_num.f32_lt) })
 }
 
 /// `f32x4.pmax` — pseudo-max (`(a<b)?b:a`).
 pub fn f32x4_pmax(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_pmax — implemented in P6-07"
+  map2_lanes(a, b, 32, fn(x, y) { pmax_lane(x, y, rt_num.f32_lt) })
 }
 
 /// `f32x4.ceil` — lane-wise IEEE round variant.
 pub fn f32x4_ceil(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_ceil — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_ceil)
 }
 
 /// `f32x4.floor` — lane-wise IEEE round variant.
 pub fn f32x4_floor(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_floor — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_floor)
 }
 
 /// `f32x4.trunc` — lane-wise IEEE round variant.
 pub fn f32x4_trunc(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_trunc — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_trunc)
 }
 
 /// `f32x4.nearest` — lane-wise IEEE round variant.
 pub fn f32x4_nearest(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_nearest — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_nearest)
 }
 
 /// `f64x2.add` — lane-wise IEEE-754 add.
 pub fn f64x2_add(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_add — implemented in P6-07"
+  map2_lanes(a, b, 64, rt_num.f64_add)
 }
 
 /// `f64x2.sub` — lane-wise IEEE-754 sub.
 pub fn f64x2_sub(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_sub — implemented in P6-07"
+  map2_lanes(a, b, 64, rt_num.f64_sub)
 }
 
 /// `f64x2.mul` — lane-wise IEEE-754 mul.
 pub fn f64x2_mul(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_mul — implemented in P6-07"
+  map2_lanes(a, b, 64, rt_num.f64_mul)
 }
 
 /// `f64x2.div` — lane-wise IEEE-754 div.
 pub fn f64x2_div(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_div — implemented in P6-07"
+  map2_lanes(a, b, 64, rt_num.f64_div)
 }
 
 /// `f64x2.neg` — lane-wise IEEE-754 neg.
 pub fn f64x2_neg(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_neg — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_neg)
 }
 
 /// `f64x2.abs` — lane-wise IEEE-754 abs.
 pub fn f64x2_abs(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_abs — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_abs)
 }
 
 /// `f64x2.sqrt` — lane-wise IEEE-754 sqrt.
 pub fn f64x2_sqrt(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_sqrt — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_sqrt)
 }
 
 /// `f64x2.min` — spec min (NaN- and -0.0-aware).
 pub fn f64x2_min(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_min — implemented in P6-07"
+  map2_lanes(a, b, 64, rt_num.f64_min)
 }
 
 /// `f64x2.max` — spec max (NaN- and -0.0-aware).
 pub fn f64x2_max(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_max — implemented in P6-07"
+  map2_lanes(a, b, 64, rt_num.f64_max)
 }
 
 /// `f64x2.pmin` — pseudo-min (`(b<a)?b:a`).
 pub fn f64x2_pmin(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_pmin — implemented in P6-07"
+  map2_lanes(a, b, 64, fn(x, y) { pmin_lane(x, y, rt_num.f64_lt) })
 }
 
 /// `f64x2.pmax` — pseudo-max (`(a<b)?b:a`).
 pub fn f64x2_pmax(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_pmax — implemented in P6-07"
+  map2_lanes(a, b, 64, fn(x, y) { pmax_lane(x, y, rt_num.f64_lt) })
 }
 
 /// `f64x2.ceil` — lane-wise IEEE round variant.
 pub fn f64x2_ceil(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_ceil — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_ceil)
 }
 
 /// `f64x2.floor` — lane-wise IEEE round variant.
 pub fn f64x2_floor(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_floor — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_floor)
 }
 
 /// `f64x2.trunc` — lane-wise IEEE round variant.
 pub fn f64x2_trunc(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_trunc — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_trunc)
 }
 
 /// `f64x2.nearest` — lane-wise IEEE round variant.
 pub fn f64x2_nearest(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_nearest — implemented in P6-07"
+  map1_lanes(a, 64, rt_num.f64_nearest)
 }
 
 // ── float comparisons → a v128 mask ─────────────────────────────────────────────
 
 /// `f32x4.eq` — lane-wise ordered comparison → per-lane mask.
 pub fn f32x4_eq(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_eq — implemented in P6-07"
+  fcmp(a, b, 32, rt_num.f32_eq)
 }
 
 /// `f32x4.ne` — lane-wise ordered comparison → per-lane mask.
 pub fn f32x4_ne(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_ne — implemented in P6-07"
+  fcmp(a, b, 32, rt_num.f32_ne)
 }
 
 /// `f32x4.lt` — lane-wise ordered comparison → per-lane mask.
 pub fn f32x4_lt(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_lt — implemented in P6-07"
+  fcmp(a, b, 32, rt_num.f32_lt)
 }
 
 /// `f32x4.le` — lane-wise ordered comparison → per-lane mask.
 pub fn f32x4_le(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_le — implemented in P6-07"
+  fcmp(a, b, 32, rt_num.f32_le)
 }
 
 /// `f32x4.gt` — lane-wise ordered comparison → per-lane mask.
 pub fn f32x4_gt(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_gt — implemented in P6-07"
+  fcmp(a, b, 32, rt_num.f32_gt)
 }
 
 /// `f32x4.ge` — lane-wise ordered comparison → per-lane mask.
 pub fn f32x4_ge(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f32x4_ge — implemented in P6-07"
+  fcmp(a, b, 32, rt_num.f32_ge)
 }
 
 /// `f64x2.eq` — lane-wise ordered comparison → per-lane mask.
 pub fn f64x2_eq(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_eq — implemented in P6-07"
+  fcmp(a, b, 64, rt_num.f64_eq)
 }
 
 /// `f64x2.ne` — lane-wise ordered comparison → per-lane mask.
 pub fn f64x2_ne(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_ne — implemented in P6-07"
+  fcmp(a, b, 64, rt_num.f64_ne)
 }
 
 /// `f64x2.lt` — lane-wise ordered comparison → per-lane mask.
 pub fn f64x2_lt(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_lt — implemented in P6-07"
+  fcmp(a, b, 64, rt_num.f64_lt)
 }
 
 /// `f64x2.le` — lane-wise ordered comparison → per-lane mask.
 pub fn f64x2_le(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_le — implemented in P6-07"
+  fcmp(a, b, 64, rt_num.f64_le)
 }
 
 /// `f64x2.gt` — lane-wise ordered comparison → per-lane mask.
 pub fn f64x2_gt(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_gt — implemented in P6-07"
+  fcmp(a, b, 64, rt_num.f64_gt)
 }
 
 /// `f64x2.ge` — lane-wise ordered comparison → per-lane mask.
 pub fn f64x2_ge(a: BitArray, b: BitArray) -> BitArray {
-  let _ = #(a, b)
-  panic as "rt_simd.f64x2_ge — implemented in P6-07"
+  fcmp(a, b, 64, rt_num.f64_ge)
 }
 
 // ── conversions (singular — convert / trunc_sat / demote / promote) ─────────────────────────────────────────────
 
 /// `i32x4.trunc_sat_f32x4_s` — saturating f32x4→i32x4 (NaN→0).
 pub fn i32x4_trunc_sat_f32x4_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_trunc_sat_f32x4_s — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.i32_trunc_sat_f32_s)
 }
 
 /// `i32x4.trunc_sat_f32x4_u` — saturating unsigned f32x4→i32x4.
 pub fn i32x4_trunc_sat_f32x4_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_trunc_sat_f32x4_u — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.i32_trunc_sat_f32_u)
 }
 
 /// `i32x4.trunc_sat_f64x2_s_zero` — f64x2→i32x4, upper lanes 0.
 pub fn i32x4_trunc_sat_f64x2_s_zero(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_trunc_sat_f64x2_s_zero — implemented in P6-07"
+  narrow_zero(a, 64, 32, rt_num.i32_trunc_sat_f64_s)
 }
 
 /// `i32x4.trunc_sat_f64x2_u_zero` — unsigned f64x2→i32x4, upper 0.
 pub fn i32x4_trunc_sat_f64x2_u_zero(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.i32x4_trunc_sat_f64x2_u_zero — implemented in P6-07"
+  narrow_zero(a, 64, 32, rt_num.i32_trunc_sat_f64_u)
 }
 
 /// `f32x4.convert_i32x4_s` — signed i32x4→f32x4.
 pub fn f32x4_convert_i32x4_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_convert_i32x4_s — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_convert_i32_s)
 }
 
 /// `f32x4.convert_i32x4_u` — unsigned i32x4→f32x4.
 pub fn f32x4_convert_i32x4_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_convert_i32x4_u — implemented in P6-07"
+  map1_lanes(a, 32, rt_num.f32_convert_i32_u)
 }
 
 /// `f32x4.demote_f64x2_zero` — f64x2→f32x4, upper lanes 0.
 pub fn f32x4_demote_f64x2_zero(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f32x4_demote_f64x2_zero — implemented in P6-07"
+  narrow_zero(a, 64, 32, rt_num.f32_demote_f64)
 }
 
 /// `f64x2.convert_low_i32x4_s` — low two i32x4→f64x2 (signed).
 pub fn f64x2_convert_low_i32x4_s(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_convert_low_i32x4_s — implemented in P6-07"
+  convert_low2(a, 32, 64, rt_num.f64_convert_i32_s)
 }
 
 /// `f64x2.convert_low_i32x4_u` — low two i32x4→f64x2 (unsigned).
 pub fn f64x2_convert_low_i32x4_u(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_convert_low_i32x4_u — implemented in P6-07"
+  convert_low2(a, 32, 64, rt_num.f64_convert_i32_u)
 }
 
 /// `f64x2.promote_low_f32x4` — low two f32x4→f64x2.
 pub fn f64x2_promote_low_f32x4(a: BitArray) -> BitArray {
-  let _ = a
-  panic as "rt_simd.f64x2_promote_low_f32x4 — implemented in P6-07"
+  convert_low2(a, 32, 64, rt_num.f64_promote_f32)
 }
 
 // ── narrow (saturating), extend, extmul, extadd_pairwise ─────────────────────────────────────────────
