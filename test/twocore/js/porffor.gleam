@@ -16,6 +16,7 @@
 //// live differential byte-compares only the clean programs (the baked `.expected` — stdout only —
 //// judges the rest, §E.3). Every function here is TOTAL.
 
+import gleam/list
 import gleam/string
 import twocore/conformance/ffi
 
@@ -44,9 +45,36 @@ pub fn node_available() -> Bool {
 /// uncaught throw. Never fails (a missing `npx` is guarded by `available()` first). Total.
 pub fn run(js_path: String) -> #(Int, String) {
   case ffi.find_executable("npx") {
-    Ok(npx) -> ffi.run(npx, ["porffor", js_path])
+    Ok(npx) -> {
+      let #(code, output) = ffi.run(npx, ["porffor", js_path])
+      #(code, strip_npm_noise(output))
+    }
     Error(_) -> #(-1, "")
   }
+}
+
+/// Remove npm's own diagnostic lines (`npm warn …` / `npm notice …`) from a shelled-out
+/// `npx porffor` output. On a COLD npm cache (e.g. CI's fresh runner), the FIRST `npx porffor`
+/// invocation prints `npm warn exec The following package was not found and will be installed:
+/// porffor@…` to stderr, which `ffi.run` folds into stdout — polluting the console reference the
+/// live differential byte-compares. These lines are npm's diagnostics, NEVER a JS program's
+/// `console.log` output, so dropping them makes the oracle robust regardless of npm cache state
+/// (locally warm ⇒ unchanged; CI cold ⇒ the warning is removed). The exit code is untouched, so
+/// uncaught-throw detection is unaffected. Total.
+pub fn strip_npm_noise(s: String) -> String {
+  s
+  |> string.split("\n")
+  |> list.filter(fn(line) { !is_npm_diagnostic(line) })
+  |> string.join("\n")
+}
+
+/// `True` iff `line` is one of npm's diagnostic prefixes (`npm warn`/`npm WARN`/`npm notice`/
+/// `npm warning`) — its install/exec/notice noise, distinct from any program output. Total.
+fn is_npm_diagnostic(line: String) -> Bool {
+  string.starts_with(line, "npm warn")
+  || string.starts_with(line, "npm WARN")
+  || string.starts_with(line, "npm notice")
+  || string.starts_with(line, "npm warning")
 }
 
 /// Run `js_path` with Node (`node <js_path>`) — the ground-truth JS semantics oracle. Returns

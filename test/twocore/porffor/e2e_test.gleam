@@ -20,6 +20,7 @@ import gleam/string
 import gleeunit/should
 import simplifile
 import twocore/conformance/ffi
+import twocore/js/porffor
 import twocore/pipeline
 import twocore/runtime/porffor_abi.{PNumber}
 
@@ -89,7 +90,8 @@ pub fn js_on_beam_differential_test() {
         let assert Ok(wasm) =
           simplifile.read_bits(fixture_dir <> name <> ".wasm")
         let assert Ok(run) = pipeline.run_porffor(wasm, "m")
-        let #(code, oracle) = ffi.run(npx, ["porffor", js])
+        let #(code, raw) = ffi.run(npx, ["porffor", js])
+        let oracle = porffor.strip_npm_noise(raw)
         case code {
           0 -> {
             io.println(
@@ -144,7 +146,8 @@ pub fn js_on_beam_trycatch_differential_test() {
       let js = fixture_dir <> "trycatch.js"
       let assert Ok(wasm) = simplifile.read_bits(fixture_dir <> "trycatch.wasm")
       let assert Ok(run) = pipeline.run_porffor(wasm, "m")
-      let #(code, oracle) = ffi.run(npx, ["porffor", js])
+      let #(code, raw) = ffi.run(npx, ["porffor", js])
+      let oracle = porffor.strip_npm_noise(raw)
       case code {
         0 -> {
           io.println(
