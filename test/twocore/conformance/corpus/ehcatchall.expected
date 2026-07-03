@@ -1,0 +1,5 @@
+# ehcatchall — catch_all + non-matching-catch propagation. catchall(x)=42 always: throw $a(x)
+# propagates past a non-matching inner `catch $b` (spec §4.4.9 no-match ⇒ propagate) to the outer
+# `catch_all`, which fires → 42. Values differential vs wasmtime 46.0.1 (-W exceptions=y).
+invoke catchall i32:7 => return i32:42
+invoke catchall i32:0 => return i32:42

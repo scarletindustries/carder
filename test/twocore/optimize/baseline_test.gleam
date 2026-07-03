@@ -95,6 +95,26 @@ fn contains_loop(e: ir.Expr) -> Bool {
   }
 }
 
+/// True iff `e` contains a `Block` labelled `label` anywhere in its subtree (descending into `Try`
+/// bodies + handlers). Used by the P7-10 regression test to confirm block-simplify did NOT collapse
+/// a block that is broken to from inside a `Try` handler.
+fn has_block(e: ir.Expr, label: String) -> Bool {
+  case e {
+    ir.Block(l, _, body) -> l == label || has_block(body, label)
+    ir.Let(_, rhs, body) -> has_block(rhs, label) || has_block(body, label)
+    ir.Loop(_, _, _, body) -> has_block(body, label)
+    ir.If(_, _, t, el) -> has_block(t, label) || has_block(el, label)
+    ir.Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) { has_block(a.body, label) })
+      || has_block(default, label)
+    ir.Charge(_, body) -> has_block(body, label)
+    ir.Try(_, body, handlers) ->
+      has_block(body, label)
+      || list.any(handlers, fn(h) { has_block(h.handler, label) })
+    _ -> False
+  }
+}
+
 // Interesting i32 corner constants (raw unsigned bit patterns) for the differential batteries.
 const i32_corners: List(Int) = [
   0, 1, 2, 7, 2_147_483_647, 2_147_483_648, 4_294_967_295, 3_735_928_559, 65_535,
@@ -471,6 +491,28 @@ pub fn algebraic_float_reflexive_compare_not_rewritten_test() {
 /// yields).
 pub fn block_with_no_break_collapses_test() {
   assert opt_body(ir.Block("b", [], ir.Values([ir.ConstI32(5)]))) == vi32(5)
+}
+
+/// REGRESSION (P7-10 capstone — the EH-`.wast` optimizer bug). A `Block` whose ONLY `Break` to its
+/// label lives inside a `Try` catch HANDLER (the modern `try_table`→enclosing-label transfer, T1)
+/// must be PRESERVED — `block-label-simplify`'s `breaks_to` scan must descend into `Try` bodies AND
+/// handlers, exactly as `lower`'s `expr_breaks_to` does. Before the fix the scan stopped at `Try`,
+/// so it saw "no break to `b`" and collapsed the block, leaving the handler's `Break("b", …)`
+/// dangling → `emit: UnboundLabel("b")` (which made `throw.wast`/`throw_ref.wast` fail to
+/// instantiate). This is the exact IR shape the capstone's EH `.wast` run surfaced.
+pub fn block_broken_to_only_from_try_handler_is_preserved_test() {
+  let inner_try =
+    ir.Try([], ir.Throw("t0", []), [
+      ir.CatchHandler(
+        ir.OnTag("t0"),
+        [],
+        option.None,
+        ir.Break("b", [ir.ConstI32(7)]),
+      ),
+    ])
+  let e = ir.Block("b", [ir.TI32], inner_try)
+  // The block SURVIVES optimization (not collapsed away from under its handler-hosted break).
+  assert has_block(opt_body(e), "b") == True
 }
 
 /// A non-iterating `Loop` (no `Continue`) is DE-LOOPED and, with its init propagated, reduces to

@@ -90,6 +90,21 @@ const phase5_surface_programs: List(String) = ["reftab", "bulkmem", "multimem"]
 /// spec-sourced (cross-checked vs wasmtime).
 const simd_kernels: List(String) = ["simddot", "simdxform", "simdmem"]
 
+/// The capstone-authored EXCEPTION-HANDLING backstop (Phase-7 proof 1), each exporting a SCALAR so
+/// it rides the byte-identical numeric `Outcome` across modes/tiers while exercising one EH
+/// behaviour on a NAMED program (the P6-11 SIMD-kernel discipline, now over EH). Both encodings the
+/// frontend decodes into the one neutral IR (T1): `ehthrow` = the LEGACY `try`/`catch` Porffor
+/// emits; `ehcatch` = the MODERN `try_table` catch→ENCLOSING-label transfer (the exact IR shape the
+/// EH `.wast` run surfaced as the optimizer block-elimination bug — a fixture-independent regression
+/// guard); `ehcatchall` = `catch_all` + a non-matching catch's no-match propagation (spec §4.4.9);
+/// `ehnested` = nested try_table unwinding to the innermost MATCHING handler; `ehrethrow` = the
+/// modern `exnref`/`throw_ref` re-raise (Porffor-inert, spec-only — T9). Values are differential vs
+/// wasmtime 46.0.1 (`-W exceptions=y`) for the modern programs; the legacy `ehthrow` is spec-sourced
+/// + cross-validated by the official `legacy/throw.wast` (eh_conformance_test).
+const eh_backstop_programs: List(String) = [
+  "ehthrow", "ehcatch", "ehcatchall", "ehnested", "ehrethrow",
+]
+
 /// The REAL shipped deployment profiles the capstone drives every SIMD kernel through — the exact
 /// postures a user gets (not a test-capped variant). `safe` = Cell/Paged, Baseline optimizer,
 /// enforcing fuel; `unsafe` = the Aggressive optimizer + open runtime (Paged, so the MODE axis is
@@ -141,6 +156,28 @@ fn mem64_profiles() -> List(#(String, Binding)) {
 pub fn simd_kernels_spec_correct_and_profile_neutral_test() {
   let failures =
     list.flat_map(simd_kernels, check_across_profiles(_, shipped_profiles()))
+  assert failures == []
+}
+
+// ─────────────────────────────── Phase-7 proof 1 — EH engine (deliberately-authored backstop) ───────────────────────────────
+
+/// PHASE-7 PROOF 1 (EH engine spec-correct end-to-end — the deliberately-authored backstop). Every
+/// EH kernel is spec-correct against its `.expected` (differential vs wasmtime 46.0.1 for the modern
+/// programs; the legacy `ehthrow` cross-validated by the official `legacy/throw.wast`) under
+/// `safe`/`unsafe`/`portable` AND byte-identical across the three — because EH is BEAM-native control
+/// flow that neither reads nor writes instance state, so it is invariant across the state strategy
+/// (Cell in safe/unsafe, Threaded in portable — the state-free EH surface runs anywhere; the T6
+/// Cell-only bound is only the state-threaded-through-throw combo, which these do not exercise). A
+/// mis-lowered re-raise, a wrong catch-clause order, a lost payload, an eliminated block broken to
+/// from a catch handler (the fixed optimizer bug), or a cross-profile divergence fails naming the
+/// exact program + profile. This is the fine-grained backstop behind eh_conformance_test's official
+/// `.wast` run (the P6-11 kernel/whole-suite division, now over EH).
+pub fn eh_backstop_spec_correct_and_profile_neutral_test() {
+  let failures =
+    list.flat_map(eh_backstop_programs, check_across_profiles(
+      _,
+      shipped_profiles(),
+    ))
   assert failures == []
 }
 

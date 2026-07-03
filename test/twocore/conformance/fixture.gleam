@@ -128,6 +128,13 @@ pub type Action {
 ///   `expected` (compared by the oracle). Full pipeline.
 /// - `AssertTrap(line, action, text)`: `action` must trap; `text` is the expected
 ///   trap-message SUBSTRING (e.g. `"integer divide by zero"`). Full pipeline.
+/// - `AssertException(line, action, expected)`: `action` must raise an **uncaught WASM
+///   exception** (the exception-handling proposal's `assert_exception`). Distinct from
+///   `assert_trap` (T8/S8 — a WASM exception is control flow, not a trap): a `catch_all`
+///   catches it but a trap propagates through. `expected` is the tag's operand-value
+///   list where wast2json baked concrete values, else the operand TYPES (no value) — the
+///   runner treats the presence of a well-formed WASM-exception outcome as the pass
+///   condition (a normal return or a plain trap is a FAIL). Full pipeline.
 /// - `AssertInvalid(line, filename, module_type, text)`: `filename` must FAIL
 ///   validation. Frontend only — never instantiated.
 /// - `AssertMalformed(line, filename, module_type, text)`: `filename` must FAIL
@@ -147,6 +154,7 @@ pub type Command {
   Register(line: Int, as_name: String, module: Option(String))
   AssertReturn(line: Int, action: Action, expected: List(SpecValue))
   AssertTrap(line: Int, action: Action, text: String)
+  AssertException(line: Int, action: Action, expected: List(SpecValue))
   AssertInvalid(
     line: Int,
     filename: String,
@@ -233,6 +241,18 @@ fn command_decoder() -> decode.Decoder(Command) {
       use action <- decode.field("action", action_decoder())
       use text <- decode.optional_field("text", "", decode.string)
       decode.success(AssertTrap(line, action, text))
+    }
+    "assert_exception" -> {
+      use action <- decode.field("action", action_decoder())
+      // wast2json bakes the tag's operand list into `expected`; where an operand value is
+      // known it carries a `value`, else just a `type` (value-less, decoded to a 0 sentinel
+      // and never compared). The runner only asserts the outcome is a WASM exception.
+      use expected <- decode.optional_field(
+        "expected",
+        [],
+        decode.list(spec_value_decoder()),
+      )
+      decode.success(AssertException(line, action, expected))
     }
     "assert_invalid" -> {
       use filename <- decode.field("filename", decode.string)

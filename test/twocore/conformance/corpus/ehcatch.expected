@@ -1,0 +1,7 @@
+# ehcatch — MODERN try_table catch→enclosing-label transfer (the P7-10 optimizer-fix regression
+# shape). catch(x) = x*10 when x≠0 (the thrown payload, delivered to $out by the catch clause);
+# 999 when x==0 (no throw, the try_table body falls through). Values differential vs wasmtime 46.0.1
+# (-W exceptions=y). Raw unsigned bit patterns (D5).
+invoke catch i32:0 => return i32:999
+invoke catch i32:5 => return i32:50
+invoke catch i32:3 => return i32:30

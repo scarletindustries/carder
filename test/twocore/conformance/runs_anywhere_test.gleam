@@ -531,3 +531,141 @@ pub fn portable_mem64_runs_byte_identical_to_oracle_test() {
     ])
   assert failures == []
 }
+
+// ─────────────── P7-10 PROOF 5: runs-anywhere RE-CONFIRMED for the EXCEPTION-HANDLING surface (J5/J7) ───────────────
+
+/// The Phase-7 EH backstop programs the runs-anywhere property must be RE-CONFIRMED over (capstone
+/// §F). EH grew the surface again, so the `Throw`/`Try`/`ThrowRef` nodes + the `exnref` value must
+/// ALSO run under the tier-P `portable` build (Threaded/Paged/`bif`) with no native code and no
+/// crashable instance cell — else the runs-anywhere headline (and, transitively, the JS-on-the-BEAM
+/// headline, since Porffor's output IS this surface) no longer covers the whole engine. EH is
+/// BEAM-native control flow: a throw unwinds the process's native stack, not the `state_strategy`
+/// record/cell, so the state-FREE EH surface is state-strategy-invariant and runs under `portable`
+/// (Threaded) byte-identically to the `cell`/`paged` oracle — the T6 Cell-only bound is only the
+/// state-threaded-through-throw combo, which these do not exercise. Authored `.wat` → `.wasm` under
+/// `corpus/` (capstone-owned; both encodings — legacy `ehthrow`, modern `ehcatch`/`ehcatchall`/
+/// `ehnested`/`ehrethrow`).
+const p7_eh_programs: List(String) = [
+  "ehthrow", "ehcatch", "ehcatchall", "ehnested", "ehrethrow",
+]
+
+/// PROOF 5a (EH surface, J5 — no native code). The `portable` `.core` of every EH kernel links ZERO
+/// native / OTP-native state: `rt_exn` is a pure-BEAM tuple-and-`raise` runtime (no NIF), the catch
+/// is a native Core Erlang `try…catch`, the `exnref` is an opaque `{ref_exn,_}` box — nothing native
+/// is even reachable, so the worst case of an EH-lowering bug under `portable` is a wrong-catch /
+/// lost-payload / a node-safe process exception, NEVER a host escape (spec §7 embedding; J5).
+pub fn portable_p7_eh_links_zero_native_state_test() {
+  let failures =
+    list.flat_map(p7_eh_programs, fn(name) {
+      let core = portable_core(name)
+      let check = fn(tok) {
+        case combos.count_occurrences(core, tok) {
+          0 -> []
+          n -> [
+            name
+            <> " links native primitive '"
+            <> tok
+            <> "' × "
+            <> int.to_string(n),
+          ]
+        }
+      }
+      list.flatten([
+        check("atomics"),
+        check("ets"),
+        check("persistent_term"),
+        check("load_nif"),
+        check("erlang_nif"),
+      ])
+    })
+  assert failures == []
+}
+
+/// PROOF 5a (EH surface, J5 — no crashable instance cell). No process-dictionary INSTANCE-STATE seam
+/// (`'seed'`/`'mem_get'`/`'mem_put'`/`'global_get'`/`'global_set'`) in any EH kernel's portable
+/// `.core`: the EH programs touch no memory/global, and a throw carries the build-controlled 3-tuple
+/// `{wasm_exn, TagId, Payload}` — no instance state travels through the throw (T6). So the whole EH
+/// surface carries the SAME "no crashable state" property Phase 4 proved for the base corpus.
+pub fn portable_p7_eh_has_no_instance_cell_seam_test() {
+  let cell_seam = [
+    "'seed'", "'mem_get'", "'mem_put'", "'global_get'", "'global_set'",
+  ]
+  let failures =
+    list.flat_map(p7_eh_programs, fn(name) {
+      let core = portable_core(name)
+      list.flat_map(cell_seam, fn(tok) {
+        case combos.count_occurrences(core, tok) {
+          0 -> []
+          n -> [
+            name
+            <> " emits pdict instance-cell seam '"
+            <> tok
+            <> "' × "
+            <> int.to_string(n),
+          ]
+        }
+      })
+    })
+  assert failures == []
+}
+
+/// PROOF 5a (EH surface, non-vacuity). The greps above are a REAL audit, not vacuously-green: the
+/// `portable` build DOES route the EH nodes through the pure-BEAM `rt_exn` runtime + native Core
+/// Erlang `try` (a real replacement, not an absence). Every EH program names `rt_exn` (the stable
+/// EH-runtime module — `throw_exn`/`match_tag`/`reraise`/`capture_exnref`/`throw_ref`) AND emits a
+/// Core Erlang `try` (the catch). If P7-06/07 renamed the seam, these tokens follow — the seam is
+/// named, not guessed. And `rt_exn` is native-free: an EH kernel's portable `.core` links no native
+/// primitive at all (proven above).
+pub fn portable_p7_eh_uses_pure_beam_rt_exn_test() {
+  let failures =
+    list.flat_map(p7_eh_programs, fn(name) {
+      let core = portable_core(name)
+      list.flatten([
+        case combos.count_occurrences(core, "rt_exn") > 0 {
+          True -> []
+          False -> [
+            name <> ": portable .core does not name rt_exn (EH seam absent)",
+          ]
+        },
+        case combos.count_occurrences(core, "try") > 0 {
+          True -> []
+          False -> [
+            name <> ": portable .core emits no Core Erlang 'try' (catch absent)",
+          ]
+        },
+      ])
+    })
+  assert failures == []
+}
+
+/// PROOF 5b (EH EXECUTED — the dynamic half). Every EH kernel, compiled under the REAL
+/// `profiles.portable()` profile and run through `load → instantiate → invoke` on a bare BEAM, is
+/// (1) spec-correct against its `.expected` and (2) BYTE-IDENTICAL (raw bit pattern, D5) to the
+/// `cell`/`paged` oracle (`profiles.safe()`). This re-confirms that the EH lowering (a throw →
+/// `rt_exn` raise; a catch → a native Core Erlang `try`; a re-raise → `rt_exn` reraise) executes on a
+/// bare BEAM without a native backend — the runs-anywhere property now covers the EH surface and,
+/// transitively, the JS-on-the-BEAM surface (Porffor's output is this WASM surface).
+pub fn portable_p7_eh_runs_byte_identical_to_oracle_test() {
+  let portable_d = driver.pipeline_with(profiles.portable())
+  let oracle_d = driver.pipeline_with(profiles.safe())
+
+  let failures =
+    list.flat_map(p7_eh_programs, fn(name) {
+      let #(p_outs, p_fails) = combos.evaluate(portable_d, name)
+      let #(o_outs, _) = combos.evaluate(oracle_d, name)
+      list.flatten([
+        list.map(p_fails, fn(f) { "portable spec-incorrect: " <> f }),
+        case p_outs == o_outs {
+          True -> []
+          False -> [
+            name
+            <> " [portable ≢ cell/paged oracle]: "
+            <> string.inspect(o_outs)
+            <> " vs "
+            <> string.inspect(p_outs),
+          ]
+        },
+      ])
+    })
+  assert failures == []
+}

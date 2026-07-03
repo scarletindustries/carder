@@ -102,6 +102,34 @@ for wat_target in memory64 linking; do
   fi
 done
 
+# --- EXCEPTION-HANDLING fixtures (P7-10) ----------------------------------------
+# The official EH `.wast` suite needs `wast2json --enable-exceptions`, and its `.wasm` modules carry
+# EH opcodes. To keep the Phase-1..6 headline (46529/1768/0) BYTE-IDENTICAL, the EH fixtures live in
+# a SUBDIRECTORY `fixtures/eh/` that the main `conformance_test.gleam` top-level glob does not see;
+# they are driven separately by `eh_conformance_test.gleam` under safe/unsafe/portable. MEASURED at
+# the pin: 4 of the 8 official EH files convert (`throw`, `throw_ref`, legacy `throw`, legacy
+# `rethrow`); the other 4 (`tag`, `try_table`, legacy `try_catch`, legacy `try_delegate`) are blocked
+# by GC recursive types / typed refs / the tail-call proposal — categorized in eh_conformance_test,
+# NOT an EH gap. wabt legacy naming: `legacy/throw.wast` → `legacy_throw.json` (a flat name in eh/).
+eh_dir="$fixtures_dir/eh"
+mkdir -p "$eh_dir"
+vendor_eh() {  # <src-rel-path> <out-basename>
+  local src="$clone_dir/$1" out="$eh_dir/$2.json"
+  if [ ! -f "$src" ]; then echo "vendor: EH MISSING $1 at pin (skipped)" >&2; return; fi
+  if ( cd "$eh_dir" && wast2json --enable-exceptions "$src" -o "$out" ) >"$out.convert.log" 2>&1; then
+    rm -f "$out.convert.log"
+    res="$(spectest-interp --enable-exceptions "$out" 2>&1 | tail -1 || true)"
+    echo "vendor: EH OK   $2  ($res)"
+  else
+    echo "vendor: EH SKIP $1  (wast2json --enable-exceptions could not convert at pin)" >&2
+    rm -f "$out"
+  fi
+}
+vendor_eh "throw.wast"          "throw"
+vendor_eh "throw_ref.wast"      "throw_ref"
+vendor_eh "legacy/throw.wast"   "legacy_throw"
+vendor_eh "legacy/rethrow.wast" "legacy_rethrow"
+
 echo "vendor: converted +validated:$converted"
 [ -n "$skipped" ] && echo "vendor: skipped (un-convertible at pin):$skipped"
 if [ "$fail" != "0" ]; then echo "vendor: one or more CONVERTIBLE fixtures failed validation" >&2; exit 1; fi

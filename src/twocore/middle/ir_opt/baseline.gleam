@@ -766,6 +766,14 @@ fn breaks_to(label: String, e: ir.Expr) -> Bool {
       list.any(arms, fn(a) { breaks_to(label, a.body) })
       || breaks_to(label, default)
     ir.Charge(_, body) -> breaks_to(label, body)
+    // A `Try` region's body AND every catch handler are sub-expressions a `Break` may live
+    // in (Phase 7 — a modern `try_table` catch clause transfers to an ENCLOSING label via a
+    // `Break` in its handler, T1). This scan MUST descend into both, exactly as `lower`'s
+    // `expr_breaks_to` does, or block-simplify would wrongly drop a block that is broken to
+    // only from inside a catch handler — leaving a dangling `Break` → `emit: UnboundLabel`.
+    ir.Try(_, body, handlers) ->
+      breaks_to(label, body)
+      || list.any(handlers, fn(h) { breaks_to(label, h.handler) })
     _ -> False
   }
 }
@@ -783,6 +791,11 @@ fn continues_to(label: String, e: ir.Expr) -> Bool {
       list.any(arms, fn(a) { continues_to(label, a.body) })
       || continues_to(label, default)
     ir.Charge(_, body) -> continues_to(label, body)
+    // Descend into a `Try`'s body + catch handlers (symmetric with `breaks_to`): a
+    // `Continue` to an enclosing loop can live in a catch handler's transfer (T1).
+    ir.Try(_, body, handlers) ->
+      continues_to(label, body)
+      || list.any(handlers, fn(h) { continues_to(label, h.handler) })
     _ -> False
   }
 }

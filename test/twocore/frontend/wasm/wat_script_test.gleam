@@ -338,6 +338,7 @@ fn fixture_kind(cmd: fixture.Command) -> String {
     fixture.Register(_, _, _) -> "register"
     fixture.AssertReturn(_, _, _) -> "assert_return"
     fixture.AssertTrap(_, _, _) -> "assert_trap"
+    fixture.AssertException(_, _, _) -> "assert_exception"
     fixture.AssertInvalid(_, _, _, _) -> "assert_invalid"
     fixture.AssertMalformed(_, _, _, _) -> "assert_malformed"
     fixture.AssertUninstantiable(_, _, _) -> "assert_uninstantiable"

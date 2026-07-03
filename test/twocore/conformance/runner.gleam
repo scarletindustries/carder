@@ -31,9 +31,9 @@ import gleam/string
 import twocore/conformance/ffi
 import twocore/conformance/fixture.{
   type Action, type Command, type Fixture, type SpecValue, ActionCmd,
-  AssertInvalid, AssertMalformed, AssertReturn, AssertTrap, AssertUninstantiable,
-  AssertUnlinkable, BinaryModule, Get, Invoke, ModuleCmd, Register, TextModule,
-  Unhandled,
+  AssertException, AssertInvalid, AssertMalformed, AssertReturn, AssertTrap,
+  AssertUninstantiable, AssertUnlinkable, BinaryModule, Get, Invoke, ModuleCmd,
+  Register, TextModule, Unhandled,
 }
 import twocore/conformance/oracle
 import twocore/conformance/registry.{type Registry}
@@ -275,6 +275,12 @@ fn run_command(
       run_trap(driver, reg, rep, src, line, action, text),
     )
 
+    AssertException(line, action, _expected) -> #(
+      reg,
+      env,
+      run_exception(driver, reg, rep, src, line, action),
+    )
+
     AssertInvalid(line, filename, mt, _text) -> #(
       reg,
       env,
@@ -436,6 +442,62 @@ fn run_trap(
           <> ": expected trap '"
           <> text
           <> "', returned "
+          <> string.inspect(vs),
+      )
+    Ok(DriverError(d)) -> skip(rep, at(src, line) <> field <> ": driver: " <> d)
+  }
+}
+
+// assert_exception — FULL pipeline; the action must raise an UNCAUGHT WASM exception.
+
+/// Judge an `assert_exception`: the action must unwind out with a WASM **exception**, not a
+/// return and not a trap. An uncaught `throw`/`throw_ref` raises the build-controlled
+/// `erlang:error({wasm_exn, TagId, Payload})` term (T3/T8), which the invoke FFI catches and
+/// renders as the reason string `"{wasm_exn,…}"` (S8 — a WASM exception is its own term class,
+/// never a `{wasm_trap,…}`). So the pass condition is a `Trapped` outcome whose reason names the
+/// `wasm_exn` class; a plain trap (`{wasm_trap,…}`, e.g. a null-`exnref` `throw_ref`) or a normal
+/// return is a FAIL — exactly the `assert_exception` ≠ `assert_trap` distinction the spec draws
+/// (a `catch_all` catches exceptions but a trap propagates). This is the run-ABI's uncaught-
+/// exception observation the capstone drives the official EH `.wast` through.
+fn run_exception(
+  driver: Driver,
+  reg: Reg,
+  rep: Report,
+  src: String,
+  line: Int,
+  action: Action,
+) -> Report {
+  let #(field, result) = case action {
+    Get(field, module) -> #(
+      field,
+      invoke_result(driver, reg, module, fn(inst) {
+        driver.get_global(inst, field)
+      }),
+    )
+    Invoke(field, args, module) -> #(
+      field,
+      invoke_result(driver, reg, module, fn(inst) {
+        driver.invoke(inst, field, args)
+      }),
+    )
+  }
+  case result {
+    Error(why) -> skip(rep, at(src, line) <> why)
+    Ok(Trapped(r)) ->
+      case string.starts_with(r, "{wasm_exn") {
+        True -> pass(rep)
+        False ->
+          fail(
+            rep,
+            at(src, line) <> field <> ": expected WASM exception, trapped " <> r,
+          )
+      }
+    Ok(Returned(vs)) ->
+      fail(
+        rep,
+        at(src, line)
+          <> field
+          <> ": expected WASM exception, returned "
           <> string.inspect(vs),
       )
     Ok(DriverError(d)) -> skip(rep, at(src, line) <> field <> ": driver: " <> d)

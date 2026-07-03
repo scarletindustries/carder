@@ -254,7 +254,7 @@ END {
   }
 
   # ---- footnotes ----
-  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 6: the complete standardized WebAssembly 2.0 surface — fixed-width SIMD (v128 + the ~236 lane instructions, emulated lane-wise), the memory64 runtime (documented spec-aligned page cap), and cross-module function linking. Pass roughly doubled (+25,004, the 59 simd_*.wast files); " commas(tF) " failing under every shipped tier. Residual out of scope (each a separate proposal): relaxed-SIMD, GC-proposal typed references, module-linking, exception-handling, SIMD text-format.</text>"
+  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 7: WebAssembly exception handling (tags, throw, try_table/try-catch/catch_all, throw_ref/rethrow, exnref) lowered to BEAM-native try/catch/raise — the engine feature that unlocks JS on the BEAM via Porffor. Measured: a real Porffor-compiled JS corpus runs on the BEAM matching porf run (52 pass / 0 fail / 3 skip, bounded by Porffor's ~1/3 ECMA); the official EH .wast run green (153 asserts, " commas(tF) " fail, both encodings, safe/unsafe/portable, eh_conformance_test). The Phase-1..6 counts above are UNCHANGED (EH is driven separately, byte-identical). Phase 6 surface: SIMD (emulated lane-wise) + memory64 (documented page cap) + cross-module linking. Residual out of scope: GC, tail-call, stack-switching, the component model, relaxed-SIMD, WASI/DOM, a native JS frontend.</text>"
   print "  <text x='24' y='" fn2Y "' font-size='9' fill='" faint "'>Source: WebAssembly/testsuite @ " sha " · wabt " wabt " · " totalFiles " top-level .wast: " n " run / " gm " skip · " allow " allowlisted · regenerate: scripts/gen-conformance-svg.sh</text>"
 
   print "</svg>"

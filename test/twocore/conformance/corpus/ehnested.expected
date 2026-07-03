@@ -1,0 +1,6 @@
+# ehnested — nested try_table, innermost-matching-handler unwinding (spec §4.4.9). nested(x)=x+100:
+# throw $b(x) skips the non-matching inner `catch $a` and is caught by the outer `catch $b`, which
+# binds the payload; +100 proves the correct level caught. Differential vs wasmtime 46.0.1.
+invoke nested i32:5 => return i32:105
+invoke nested i32:0 => return i32:100
+invoke nested i32:42 => return i32:142

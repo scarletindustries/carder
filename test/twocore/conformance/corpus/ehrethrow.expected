@@ -1,0 +1,7 @@
+# ehrethrow — exnref capture + throw_ref re-raise (Porffor-inert modern surface, T9). rethrow(x)=
+# x+1000: throw $e(x) is captured as an exnref by `catch_all_ref`, re-raised by `throw_ref`, and
+# caught by the outer `catch $e` which binds the payload; +1000 proves the re-raised payload
+# survived. Differential vs wasmtime 46.0.1 (-W exceptions=y).
+invoke rethrow i32:5 => return i32:1005
+invoke rethrow i32:0 => return i32:1000
+invoke rethrow i32:7 => return i32:1007
