@@ -1,0 +1,8 @@
+# simdmem — SIMD memory kernel: v128.store/load round-trip, load32_splat, store32_lane, and an
+# out-of-bounds v128.load → trap (the bounds-checked rt_mem seam, I6). Little-endian lane layout.
+# Cross-checked vs wasmtime 46.0.1.
+invoke st_ld i32:42 => return i32:42                   # store splat(42), load, lane 3
+invoke splat i32:77 => return i32:77                   # write 77, load32_splat, lane 1
+invoke lane i32:55 => return i32:55                    # store32_lane(2) of splat(55), reload i32
+# a v128.load straddling the page end (65530+16 > 65536) traps — no host escape.
+invoke oob => trap out of bounds memory access

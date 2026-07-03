@@ -1,0 +1,16 @@
+# simdxform — SIMD float-lane + lanewise-misc kernel. Float results are RAW IEEE-754 f32 bit
+# patterns (D5, never BEAM doubles); f32x4 ops are single-rounded per lane (I3). Cross-checked
+# vs wasmtime 46.0.1.
+# fma(x) = x*3.5 + 10 (lane 2). fma(2.0)=17.0 ; fma(0.0)=10.0 ; fma(-1.5)=4.75.
+invoke fma f32:1073741824 => return f32:1099431936    # 2.0  -> 17.0
+invoke fma f32:0 => return f32:1092616192             # 0.0  -> 10.0
+invoke fma f32:3217031168 => return f32:1083703296    # -1.5 -> 4.75
+# sqrtmin(x) = min(sqrt(x), 3.0) (lane 0). sqrt(16)=4→min 3 ; sqrt(4)=2 ; sqrt(1)=1.
+invoke sqrtmin f32:1098907648 => return f32:1077936128 # 16.0 -> 3.0
+invoke sqrtmin f32:1082130432 => return f32:1073741824 # 4.0  -> 2.0
+invoke sqrtmin f32:1065353216 => return f32:1065353216 # 1.0  -> 1.0
+# shuf: bytes 4..7 of a=[10,20,30,40] → lane 0 = a's lane 1 = 20 (i8x16.shuffle, LE layout).
+invoke shuf => return i32:20
+# bsel: bitselect(a=[111..], b=[999..], mask=i32x4.eq(splat(x),[7,0,0,0])) lane 0.
+invoke bsel i32:7 => return i32:111                    # mask lane0 all-ones → a
+invoke bsel i32:0 => return i32:999                    # mask lane0 zero → b

@@ -1,0 +1,18 @@
+# mem64 — the memory64 runtime backstop (I4/S9). A 64-bit-addressed memory: i64 page counts, an
+# address past 2^32 (4 GiB), a grow beyond the documented page cap (mem64_max_pages = 2^32 pages)
+# → -1, and an access beyond the current size → trap. The runnable behaviours are cross-checked vs
+# wasmtime 46.0.1; the page-cap trap boundary is 2core's DOCUMENTED implementation limit (I4 — not
+# a spec value, not a 2^64 reservation). Results are RAW unsigned i64 bit patterns (D5).
+invoke size => return i64:1
+# grow by 2^32 pages exceeds the mem64 page cap → -1 (0xFFFF..FFFF), allocates nothing.
+invoke grow_over => return i64:18446744073709551615
+invoke size => return i64:1
+# grow by 65537 pages → old size 1 (new size 65538, past the i32 4 GiB ceiling, O(1) sparse).
+invoke grow_big => return i64:1
+invoke size => return i64:65538
+# store 0x0123456789ABCDEF at byte 2^32+40 and load it back — i64 addressing past 4 GiB.
+invoke st_ld => return i64:81985529216486895
+# a freshly-grown region past 2^32 reads as zero (sparse; no allocation).
+invoke load_hi => return i64:0
+# a load at byte_len (65538*65536 = 4295098368) is beyond the current size → trap.
+invoke oob => trap out of bounds memory access

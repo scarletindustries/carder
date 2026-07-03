@@ -1,0 +1,16 @@
+# simddot — SIMD integer-lane kernel. Values spec-sourced from the vector-instruction semantics
+# (i32x4.dot_i16x8_s is the pairwise Σ a_i·b_i into i32 lanes; add_sat_s saturates at the i16
+# lane range; i32x4.max_s / mul are two's-complement-exact at the lane width). Cross-checked vs
+# wasmtime 46.0.1. Args/results are RAW unsigned bit patterns (D5).
+# dot8(scale) = 36*scale (the 4 dot lanes [3s,7s,11s,15s] summed).
+invoke dot8 i32:1 => return i32:36
+invoke dot8 i32:10 => return i32:360
+invoke dot8 i32:4294967295 => return i32:4294967260   # dot8(-1) = -36 → 0xFFFFFFDC
+# addsat: splat(x) + 30000 (i16x8, signed saturating). 5000+30000 clamps to +32767.
+invoke addsat i32:5000 => return i32:32767
+invoke addsat i32:100 => return i32:30100
+invoke addsat i32:4294962296 => return i32:25000      # addsat(-5000): -5000+30000 = 25000 (no sat)
+# lanes: max_s(splat(x)*[1,2,3,4], floor 100 in lane 2), read lane 2 = max(3x, 100).
+invoke lanes i32:10 => return i32:100                  # 30 vs 100 → 100
+invoke lanes i32:50 => return i32:150                  # 150 vs 100 → 150
+invoke lanes i32:0 => return i32:100

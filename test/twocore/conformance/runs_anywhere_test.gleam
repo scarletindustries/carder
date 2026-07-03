@@ -358,3 +358,176 @@ pub fn portable_new_surface_runs_byte_identical_to_oracle_test() {
     })
   assert failures == []
 }
+
+// ─────────────── P6-11 PROOF 5: runs-anywhere RE-CONFIRMED for the SIMD + memory64 surface (I3/I6) ───────────────
+
+/// The Phase-6 new-surface programs the runs-anywhere property must be RE-CONFIRMED over (capstone
+/// §F.2): the pure SIMD kernels `simddot`/`simdxform` (v128 lane ops over consts/params, NO memory —
+/// the cleanest non-vacuity: `rt_simd` present, native zero), `simdmem` (the v128 memory family
+/// through the immutable-binary `rt_mem` seam), and `mem64` (i64 addressing threaded through the
+/// record). Phase 6 grew the surface, so these MUST also run under the tier-P `portable` build with
+/// no native code and no crashable instance cell — else the runs-anywhere headline no longer covers
+/// the WHOLE engine. Authored `.wat` → `.wasm` under `corpus/` (capstone-owned).
+const p6_surface_programs: List(String) = [
+  "simddot", "simdxform", "simdmem", "mem64",
+]
+
+/// A per-instance fuel budget clear of `mem64`'s 65537-page grow (whose success-path charge is
+/// `65537 * 65536` — `rt_mem.mem_grow`, R9). The memory64 RUNTIME is observed here ORTHOGONALLY to
+/// the fuel meter (raised on BOTH the portable build and the oracle, so the comparison isolates the
+/// state-strategy axis, not the CPU bound — the fuel bound is proven by the Phase-4 fuel suites).
+const mem64_fuel: Int = 6_000_000_000
+
+/// PROOF 5a (new surface, G6 — no native code). The `portable` `.core` of every Phase-6 kernel links
+/// ZERO native / OTP-native state: `rt_simd` is a pure tier-P `bif` (v128 lane ops over 16-byte
+/// binaries), `rt_mem` is immutable BEAM binaries, i64 addressing is BEAM bignums — nothing native is
+/// even reachable, so a lane/bounds bug's worst case is a wrong/missing trap or a node-safe process
+/// crash, never a host escape (spec §7 embedding; I6).
+pub fn portable_p6_surface_links_zero_native_state_test() {
+  let failures =
+    list.flat_map(p6_surface_programs, fn(name) {
+      let core = portable_core(name)
+      let check = fn(tok) {
+        case combos.count_occurrences(core, tok) {
+          0 -> []
+          n -> [
+            name
+            <> " links native primitive '"
+            <> tok
+            <> "' × "
+            <> int.to_string(n),
+          ]
+        }
+      }
+      list.flatten([
+        check("atomics"),
+        check("ets"),
+        check("persistent_term"),
+        check("nif"),
+        check("load_nif"),
+        check("erlang_nif"),
+      ])
+    })
+  assert failures == []
+}
+
+/// PROOF 5a (new surface, G1 — no crashable instance cell). No process-dictionary INSTANCE-STATE
+/// seam in any Phase-6 kernel's portable `.core`: the `Threaded` build threads the memories vector
+/// (`simdmem`/`mem64`) through the record, never the `rt_state` pdict cell; the pure SIMD kernels
+/// touch no state at all. So the whole Phase-6 surface carries the SAME "no crashable state" property
+/// Phase 4 proved for the base corpus.
+pub fn portable_p6_surface_has_no_instance_cell_seam_test() {
+  let cell_seam = [
+    "'seed'", "'mem_get'", "'mem_put'", "'global_get'", "'global_set'",
+  ]
+  let failures =
+    list.flat_map(p6_surface_programs, fn(name) {
+      let core = portable_core(name)
+      list.flat_map(cell_seam, fn(tok) {
+        case combos.count_occurrences(core, tok) {
+          0 -> []
+          n -> [
+            name
+            <> " emits pdict instance-cell seam '"
+            <> tok
+            <> "' × "
+            <> int.to_string(n),
+          ]
+        }
+      })
+    })
+  assert failures == []
+}
+
+/// PROOF 5a (new surface, non-vacuity). The greps above are a REAL audit, not vacuously-green: the
+/// pure SIMD kernels DO route through `rt_simd` (the tier-P `bif` lane path — a real replacement, not
+/// an absence); `simdmem` ALSO names `rt_mem` (the v128 memory family routes through the
+/// bounds-checked seam) + the threaded `'t_load'` head; `mem64` threads the memories vector through
+/// the record (`rt_state` + `rt_mem` present). And `rt_simd` is native-free: a pure SIMD kernel's
+/// portable `.core` links no native primitive at all. If P6-07/08 renamed these, the tokens follow.
+pub fn portable_p6_surface_uses_pure_beam_families_test() {
+  // rt_simd is the stable non-vacuity token for the pure SIMD lane path.
+  assert combos.count_occurrences(portable_core("simddot"), "rt_simd") > 0
+  assert combos.count_occurrences(portable_core("simdxform"), "rt_simd") > 0
+
+  // simdmem: the v128 memory family routes lane assembly through rt_simd AND the bounds-checked
+  // rt_mem seam (threaded 't_load' head), never a raw term op.
+  let simdmem = portable_core("simdmem")
+  assert combos.count_occurrences(simdmem, "rt_simd") > 0
+  assert combos.count_occurrences(simdmem, "rt_mem") > 0
+  assert combos.count_occurrences(simdmem, "'t_load'") > 0
+
+  // mem64: i64 addressing threads the memories vector through the record (rt_state) and the seam.
+  let mem64 = portable_core("mem64")
+  assert combos.count_occurrences(mem64, "rt_state") > 0
+  assert combos.count_occurrences(mem64, "rt_mem") > 0
+
+  // rt_simd is native-free (tier-P bif): a pure SIMD kernel links no native primitive.
+  let core = portable_core("simddot")
+  assert combos.count_occurrences(core, "atomics") == 0
+  assert combos.count_occurrences(core, "load_nif") == 0
+  assert combos.count_occurrences(core, "persistent_term") == 0
+}
+
+/// PROOF 5b (SIMD executed — the dynamic half). Each SIMD kernel, compiled under the REAL
+/// `profiles.portable()` profile and run through `load → instantiate → invoke` on a bare BEAM, is
+/// (1) spec-correct against its `.expected` and (2) BYTE-IDENTICAL (raw bit pattern, D5) to the
+/// `cell`/`paged` oracle (`profiles.safe()`), values AND the OOB trap alike. This re-confirms that
+/// the SIMD lane ops (pure `rt_simd` over binaries) and the SIMD-memory family (through the
+/// immutable-binary `rt_mem`) execute on a bare BEAM without a native backend (spec §7 embedding).
+pub fn portable_simd_kernels_run_byte_identical_to_oracle_test() {
+  let portable_d = driver.pipeline_with(profiles.portable())
+  let oracle_d = driver.pipeline_with(profiles.safe())
+
+  let failures =
+    list.flat_map(["simddot", "simdxform", "simdmem"], fn(name) {
+      let #(p_outs, p_fails) = combos.evaluate(portable_d, name)
+      let #(o_outs, _) = combos.evaluate(oracle_d, name)
+      list.flatten([
+        list.map(p_fails, fn(f) { "portable spec-incorrect: " <> f }),
+        case p_outs == o_outs {
+          True -> []
+          False -> [
+            name
+            <> " [portable ≢ cell/paged oracle]: "
+            <> string.inspect(o_outs)
+            <> " vs "
+            <> string.inspect(p_outs),
+          ]
+        },
+      ])
+    })
+  assert failures == []
+}
+
+/// PROOF 5b (memory64 executed — the dynamic half). `mem64`, compiled under the REAL `portable`
+/// profile (Threaded/Paged/`bif`, with the fuel meter raised clear of the 65537-page grow — the
+/// fuel bound is orthogonal to the memory64 runtime, proven by the Phase-4 fuel suites), runs
+/// through `load → instantiate → invoke` on a bare BEAM BYTE-IDENTICAL to the `cell`/`paged` oracle:
+/// i64 addressing past 2^32, the page-cap grow → -1, and the OOB trap all execute on BEAM bignums,
+/// no native code. So the runs-anywhere property covers the memory64 surface too.
+pub fn portable_mem64_runs_byte_identical_to_oracle_test() {
+  let portable_d =
+    driver.pipeline_with(
+      Binding(..profiles.portable(), fuel_budget: mem64_fuel),
+    )
+  let oracle_d =
+    driver.pipeline_with(Binding(..profiles.safe(), fuel_budget: mem64_fuel))
+
+  let #(p_outs, p_fails) = combos.evaluate(portable_d, "mem64")
+  let #(o_outs, _) = combos.evaluate(oracle_d, "mem64")
+  let failures =
+    list.flatten([
+      list.map(p_fails, fn(f) { "portable spec-incorrect: " <> f }),
+      case p_outs == o_outs {
+        True -> []
+        False -> [
+          "mem64 [portable ≢ cell/paged oracle]: "
+          <> string.inspect(o_outs)
+          <> " vs "
+          <> string.inspect(p_outs),
+        ]
+      },
+    ])
+  assert failures == []
+}

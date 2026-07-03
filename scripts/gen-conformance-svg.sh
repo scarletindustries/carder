@@ -254,7 +254,7 @@ END {
   }
 
   # ---- footnotes ----
-  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 5: complete WebAssembly surface minus SIMD — reference types, bulk memory, multi-memory, multi-table call_indirect, non-function imports + the spectest module, and a first-class WAT text parser. Pass rose +5,776; " commas(tF) " failing under every shipped tier. Residual out of scope: cross-module wasm&#8594;wasm function linking (&#8594; Phase 6), SIMD (&#8594; Phase 6), GC-proposal reftypes + extended-const.</text>"
+  print "  <text x='24' y='" fn1Y "' font-size='9.5' fill='" muted "'>Phase 6: the complete standardized WebAssembly 2.0 surface — fixed-width SIMD (v128 + the ~236 lane instructions, emulated lane-wise), the memory64 runtime (documented spec-aligned page cap), and cross-module function linking. Pass roughly doubled (+25,004, the 59 simd_*.wast files); " commas(tF) " failing under every shipped tier. Residual out of scope (each a separate proposal): relaxed-SIMD, GC-proposal typed references, module-linking, exception-handling, SIMD text-format.</text>"
   print "  <text x='24' y='" fn2Y "' font-size='9' fill='" faint "'>Source: WebAssembly/testsuite @ " sha " · wabt " wabt " · " totalFiles " top-level .wast: " n " run / " gm " skip · " allow " allowlisted · regenerate: scripts/gen-conformance-svg.sh</text>"
 
   print "</svg>"
