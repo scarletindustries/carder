@@ -18,11 +18,15 @@ with the JS→Wasm step happening **entirely in-BEAM** — no JS runtime on the 
 ```
 upstream/              pristine vendored Porffor compiler (compiler/*.js) + node_modules/acorn — DO NOT edit
 src/entry.js           the pure compileJS(code) entry (no fs, no Node)
-scripts/apply-patches.sh   strips node:fs / execSync / 2c-eval from a WORKING COPY (upstream stays clean)
+scripts/apply-patches.sh   the 7 patches applied to a WORKING COPY (strip node coupling, static/lazy acorn,
+                           empty-string null-ptr fix) — upstream stays clean
+scripts/patch-build-tool.sh  applies the codegen fixes to the npx porffor TOOL (the two-copies problem, FINDINGS §7b)
 codemod.mjs            POST-esbuild @babel/core transforms rewriting constructs Porffor self-miscompiles
 build.sh               upstream --(patch)--> esbuild@esnext --(codemod)--> dist/porffor.compiler.js
-selfhost-check.sh      compiles the bundle WITH Porffor -> validates -> runs; the RED/GREEN gate
-bisect.sh              localizes which function/construct Porffor miscompiles
+selfhost-check.sh      patches the tool, compiles the bundle WITH Porffor -> validates -> runs; the RED/GREEN gate
+bisect.sh              localizes which function/construct Porffor miscompiles (validation bugs)
+diagnostics/           instrumentation that localizes RUNTIME [run] bugs (init bracketing, site markers,
+                       function-count scaling) + DIAGNOSTICS.md — the tools that found FINDINGS §6/§7
 FINDINGS.md            the debugging record + current status of each checkpoint
 dist/                  build artifacts (gitignored)
 ```
@@ -51,17 +55,25 @@ dist/porffor.compiler.js   →   [Porffor]   →   dist/porffor.wasm   →   [2c
 ## Current status (Porffor 0.61.13) — see FINDINGS.md for detail
 
 - **pure compiler works in Node** ✅ — `compileJS('console.log(1+2)')` → a valid Wasm binary.
-- **`[validate]` GREEN** ✅ — after the codemod, the self-compiled `porffor.wasm` passes
-  `wasm-tools validate --features=all`. The sole validation blocker was ONE construct in
-  `codegen.js` `generateCall` (a double-optional `?.length`); `codemod.mjs` fixes it (FINDINGS §3–4).
-- **parser now runs** ✅ — the initial `memory access out of bounds` trap was **acorn not being
-  inlined** (a dynamic computed import esbuild left external → Porffor stubbed the parser). Patch #5
-  makes acorn a static import; the trap is gone (FINDINGS §5).
-- **`[run]` RED** ⛔ — now fails later with `SyntaxError: Regex parse: Invalid flag`: a *semantic*
-  self-compile bug corrupting a regex flags string (all flags work in native Porffor). Narrower than
-  before; the current frontier (FINDINGS §6). Downstream (porffor.beam, `fe_js`, CLI `.js` dispatch)
-  is gated on `[run]` going GREEN.
-- **progress ladder:** won't-validate → **validate GREEN** → memory-trap → **parser runs** → regex-flag.
+- **`[validate]` GREEN** ✅ — the sole validation blocker was a double-optional `?.length` in
+  `codegen.js` `generateCall`; `codemod.mjs` fixes it (FINDINGS §3–4).
+- **parser runs** ✅ — the `memory access out of bounds` trap was acorn not being inlined; patch #5
+  forces a static acorn import (FINDINGS §5).
+- **`Regex parse: Invalid flag` FIXED** ✅ — it was NOT a flag bug: Porffor's `makeString` returns the
+  **null pointer 0 for empty strings `''`**, which read garbage at address 0 in the 26 MB self-hosted
+  bundle. Fixed by pointing empty strings at a reserved zero slot (`apply-patches.sh` #7 +
+  `scripts/patch-build-tool.sh`). FINDINGS §6.
+- **`TypeError: Invalid regular expression` FIXED** ✅ — acorn's wide-utf16 identifier-class regexes
+  (Porffor's regex engine is bytestring-only) made lazy so ASCII input never builds them
+  (`apply-patches.sh` #6). FINDINGS §6b.
+- **`[run]` RED** ⛔ — now dies in module init: acorn's first `X.prototype.method = …` throws because
+  **function `.prototype` is `undefined` past ~7-8k functions** (the bundle has 11692). A scale-
+  dependent Porffor self-compile bug with a clean fast repro (`diagnostics/scale-test.mjs`); the
+  current frontier (FINDINGS §7). Downstream (porffor.beam, `fe_js`, CLI `.js`) is gated on `[run]` GREEN.
+- **progress ladder:** won't-validate → **validate GREEN** → memory-trap → **parser runs** →
+  regex-flag(=empty-string, **fixed**) → wide-regex-init(**fixed**) → **func-`.prototype`-at-scale**.
+- **diagnostics:** `diagnostics/` holds the instrumentation that found §6/§7 (init-statement bracketing,
+  construction-site markers, function-count scaling) — start there for the next `[run]` bug.
 
 ## Updating Porffor — the standard prompt
 

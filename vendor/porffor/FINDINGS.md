@@ -83,34 +83,99 @@ import** → the self-hosted compiler had **no parser** → calling the stub ret
 `_acorn.parse`. esbuild then inlines acorn (bundle 2.5 MB → 2.7 MB, acorn code present). **The memory
 trap is GONE.** (We only support acorn — the JS path; not the TS/browser/@babel/meriyah/oxc parsers.)
 
-## 6. The runtime frontier (current wall) ⛔
+## 6. The "Regex parse: Invalid flag" wall was NOT a flag bug — it was the empty string ⛔→✅
 
-With acorn inlined, `[validate]` is GREEN and `[run]` now fails **later and differently**:
+The prior wall (`SyntaxError: Regex parse: Invalid flag`, input-independent, fires at acorn init) was
+mis-diagnosed as a corrupted *flags* string from a dynamic `new RegExp(pattern, flags)`. It is not.
 
+**How it was actually found (the method matters — reuse it):**
+- Porffor lowers a regex **literal** `/pat/flags` into a *runtime* call `RegExp("pat", "flags")` with
+  BOTH operands as string literals (codegen.js `generateExp`/`decl.regex`). So the culprit is a regex
+  **literal**, and it calls the builtin `RegExp` directly — a `new RegExp` wrapper never sees it.
+- Instrumenting the bundle with **baked string-literal markers** before each regex construction
+  (`(console.log("<<REG N>>"), <ctor>)`) and running under `porffor run` pinpointed **site 0** =
+  acorn's `keywordRelationalOperator = /^in(stanceof)?$/` → `RegExp("^in(stanceof)?$", "")`.
+- A probe wrapper logging the operands separately showed: **pattern correct, but the empty flags `""`
+  arrived with `length = 197` of garbage**. The empty string was reading garbage memory.
+
+**Root cause (a real Porffor self-compile bug):** `makeString` returns **`[ number(0) ]` — the null
+pointer — for every empty string literal `''`** (codegen.js ~5686), and `makeData` skips writing
+length-0 data ("memory at 0 is 0 anyway"). Reading a bytestring at address 0 reads `memory[0..4]`.
+In a *small* program that's 0 (so `''` works — every isolated repro passes); in the **26 MB
+self-hosted bundle** address 0 is non-zero, so `''` reads a garbage length → the regex flag loop sees
+bogus bytes → "Invalid flag". The same latent bug corrupts *any* empty-string byte read at scale.
+
+**Fix (carried, applied in BOTH Porffor copies — see §8 note on the two copies):** point empty strings
+at a reserved, statically-zero slot instead of 0:
+```js
+// makeString(str): was  ->  if (str.length === 0) return [ number(0) ];
+if (str.length === 0) return [ number(allocStr(scope, '', bytestring)) ];
 ```
-SyntaxError: Regex parse: Invalid flag
-```
+`allocStr('')` reserves an interned 4-byte region in static data that is never written (stays 0), so
+`''.length === 0`. → the "Invalid flag" wall is GONE. (`scripts/apply-patches.sh` patch #7 for the
+vendored compiler; `scripts/patch-build-tool.sh` for the npx build tool.)
 
-The self-hosted compiler runs (acorn parses), but a regex construction hits an invalid flag. This is
-**not** a missing feature — every flag (`g i m s u y d`) works in *native* `porf run`. So the flags
-string is being **corrupted by a self-compile miscompilation** (Porffor mis-compiling its own — or
-acorn's — dynamic `new RegExp(src, flags)` / flag-string handling). Like §5's original symptom this is
-a *semantic* self-compile bug, but much narrower now (a specific regex-flag path, not the whole parser).
+## 6b. Wide (utf-16) regex patterns at acorn init ⛔→✅
 
-Localized so far: it is **input-independent** (compiling `''` triggers it too → it fires at
-compiler/acorn *init*, not while parsing our input). The suspect is the one dynamic-flags call in the
-bundle — **`new RegExp(pattern, flags)`** (a *variable* `flags`, vs the literal-flag calls like
-`new RegExp(lineBreak.source, "g")` which are fine) — i.e. the self-compiled code corrupts the `flags`
-string it passes. Next: isolate that call (acorn's regexp validator vs a Porffor builtin), reproduce
-it standalone with `porffor wasm` (a tiny `new RegExp(p, f)` where `f` is built dynamically), and codemod
-the flag-string construction into a form Porffor compiles faithfully. This is why upstream Porffor
-self-hosting is unsolved — the semantic layer is a sequence of these.
+Past the empty-string fix, `[run]` hit `TypeError: Invalid regular expression`, localized (same marker
+method) to acorn's `nonASCIIidentifierStart = new RegExp("[" + <chars up to 0xffdc> + "]")`. Porffor's
+`__Porffor_regex_compile(patternStr: bytestring, …)` **only accepts bytestring patterns** — a wide
+pattern throws, even natively. Acorn normally runs in the *tool* (Node) so this never bites; self-hosted
+it runs in the wasm and the *eager* init throws. These two regexes are `.test()`ed only for code points
+≥ 0xaa, so `apply-patches.sh` patch #6 makes them **lazy** (memoized on first use). ASCII input never
+constructs them. (Compiling JS with genuinely non-ASCII identifiers still needs real wide-regex support
+in Porffor's engine — documented future work.)
 
-**Progress ladder:** won't-validate → **[validate] GREEN** (§4 codemod) → memory-trap → **parser runs**
-(§5 acorn-inline) → regex-flag (§6, here). **Downstream (porffor.beam, `fe_js`, CLI `.js` dispatch) is
-gated on `[run]` GREEN.**
+## 7. The current wall: function `.prototype` is `undefined` past ~7–8k functions ⛔ (HERE)
 
-## 7. Bisection method (reusable)
+With §6 + §6b fixed, `[run]` now dies during **module init**, not while compiling. Chain of diagnosis:
+- The surfaced error is `RangeError: Invalid typed array length: 1939865600` — but that is a **red
+  herring** from Porffor's *value-conversion* glue (`wrap.js read()`/`porfToJSValue`): the wasm threw
+  an exception and `porffor run` crashes trying to read the thrown Error's corrupted `.message`
+  string. Temporarily clamping absurd lengths in `wrap.js read()` (a diagnostic patch) reveals the
+  real thrown error: **`TypeError` (message itself garbled by the same string-at-scale corruption).**
+- Bracketing every **top-level init statement** with markers (`diagnostics/instrument-init.mjs`)
+  pinned the throw to acorn's **first prototype-method assignment**:
+  `Position.prototype.offset = function offset(n){ … }` — the assignment throws because
+  **`Position.prototype` is `undefined`** (boolean-probed: `Position.prototype === undefined` → `true`,
+  while `typeof Position === "function"`).
+- This is the **first** `X.prototype.method = …` in the whole bundle, so it breaks **every**
+  prototype-based class — i.e. all of acorn.
+
+**It is scale-dependent, driven by TOTAL function count (not the constructor's own index):**
+- The exact `Position` pattern, and even 6000 dummy indirect functions + a constructor, **work** in
+  isolation (`diagnostics/scale-test.mjs`).
+- At **≥ 8000** functions the minimal repro reproduces `TypeError: Cannot set property of undefined`.
+  (At ≥ 10000 an *unrelated* limit appears: "local count too large" in the indirect wrapper.)
+- The bundle has **11692 functions / 5588 indirect** (wasm table size) — over the threshold — and
+  `Position` (an early, low-index function) fails anyway → it's a **global** resource keyed to total
+  function count, not the constructor's index.
+- Increasing `--page-size` does **not** help (it trades the throw for `memory access out of bounds`).
+
+**Unresolved:** the exact Porffor constant/region that overflows around 7–8k functions and stops
+function prototypes from being materialized. Candidates to chase next: how a user function's
+`.prototype` object is allocated/looked-up at runtime (search codegen for the funcRef→prototype path
+and `__Porffor_object_setPrototype`); the func-lut sizing (`bytesPerFuncLut = min(⌊pageSize·2 /
+nIndirect⌋, maxNameLen+8)` shrinks with more indirect funcs); and whether prototype resolution reads a
+per-function region sized by total func count. A clean minimal repro exists (`scale8000.js`), so this
+can be bisected in a **fast** loop without the 10 s bundle compile.
+
+**Progress ladder:** won't-validate → **[validate] GREEN** (§4) → memory-trap → **parser runs** (§5) →
+regex-flag = **empty-string null-ptr** (§6, FIXED) → **wide-regex init** (§6b, FIXED) →
+**func-`.prototype`-at-scale** (§7, HERE). Downstream (porffor.beam, `fe_js`, CLI `.js`) gated on `[run]`.
+
+## 7b. The two Porffor copies (important for any codegen fix)
+
+There are **two** Porffor 0.61.13 installs, and a real codegen bug must be fixed in BOTH:
+1. **vendored** `upstream/compiler` → bundled into `porffor.wasm` (the compiler-as-data). Patched by
+   `scripts/apply-patches.sh`. Fixing here makes `porffor.wasm` emit correct code for *user* JS.
+2. **`npx porffor`** (the tool) → compiles the bundle into `porffor.wasm` (the compiler-as-tool).
+   Patched by `scripts/patch-build-tool.sh` (called from `selfhost-check.sh`). Fixing here makes the
+   *bundle itself* compile correctly.
+A fix in only one leaves the other's output corrupt. The eventual clean design is to compile the
+bundle **with itself** (in Node), collapsing the two into one patched copy — see CONTINUE.md.
+
+## 8. Bisection method (reusable)
 
 To narrow a construct within a failing function `F` (spans source lines `[a..b]`):
 

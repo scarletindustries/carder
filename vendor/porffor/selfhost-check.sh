@@ -15,6 +15,11 @@ WASM="$ROOT/dist/porffor.wasm"
 
 [ -f "$COMPILER" ] || { echo "[selfhost] run ./build.sh first (missing $COMPILER)"; exit 1; }
 
+# Apply our Porffor codegen fixes to the build tool (npx porffor) before compiling — see
+# scripts/patch-build-tool.sh (the empty-string / null-pointer-0 fix, FINDINGS §7). Idempotent.
+echo "[selfhost] patching build tool (npx porffor) with codegen fixes ..."
+bash "$ROOT/scripts/patch-build-tool.sh" || { echo "[selfhost] tool patch failed"; exit 1; }
+
 echo "[selfhost] compiling the pure bundle WITH Porffor -> porffor.wasm ..."
 if ! npx --yes porffor wasm --module "$COMPILER" "$WASM" 2>/tmp/porf_selfhost.log; then
   echo "[selfhost] RED: Porffor failed to compile the bundle"; tail -3 /tmp/porf_selfhost.log; exit 1
