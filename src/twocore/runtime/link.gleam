@@ -53,6 +53,18 @@ import twocore/runtime/rt_host
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_table
 
+/// Identity coercion of a `List(Dynamic)` to the `List(Int)` shape `rt_host.call_host`
+/// consumes — sound because a host function argument is a raw numeric bit pattern (D5), which
+/// on the BEAM is exactly an Erlang integer, so the runtime term is unchanged (no decode/copy).
+/// Used ONLY at the host-closure boundary (`host_func_closure`); never on a reference/v128 term.
+@external(erlang, "gleam_stdlib", "identity")
+fn coerce_args_to_ints(args: List(Dynamic)) -> List(Int)
+
+/// Identity coercion of `rt_host.call_host`'s `List(Int)` result back to the closure ABI's
+/// `List(Dynamic)` value list — sound for the same reason (an `Int` bit pattern IS the term).
+@external(erlang, "gleam_stdlib", "identity")
+fn coerce_ints_to_dynamics(results: List(Int)) -> List(Dynamic)
+
 /// The raw IEEE-754 bit pattern (D5) of the reference `spectest` module's `global_f32 = 666.6`,
 /// as an `Int` — `0x4426A666` = `1143383654`, the f32 nearest to the double `666.6`. Stored as
 /// raw bits, NEVER a BEAM double (a double cannot preserve the exact rounding), matching the
@@ -85,8 +97,8 @@ const spectest_mem_safe_cap = 65_536
 /// - `ProvidedMemory(value, min_pages, max_pages, idx_type)`: a memory externval — the OPAQUE
 ///   `rt_mem` value; the limits + `idx_type` drive memory matching.
 /// - `ProvidedFunc(ty, call)`: a FUNCTION export made callable across instances (I5/S5/«XLINK»).
-///   `ty` drives fail-closed function-import matching (spec §3.2, unchanged from P5 — `match_fn`
-///   compares `FuncType`, never the closure). `call` is the **linker-built closure capability**:
+///   `ty` drives fail-closed function-import matching (spec §3.2.7 — `match_func` compares
+///   `FuncType` by equality, never the closure). `call` is the **linker-built closure capability**:
 ///   a first-class `fun` the LINKER (P6-09) constructs, capturing the exporting instance + its
 ///   exported function (a host/`spectest` import routes through the checked `rt_host` dispatch; a
 ///   cross-module import routes into the exporting instance's owning process). The generated
@@ -112,6 +124,25 @@ pub type Provided {
     idx_type: IdxType,
   )
   ProvidedFunc(ty: FuncType, call: fn(List(Dynamic)) -> List(Dynamic))
+}
+
+/// Construct a FUNCTION external value (spec §4.5.4 func address) from an export signature +
+/// its dispatch closure, WITHOUT depending on the `Provided` tuple layout (the D1-clean shape
+/// ABI). The register seam (P6-10) uses this to publish a `(register)`ed module's exported
+/// function as a cross-module callable — `call` is the routing closure it builds capturing the
+/// exporting instance's live handle (§C.2 of the unit doc). `link_func_imports` uses it too, for
+/// the host/`spectest` case (§B.3). See `ProvidedFunc` for the closure ABI + D3a contract.
+///
+/// - `ty`: the export's declared `FuncType` — drives fail-closed function-import matching
+///   (spec §3.2.7 function equality); NEVER compared structurally with the closure.
+/// - `call`: the dispatch closure (`fn(List(Dynamic)) -> List(Dynamic)`) applied 1-ary by
+///   `call_import` at the import site.
+/// - Returns the `ProvidedFunc(ty, call)` externval.
+pub fn provided_func(
+  ty: FuncType,
+  call: fn(List(Dynamic)) -> List(Dynamic),
+) -> Provided {
+  ProvidedFunc(ty:, call:)
 }
 
 /// A source of externvals for a `#(module, name)` import (spec §4.5.4). Two build-controlled
@@ -153,12 +184,91 @@ pub type ImportError {
 /// A FUNCTION import is still CHECKED (existence + signature) so a bogus `spectest` / registered
 /// function import fails `assert_unlinkable` (§C.3) rather than silently deferring to a call
 /// denial; a function import to a genuine host capability (e.g. `env`) is NOT link-checked (it is
-/// resolved by the `HostPolicy` at its call site), so it neither errors nor emits an element.
+/// resolved by the `HostPolicy` at its call site), so it neither errors nor emits an element. The
+/// function import's runtime CALLABLE (its dispatch closure) is resolved by the SEPARATE
+/// `link_func_imports` seam (S5 — "the instance's function-import vector"), so THIS list stays
+/// state-only and byte-identical to Phase-5 (H7).
 pub fn link_imports(
   module: Module,
   providers: List(Provider),
 ) -> Result(List(Provided), ImportError) {
   resolve(module.imports, providers, [])
+}
+
+// ── the imported-function CALL seam + the function-import vector (S5/«XLINK», P6-09) ───────────
+//
+// P5 only MATCHED a function import's signature (`match_fn`) — there was no callable. P6 makes an
+// imported-function call real: `lower` emits `CallImport(slot, ty, args)`, `emit_core` (06) emits
+// `link.call_import(closure, args_list)` against the caller's positional function-import slot, and
+// THIS unit builds the closures + resolves the function-import vector (`link_func_imports`).
+//
+// **Why a SEPARATE vector, not the state `Imports` list (a deliberate, byte-identity deviation).**
+// The unit doc's Deviation #2 sketches interleaving function slots into the single positional
+// `Imports` list. That growth is only sound once `emit_core` grows in lockstep
+// (`count_state_imports` → count function imports too + the `imported_slots` `ImportFn` arm + the
+// dispatch-vector seed) — which is P6-06's charter and is NOT landed yet. Growing the single list
+// now would desync `link_imports` (state resolver) from the driver's `provided == [] ? 0 : 1`
+// arity dispatch and `emit_core`'s state-only destructure, breaking every already-instantiating
+// `env`-function-importing corpus module. So `link_imports` stays STATE-ONLY (byte-identical, H7)
+// and the function-import CALLABLES are resolved by a sibling seam, `link_func_imports` — which is
+// exactly "the instance's function-import vector" S5 names. 06 composes the two vectors when it
+// lands the dispatch-vector seed. This is the "leaf" flagged in state.md.
+
+/// Dispatch an imported-function call — the thin 1-ary seam `emit_core` (06) emits for a
+/// `CallImport` node (S5). It APPLIES the handed-in `closure` to the argument value list and
+/// returns the callee's result value list. That is the ENTIRE body: `closure(args)`.
+///
+/// **D3a — a handed-in capability, never ambient authority.** `closure` is a first-class `fun`
+/// value read from the caller's positional function-import slot (built by the linker at link time,
+/// §B.3/§C.2), applied directly. This is NOT `erlang:apply(Module, Atom, Args)` on a data-derived
+/// `module:atom`, and NOT the 2-arg `erlang:apply(Closure, ArgsList)` that would SPREAD the list
+/// into an N-ary fun's parameters (the arity bug S5 fixes) — it is a plain 1-ary application of a
+/// 1-ary list-taking closure. The dispatch target is thus a supplied capability, exactly like
+/// `externref` / `call_host`; generated code never names the callee (D3a).
+///
+/// - `closure`: the resolved import's dispatch closure (`fn(List(Dynamic)) -> List(Dynamic)`) — a
+///   host closure wrapping `rt_host.call_host` (§B.3) or a cross-module routing closure (§A/§C.2).
+/// - `args`: the call's argument value list (D5 — each a raw i32/i64/f32/f64 bit pattern, an
+///   `rt_ref` reference term, or a 16-byte v128 binary; one `Dynamic` per WASM argument).
+/// - Returns the callee's result value list (multi-value: a host `print*` returns `[]`, a
+///   cross-module function returns 0/1/many). A callee trap PROPAGATES by the closure raising
+///   (§E.2) — `call_import` neither catches nor synthesizes a trap.
+pub fn call_import(
+  closure: fn(List(Dynamic)) -> List(Dynamic),
+  args: List(Dynamic),
+) -> List(Dynamic) {
+  closure(args)
+}
+
+/// Resolve the FUNCTION-import vector of `module` — one dispatch closure per function import, in
+/// function-import declaration order (spec §2.5.1) — matched FAIL-CLOSED (spec §3.2.7). This is
+/// "the instance's function-import vector" (S5): the callables `emit_core` (06) seeds into the
+/// imported-function dispatch vector and applies via `call_import`. SEPARATE from `link_imports`
+/// (which stays state-only, byte-identical — see the section note); STATE imports contribute no
+/// element here.
+///
+/// Each function import resolves to `ProvidedFunc(ty, call)`:
+/// - `#("spectest", name)` → matched against `rt_host.spectest_func_type(name)` (equality); the
+///   closure wraps `rt_host.call_host("spectest", name, _)` under THIS instance's `HostPolicy`
+///   (§B.3). Missing name → `UnknownImport`; signature mismatch → `IncompatibleImportType`.
+/// - `#(registered_mod, name)` where `registered_mod` is `(register)`ed → its export `name` must be
+///   a `ProvidedFunc(sig, closure)`; match `sig == ty` and return that register-seam-built routing
+///   closure (§C.2). Missing export → `UnknownImport`; a non-function export →
+///   `IncompatibleImportType`; a signature mismatch → `IncompatibleImportType`.
+/// - `#(other, name)` (neither `spectest` NOR registered) → a genuine host capability (e.g. `env`):
+///   NOT link-checked (its fate is the call-site `HostPolicy`), resolved to a host closure wrapping
+///   `call_host` and gated fail-closed at call time (preserves the P5 posture, §B.3).
+///
+/// - `module`: the IR module whose function imports are resolved.
+/// - `providers`: the `(register)`ed instances (`spectest` is consulted IN ADDITION).
+/// - Returns `Ok(closures_in_function_import_order)` when every function import is provided AND
+///   matches, else `Error(ImportError)` for the FIRST unsatisfied/mismatched one (fail-closed, H6
+///   — no instance is created; the `assert_unlinkable` case).
+pub fn link_func_imports(
+  module: Module,
+  providers: List(Provider),
+) -> Result(List(Provided), ImportError) {
+  resolve_funcs(module.imports, providers, [])
 }
 
 /// The build-fixed `spectest` module's exported STATE externvals (spec test host module, R14). A
@@ -269,6 +379,20 @@ pub fn provided_memory_value(p: Provided) -> Dynamic {
   }
 }
 
+/// Extract the dispatch closure from a `ProvidedFunc` (for an imported-function dispatch-vector
+/// slot, S5/§D.2). `emit_core` (06) weaves each function-import positional `Imp<p>` through this
+/// fixed `link` call (D3a — a build-controlled extractor, the slot chosen statically), then applies
+/// the closure via `call_import`. Fail-closed `panic` on any other variant (an internal codegen
+/// invariant — 06 pairs the extractor with the import kind; a `panic` is node-safe, never a WASM
+/// trap — matching `provided_global_bits`/`provided_table_value` etc.).
+pub fn provided_func_call(p: Provided) -> fn(List(Dynamic)) -> List(Dynamic) {
+  case p {
+    ProvidedFunc(_, call) -> call
+    _ ->
+      panic as "link.provided_func_call: not a function (internal invariant violation)"
+  }
+}
+
 // ── internal resolution ────────────────────────────────────────────────────────────────────────
 
 /// Walk the module's imports in declaration order, accumulating one `Provided` per STATE import
@@ -344,28 +468,88 @@ fn resolve_one(
   }
 }
 
-/// Resolve a FUNCTION import (a call-site capability, no state element). `spectest` functions are
-/// matched against the build-fixed signature table; a registered module's function export against
-/// its recorded signature; a genuine host capability (neither) is left to the call-site
-/// `HostPolicy` (no link check). Fail-closed on a missing/mismatched `spectest`/registered import.
+/// Resolve a FUNCTION import for the STATE `Imports` list: it is CHECKED fail-closed (existence +
+/// signature) but contributes NO positional STATE element — the callable lives in the SEPARATE
+/// function-import vector (`link_func_imports`), and the state list stays byte-identical (H7, see
+/// the seam note). Delegates matching to the shared `resolve_func_provided` (ONE source of truth
+/// for function matching) and discards the resolved callable, mapping a successful resolution to
+/// `Ok(None)`. So a bogus `spectest`/registered function import still fails `assert_unlinkable`
+/// exactly as in P5, and a genuine host capability (`env`) neither errors nor emits an element.
 fn resolve_fn_import(
   capability: String,
   name: String,
   ty: FuncType,
   providers: List(Provider),
 ) -> Result(Option(Provided), ImportError) {
+  case resolve_func_provided(capability, name, ty, providers) {
+    Ok(_callable) -> Ok(None)
+    Error(e) -> Error(e)
+  }
+}
+
+/// Walk the module's imports in declaration order, accumulating one `ProvidedFunc` per FUNCTION
+/// import (reversed, restored by `list.reverse`) and skipping state imports. Returns the first
+/// `ImportError` fail-closed. The function-import-vector twin of `resolve` (S5).
+fn resolve_funcs(
+  imports: List(ir.ImportDecl),
+  providers: List(Provider),
+  acc: List(Provided),
+) -> Result(List(Provided), ImportError) {
+  case imports {
+    [] -> Ok(list.reverse(acc))
+    [imp, ..rest] ->
+      case imp {
+        ImportFn(capability, name, ty) ->
+          case resolve_func_provided(capability, name, ty, providers) {
+            Ok(p) -> resolve_funcs(rest, providers, [p, ..acc])
+            Error(e) -> Error(e)
+          }
+        _ -> resolve_funcs(rest, providers, acc)
+      }
+  }
+}
+
+/// Resolve ONE function import to its dispatch closure (`ProvidedFunc(ty, call)`), matched
+/// fail-closed (spec §3.2.7 — function types are matched by EQUALITY). The shared resolver both
+/// `resolve_fn_import` (state list, discards the callable) and `resolve_funcs` (function vector,
+/// keeps it) go through, so matching has ONE definition.
+///
+/// - `#("spectest", name)` → equality-matched against `rt_host.spectest_func_type(name)`; on a
+///   match the closure wraps `rt_host.call_host` (§B.3). Missing → `UnknownImport`; mismatch →
+///   `IncompatibleImportType`.
+/// - `#(reg, name)`, `reg` registered → its `ProvidedFunc(sig, closure)` export; `sig == ty` →
+///   that register-seam-built routing closure (§C.2). Missing → `UnknownImport`; a non-function
+///   export or a signature mismatch → `IncompatibleImportType`.
+/// - `#(other, name)`, unregistered → a genuine host capability (e.g. `env`): resolved to a host
+///   closure wrapping `call_host` (call-site-gated, NOT link-checked — P5 posture, §B.3).
+fn resolve_func_provided(
+  capability: String,
+  name: String,
+  ty: FuncType,
+  providers: List(Provider),
+) -> Result(Provided, ImportError) {
   case capability {
     "spectest" ->
       case rt_host.spectest_func_type(name) {
-        Ok(sig) -> match_fn(capability, name, sig, ty)
+        Ok(sig) -> match_func(capability, name, sig, ty, host_func_closure)
         Error(Nil) -> Error(UnknownImport(capability, name))
       }
     _ ->
       case is_registered(capability, providers) {
-        False -> Ok(None)
+        // A genuine host capability (env, wasi, …): call-site-gated, not link-checked.
+        False -> Ok(ProvidedFunc(ty, host_func_closure(capability, name)))
         True ->
           case lookup_registered(capability, name, providers) {
-            Ok(ProvidedFunc(sig, _)) -> match_fn(capability, name, sig, ty)
+            Ok(ProvidedFunc(sig, closure)) ->
+              case sig == ty {
+                True -> Ok(ProvidedFunc(sig, closure))
+                False ->
+                  Error(IncompatibleImportType(
+                    capability,
+                    name,
+                    "function signature",
+                  ))
+              }
             Ok(_) ->
               Error(IncompatibleImportType(
                 capability,
@@ -378,17 +562,45 @@ fn resolve_fn_import(
   }
 }
 
-/// A function externtype matches iff the signatures are structurally equal (spec §3.2 function
-/// matching). `Ok(None)` (no state element) on a match, else `IncompatibleImportType`.
-fn match_fn(
+/// A function externtype matches iff the signatures are structurally EQUAL (spec §3.2.7 function
+/// matching — functions are invariant). On a match, build the callable via `build_closure(module,
+/// name)` and return `Ok(ProvidedFunc(declared, closure))`; else `IncompatibleImportType`. Used
+/// for the `spectest`/host case where THIS unit builds the closure (the registered case reuses the
+/// register-seam-supplied closure directly).
+fn match_func(
   module: String,
   name: String,
   provided: FuncType,
   declared: FuncType,
-) -> Result(Option(Provided), ImportError) {
+  build_closure: fn(String, String) -> fn(List(Dynamic)) -> List(Dynamic),
+) -> Result(Provided, ImportError) {
   case provided == declared {
-    True -> Ok(None)
+    True -> Ok(ProvidedFunc(declared, build_closure(module, name)))
     False -> Error(IncompatibleImportType(module, name, "function signature"))
+  }
+}
+
+/// Build a HOST function import's dispatch closure — the fail-closed capability boundary (§B.3) as
+/// a `fn(List(Dynamic)) -> List(Dynamic)`. It marshals the argument value list to the raw
+/// bit-pattern `List(Int)` `rt_host.call_host` consumes (identity coercion — a host arg is numeric,
+/// D5), applies `call_host` under THIS instance's `HostPolicy` (deny-all by default; `safe_spectest`
+/// admits the `spectest` prints), and packages the `List(Int)` result back as a value list.
+///
+/// `call_host` RAISES the catchable `{capability_denied, Cap, Name}` on a denied call, so a denied
+/// host import surfaces as a trap through `call_import` exactly as before (no path around the gate).
+/// D3a: `Cap`/`Name` are the build-controlled import strings captured here at link time; `call_host`
+/// dispatches a build-fixed handler closure directly (rt_host §D3a), never `apply/3` on a
+/// data-derived module/atom.
+fn host_func_closure(
+  cap: String,
+  name: String,
+) -> fn(List(Dynamic)) -> List(Dynamic) {
+  fn(args) {
+    coerce_ints_to_dynamics(rt_host.call_host(
+      cap,
+      name,
+      coerce_args_to_ints(args),
+    ))
   }
 }
 

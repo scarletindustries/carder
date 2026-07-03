@@ -20,7 +20,7 @@ import gleam/dynamic
 import gleam/result
 import gleeunit/should
 import twocore/runtime/rt_meter
-import twocore/runtime/rt_state.{StateDecl}
+import twocore/runtime/rt_state.{FullDecl, StateDecl}
 
 /// Run `thunk` and report whether it raised: `Ok(value)` on a normal return, `Error(text)`
 /// on any raise/exit/throw. The fail-closed tests assert `result.is_error` — i.e. the op
@@ -673,4 +673,65 @@ pub fn fresh_full_matches_seed_full_test() {
   rt_state.t_data_dropped(st2, 0) |> should.be_true
   // Value semantics: the original record is unchanged.
   rt_state.t_data_dropped(st, 0) |> should.be_false
+}
+
+// ── boxed non-numeric globals hold v128 (S6) ───────────────────────────────────
+//
+// A `v128` global is a 16-byte `BitArray` (`<<_:128>>`) — a `Dynamic` that CANNOT live in the
+// numeric-`Int` `globals` map (D5 byte-identity) but boxes in the parallel `ref_globals` map
+// exactly like a reference value (S6). These prove the SAME boxed accessors round-trip a v128
+// bit-exact (16 raw little-endian bytes, including high/sign bytes), seeded from the state decl.
+// (The spec value model: a v128 is 16 raw bytes, no lane interpretation —
+// <https://webassembly.github.io/spec/core/syntax/values.html#vectors>.)
+
+/// Two distinct 16-byte v128 bit patterns — the second mixes high/sign bytes (a `-0.0`-style top
+/// byte + `0xFF` lane bytes) so a lossy round-trip (e.g. through a BEAM double or a truncating
+/// path) would corrupt it. Kept as raw `BitArray`s (D5 — the bits, never a decoded structure).
+fn v128_a() -> BitArray {
+  <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>
+}
+
+fn v128_b() -> BitArray {
+  <<0xFF, 0xFE, 0, 0, 0, 0, 0, 0x80, 0x7F, 0xC0, 0, 1, 0, 0, 0, 0>>
+}
+
+/// CELL path: a v128 global seeded through `FullDecl.ref_globals` reads back bit-exact via
+/// `ref_global_get`, and a `global.set` of a new v128 (`ref_global_set`) round-trips — the SAME
+/// boxed accessors reference globals use (S6). The 16 raw bytes survive verbatim.
+pub fn ref_global_boxes_v128_round_trip_test() {
+  let a = v128_a()
+  let b = v128_b()
+  rt_state.seed_full(
+    FullDecl(mems: [], globals: [], tables: [], ref_globals: [
+      #("v", dynamic.bit_array(a)),
+    ]),
+  )
+
+  // The seeded v128 reads back bit-exact.
+  rt_state.ref_global_get("v") |> should.equal(dynamic.bit_array(a))
+
+  // `global.set` of a new v128 round-trips (16 raw bytes, high/sign bytes intact).
+  rt_state.ref_global_set("v", dynamic.bit_array(b))
+  rt_state.ref_global_get("v") |> should.equal(dynamic.bit_array(b))
+}
+
+/// THREADED path: the same v128 round-trip through the pure `fresh_full`/`t_ref_global_*` twins,
+/// with value semantics — a `t_ref_global_set` returns a NEW record; the original is unchanged
+/// (S6 + the §10 uniform-threading rule).
+pub fn t_ref_global_boxes_v128_round_trip_test() {
+  let a = v128_a()
+  let b = v128_b()
+  let st0 =
+    rt_state.fresh_full(
+      FullDecl(mems: [], globals: [], tables: [], ref_globals: [
+        #("v", dynamic.bit_array(a)),
+      ]),
+    )
+
+  rt_state.t_ref_global_get(st0, "v") |> should.equal(dynamic.bit_array(a))
+
+  let st1 = rt_state.t_ref_global_set(st0, "v", dynamic.bit_array(b))
+  rt_state.t_ref_global_get(st1, "v") |> should.equal(dynamic.bit_array(b))
+  // Value semantics: the original record still holds the seeded v128.
+  rt_state.t_ref_global_get(st0, "v") |> should.equal(dynamic.bit_array(a))
 }

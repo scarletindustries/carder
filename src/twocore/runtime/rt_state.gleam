@@ -35,10 +35,14 @@
 //// own field via `mem_get`/`mem_put` / `table_get`/`table_put`. Mutable globals are
 //// raw-bit-pattern `Int`s keyed by name.
 ////
-//// **Globals are raw bits (D5).** i32/i64/f32/f64 globals are all stored identically as a
-//// raw bit-pattern `Int`. f32/f64 are NEVER round-tripped through a BEAM double (a double
-//// cannot hold NaN payloads / signalling bits), so `rt_state` does no float math and needs
-//// no per-global type tag.
+//// **Globals are raw bits (D5) or boxed `Dynamic`s.** i32/i64/f32/f64 globals are all stored
+//// identically as a raw bit-pattern `Int` in `globals`. f32/f64 are NEVER round-tripped through a
+//// BEAM double (a double cannot hold NaN payloads / signalling bits), so `rt_state` does no float
+//// math and needs no per-global type tag. **Non-numeric globals box in the parallel `ref_globals`
+//// map** as opaque `Dynamic`s: a REFERENCE global (funcref/externref, R8) and — Phase-6 (S6) — a
+//// `v128` global (a 16-byte `BitArray`), which cannot live in the `Int` `globals` map without
+//// disturbing the byte-identical numeric path. `rt_state` treats every `ref_globals` entry
+//// opaquely (`emit_core` routes both reftype and v128 global access through the boxed accessors).
 ////
 //// **Effect note (E6).** `global.get`/`global.set` (and the mem/table accessors) are
 //// side-effecting: a future optimizer must treat them as barriers — never CSE, reorder, or
@@ -109,9 +113,15 @@ type StateKey {
 ///   `rt_table`). Index 0 is the Phase-2 single table.
 /// - `dropped_data`: the set of passive DATA segment indices marked dropped (R2). Drop is O(1).
 /// - `dropped_elem`: the set of passive ELEMENT segment indices marked dropped (R2).
-/// - `ref_globals`: the mutable/immutable REFERENCE globals (funcref/externref) as opaque
-///   `Dynamic` terms keyed by name (R8) — kept parallel to `globals` so the numeric path is
-///   byte-identical.
+/// - `ref_globals`: the mutable/immutable **boxed non-numeric globals** as opaque `Dynamic` terms
+///   keyed by name — kept parallel to `globals` so the numeric raw-bit path (D5) is byte-identical.
+///   Phase-5 (R8) this held REFERENCE globals (funcref/externref); Phase-6 (S6) WIDENS its role to
+///   also hold **`v128` globals** — a `v128` is a 16-byte `BitArray` (`<<_:128>>`), a `Dynamic`
+///   that stores/retrieves exactly like a reference value and, like a reference, cannot live in the
+///   numeric-`Int` `globals` map (which must stay byte-identical for D5). `emit_core` (unit 06)
+///   routes a `v128`-typed `global.get`/`global.set`/const-init to the SAME boxed accessor
+///   (`ref_global_get`/`ref_global_set`) it uses for reftype globals; `rt_state` does not
+///   distinguish the two (both are opaque `Dynamic`s), so no per-global type tag is needed.
 pub type InstanceState {
   InstanceState(
     mems: List(Dynamic),
@@ -168,8 +178,11 @@ pub type StateDecl {
 ///   global's pair is its provided bits, a defined global's its const-folded init.
 /// - `tables`: the instance's tables as a **dense index-keyed vector** in index order, imported
 ///   tables first (R7 — `emit_core` resolves table name→index at compile time). Each entry OPAQUE.
-/// - `ref_globals`: the REFERENCE-typed globals (funcref/externref) as `#(name, ref)` pairs on the
-///   opaque `Dynamic` path (R8), kept parallel to `globals` so the numeric path is byte-identical.
+/// - `ref_globals`: the **boxed non-numeric globals** as `#(name, value)` pairs on the opaque
+///   `Dynamic` path, kept parallel to `globals` so the numeric path is byte-identical. Reference
+///   globals (funcref/externref, R8) AND — Phase-6 (S6) — `v128` globals (each a 16-byte
+///   `BitArray`) seed through here; an imported such global's pair is its provided value, a defined
+///   one's its rendered/const init. `rt_state` treats every entry as an opaque `Dynamic`.
 pub type FullDecl {
   FullDecl(
     mems: List(Dynamic),
@@ -341,13 +354,17 @@ pub fn drop_elem(seg: Int) -> Nil {
   put_cell(InstanceState(..st, dropped_elem: set.insert(st.dropped_elem, seg)))
 }
 
-// ── reference globals (cell family; R8) ───────────────────────────────────────
+// ── boxed non-numeric globals (cell family; R8 + S6) ──────────────────────────
 //
-// A reference-typed global holds a `Dynamic` (funcref/externref), not an `Int`, so it lives in
-// a PARALLEL map, leaving the raw-bit numeric `globals` (D5) untouched and byte-identical.
+// A boxed global holds a `Dynamic`, not an `Int`, so it lives in a PARALLEL map, leaving the
+// raw-bit numeric `globals` (D5) untouched and byte-identical. Two kinds box here: a REFERENCE
+// global (funcref/externref, R8) and — Phase-6 (S6) — a `v128` global (a 16-byte `BitArray`).
+// `rt_state` does not distinguish them; both round-trip as opaque `Dynamic`s through these
+// accessors (`emit_core` routes both reftype and v128 `global.get`/`global.set` here).
 
-/// Read reference global `name`'s current value from this process's cell (R8).
-/// - Returns the reference `Dynamic`. Fail-closed: `panic`s on an un-seeded cell OR an
+/// Read boxed global `name`'s current value from this process's cell (R8/S6) — a reference
+/// (funcref/externref) or a `v128` (16-byte `BitArray`), as an opaque `Dynamic`.
+/// - Returns the boxed `Dynamic`. Fail-closed: `panic`s on an un-seeded cell OR an
 ///   undeclared `name` (both unreachable post-validation) — never fabricates a value.
 pub fn ref_global_get(name: String) -> Dynamic {
   case dict.get(require_cell().ref_globals, name) {
@@ -357,9 +374,10 @@ pub fn ref_global_get(name: String) -> Dynamic {
   }
 }
 
-/// Write reference global `name` in this process's cell (R8).
-/// - `value`: the new reference `Dynamic`. Returns `Nil`. Fail-closed on an un-seeded cell.
-///   Only `name` changes; other globals and fields are preserved by reference.
+/// Write boxed global `name` in this process's cell (R8/S6) — a reference or a `v128` `Dynamic`.
+/// - `value`: the new boxed `Dynamic` (stored verbatim; `rt_state` never inspects it, so a v128's
+///   16 raw bytes / a reference's opacity survive exactly). Returns `Nil`. Fail-closed on an
+///   un-seeded cell. Only `name` changes; other globals and fields are preserved by reference.
 pub fn ref_global_set(name: String, value: Dynamic) -> Nil {
   let st = require_cell()
   put_cell(
@@ -571,9 +589,10 @@ pub fn t_drop_elem(st: InstanceState, seg: Int) -> InstanceState {
   InstanceState(..st, dropped_elem: set.insert(st.dropped_elem, seg))
 }
 
-// ── reference globals (threaded twins; R8) ────────────────────────────────────
+// ── boxed non-numeric globals (threaded twins; R8 + S6) ───────────────────────
 
-/// Read reference global `name`'s value from the threaded record (R8). READ-ONLY.
+/// Read boxed global `name`'s value from the threaded record (R8/S6) — a reference or a `v128`
+/// (16-byte `BitArray`), as an opaque `Dynamic`. READ-ONLY.
 /// Fail-closed `panic` on an undeclared `name` (unreachable post-validation).
 pub fn t_ref_global_get(st: InstanceState, name: String) -> Dynamic {
   case dict.get(st.ref_globals, name) {
@@ -583,7 +602,8 @@ pub fn t_ref_global_get(st: InstanceState, name: String) -> Dynamic {
   }
 }
 
-/// Rebind reference global `name` in the threaded record, RETURNING it (R8).
+/// Rebind boxed global `name` in the threaded record, RETURNING it (R8/S6) — a reference or a
+/// `v128` `Dynamic` (stored verbatim; opacity / raw v128 bytes preserved).
 /// Only `name` changes; other globals/fields shared by reference.
 pub fn t_ref_global_set(
   st: InstanceState,

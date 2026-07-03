@@ -19,16 +19,31 @@ import gleam/dict
 import gleam/dynamic
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
+import gleam/string
 import gleeunit/should
+import simplifile
 import twocore/ir
+import twocore/runtime/instance.{HostDenyAll, HostOpen}
 import twocore/runtime/link.{
   type ImportError, type Provided, IncompatibleImportType, ProvidedFunc,
   ProvidedGlobal, ProvidedMemory, ProvidedRefGlobal, ProvidedTable, Registered,
   UnknownImport,
 }
+import twocore/runtime/rt_host
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_state
 import twocore/runtime/rt_table
+
+/// Run `thunk`; `Ok(v)` on a normal return, `Error(text)` on ANY raise (used to prove a
+/// fail-closed `panic`). See `twocore_rt_state_test_ffi` (pure Gleam cannot `catch`).
+@external(erlang, "twocore_rt_state_test_ffi", "catch_thunk")
+fn catch_thunk(thunk: fn() -> a) -> Result(a, String)
+
+/// Run `thunk`; `Ok(#(cap, name))` ONLY if it raises the error-class `{capability_denied, Cap,
+/// Name}` (the host deny boundary), else `Error(text)`. See `twocore_rt_test_ffi`.
+@external(erlang, "twocore_rt_test_ffi", "host_denial")
+fn host_denial(thunk: fn() -> a) -> Result(#(String, String), String)
 
 /// A minimal module whose only content is `imports` — the fixture the resolver walks (every other
 /// field empty, so `link_imports` sees exactly the imports under test in declaration order).
@@ -391,4 +406,207 @@ fn phrase_of(r: Result(List(Provided), ImportError)) -> Result(String, Nil) {
     Ok(_) -> Error(Nil)
     Error(e) -> Ok(link.import_error_phrase(e))
   }
+}
+
+// ── 7. The imported-function CALL seam + the function-import vector (S5/«XLINK», P6-09) ─────────
+//
+// The linker MACHINERY proven in ISOLATION (the full WASM→WASM e2e run is P6-06/P6-10's, once
+// emit_core seeds the dispatch vector + emits `call_import` for a `CallImport` node). Spec cites:
+// §4.5.4 instantiation (func external value), §3.2.7 function matching (equality), §4.4.7 traps.
+
+/// `call_import` dispatches the HANDED-IN closure capability — never a name (D3a). Applying it to
+/// two different closures yields each closure's own result (so the target is the supplied `fun`,
+/// not an ambient lookup), and the argument list reaches the closure as a SINGLE 1-ary application
+/// (no `apply/2` spread — S5's arity fix): a 2-element arg list arrives intact.
+pub fn call_import_dispatches_the_handed_in_capability_test() {
+  let a = fn(_args) { [dynamic.int(1)] }
+  let b = fn(_args) { [dynamic.int(2)] }
+  link.call_import(a, []) |> should.equal([dynamic.int(1)])
+  link.call_import(b, []) |> should.equal([dynamic.int(2)])
+
+  // The whole arg list is handed to the 1-ary closure intact (not spread into parameters).
+  let passthrough = fn(args) { args }
+  link.call_import(passthrough, [dynamic.int(7), dynamic.int(8)])
+  |> should.equal([dynamic.int(7), dynamic.int(8)])
+}
+
+/// `provided_func` builds a `ProvidedFunc(ty, call)` and `provided_func_call` extracts the closure
+/// back out (the emit-side ABI, §D.2); the closure round-trips through `call_import`. The carried
+/// `ty` is the export signature (drives matching); the closure is applied, never `==`'d.
+pub fn provided_func_round_trips_test() {
+  let ty = ir.FuncType([], [ir.TI32])
+  let pf = link.provided_func(ty, fn(_args) { [dynamic.int(42)] })
+  // `ty` is carried verbatim (matching reads it).
+  let assert ProvidedFunc(carried, _) = pf
+  carried |> should.equal(ty)
+  // The closure round-trips out and dispatches.
+  link.call_import(link.provided_func_call(pf), [])
+  |> should.equal([dynamic.int(42)])
+}
+
+/// `provided_func_call` fails CLOSED (`panic`, node-safe) on a non-function `Provided` — an
+/// internal codegen invariant, mirroring `provided_global_bits` etc. (never a WASM trap).
+pub fn provided_func_call_panics_on_non_function_test() {
+  catch_thunk(fn() {
+    let _ = link.provided_func_call(ProvidedGlobal(0, ir.TI32, False))
+    Nil
+  })
+  |> result.is_error
+  |> should.be_true
+}
+
+/// The registry resolves a `(register)`ed module's FUNCTION export to its dispatch closure
+/// (spec §4.5.4 func external value): a provider carrying `ProvidedFunc(sig, closure)` under an
+/// export name is matched (sig equality) and returned as the importer's function-import-vector
+/// slot; the closure (here a stand-in for the cross-module routing closure §C.2) dispatches
+/// through `call_import`.
+pub fn link_func_imports_resolves_registered_function_test() {
+  let sig = ir.FuncType([], [ir.TI32])
+  // A stand-in for the register-seam-built routing closure (P6-10 captures the live handle).
+  let route = fn(_args) { [dynamic.int(42)] }
+  let provider =
+    Registered("A", dict.from_list([#("call", link.provided_func(sig, route))]))
+  let m = module_with_imports([ir.ImportFn("A", "call", sig)])
+
+  let assert Ok([pf]) = link.link_func_imports(m, [provider])
+  // The resolved slot is exactly the registered function's callable.
+  link.call_import(link.provided_func_call(pf), [])
+  |> should.equal([dynamic.int(42)])
+}
+
+/// `link_func_imports` fails CLOSED (spec §3.2.7 / §4.5.4, the `assert_unlinkable` path) on every
+/// unsatisfied or mismatched function import: a missing registered export, a signature mismatch, a
+/// registered NON-function export, a missing `spectest` function, and a `spectest` signature
+/// mismatch — each a link error, no instance created. The satisfying counterparts link `Ok`.
+pub fn link_func_imports_fail_closed_test() {
+  let sig = ir.FuncType([], [ir.TI32])
+  let provider =
+    Registered(
+      "A",
+      dict.from_list([#("call", link.provided_func(sig, fn(_a) { [] }))]),
+    )
+
+  // (a) missing registered export → unknown import.
+  let missing = module_with_imports([ir.ImportFn("A", "nope", sig)])
+  is_unknown(link.link_func_imports(missing, [provider]), "A", "nope")
+  |> should.be_true
+
+  // (b) signature mismatch (import [i32]->[] vs provider []->[i32]) → incompatible import type.
+  let wrong_sig =
+    module_with_imports([ir.ImportFn("A", "call", ir.FuncType([ir.TI32], []))])
+  is_incompatible(link.link_func_imports(wrong_sig, [provider]), "A", "call")
+  |> should.be_true
+
+  // (c) a registered NON-function export imported as a function → incompatible import type.
+  let state_provider =
+    Registered("B", dict.from_list([#("g", ProvidedGlobal(0, ir.TI32, False))]))
+  let as_func = module_with_imports([ir.ImportFn("B", "g", sig)])
+  is_incompatible(link.link_func_imports(as_func, [state_provider]), "B", "g")
+  |> should.be_true
+
+  // (d) a missing `spectest` function → unknown import.
+  let bad_spectest =
+    module_with_imports([ir.ImportFn("spectest", "not_a_print", sig)])
+  is_unknown(
+    link.link_func_imports(bad_spectest, []),
+    "spectest",
+    "not_a_print",
+  )
+  |> should.be_true
+
+  // (e) a `spectest` function with the wrong signature → incompatible import type.
+  let spectest_mismatch =
+    module_with_imports([
+      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI64], [])),
+    ])
+  is_incompatible(
+    link.link_func_imports(spectest_mismatch, []),
+    "spectest",
+    "print_i32",
+  )
+  |> should.be_true
+
+  // The satisfying registered + spectest counterparts link Ok (one slot each).
+  let ok_reg = module_with_imports([ir.ImportFn("A", "call", sig)])
+  let assert Ok([_]) = link.link_func_imports(ok_reg, [provider])
+  let ok_spectest =
+    module_with_imports([
+      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
+    ])
+  let assert Ok([_]) = link.link_func_imports(ok_spectest, [])
+  Nil
+}
+
+/// A `spectest` function import's dispatch closure routes through `rt_host.call_host` under THIS
+/// instance's `HostPolicy` (§B.3): admitted (here `HostOpen`), `spectest.print_i32` returns the
+/// empty value list `[]` (WASM result type `[]`). An `env` host import routes the same way —
+/// `env.identity` echoes its argument. Proves the host-closure construction + the value-list ABI.
+pub fn link_func_imports_host_closure_dispatches_test() {
+  rt_host.seed_policy(HostOpen)
+
+  // spectest.print_i32 : [i32] -> []  → [] (no output; the suite never asserts print output).
+  let print_mod =
+    module_with_imports([
+      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
+    ])
+  let assert Ok([print_pf]) = link.link_func_imports(print_mod, [])
+  link.call_import(link.provided_func_call(print_pf), [dynamic.int(42)])
+  |> should.equal([])
+
+  // env.identity : [i32] -> [i32]  → echoes its argument (the representative host handler).
+  let id_mod =
+    module_with_imports([
+      ir.ImportFn("env", "identity", ir.FuncType([ir.TI32], [ir.TI32])),
+    ])
+  let assert Ok([id_pf]) = link.link_func_imports(id_mod, [])
+  link.call_import(link.provided_func_call(id_pf), [dynamic.int(9)])
+  |> should.equal([dynamic.int(9)])
+}
+
+/// The host-closure capability boundary is preserved: under deny-all (the fail-closed default,
+/// D4) the SAME `env.identity` closure DENIES — applying it raises the catchable
+/// `{capability_denied, "env", "identity"}` (surfaced as a trap through `call_import`, no path
+/// around the gate — §B.3). Proves cross-module linking does not widen the host boundary.
+pub fn link_func_imports_host_closure_denied_under_deny_all_test() {
+  rt_host.seed_policy(HostDenyAll)
+  let m =
+    module_with_imports([
+      ir.ImportFn("env", "identity", ir.FuncType([ir.TI32], [ir.TI32])),
+    ])
+  let assert Ok([pf]) = link.link_func_imports(m, [])
+  let closure = link.provided_func_call(pf)
+  host_denial(fn() { link.call_import(closure, [dynamic.int(1)]) })
+  |> should.equal(Ok(#("env", "identity")))
+}
+
+/// The function-import vector is POSITIONAL in FUNCTION-import declaration order (spec §2.5.1),
+/// STATE imports contributing no element (they are the SEPARATE `link_imports` list). An
+/// interleaved (fn, global, memory, fn, table) import list yields exactly the two function slots.
+pub fn link_func_imports_positional_order_test() {
+  rt_host.seed_policy(HostOpen)
+  let m =
+    module_with_imports([
+      ir.ImportFn("env", "f1", ir.FuncType([], [])),
+      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
+      ir.ImportMemory("spectest", "memory", 1, Some(2), ir.Idx32),
+      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
+      ir.ImportTable("spectest", "table", ir.FuncRef, 10, Some(20)),
+    ])
+  // Exactly the two FUNCTION imports, in order; the three state imports are absent here.
+  kind_tags(link.link_func_imports(m, [])) |> should.equal(Ok(["func", "func"]))
+
+  // And `link_imports` (the STATE list) is UNCHANGED — byte-identical, state-only (H7).
+  kind_tags(link.link_imports(m, []))
+  |> should.equal(Ok(["global", "memory", "table"]))
+}
+
+/// D3a source guard: `link.gleam`'s dispatch is a handed-in capability, never an ambient
+/// `apply(Module, Atom, …)`. The only `@external` is `gleam_stdlib:identity` (numeric coercion);
+/// there is NO `erlang:apply` BIF external anywhere. Structural belt to the `call_import` proof.
+pub fn link_dispatch_is_capability_not_ambient_apply_test() {
+  let assert Ok(src) = simplifile.read("src/twocore/runtime/link.gleam")
+  // No `@external(erlang, "erlang", "apply")` (nor any erlang:apply BIF binding).
+  should.be_false(string.contains(src, "\"erlang\", \"apply\""))
+  // The coercion external IS present (identity — not a dispatch primitive).
+  should.be_true(string.contains(src, "\"gleam_stdlib\", \"identity\""))
 }
