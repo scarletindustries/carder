@@ -45,7 +45,7 @@ JavaScript runs on the BEAM byte-identically to `porf run`.
                                                                                                                                  └ rt_meter / rt_bif (build)  ┘
 ```
 
-Every arrow is an independently-invokable stage with a CLI verb (§6). The IR (`src/twocore/ir.gleam`)
+Every arrow is an independently-invokable stage with a CLI verb (§7). The IR (`src/twocore/ir.gleam`)
 is the seam between frontend and middle-end and has a canonical, round-trippable `.ir` textual form
 (`ir/printer.gleam` + `ir/parser.gleam`). **`emit_core` is the single binding chokepoint** — the only
 place that knows which concrete runtime a build links (decision D3b).
@@ -99,7 +99,39 @@ Capability boundary: `rt_host` (+ `rt_stdlib`, `link`). Build-time-only gate: `r
 
 ---
 
-## 5. The optimizer, as built (`ir_opt`)
+## 5. Deployment model — how emitted code links to the runtime
+
+**The runtime is *not* embedded in emitted modules.** A generated `.beam` is a thin module of
+*inter-module calls* to a shared runtime that must already be resident in the target node. This is
+deliberate (decisions D3a/D3d/D10) and load-bearing.
+
+- **Every runtime reference is a module-qualified static call, never inlined.** `emit_core` lowers all
+  runtime ops to `call '<twocore@runtime@rt_*>':'<fn>'(...)` — the module atom comes from the `Binding`
+  (`emit_core.gleam` `runtime_call`/`seam_call`), e.g. a WASM `i32.add` emits
+  `call 'twocore@runtime@rt_num':'i32_add'(...)`. Runtime bodies are *never* copied into generated code
+  ("Never embedded in or threaded through generated code", D3d).
+- **`build_beam` compiles exactly one `.core` into one `.beam`.** There is no linking, `beam_lib`
+  chunk-merging, or bundling step — `to-beam`/`to-beam-wasm` write that single generated module to disk;
+  `run`/`exec` load one module into the VM. So an emitted module is **not self-contained**.
+- **Consequence:** to load/run an emitted `.beam`, the **compiled `twocore` OTP application** must be on
+  the target node's code path — not just the `rt_*.beam` files, but their deps (`gleam_stdlib`,
+  `gleam_erlang`) and the hand-written Erlang FFI shims (`twocore_codegen_ffi.erl`,
+  `twocore_rt_state_ffi.erl`, …). A generated module copied to a bare node fails `undef` on its first
+  `twocore@runtime@*` call. Today the whole flow is **in-process** (D10 — load into the current VM),
+  which works because that VM *is* the running `twocore` app and already has the runtime loaded.
+
+**Why it's this way:** it is what makes *"generated code is pure Core Erlang"* true while the runtime
+underneath swaps per-tier native implementations — the emitted module is tier-agnostic and just calls
+the shared `rt_*` names. It is also what makes **B3 monomorphization** cheap (Safe.beam ≠ Unsafe.beam ≠
+threaded.beam are all tiny modules sharing one loaded runtime). A genuinely standalone artifact is
+therefore an **OTP release** of the `twocore` app + deps, *not* a runtime inlined into each module
+(which would defeat the shared-runtime and hot-reload properties). The deferred **single-`.beam`
+runtime-dispatch binding (B1)** ([`02-roadmap.md`](02-roadmap.md) §D) would let one module pick its
+runtime at instance time, but it still would not inline the runtime.
+
+---
+
+## 6. The optimizer, as built (`ir_opt`)
 
 `ir_opt.optimize/2` runs `pipeline(opt_level)` to a fixpoint. It sits **upstream of tier + mode
 selection**, so a sound pass speeds up *every* tier and *both* modes with no per-tier code.
@@ -112,7 +144,7 @@ Soundness rests on `ir/effect.gleam` (the conservative purity/effect classifier 
 
 ---
 
-## 6. CLI (every stage is independently invokable)
+## 7. CLI (every stage is independently invokable)
 
 `gleam run -- <verb>`. Stage verbs: `decode`, `validate`, `lower` (aliases `to-ir`/`ir`), `ir-lower`,
 `opt`, `emit`, `to-core`, `to-beam` (alias `build`), `to-beam-wasm`. End-to-end: `run`, `exec`
@@ -125,7 +157,7 @@ exit). Example: `gleam run -- run test/twocore/conformance/corpus/add.wasm add 3
 
 ---
 
-## 7. Source-tree map
+## 8. Source-tree map
 
 ```
 src/twocore.gleam                         CLI dispatch (arg parsing + file IO only)
@@ -183,7 +215,7 @@ Docs (measured writeups, kept): `docs/phase-{3,4,9,10}-benchmark.md`, `docs/phas
 
 ---
 
-## 8. Conformance & the categorized residual
+## 9. Conformance & the categorized residual
 
 The pinned WASM spec suite runs differentially (Tier-A: expected values baked in the `.wast`; Tier-B:
 a `wasmtime`/`wast2json`/rebuild-oracle engine), held across the full `(mode × state_strategy ×
