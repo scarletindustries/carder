@@ -107,6 +107,10 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | ir.MemGrow(..)
     | ir.MemLoad(..)
     | ir.MemStore(..)
+    | // Phase-10 unchecked accesses (N4) carry only `Value` operands (no sub-`Expr`), so like the
+      // checked memory leaves they return unchanged from this traversal.
+      ir.MemLoadUnchecked(..)
+    | ir.MemStoreUnchecked(..)
     | ir.GlobalGet(..)
     | ir.GlobalSet(..)
     | ir.CallDirect(..)

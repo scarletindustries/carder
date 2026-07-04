@@ -94,6 +94,12 @@ pub fn footprint_of(e: Expr) -> Result(Footprint, Nil) {
       Ok(Footprint(mem: mem, addr: addr, offset: offset, bytes: op.bytes))
     MemStore(mem, op, addr, _value, offset) ->
       Ok(Footprint(mem: mem, addr: addr, offset: offset, bytes: op.bytes))
+    // Phase-10 unchecked accesses (N4) touch the SAME bytes as their checked twins, so they have
+    // the same footprint — they alias the checked nodes exactly.
+    ir.MemLoadUnchecked(mem, op, addr, offset, _result) ->
+      Ok(Footprint(mem: mem, addr: addr, offset: offset, bytes: op.bytes))
+    ir.MemStoreUnchecked(mem, op, addr, _value, offset) ->
+      Ok(Footprint(mem: mem, addr: addr, offset: offset, bytes: op.bytes))
     _ -> Error(Nil)
   }
 }
@@ -172,7 +178,12 @@ fn range_alias(oa: Int, la: Int, ob: Int, lb: Int) -> AliasResult {
 pub fn is_memory_barrier(e: Expr) -> Bool {
   case e {
     // ── memory-transparent: footprints (handled precisely by the walkers) ──
-    ir.MemLoad(_, _, _, _, _) | ir.MemStore(_, _, _, _, _) -> False
+    ir.MemLoad(_, _, _, _, _)
+    | ir.MemStore(_, _, _, _, _)
+    | // Phase-10 unchecked accesses (N4): footprints too (same bytes as the checked twins), so
+      // handled precisely by the walkers, NOT a blanket "forget".
+      ir.MemLoadUnchecked(_, _, _, _, _)
+    | ir.MemStoreUnchecked(_, _, _, _, _) -> False
     // ── memory-transparent: read-only / disjoint-state / sequencing / pure ──
     ir.MemSize(_)
     | ir.GlobalGet(_)
@@ -269,7 +280,10 @@ pub fn count_mem_ops(m: Module) -> Int {
 /// operands) contribute `0`.
 fn count_in_expr(e: Expr) -> Int {
   case e {
-    MemLoad(_, _, _, _, _) | MemStore(_, _, _, _, _) -> 1
+    MemLoad(_, _, _, _, _)
+    | MemStore(_, _, _, _, _)
+    | ir.MemLoadUnchecked(_, _, _, _, _)
+    | ir.MemStoreUnchecked(_, _, _, _, _) -> 1
     ir.Let(_, rhs, body) -> count_in_expr(rhs) + count_in_expr(body)
     Block(_, _, body) -> count_in_expr(body)
     Loop(_, _, _, body) -> count_in_expr(body)

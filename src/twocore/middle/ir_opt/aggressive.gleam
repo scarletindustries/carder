@@ -444,6 +444,24 @@ fn apply_rename_subst(
         rs_value(value, rename, subst),
         offset,
       )
+    // Phase-10 unchecked accesses (N4): rewrite their `Value` operands exactly like the checked
+    // twins (the `mem`/`op`/`offset`/`result` are static).
+    ir.MemLoadUnchecked(mem, op, addr, offset, result) ->
+      ir.MemLoadUnchecked(
+        mem,
+        op,
+        rs_value(addr, rename, subst),
+        offset,
+        result,
+      )
+    ir.MemStoreUnchecked(mem, op, addr, value, offset) ->
+      ir.MemStoreUnchecked(
+        mem,
+        op,
+        rs_value(addr, rename, subst),
+        rs_value(value, rename, subst),
+        offset,
+      )
     // ── Phase-5 reference/table/bulk nodes: rewrite their `Value` operands so an inlined
     // callee's params are substituted into them (their names/segment indices are static). ──
     ir.RefFunc(_) -> e

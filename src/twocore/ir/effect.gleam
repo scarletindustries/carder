@@ -58,11 +58,12 @@ import twocore/ir.{
   type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallClosure,
   CallDirect, CallHost, CallImport, CallIndirect, Charge, Continue, Convert,
   DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
-  Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize,
-  MemStore, Num, NumTerm, RefFunc, RefIsNull, Return, Simd, SimdLoad,
-  SimdLoadLane, SimdShuffle, SimdStore, SimdStoreLane, Switch, TableCopy,
-  TableFill, TableGet, TableGrow, TableInit, TableSet, TableSize, TermOp,
-  TermTag, TermTest, Throw, ThrowRef, Trap, TruncS, TruncU, Try, Values,
+  Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad,
+  MemLoadUnchecked, MemSize, MemStore, MemStoreUnchecked, Num, NumTerm, RefFunc,
+  RefIsNull, Return, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
+  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
+  TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS,
+  TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -97,6 +98,11 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     | MemGrow(_, _)
     | MemLoad(_, _, _, _, _)
     | MemStore(_, _, _, _, _)
+    | // Phase-10 range-BCE (N4): the UNCHECKED memory accesses read/write mutable memory exactly like
+      // `MemLoad`/`MemStore` — barriers (no CSE, no reorder, no DCE). They omit only the bounds-check,
+      // never the memory effect, so their effect classification is IDENTICAL to the checked nodes.
+      MemLoadUnchecked(_, _, _, _, _)
+    | MemStoreUnchecked(_, _, _, _, _)
     | GlobalGet(_)
     | GlobalSet(_, _)
     | CallDirect(_, _)

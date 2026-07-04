@@ -500,7 +500,56 @@ Standalone range-based **bounds-check elimination** (needs an unchecked-access I
 entry points); **LICM** of the loop-invariant handle fetch (needs the handle exposed as an IR
 value); **MemorySSA across control flow** (Phase 9 is per straight-line region — resets at every
 `If`/`Switch`/`Loop`/`Block`/`Try`); **escape analysis** for the term/object value path (object
-speed, not linear-memory speed — the Phase-8 value layer's future speed unit).
+speed, not linear-memory speed — the Phase-8 value layer's future speed unit). **→ The first three
+(the linear-memory items) are Phase 10.**
+
+---
+
+## Phase 10 — The Memory Optimizer, completed (LICM + cross-CF MemorySSA + range-based BCE)
+
+Goal & honest scope: see [`specs/phase-10/00-overview.md`](phase-10/00-overview.md) (decisions
+**N1–N8**) — the direct sequel to Phase 9, building the three linear-memory optimizations Phase 9
+deferred. **LICM** (hoist pure loop-invariant work — incl. invariant address arithmetic — to a
+preheader) and **cross-control-flow MemorySSA** (let forwarding/RLE/DSE survive an `If`/`Block`/
+`Switch` when no branch clobbers, via a may-clobber analysis) are **pure IR→IR**, trust-neutral,
+all-tiers/both-modes (Phase-9 discipline). **Range-based BCE** is the first memory optimization since
+Phase 4 to grow the runtime ABI (an *unchecked* memory access), made **sound + trust-neutral by loop
+versioning** — a runtime range-guard picks the unchecked fast loop **only when it has proven the
+whole range in-bounds**, else the original checked loop, so values **and traps** are exactly
+preserved (N4). Baseline entering Phase 10: **1783 tests, 0 failures, 0 warnings**.
+
+### Phase-10 freeze milestone
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«MEM10-FROZEN»` — `loop_analysis` (free-vars/invariance) + `mem_clobber` (may-clobber/may-write) leaf modules + the additive `MemLoadUnchecked`/`MemStoreUnchecked` IR nodes (ir/printer/parser/effect/mem_ssa/emit — **freeze-safe: lower like the checked nodes**) + the `rt_mem`/`rt_mem_atomics` unchecked signatures | P10-01 | **FROZEN ✓** | 02–07 |
+
+### Phase-10 units
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P10-01** Keystone | [`01`](phase-10/01-keystone.md) | **done** | — | `loop_analysis.gleam` (`free_vars`/`is_loop_invariant`/`bound_names`) + `mem_clobber.gleam` (`may_clobber`/`may_write_memory`) leaf modules; the additive `MemLoadUnchecked`/`MemStoreUnchecked` nodes wired freeze-safe across ir/printer/parser/effect/mem_ssa/pass/baseline/aggressive/ir_lower/emit_core (lower via the checked path → corpus byte-identical). **Landed GREEN: 1794 tests (was 1783), 0 warnings, format clean, conformance fail=0 (46529 byte-identical).** |
+| **P10-02** LICM | [`02`](phase-10/02-licm.md) | **unclaimed** | `«MEM10-FROZEN»` | `licm.gleam` `licm_pass()` — hoist pure loop-invariant `Let`s to a preheader (moving-frontier drain). Pure IR, no pipeline edit (corpus byte-identical). |
+| **P10-03** cross-CF MemorySSA | [`03`](phase-10/03-cross-cf-memoryssa.md) | **unclaimed** | `«MEM10-FROZEN»` | cross-CF edits to `mem_forward.gleam` (keep `avail[f]` across an `If`/`Block`/`Switch` when `!may_clobber(child,f)` on every branch) + honest DSE scope (Phase-9 `is_pure` already looks through pure CF). Updates the Phase-9 `no_forward_across_control_flow_boundary_test`. No pipeline edit. |
+| **P10-04** rt_mem unchecked | [`04`](phase-10/04-rt-mem-unchecked.md) | **unclaimed** | `«MEM10-FROZEN»` | `load_unchecked`/`store_unchecked` (+ `t_*` twins) on `rt_mem` (paged) + `rt_mem_atomics` (atomics); BEAM-safe on OOB (paged=caught binary-slice error, atomics=ERTS-checked `atomics:get/put`); nif excluded (checked fallback). Differential vs the checked oracle. |
+| **P10-05** emit unchecked | [`05`](phase-10/05-emit-unchecked.md) | **unclaimed** | 01, 04 | Flip `emit_core`'s unchecked-node lowering from the checked path to the unchecked entry points on paged/atomics (via a fail-closed `mem_module` name whitelist); checked fallback for nif / `mem>0`. |
+| **P10-06** range-BCE | [`06`](phase-10/06-range-bce.md) | **unclaimed** | 01, 05, `loop_analysis` | `bce.gleam` `bce_pass()` — recognize an affine single-IV loop (no grow/call), synthesize a pure W64 range guard, emit loop versioning (`if in_range { unchecked fast loop } else { checked slow loop }`). Idempotent (skip already-versioned). |
+| **P10-07** capstone | [`07`](phase-10/07-capstone.md) | **unclaimed** | 02, 03, 06 | Wire LICM + cross-CF + BCE into `ir_opt.pipeline`; corpus differential (`OptNone ≡ Baseline ≡ Aggressive`, all tiers + both modes); measured benchmarks (LICM hoist-count + speedup; BCE atomics unchecked-count + speedup) + `docs/phase-10-benchmark.md` (honest ceiling). |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §4 M2 optimizer — loop optimizations + BCE | P10-02/06 | LICM + range-based bounds-check elimination (loop versioning), the Phase-9-deferred loop work. |
+| §4 M2 optimizer — cross-block MemorySSA | P10-03 | forwarding/RLE survive control flow via a may-clobber analysis. |
+| §10 tier ladder speedup | P10-04/05/06 | the unchecked runtime path (paged/atomics) + BCE — the bounds-check residual, largest on atomics. |
+
+### Deferred to a later phase (explicit)
+
+**Escape analysis** for the term/object value path (object speed, not linear memory — a future phase
+gated on a frontend emitting object-heavy code); a general (polyhedral) **range solver** (Phase-10
+BCE is single-affine-IV); nested/multi-dimensional BCE; **tier-N unchecked native** access (nif stays
+checked; a real C NIF for tier-N is itself a Phase-4 deferral).
 
 ---
 

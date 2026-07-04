@@ -970,6 +970,13 @@ fn emit(
       emit_mem_load(mem, op, addr, offset, result, cont, sc, state, ctx)
     MemStore(mem, op, addr, value, offset) ->
       emit_mem_store(mem, op, addr, value, offset, cont, sc, state, ctx)
+    // ── Phase-10 unchecked accesses (N4): FREEZE-SAFE lowering — route to the CHECKED emitters
+    //    (identical behaviour, incl. the OOB trap). Unit 05 flips these to the unchecked entry
+    //    points; until then a stray unchecked node can never be unsound. ──
+    ir.MemLoadUnchecked(mem, op, addr, offset, result) ->
+      emit_mem_load(mem, op, addr, offset, result, cont, sc, state, ctx)
+    ir.MemStoreUnchecked(mem, op, addr, value, offset) ->
+      emit_mem_store(mem, op, addr, value, offset, cont, sc, state, ctx)
     GlobalGet(name) -> emit_global_get(name, cont, sc, state, ctx)
     GlobalSet(name, value) -> emit_global_set(name, value, cont, sc, state, ctx)
     CallIndirect(table, index, ty, args) ->
@@ -6010,6 +6017,9 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     MemGrow(_, delta) -> collect_value(delta, acc)
     MemLoad(_, _, addr, _, _) -> collect_value(addr, acc)
     MemStore(_, _, addr, value, _) ->
+      collect_value(value, collect_value(addr, acc))
+    ir.MemLoadUnchecked(_, _, addr, _, _) -> collect_value(addr, acc)
+    ir.MemStoreUnchecked(_, _, addr, value, _) ->
       collect_value(value, collect_value(addr, acc))
     // ── Phase-5 reference/table/bulk nodes: collect the `Var` names in their operands so
     // gensym avoids them (over-approximating is safe). ──

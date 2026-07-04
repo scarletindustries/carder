@@ -610,6 +610,33 @@ pub type Expr {
   /// width; `op.signed` is IRRELEVANT for stores and is ignored. Side-effecting (E6); the
   /// evaluation order is addr, then value, then the store.
   MemStore(mem: Int, op: MemAccess, addr: Value, value: Value, offset: Int)
+  /// A linear-memory load the optimizer has **proven in-bounds** (Phase-10 range-BCE, N4). Identical
+  /// operands + meaning as `MemLoad`, but it carries **no bounds check**: `emit_core` lowers it to
+  /// `rt_mem`'s UNCHECKED entry point, which skips the `MemoryOutOfBounds` compare. **Produced ONLY
+  /// by the BCE pass**, inside the fast arm of a versioned loop whose runtime range-guard proved the
+  /// whole access range in-bounds — a WASM module NEVER produces one (decode/validate/lower never
+  /// emit it; the WASM validator surface rejects it). On paged/atomics the unchecked path is
+  /// BEAM-safe even on a (guard-impossible) OOB (a caught error → trap, never corruption); on nif it
+  /// falls back to the checked path (N5). Side-effecting (reads mutable memory) — a barrier, exactly
+  /// like `MemLoad`.
+  MemLoadUnchecked(
+    mem: Int,
+    op: MemAccess,
+    addr: Value,
+    offset: Int,
+    result: ValType,
+  )
+  /// A linear-memory store the optimizer has **proven in-bounds** (Phase-10 range-BCE, N4). The
+  /// unchecked twin of `MemStore` — see `MemLoadUnchecked` for the invariants. Side-effecting
+  /// (writes mutable memory); a barrier. Produced ONLY by the BCE pass; a WASM module never
+  /// produces one.
+  MemStoreUnchecked(
+    mem: Int,
+    op: MemAccess,
+    addr: Value,
+    value: Value,
+    offset: Int,
+  )
   /// `memory.fill(dest, value, count)` on memory `mem` — set `count` bytes from `dest` to
   /// the low byte of `value`. **Eager bounds; trap `MemoryOutOfBounds` before any write** if
   /// `dest + count > bytelen` (R10).

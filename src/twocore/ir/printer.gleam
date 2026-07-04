@@ -607,6 +607,28 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> " offset="
       <> int.to_string(offset)
       <> print_memidx(mem)
+    // ── Phase-10 unchecked accesses (N4): the same grammar as the checked forms, keyword
+    //    `mem.load_unchecked` / `mem.store_unchecked`. Only the BCE pass produces these. ──
+    ir.MemLoadUnchecked(mem, op, addr, offset, result) ->
+      "mem.load_unchecked "
+      <> print_valtype(result)
+      <> " "
+      <> print_memaccess(op)
+      <> " "
+      <> print_value(addr)
+      <> " offset="
+      <> int.to_string(offset)
+      <> print_memidx(mem)
+    ir.MemStoreUnchecked(mem, op, addr, value, offset) ->
+      "mem.store_unchecked "
+      <> print_memaccess(op)
+      <> " "
+      <> print_value(addr)
+      <> " "
+      <> print_value(value)
+      <> " offset="
+      <> int.to_string(offset)
+      <> print_memidx(mem)
     // ── Phase-5 reference / table / bulk nodes (H2, §A.3–§A.5). No Phase-1..4 module
     // contains these, so any spelling is conformance-neutral by construction. Value operands
     // are printed positionally; `seg=<n>` is always spelled; `mem=`/`dst_mem=`/`src_mem=`

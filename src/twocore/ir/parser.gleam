@@ -1316,6 +1316,8 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
         }
         "mem.load" -> parse_mem_load(rest)
         "mem.store" -> parse_mem_store(rest)
+        "mem.load_unchecked" -> parse_mem_load_unchecked(rest)
+        "mem.store_unchecked" -> parse_mem_store_unchecked(rest)
         // ── Phase-5 reference / table / bulk expressions (H2, §A.3–§A.5). ──
         "ref.func" -> {
           use #(n, rest) <- result.try(parse_at_name(rest))
@@ -1622,6 +1624,36 @@ fn parse_mem_store(
   use #(off, rest) <- result.try(expect_number(rest))
   let #(mem, rest) = parse_opt_kv(rest, "mem")
   Ok(#(MemStore(mem, macc, addr, val, off), rest))
+}
+
+/// Parses `mem.load_unchecked …` — same grammar as `mem.load` (Phase-10, N4), building the
+/// UNCHECKED node. Only the BCE pass produces these; the parser round-trips them for `.ir` fidelity.
+fn parse_mem_load_unchecked(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(result, rest) <- result.try(parse_valtype(toks))
+  use #(macc, rest) <- result.try(parse_memaccess(rest))
+  use #(addr, rest) <- result.try(parse_value(rest))
+  use rest <- result.try(expect_word(rest, "offset"))
+  use rest <- result.try(expect(rest, TEquals, "="))
+  use #(off, rest) <- result.try(expect_number(rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(ir.MemLoadUnchecked(mem, macc, addr, off, result), rest))
+}
+
+/// Parses `mem.store_unchecked …` — same grammar as `mem.store` (Phase-10, N4), building the
+/// UNCHECKED node.
+fn parse_mem_store_unchecked(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(macc, rest) <- result.try(parse_memaccess(toks))
+  use #(addr, rest) <- result.try(parse_value(rest))
+  use #(val, rest) <- result.try(parse_value(rest))
+  use rest <- result.try(expect_word(rest, "offset"))
+  use rest <- result.try(expect(rest, TEquals, "="))
+  use #(off, rest) <- result.try(expect_number(rest))
+  let #(mem, rest) = parse_opt_kv(rest, "mem")
+  Ok(#(ir.MemStoreUnchecked(mem, macc, addr, val, off), rest))
 }
 
 /// Parses a memory-access descriptor: `<bytes>` optionally followed by `signed`.

@@ -198,6 +198,11 @@ fn lower_expr(
     | ir.MemGrow(_, _)
     | ir.MemLoad(_, _, _, _, _)
     | ir.MemStore(_, _, _, _, _)
+    | // Phase-10 unchecked accesses (N4): leaves like the checked twins — `ir_lower` (a CallHost-gate
+      // + Loop-meter pass) leaves them unchanged. (A WASM module never produces them; they arise only
+      // in the optimizer, downstream of `ir_lower`.)
+      ir.MemLoadUnchecked(_, _, _, _, _)
+    | ir.MemStoreUnchecked(_, _, _, _, _)
     | ir.GlobalGet(_)
     | ir.GlobalSet(_, _)
     | ir.CallDirect(_, _)

@@ -830,6 +830,17 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
         subst_value(value, subs),
         offset,
       )
+    // Phase-10 unchecked accesses (N4): substitute into their `Value` operands like the checked twins.
+    ir.MemLoadUnchecked(mem, op, addr, offset, result) ->
+      ir.MemLoadUnchecked(mem, op, subst_value(addr, subs), offset, result)
+    ir.MemStoreUnchecked(mem, op, addr, value, offset) ->
+      ir.MemStoreUnchecked(
+        mem,
+        op,
+        subst_value(addr, subs),
+        subst_value(value, subs),
+        offset,
+      )
     // ── Phase-5 reference/table/bulk nodes: substitute into their `Value` operands. ──
     ir.RefFunc(_) -> e
     ir.RefIsNull(arg) -> ir.RefIsNull(subst_value(arg, subs))
@@ -1029,6 +1040,9 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.MemGrow(_, delta) -> value_name(delta)
     ir.MemLoad(_, _, addr, _, _) -> value_name(addr)
     ir.MemStore(_, _, addr, value, _) ->
+      list.append(value_name(addr), value_name(value))
+    ir.MemLoadUnchecked(_, _, addr, _, _) -> value_name(addr)
+    ir.MemStoreUnchecked(_, _, addr, value, _) ->
       list.append(value_name(addr), value_name(value))
     // ── Phase-5 reference/table/bulk nodes: collect the `Var` names in their operands. ──
     ir.RefFunc(_) -> []
