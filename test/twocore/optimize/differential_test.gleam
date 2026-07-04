@@ -35,7 +35,7 @@ import twocore/conformance/fixture.{
 }
 import twocore/conformance/oracle
 import twocore/conformance/runner.{type Driver, DriverError, Returned, Trapped}
-import twocore/middle/ir_opt
+import twocore/opt_level.{Aggressive, Baseline, OptNone}
 import twocore/pipeline
 import twocore/runtime/instance.{type Binding, Binding}
 import twocore/runtime/profiles
@@ -83,9 +83,9 @@ pub type Outcome {
 /// `FuelExhausted` never fires; proof 4 tests the trap separately).
 pub fn optimizer_soundness_differential_test() {
   let base = profiles.safe()
-  let none = pipeline_at(Binding(..base, opt_level: ir_opt.OptNone))
-  let baseline = pipeline_at(Binding(..base, opt_level: ir_opt.Baseline))
-  let aggressive = pipeline_at(Binding(..base, opt_level: ir_opt.Aggressive))
+  let none = pipeline_at(Binding(..base, opt_level: OptNone))
+  let baseline = pipeline_at(Binding(..base, opt_level: Baseline))
+  let aggressive = pipeline_at(Binding(..base, opt_level: Aggressive))
 
   let failures =
     list.flat_map(corpus_programs, fn(name) {

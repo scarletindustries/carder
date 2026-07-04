@@ -71,7 +71,7 @@
 //// only `ir`); `fuel_budget`'s Safe default is read from `runtime/rt_meter` (also acyclic —
 //// `rt_meter` imports neither `instance` nor `ir_opt`), the single source of the budget.
 
-import twocore/middle/ir_opt.{type OptLevel, Baseline}
+import twocore/opt_level.{type OptLevel, Baseline}
 import twocore/runtime/rt_meter
 
 /// The global execution mode (high-level §6). Phase 3 makes `Unsafe` real (the aggressive

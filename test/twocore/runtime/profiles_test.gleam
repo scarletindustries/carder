@@ -3,7 +3,7 @@
 //// is no API here that yields an unsafe posture.
 
 import gleam/list
-import twocore/middle/ir_opt.{Aggressive, Baseline}
+import twocore/opt_level.{Aggressive, Baseline}
 import twocore/runtime/instance.{
   Atomics, BifAllowlist, BifOpen, Binding, Cell, HostDenyAll, HostOpen,
   HostWhitelist, MeterFuel, MeterOff, Nif, Paged, Safe, StdlibOwn,

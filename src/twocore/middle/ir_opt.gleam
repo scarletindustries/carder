@@ -18,25 +18,14 @@ import twocore/middle/ir_opt/licm
 import twocore/middle/ir_opt/mem_dse
 import twocore/middle/ir_opt/mem_forward
 import twocore/middle/ir_opt/pass.{type Pass, run_pipeline}
+import twocore/opt_level.{type OptLevel, Aggressive, Baseline, OptNone}
 
-/// The optimization level a build profile selects (F1). `OptNone` is the identity (the
-/// Phase-1/2 build path with the optimizer bypassed — the differential baseline of F2).
-///
-/// **Naming (settled decision).** F1's prose calls the identity level `None`; it is frozen
-/// here as the constructor `OptNone` to avoid colliding with `gleam/option.None`, which the
-/// files that thread the level (`instance`, `emit_core`, `pipeline`) all import. `Baseline`
-/// and `Aggressive` are collision-free and importable unqualified.
-///
-/// - `OptNone`: run no passes — `optimize` is the exact identity.
-/// - `Baseline`: the trust-neutral passes (unit 03).
-/// - `Aggressive`: `baseline ++` the Unsafe-only passes (unit 04); a strict superset of
-///   `Baseline`. Legal only over a metering-free module (`Aggressive ⟹ MeterOff`, see
-///   `optimize`).
-pub type OptLevel {
-  OptNone
-  Baseline
-  Aggressive
-}
+// `OptLevel { OptNone Baseline Aggressive }` was relocated to the dependency-free leaf
+// `twocore/opt_level` (Phase-11 R3 / `«RT-LAYER-FROZEN»`) so the runtime can name the level
+// without importing a compiler module. `ir_opt` still owns `optimize/2` + `pipeline/1` below and
+// references the type/constructors via the import above; the move changed the type's location,
+// not its behavior, and emitted output is byte-identical (the no-arg constructors lower to the
+// same unqualified atoms).
 
 /// Optimize `module` at `level` (F1) — the single public entry point of the stage.
 ///

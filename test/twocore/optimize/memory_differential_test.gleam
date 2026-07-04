@@ -13,6 +13,7 @@ import gleam/option
 import twocore/ir
 import twocore/middle/ir_opt
 import twocore/middle/ir_opt/mem_ssa
+import twocore/opt_level.{Aggressive, Baseline, OptNone}
 import twocore/pipeline
 import twocore/runtime/instance.{Binding}
 import twocore/runtime/profiles
@@ -111,8 +112,8 @@ fn churn_module() -> ir.Module {
 pub fn memory_passes_fire_in_baseline_pipeline_test() {
   let m = churn_module()
   // OptNone is the identity, so it holds the original count.
-  let none = mem_ssa.count_mem_ops(ir_opt.optimize(m, ir_opt.OptNone))
-  let base = mem_ssa.count_mem_ops(ir_opt.optimize(m, ir_opt.Baseline))
+  let none = mem_ssa.count_mem_ops(ir_opt.optimize(m, OptNone))
+  let base = mem_ssa.count_mem_ops(ir_opt.optimize(m, Baseline))
   assert none == 6
   // 1 dead store + 3 forwarded/RLE'd loads eliminated ⟹ 2 live stores remain.
   assert base == 2
@@ -120,8 +121,8 @@ pub fn memory_passes_fire_in_baseline_pipeline_test() {
 
 pub fn aggressive_eliminates_at_least_as_much_as_baseline_test() {
   let m = churn_module()
-  let base = mem_ssa.count_mem_ops(ir_opt.optimize(m, ir_opt.Baseline))
-  let aggr = mem_ssa.count_mem_ops(ir_opt.optimize(m, ir_opt.Aggressive))
+  let base = mem_ssa.count_mem_ops(ir_opt.optimize(m, Baseline))
+  let aggr = mem_ssa.count_mem_ops(ir_opt.optimize(m, Aggressive))
   // Aggressive is a strict superset of Baseline, so it never leaves MORE memory ops.
   assert aggr <= base
 }
@@ -132,19 +133,19 @@ pub fn optimize_is_monotone_in_mem_ops_test() {
   // The passes NEVER add a memory op: count(optimize(m, Baseline)) <= count(m), for the kernel and
   // for a module with no redundancy (which is left unchanged).
   let churn = churn_module()
-  assert mem_ssa.count_mem_ops(ir_opt.optimize(churn, ir_opt.Baseline))
+  assert mem_ssa.count_mem_ops(ir_opt.optimize(churn, Baseline))
     <= mem_ssa.count_mem_ops(churn)
   let plain = no_redundancy_module()
   // no redundant traffic ⟹ the count is unchanged (nothing to eliminate).
-  assert mem_ssa.count_mem_ops(ir_opt.optimize(plain, ir_opt.Baseline))
+  assert mem_ssa.count_mem_ops(ir_opt.optimize(plain, Baseline))
     == mem_ssa.count_mem_ops(plain)
 }
 
 pub fn optimize_converges_to_a_fixpoint_test() {
   // Re-optimizing the optimized module is a no-op — the fixpoint is reached, no oscillation.
   let m = churn_module()
-  let once = ir_opt.optimize(m, ir_opt.Baseline)
-  let twice = ir_opt.optimize(once, ir_opt.Baseline)
+  let once = ir_opt.optimize(m, Baseline)
+  let twice = ir_opt.optimize(once, Baseline)
   assert twice == once
 }
 
@@ -154,7 +155,7 @@ pub fn transformed_kernel_matches_optnone_on_beam_test() {
   // The kernel — which the memory passes DEMONSTRABLY transform (4 nodes removed) — returns the
   // SAME value at OptNone (optimizer bypassed) and Baseline (memory passes on), on real BEAM.
   let m = churn_module()
-  let none = Binding(..profiles.safe(), opt_level: ir_opt.OptNone)
+  let none = Binding(..profiles.safe(), opt_level: OptNone)
   let base = profiles.safe()
   // 222 + 5 + 5 = 232.
   assert run(m, none, "churn", [0]) == pipeline.Returned([232])
@@ -165,7 +166,7 @@ pub fn transformed_kernel_preserves_oob_trap_on_beam_test() {
   // At an OOB address the (surviving) stores still trap identically under both optimizer levels —
   // the passes never remove a trap.
   let m = churn_module()
-  let none = Binding(..profiles.safe(), opt_level: ir_opt.OptNone)
+  let none = Binding(..profiles.safe(), opt_level: OptNone)
   let base = profiles.safe()
   let none_out = run(m, none, "churn", [9_000_000])
   let base_out = run(m, base, "churn", [9_000_000])

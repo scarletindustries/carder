@@ -20,8 +20,9 @@ import gleam/list
 import gleam/option
 import twocore/ir
 import twocore/ir/effect
-import twocore/middle/ir_opt.{Aggressive, Baseline, OptNone}
+import twocore/middle/ir_opt
 import twocore/middle/ir_opt/pass
+import twocore/opt_level.{Aggressive, Baseline, OptNone}
 import twocore/runtime/instance.{
   type Binding, BifAllowlist, BifOpen, HostDenyAll, HostOpen, MeterFuel,
   MeterOff, Safe, StdlibOwn, StdlibPassthrough, Unsafe,

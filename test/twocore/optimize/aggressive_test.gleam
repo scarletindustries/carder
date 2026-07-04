@@ -20,6 +20,7 @@ import twocore/ir
 import twocore/middle/ir_opt
 import twocore/middle/ir_opt/aggressive
 import twocore/middle/ir_opt/pass
+import twocore/opt_level.{Aggressive, Baseline, OptNone}
 import twocore/runtime/profiles
 
 // ───────────────────────────── harness ─────────────────────────────
@@ -66,12 +67,12 @@ fn p_i32(name: String) -> ir.Local {
 
 /// The optimized (`Aggressive`) module.
 fn opt_agg(m: ir.Module) -> ir.Module {
-  ir_opt.optimize(m, ir_opt.Aggressive)
+  ir_opt.optimize(m, Aggressive)
 }
 
 /// The optimized (`Baseline`) module.
 fn opt_base(m: ir.Module) -> ir.Module {
-  ir_opt.optimize(m, ir_opt.Baseline)
+  ir_opt.optimize(m, Baseline)
 }
 
 /// The body of the function named `name` in `m`, or `Values([])` if absent (total, no panic).
@@ -668,7 +669,7 @@ pub fn optnone_is_identity_test() {
       ),
     )
   let m = mod_of([main, dbl_callee()], [])
-  assert ir_opt.optimize(m, ir_opt.OptNone) == m
+  assert ir_opt.optimize(m, OptNone) == m
 }
 
 // ══════════════════════════ §9. end-to-end emittability of the inlined shape ══════════════════════════

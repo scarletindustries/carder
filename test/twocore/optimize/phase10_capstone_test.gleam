@@ -11,6 +11,7 @@ import gleam/list
 import gleam/option
 import twocore/ir
 import twocore/middle/ir_opt
+import twocore/opt_level.{type OptLevel, Baseline, OptNone}
 import twocore/pipeline
 import twocore/runtime/instance.{Binding}
 import twocore/runtime/profiles
@@ -21,13 +22,13 @@ pub fn licm_fires_in_baseline_pipeline_test() {
   // sumk(n,a,b): acc += a*b each iteration. The invariant a*b is hoisted out of the loop, so the
   // optimized module has NO `IMul` node left inside the loop body.
   let m = sumk_module()
-  let opt = ir_opt.optimize(m, ir_opt.Baseline)
+  let opt = ir_opt.optimize(m, Baseline)
   let assert [f] = opt.functions
   assert imuls_inside_loops(f.body) == 0
   // it also runs correctly + identically to OptNone: sumk(10,3,4) = 3*4*10 = 120.
-  assert run(m, ir_opt.OptNone, "sumk", [10, 3, 4]) == pipeline.Returned([120])
-  assert run(m, ir_opt.Baseline, "sumk", [10, 3, 4])
-    == run(m, ir_opt.OptNone, "sumk", [10, 3, 4])
+  assert run(m, OptNone, "sumk", [10, 3, 4]) == pipeline.Returned([120])
+  assert run(m, Baseline, "sumk", [10, 3, 4])
+    == run(m, OptNone, "sumk", [10, 3, 4])
 }
 
 // ─────────────────────────── BCE fires in the wired pipeline ───────────────────────────
@@ -35,15 +36,14 @@ pub fn licm_fires_in_baseline_pipeline_test() {
 pub fn bce_fires_in_baseline_pipeline_test() {
   // The affine-cursor sumbuf loop is versioned: the optimized module contains an unchecked access.
   let m = sumbuf_module()
-  let opt = ir_opt.optimize(m, ir_opt.Baseline)
+  let opt = ir_opt.optimize(m, Baseline)
   let assert [f] = opt.functions
   assert contains_unchecked(f.body)
   // value preserved (sumbuf over [1,2,3,4] with n=16 → 10) and OOB trap preserved.
-  assert run(m, ir_opt.Baseline, "sumbuf", [16]) == pipeline.Returned([10])
-  assert run(m, ir_opt.Baseline, "sumbuf", [16])
-    == run(m, ir_opt.OptNone, "sumbuf", [16])
-  let base_oob = run(m, ir_opt.Baseline, "sumbuf", [9_000_000])
-  assert base_oob == run(m, ir_opt.OptNone, "sumbuf", [9_000_000])
+  assert run(m, Baseline, "sumbuf", [16]) == pipeline.Returned([10])
+  assert run(m, Baseline, "sumbuf", [16]) == run(m, OptNone, "sumbuf", [16])
+  let base_oob = run(m, Baseline, "sumbuf", [9_000_000])
+  assert base_oob == run(m, OptNone, "sumbuf", [9_000_000])
   let assert pipeline.Trapped(_) = base_oob
 }
 
@@ -51,10 +51,10 @@ pub fn bce_fires_in_baseline_pipeline_test() {
 
 pub fn optimize_converges_on_licm_and_bce_kernels_test() {
   // BCE is node-adding but idempotent; re-optimizing the optimized module is a no-op.
-  let a = ir_opt.optimize(sumk_module(), ir_opt.Baseline)
-  assert ir_opt.optimize(a, ir_opt.Baseline) == a
-  let b = ir_opt.optimize(sumbuf_module(), ir_opt.Baseline)
-  assert ir_opt.optimize(b, ir_opt.Baseline) == b
+  let a = ir_opt.optimize(sumk_module(), Baseline)
+  assert ir_opt.optimize(a, Baseline) == a
+  let b = ir_opt.optimize(sumbuf_module(), Baseline)
+  assert ir_opt.optimize(b, Baseline) == b
 }
 
 // ─────────────────────────── kernels ───────────────────────────
@@ -256,7 +256,7 @@ fn contains_unchecked(e: ir.Expr) -> Bool {
 
 fn run(
   m: ir.Module,
-  level: ir_opt.OptLevel,
+  level: OptLevel,
   export: String,
   args: List(Int),
 ) -> pipeline.RunResult {

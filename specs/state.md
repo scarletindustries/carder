@@ -49,7 +49,7 @@ clean · WASM conformance **46,529 pass / 1,768 skip / 0 fail** (Safe ≡ Unsafe
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«RT-LAYER-FROZEN»` — runtime reaches zero compiler modules (`OptLevel` relocated; `ir` NOT split) | P11-01 | `unclaimed` | P11-02 |
+| `«RT-LAYER-FROZEN»` — runtime reaches zero compiler modules (`OptLevel` relocated to the leaf `twocore/opt_level`; `ir` NOT split) | P11-01 | `FROZEN ✓` | P11-02 |
 | `«CLOSURE-FROZEN»` — link-closure manifest + acquisition method + mechanically-derived OTP-ambient allowlist + mangle/mergeability invariants + drift test | P11-02 | `unclaimed` | P11-03 |
 | `«LINKER-IFACE-FROZEN»` — `beam_link.link_program` public signature + `LinkError` variants | P11-03 | `unclaimed` | P11-04, P11-06 |
 | `«BARE-NODE-HARNESS-PROVEN»` — isolation harness proven against a hand-authored trivial `.beam` (gate: fails when a `twocore@` module is reachable) | P11-05 | `unclaimed` | P11-06 (L2) |
@@ -58,7 +58,7 @@ clean · WASM conformance **46,529 pass / 1,768 skip / 0 fail** (Safe ≡ Unsafe
 
 | Unit | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|
-| **P11-01** Keystone: runtime layer split (`OptLevel`→leaf; `ir` not split, R2/R3) | `unclaimed` | — | Runtime reaches zero compiler modules (grep-verified); default output byte-identical; the ~10-file reach set repointed. |
+| **P11-01** Keystone: runtime layer split (`OptLevel`→leaf; `ir` not split, R2/R3) | `done` | — | Runtime reaches zero compiler modules (grep-verified); default output byte-identical; the ~10-file reach set repointed. |
 | **P11-02** Link-closure manifest + allowlist + acquisition + invariants (R1/R7/R8/R12/R15) | `unclaimed` | `«RT-LAYER-FROZEN»` | Frozen closure set (incl. `gleam_stdlib.erl`), per-module Core-acquisition method, mechanically-derived allowlist, `__`-free + mergeability invariants + drift test. |
 | **P11-03** The `cerl` linker engine (R4/R5/R6/R9/R10/R11) | `unclaimed` | `«CLOSURE-FROZEN»` | `beam_link.link_program` + `twocore_linker_ffi.erl`: 3-node-class rewrite incl. fun-captures, funref+`instantiate` reachability roots, DCE, deterministic `from_core`, built-in fail-closed structural D3a check; in-process smoke differential green. |
 | **P11-04** CLI `--link` (`to-beam-wasm` only) + `build_beam` entry + fail-closed gate (R13/R14) | `unclaimed` | `«CLOSURE-FROZEN»` (ambient allowlist), `«LINKER-IFACE-FROZEN»` (sig) | `--link` default off (byte-identical); tier-N + import-bearing + `on_load` rejected at the CLI/linker boundary. |
@@ -67,7 +67,9 @@ clean · WASM conformance **46,529 pass / 1,768 skip / 0 fail** (Safe ≡ Unsafe
 
 ### Landing log
 
-_(none yet)_
+- **P11-01** — 1865 tests (was 1863, +2 `link_layer_freeze_test`), conformance unchanged, 0 new warnings, format clean, byte-identical default output. `OptLevel { OptNone Baseline Aggressive }` relocated to the dependency-free leaf **`twocore/opt_level`** (type now at `twocore/opt_level.OptLevel`); `ir` NOT split (R2). `«RT-LAYER-FROZEN» ✓`.
+  - **Deliberate cross-file reaches (P11-01-owned):** `src/twocore/middle/ir_opt.gleam` (deleted the `OptLevel` type block, now imports it from `twocore/opt_level`), `src/twocore/runtime/instance.gleam:74` + `src/twocore/runtime/profiles.gleam:53` (repointed imports — removes the runtime's last compiler-module import), and the 7 test files that name the constructors (`opt_iface_freeze_test`, `profiles_test`, `differential_test`, `phase10_capstone_test`, `baseline_test`, `memory_differential_test`, `aggressive_test`).
+  - **Spec-drift note for downstream units:** the unit doc's per-file table for `phase10_capstone_test` omitted a `ir_opt.OptLevel` **type** reference (line 259, `level: ir_opt.OptLevel`); its `opt_level` import needed `type OptLevel` in addition to the `Baseline`/`OptNone` constructors. All other files matched the doc.
 
 ---
 

@@ -50,7 +50,7 @@
 import gleam/int
 import gleam/option.{None}
 import gleam/result
-import twocore/middle/ir_opt.{Aggressive}
+import twocore/opt_level.{Aggressive}
 import twocore/runtime/instance.{
   type Binding, type MemTier, type Mode, type StateStrategy, type TableTier,
   Atomics, BifOpen, Binding, Cell, HostOpen, HostWhitelist, MeterOff, Nif, Paged,

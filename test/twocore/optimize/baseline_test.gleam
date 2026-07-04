@@ -14,6 +14,7 @@ import gleam/list
 import gleam/option
 import twocore/ir
 import twocore/middle/ir_opt
+import twocore/opt_level.{Baseline, OptNone}
 import twocore/runtime/rt_num
 
 // ───────────────────────────── harness ─────────────────────────────
@@ -40,7 +41,7 @@ fn mod_with_body(body: ir.Expr) -> ir.Module {
 
 /// The optimized (`Baseline`) body of the one-function module wrapping `body`. Total.
 fn opt_body(body: ir.Expr) -> ir.Expr {
-  first_body(ir_opt.optimize(mod_with_body(body), ir_opt.Baseline))
+  first_body(ir_opt.optimize(mod_with_body(body), Baseline))
 }
 
 /// The first function's body, or an empty `Values` if (impossibly) absent — total, no panic.
@@ -680,8 +681,8 @@ pub fn optimize_is_idempotent_test() {
       ),
     )
   let m = mod_with_body(e)
-  let once = ir_opt.optimize(m, ir_opt.Baseline)
-  assert ir_opt.optimize(once, ir_opt.Baseline) == once
+  let once = ir_opt.optimize(m, Baseline)
+  assert ir_opt.optimize(once, Baseline) == once
 }
 
 /// `OptNone` is the exact identity even over a heavily-foldable module (the F2 differential
@@ -689,5 +690,5 @@ pub fn optimize_is_idempotent_test() {
 pub fn optnone_is_exact_identity_test() {
   let m =
     mod_with_body(ir.Num(ir.IAdd(ir.W32), [ir.ConstI32(1), ir.ConstI32(2)]))
-  assert ir_opt.optimize(m, ir_opt.OptNone) == m
+  assert ir_opt.optimize(m, OptNone) == m
 }
