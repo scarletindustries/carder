@@ -154,3 +154,41 @@ maps, the term↔numeric boxing bridge, and a fixed, capability-safe **runtime-c
 and assert *defined behavior* (never bytes); `gleam format` clean; `gleam build` 0 warnings; the full
 suite stays green (≥1694, 0 failures); the WASM corpus byte-identical; committed as one focused unit
 and pushed.
+
+---
+
+## 5. Status — shipped
+
+**All six IR units are implemented, tested, and on `main` (green: 1734 tests, 0 failures, 0 warnings,
+WASM byte-identical throughout).**
+
+| # | Unit | Commit | Adds |
+|---|---|---|---|
+| 01 | term construction | `phase-8/01` | `Value` `ConstAtom`/`ConstBinary`; `TermOp` `TupleSize`/`ListHead`/`ListTail`/`IsEmptyList` (+ real lowering for the pre-existing `MakeTuple`/`TupleGet`/`MakeCons`) |
+| 02 | native closures | `phase-8/02` | `Expr` `MakeClosure`/`CallClosure` → Core `fun`/`apply` (new `CApplyExpr`) — **closures over enclosing locals, Porffor's wall gone** |
+| 03 | maps | `phase-8/03` | `Expr` `MapOp{New,Get,Put,Has,Remove,Size}` → BEAM maps (object substrate) |
+| 04 | boxing bridge | `phase-8/04` | `BoxInt/UnboxInt/BoxFloat/UnboxFloat` lowering — a **lossless identity retag** (2core scalars are raw bit patterns, D5; the only NaN/Inf-safe representation) |
+| 05 | `rt_js` boundary | `phase-8/05` | `Binding.js_runtime_module` + the fixed, fail-closed `CallHost("js",…)` dispatch (D3a, no apply-from-data) + an `rt_js` stub |
+| 06 | classification + native arithmetic | `phase-8/06` | `Expr` `TermTest`/`TermTag` (guards) + `NumTerm` (native BEAM `+`/`-`/`*`/compare) — the **guarded fast path**, with the composed `a+b` fast/slow proof |
+
+The mid-phase reconciliation (`61eae06`) corrected the numeric model after unit 04's bit-pattern
+finding: a **JS number is a native BEAM `float()`/`integer()`** (so `TermTest(IsNumber)` guards + native
+`NumTerm` arithmetic work), while `Box/UnboxFloat` is the *separate* raw-f64↔term bridge (typed arrays /
+wasm interop). See [`HANDOFF-arc-frontend.md`](HANDOFF-arc-frontend.md) §2 (the "number note").
+
+## 6. Future work (NOT in Phase 8 — for a later IR unit or the frontend)
+
+- **Shaped-object inline caches (K4, a real speed unit).** A monomorphic hidden-class fast path: a
+  shaped **tuple** (`{shape_id, slot₀, slot₁, …}`) + a `TermTag`/shape-id guard + a fixed-offset
+  `TupleGet`, deopting to `rt_js.get_prop` on a shape miss. Needs a `CMap`/non-empty-map Core literal
+  node (unit 03 used `maps:new/0` + `maps:put` chains; a shaped path wants a real map/tuple literal).
+- **Guarded division** (`NumTerm` omits `/`,`%` because BEAM `/0` traps but JS `1/0=Infinity`): a
+  divisor≠0 guard + native op with an Infinity-producing deopt, if profiling shows `rt_js` div is hot.
+- **Mutable cells** for captured-and-mutated locals + object storage: deliberately left to `rt_js`
+  (K1 — no general IR meaning). If they prove a bottleneck, revisit a first-class `Cell` primitive.
+- **Generators / async / direct `eval`:** the frontend's problem (CPS/state-machine transform or an
+  arc-VM hybrid) — see `HANDOFF-arc-frontend.md` §6. No IR support is owed; the sync subset is
+  fully served by units 01–06.
+- **Milestone 0 (de-risk the perf premise):** hand-write IR for one hot function (unboxed/native path
+  + a `MakeClosure` + one `CallHost`), run to BEAM, benchmark vs arc's interpreter — the load-bearing
+  unknown before the frontend invests. Owned by whoever starts the frontend.
