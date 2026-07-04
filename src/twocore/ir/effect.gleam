@@ -58,7 +58,7 @@ import twocore/ir.{
   type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallClosure,
   CallDirect, CallHost, CallImport, CallIndirect, Charge, Continue, Convert,
   DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
-  Loop, MakeClosure, MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize,
+  Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize,
   MemStore, Num, RefFunc, RefIsNull, Return, Simd, SimdLoad, SimdLoadLane,
   SimdShuffle, SimdStore, SimdStoreLane, Switch, TableCopy, TableFill, TableGet,
   TableGrow, TableInit, TableSet, TableSize, TermOp, Throw, ThrowRef, Trap,
@@ -167,9 +167,15 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     // non-barrier and classifies `Pure` like `TermOp` (CSE/DCE/hoist of a fun literal are sound).
     // It carries only `Value` operands (no sub-`Expr`), so `children_all_pure` reaches its
     // `_ -> True` catch-all vacuously. (`CallClosure` is the barrier — see the `True` arm above.) ──
+    // ── Phase-8 map layer (K8, unit 03): every `MapOp` is PURE — a BEAM map is immutable, so
+    // construction, functional update, AND the reads all read/write no shared mutable state, never
+    // trap, and transfer no control. So it is a non-barrier like `TermOp`/`MakeClosure` (CSE/DCE/
+    // reorder sound). It carries only `Value` operands (no sub-`Expr`), so `children_all_pure`
+    // reaches its `_ -> True` catch-all vacuously. ──
     Values(_)
     | TermOp(_, _)
     | MakeClosure(_, _, _)
+    | MapOp(_, _)
     | Simd(_, _)
     | SimdShuffle(_, _, _)
     | Let(_, _, _)

@@ -421,6 +421,9 @@ fn apply_rename_subst(
     ir.Num(op, args) -> ir.Num(op, rs_values(args, rename, subst))
     ir.Convert(op, arg) -> ir.Convert(op, rs_value(arg, rename, subst))
     ir.TermOp(op, args) -> ir.TermOp(op, rs_values(args, rename, subst))
+    // Phase-8 map layer: rewrite the `Value` operands (the `op` is static). Pure, so a pass may
+    // hoist/CSE it (`ir/effect`); the operand rewrite happens here.
+    ir.MapOp(op, args) -> ir.MapOp(op, rs_values(args, rename, subst))
     ir.MemSize(_) -> e
     ir.MemGrow(mem, delta) -> ir.MemGrow(mem, rs_value(delta, rename, subst))
     ir.MemLoad(mem, op, addr, offset, result) ->

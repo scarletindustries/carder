@@ -154,7 +154,11 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
       // (`ir/effect`), so no pass hoists across it; `MakeClosure` is pure. A pass that rewrites
       // their `Value` operands does so in its own per-node arm, not here.
       ir.MakeClosure(..)
-    | ir.CallClosure(..) -> e
+    | ir.CallClosure(..)
+    | // Phase-8 map layer (unit 03) carries only `Value` operands (no sub-`Expr`), so like the
+      // leaves it returns unchanged from this `Expr`-traversal combinator. It is pure (`ir/effect`);
+      // a pass that rewrites its `Value` operands does so in its own per-node arm, not here.
+      ir.MapOp(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
     // Phase-7 `Try` recurses into its `body` and each handler's inline `handler` expression
     // (both are sub-`Expr`s), so a traversal reaches an EH region's interior. The node itself is

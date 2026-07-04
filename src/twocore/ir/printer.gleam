@@ -47,11 +47,11 @@ import twocore/ir.{
   ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS,
   IShrU, ISub, IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
   InvalidConversionToInteger, Let, Loop, LoopParam, MakeClosure, MakeCons,
-  MakeTuple, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryOutOfBounds,
-  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
-  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS,
-  TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement,
-  UninitializedElement, Unreachable, Values, Var, W32, W64,
+  MakeTuple, MapOp, MemAccess, MemGrow, MemLoad, MemSize, MemStore,
+  MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch,
+  SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap,
+  TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt,
+  UndefinedElement, UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 
 // ───────────────────────────── public entry point ─────────────────────────────
@@ -561,6 +561,11 @@ fn print_expr(indent: Int, e: Expr) -> String {
       "convert " <> convop_to_string(op) <> " " <> print_value(arg)
     TermOp(op, args) ->
       "term " <> termop_to_string(op) <> " " <> value_list(args)
+    // Phase-8 map layer (K4, unit 03). No Phase-1..7 module contains these, so the spelling is
+    // conformance-neutral by construction; `parser.parse_expr` reads it back. The op spelling is
+    // a single dotted keyword (`map.new`/`map.get`/… — like the existing `mem.size`/`global.get`),
+    // followed by the operand value list.
+    MapOp(op, args) -> mapop_to_string(op) <> " " <> value_list(args)
     // The four existing memory nodes gain a trailing `mem=<n>` decorator, OMITTED when the
     // index is 0 (§A.6) — so a single-memory (index-0) module's `.ir` is byte-identical to
     // Phase-4 (H7); a non-zero index appends ` mem=<n>`.
@@ -1202,6 +1207,19 @@ fn termop_to_string(op: TermOp) -> String {
     ir.ListHead -> "list_head"
     ir.ListTail -> "list_tail"
     ir.IsEmptyList -> "is_empty_list"
+  }
+}
+
+/// Renders a map-layer op (Phase-8 unit 03) as its dotted keyword: `map.new`, `map.get`,
+/// `map.put`, `map.has`, `map.remove`, `map.size`. The parser's `string_to_mapop` reads each back.
+fn mapop_to_string(op: ir.MapOp) -> String {
+  case op {
+    ir.MapNew -> "map.new"
+    ir.MapGet -> "map.get"
+    ir.MapPut -> "map.put"
+    ir.MapHas -> "map.has"
+    ir.MapRemove -> "map.remove"
+    ir.MapSize -> "map.size"
   }
 }
 

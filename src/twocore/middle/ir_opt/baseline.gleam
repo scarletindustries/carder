@@ -810,6 +810,8 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
     ir.Num(op, args) -> ir.Num(op, subst_values(args, subs))
     ir.Convert(op, arg) -> ir.Convert(op, subst_value(arg, subs))
     ir.TermOp(op, args) -> ir.TermOp(op, subst_values(args, subs))
+    // Phase-8 map layer: substitute into the `Value` operands (the `op` is static).
+    ir.MapOp(op, args) -> ir.MapOp(op, subst_values(args, subs))
     ir.MemSize(_) -> e
     ir.MemGrow(mem, delta) -> ir.MemGrow(mem, subst_value(delta, subs))
     ir.MemLoad(mem, op, addr, offset, result) ->
@@ -1010,6 +1012,8 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.Num(_, args) -> values_names(args)
     ir.Convert(_, arg) -> value_name(arg)
     ir.TermOp(_, args) -> values_names(args)
+    // Phase-8 map layer: collect the `Var` names in the map op's operands (the `op` is static).
+    ir.MapOp(_, args) -> values_names(args)
     ir.MemSize(_) -> []
     ir.MemGrow(_, delta) -> value_name(delta)
     ir.MemLoad(_, _, addr, _, _) -> value_name(addr)

@@ -144,6 +144,34 @@ pub fn closure_nodes_effect_classification_test() {
   assert can_reorder(call, call) == False
 }
 
+/// SPEC (Phase-8 K8, 03-objects-maps.md §Effect): ALL SIX `MapOp`s are `Pure` non-barriers — a
+/// BEAM map is immutable, so construction, functional update, AND the reads read/write no shared
+/// mutable state, never trap, and transfer no control (CSE/DCE/reorder are sound). Every variant
+/// must be a non-barrier, classify `Pure`, and be shareable + eliminable-if-unused. A false
+/// `Effectful` here would needlessly forbid the optimizer; a false `Pure` is impossible (maps are
+/// immutable) — this pins the whole family as pure. Covers every `MapOp`, so it also proves the
+/// classifier is TOTAL over `MapOp`.
+pub fn map_nodes_effect_classification_test() {
+  let ops = [
+    ir.MapOp(ir.MapNew, []),
+    ir.MapOp(ir.MapGet, [ir.Var("m"), ir.Var("k"), ir.Var("d")]),
+    ir.MapOp(ir.MapPut, [ir.Var("m"), ir.Var("k"), ir.Var("v")]),
+    ir.MapOp(ir.MapHas, [ir.Var("m"), ir.Var("k")]),
+    ir.MapOp(ir.MapRemove, [ir.Var("m"), ir.Var("k")]),
+    ir.MapOp(ir.MapSize, [ir.Var("m")]),
+  ]
+  list.each(ops, fn(e) {
+    assert is_effectful_node(e) == False
+    assert classify(e) == Pure
+    assert is_pure(e) == True
+    assert can_cse(e) == True
+    assert can_eliminate_if_unused(e) == True
+  })
+  // A pure map op commutes with a barrier (either-side-pure ⇒ reorderable).
+  assert can_reorder(ir.MapOp(ir.MapSize, [ir.Var("m")]), a_store()) == True
+  assert can_reorder(a_store(), ir.MapOp(ir.MapNew, [])) == True
+}
+
 // ─────────────────── §G.6 — purity is DEEP, not shallow ───────────────────
 
 /// A non-barrier SHELL (`Let`/`Block`/`If`/`Switch`) is `Pure` only when all its
@@ -446,6 +474,7 @@ fn every_expr_variant() -> List(ir.Expr) {
     ir.Convert(ir.I32WrapI64, ir.Var("x")),
     ir.Convert(ir.TruncS(ir.FW64, ir.W32), ir.Var("x")),
     ir.TermOp(ir.MakeTuple, [ir.Var("a")]),
+    ir.MapOp(ir.MapPut, [ir.Var("m"), ir.Var("k"), ir.Var("v")]),
     ir.MemSize(0),
     ir.MemGrow(0, ir.ConstI32(1)),
     a_load(),
@@ -504,6 +533,7 @@ pub fn classify_total_and_barrier_set_correct_test() {
     a_pure_add(),
     ir.Convert(ir.I32WrapI64, ir.Var("x")),
     ir.TermOp(ir.MakeTuple, [ir.Var("a")]),
+    ir.MapOp(ir.MapNew, []),
     ir.Let(["t"], ir.Values([ir.Var("a")]), ir.Values([ir.Var("t")])),
     ir.Block("b", [], ir.Values([])),
     ir.If(ir.Var("c"), [], ir.Values([]), ir.Values([])),

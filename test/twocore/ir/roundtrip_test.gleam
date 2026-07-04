@@ -396,6 +396,14 @@ fn expr_corpus() -> List(ir.Expr) {
     ir.TermOp(ir.ListHead, [ir.Var("l")]),
     ir.TermOp(ir.ListTail, [ir.Var("l")]),
     ir.TermOp(ir.IsEmptyList, [ir.Var("l")]),
+    // map ops (Phase-8 unit 03: the full MapOp surface round-trips textually — the dotted
+    // keyword spellings `map.new`/`map.get`/… plus the map-first operand order).
+    ir.MapOp(ir.MapNew, []),
+    ir.MapOp(ir.MapGet, [ir.Var("m"), ir.ConstAtom("k"), ir.ConstI32(0)]),
+    ir.MapOp(ir.MapPut, [ir.Var("m"), ir.ConstAtom("k"), ir.Var("v")]),
+    ir.MapOp(ir.MapHas, [ir.Var("m"), ir.ConstAtom("k")]),
+    ir.MapOp(ir.MapRemove, [ir.Var("m"), ir.ConstAtom("k")]),
+    ir.MapOp(ir.MapSize, [ir.Var("m")]),
     // Phase-8 term literals as forwarded values: a literal atom and a literal binary.
     ir.Values([ir.ConstAtom("ok"), ir.ConstBinary(<<"hi">>)]),
     ir.Values([ir.ConstAtom("true"), ir.ConstBinary(<<>>)]),

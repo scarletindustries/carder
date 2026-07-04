@@ -55,7 +55,7 @@ import twocore/ir.{
   IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If, ImportFn,
   IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
   InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeClosure, MakeCons,
-  MakeTuple, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl,
+  MakeTuple, MapOp, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl,
   MemoryOutOfBounds, Module, Num, ReinterpretFToI, ReinterpretIToF, Return,
   Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableDecl, TableOutOfBounds,
   TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat,
@@ -1269,6 +1269,15 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
         "num" -> parse_num(rest)
         "convert" -> parse_convert(rest)
         "term" -> parse_term(rest)
+        // ── Phase-8 map layer (K4, unit 03) — the inverse of `printer.print_expr`'s `MapOp` arm.
+        // Each op is its own dotted keyword (`map.new`/`map.get`/… — like `mem.size`/`global.get`),
+        // followed by the operand value list. `parse_map` maps the keyword back to the `MapOp`. ──
+        "map.new"
+        | "map.get"
+        | "map.put"
+        | "map.has"
+        | "map.remove"
+        | "map.size" -> parse_map(kw, rest)
         // The four existing memory nodes accept a trailing `mem=<n>` decorator (§A.6),
         // defaulting to index 0 when omitted (byte-identical to Phase-4).
         "mem.size" -> {
@@ -1504,6 +1513,23 @@ fn parse_term(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
     [PToken(t, l, c), ..] ->
       Error(UnexpectedToken(l, c, "term op", describe(t)))
     [] -> Error(UnexpectedEnd("term op"))
+  }
+}
+
+/// Parses a map-layer op (Phase-8 unit 03): the already-consumed dotted keyword `kw` (`map.new`,
+/// `map.get`, …) selects the `MapOp`, then the operand value list follows. `kw` is guaranteed one
+/// of the six map keywords by the dispatch in `parse_expr`, so `string_to_mapop` never fails here;
+/// the `Error(_)` arm is defensive (fails closed rather than panicking).
+fn parse_map(
+  kw: String,
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  case string_to_mapop(kw) {
+    Ok(op) -> {
+      use #(args, rest) <- result.try(parse_value_list(toks))
+      Ok(#(MapOp(op, args), rest))
+    }
+    Error(_) -> Error(UnexpectedEnd("map op"))
   }
 }
 
@@ -2400,6 +2426,21 @@ fn string_to_termop(w: String) -> Result(TermOp, Nil) {
           }
         _ -> Error(Nil)
       }
+  }
+}
+
+/// Parses a map-layer op spelling (Phase-8 unit 03): the dotted keywords `map.new`, `map.get`,
+/// `map.put`, `map.has`, `map.remove`, `map.size`. Mirrors `printer.mapop_to_string`. Any other
+/// spelling is `Error(Nil)`.
+fn string_to_mapop(w: String) -> Result(ir.MapOp, Nil) {
+  case w {
+    "map.new" -> Ok(ir.MapNew)
+    "map.get" -> Ok(ir.MapGet)
+    "map.put" -> Ok(ir.MapPut)
+    "map.has" -> Ok(ir.MapHas)
+    "map.remove" -> Ok(ir.MapRemove)
+    "map.size" -> Ok(ir.MapSize)
+    _ -> Error(Nil)
   }
 }
 

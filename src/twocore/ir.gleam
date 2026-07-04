@@ -811,6 +811,12 @@ pub type Expr {
   /// **Effectful + barrier** (K8): applying a fun transfers control to arbitrary code — the same
   /// class as `CallIndirect`/`CallHost`, so it is never reordered, CSE'd, or eliminated.
   CallClosure(callee: Value, args: List(Value))
+  /// Map construction / query / functional update — the BEAM-native immutable map, the substrate a
+  /// frontend builds JS objects on (Phase-8 unit 03; K4/K8). Groups all six map ops under one
+  /// variant (mirrors `TermOp`, minimal blast radius). All are **`Pure`**: a BEAM map is immutable,
+  /// so every op — including the reads — is a total, non-trapping, state-free value transform (see
+  /// `MapOp` for per-op arities/lowering). **No WASM module produces one** (K7 — additive).
+  MapOp(op: MapOp, args: List(Value))
 }
 
 /// One catch handler of a `Try` region (J2/T1 — the INLINE-HANDLER shape). `on` selects which
@@ -1237,6 +1243,37 @@ pub type TermOp {
   ListHead
   ListTail
   IsEmptyList
+}
+
+/// Map-layer operations — the BEAM-native immutable-map surface a dynamic-language frontend lowers
+/// JS objects to (Phase-8 unit 03; K4/K8). A BEAM map is **immutable** (a functional update returns
+/// a NEW map), so every op is **`Pure`** (reads never trap, writes never mutate shared state — CSE/
+/// DCE/reorder are all sound). Carried by the `MapOp(op, args)` `Expr`. **No WASM module produces
+/// one** (K7 — additive; the WASM `validate` surface rejects them, `lower` never emits them, so the
+/// WASM corpus stays byte-identical).
+///
+/// The `args` order is uniformly **map-first** at the IR level (`m, k[, v/default]`); `emit_core`
+/// re-orders to the Erlang `maps` calling convention (`Key`, `[Value,]` `Map`). Arities
+/// (validate/frontend uphold; `emit_core` pattern-matches them):
+/// - `MapNew`: build the empty map `#{}` from **0 args**. Result `TTerm`.
+/// - `MapGet`: look up `k` in map `m`, yielding its value, or the explicit `default` when `k` is
+///   absent (3 args `[m, k, default]` → `maps:get(K, M, Default)`; a missing key deterministically
+///   yields the frontend's `undefined` sentinel — **no BEAM `badkey`**). Result `TTerm`.
+/// - `MapPut`: return a NEW map equal to `m` but with `k` bound to `v` (overwriting any prior
+///   binding) (3 args `[m, k, v]` → `maps:put(K, V, M)`). Result `TTerm`.
+/// - `MapHas`: `1` if `k` is a key of `m`, else `0` — an **i32 truth value** (so it drops into
+///   `If`/`Switch`) (2 args `[m, k]` → `maps:is_key(K, M)`). Result `TI32`.
+/// - `MapRemove`: return a NEW map equal to `m` with any binding for `k` removed (2 args `[m, k]` →
+///   `maps:remove(K, M)`; removing an absent key is a no-op that returns an equal map). Result
+///   `TTerm`.
+/// - `MapSize`: the number of key/value pairs in `m` (1 arg `[m]` → `maps:size(M)`). Result `TI32`.
+pub type MapOp {
+  MapNew
+  MapGet
+  MapPut
+  MapHas
+  MapRemove
+  MapSize
 }
 
 /// Describes a linear-memory access (Phase-2; lock-now).

@@ -100,10 +100,10 @@ import twocore/ir.{
   ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU,
   IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub,
   IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Loop, MakeClosure, MemGrow, MemLoad, MemSize,
-  MemStore, MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return,
-  Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds, TermOp,
-  Trap, TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt,
+  InvalidConversionToInteger, Let, Loop, MakeClosure, MapOp, MemGrow, MemLoad,
+  MemSize, MemStore, MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF,
+  Return, Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds,
+  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt,
   UndefinedElement, UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
@@ -1065,6 +1065,11 @@ fn emit(
       emit_make_closure(fn_name, captures, arity, cont, sc, state, ctx)
     CallClosure(callee, args) ->
       emit_call_closure(callee, args, cont, sc, state, ctx)
+    // ── Phase-8 map layer (K4/K8, unit 03): the immutable BEAM map — the object substrate. Each
+    // op is PURE and yields ONE value disposed through `cont` (like a `TermOp`); a BEAM map is
+    // immutable, so no op traps or touches mutable state, and `sc` flows through unchanged. Neither
+    // arises from WASM (K7). ──
+    MapOp(op, args) -> emit_map_op(op, args, cont, sc, state, ctx)
   }
 }
 
@@ -1141,6 +1146,100 @@ fn emit_term_op(
     }
     // Arity mismatch — impossible for a validated module (K7); fail closed.
     _, _ -> Error(UnsupportedNode("term_op"))
+  }
+}
+
+/// Lower a `MapOp(op, args)` — the Phase-8 immutable-map layer (unit 03, K4/K8), the object
+/// substrate a JS frontend builds on. A BEAM map is immutable (a functional update returns a NEW
+/// map), so every op is PURE, yields exactly ONE value, and is disposed through `cont` via
+/// `apply_cont` (the same shape as `emit_term_op`); `sc` flows through unchanged (no map op touches
+/// threaded instance state).
+///
+/// ARG ORDER (the crux): the IR args are uniformly map-first (`m, k[, v/default]`), but the Erlang
+/// `maps` BIFs take the KEY (and value) BEFORE the map — so this re-orders per BIF. Lowerings
+/// (unit-03 table):
+/// - `MapNew` (0 args) → `call 'maps':'new'()` — the empty map `#{}` (a behavioural equal of the
+///   Core empty-map literal `~{}~`; `maps:new/0` avoids introducing a new Core AST node).
+/// - `MapGet` (`m, k, default`) → `call 'maps':'get'(K, M, Default)` — a missing key yields
+///   `Default` (the frontend's sentinel), never a BEAM `badkey`.
+/// - `MapPut` (`m, k, v`) → `call 'maps':'put'(K, V, M)` — returns a NEW map.
+/// - `MapHas` (`m, k`) → `case call 'maps':'is_key'(K, M) of 'true' -> 1; 'false' -> 0 end` — an
+///   i32 truth value (so it drops into `If`/`Switch`, like `IsEmptyList`).
+/// - `MapRemove` (`m, k`) → `call 'maps':'remove'(K, M)` — returns a NEW map.
+/// - `MapSize` (`m`) → `call 'maps':'size'(M)` — an i32 count.
+///
+/// A wrong operand arity is an impossible state for a validated module (validate/frontend uphold
+/// the arities, K7); it fails closed with `Error(UnsupportedNode("map_op"))`, never a panic.
+fn emit_map_op(
+  op: ir.MapOp,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case op, args {
+    ir.MapNew, [] ->
+      apply_cont(cont, [CCall(CAtom("maps"), CAtom("new"), [])], sc, state, ctx)
+    ir.MapGet, [m, k, default] ->
+      apply_cont(
+        cont,
+        [
+          CCall(CAtom("maps"), CAtom("get"), [
+            emit_value(k),
+            emit_value(m),
+            emit_value(default),
+          ]),
+        ],
+        sc,
+        state,
+        ctx,
+      )
+    ir.MapPut, [m, k, v] ->
+      apply_cont(
+        cont,
+        [
+          CCall(CAtom("maps"), CAtom("put"), [
+            emit_value(k),
+            emit_value(v),
+            emit_value(m),
+          ]),
+        ],
+        sc,
+        state,
+        ctx,
+      )
+    ir.MapHas, [m, k] -> {
+      // `case maps:is_key(K, M) of 'true' -> 1; 'false' -> 0 end` — one i32 truth value.
+      // `is_key/2` always returns a boolean atom, so the two clauses are exhaustive.
+      let has =
+        CCase(
+          CCall(CAtom("maps"), CAtom("is_key"), [emit_value(k), emit_value(m)]),
+          [
+            CClause([PAtom("true")], CAtom("true"), CInt(1)),
+            CClause([PAtom("false")], CAtom("true"), CInt(0)),
+          ],
+        )
+      apply_cont(cont, [has], sc, state, ctx)
+    }
+    ir.MapRemove, [m, k] ->
+      apply_cont(
+        cont,
+        [CCall(CAtom("maps"), CAtom("remove"), [emit_value(k), emit_value(m)])],
+        sc,
+        state,
+        ctx,
+      )
+    ir.MapSize, [m] ->
+      apply_cont(
+        cont,
+        [CCall(CAtom("maps"), CAtom("size"), [emit_value(m)])],
+        sc,
+        state,
+        ctx,
+      )
+    // Arity mismatch — impossible for a validated module (K7); fail closed.
+    _, _ -> Error(UnsupportedNode("map_op"))
   }
 }
 
@@ -5670,6 +5769,9 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     MakeClosure(_, captures, _) -> collect_values(captures, acc)
     CallClosure(callee, args) ->
       collect_values(args, collect_value(callee, acc))
+    // ── Phase-8 map layer: collect the `Var` names in the map op's `Value` operands so gensym
+    // avoids them (over-approximating is safe). ──
+    MapOp(_, args) -> collect_values(args, acc)
     MemSize(_) -> acc
     MemGrow(_, delta) -> collect_value(delta, acc)
     MemLoad(_, _, addr, _, _) -> collect_value(addr, acc)

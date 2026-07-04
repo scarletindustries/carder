@@ -224,7 +224,11 @@ fn lower_expr(
       // unchanged. `CallClosure` is a call but NOT a `CallHost` (no capability-policy gate: it
       // applies a fun VALUE already in hand, K3). Neither arises from WASM (K7).
       ir.MakeClosure(_, _, _)
-    | ir.CallClosure(_, _) -> Ok(expr)
+    | ir.CallClosure(_, _)
+    | // Phase-8 map layer (unit 03) carries only `Value` operands (no `CallHost`, no `Loop`, no
+      // sub-`Expr`), so this CallHost-gate + Loop-meter pass leaves it unchanged. Never arises from
+      // WASM (K7).
+      ir.MapOp(_, _) -> Ok(expr)
 
     // THE capability boundary — gate it; the node is left unchanged for `emit_core` to route
     ir.CallHost(cap, name, args) ->
