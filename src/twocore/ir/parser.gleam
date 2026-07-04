@@ -1278,6 +1278,31 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
         | "map.has"
         | "map.remove"
         | "map.size" -> parse_map(kw, rest)
+        // ── Phase-8 term classification + native number arithmetic (K2/K8, unit 06) — the inverse
+        // of `printer.print_expr`'s `TermTest`/`TermTag`/`NumTerm` arms. Each op is its own dotted
+        // keyword (`term_test.<kind>` / `num_term.<op>`, like `map.new`), then the operand value(s).
+        // `term_tag` takes a single value. ──
+        "term_test.is_int"
+        | "term_test.is_float"
+        | "term_test.is_number"
+        | "term_test.is_atom"
+        | "term_test.is_binary"
+        | "term_test.is_tuple"
+        | "term_test.is_map"
+        | "term_test.is_fun"
+        | "term_test.is_list" -> parse_term_test(kw, rest)
+        "term_tag" -> {
+          use #(arg, rest) <- result.try(parse_value(rest))
+          Ok(#(ir.TermTag(arg), rest))
+        }
+        "num_term.add"
+        | "num_term.sub"
+        | "num_term.mul"
+        | "num_term.lt"
+        | "num_term.le"
+        | "num_term.gt"
+        | "num_term.ge"
+        | "num_term.eq" -> parse_num_term(kw, rest)
         // The four existing memory nodes accept a trailing `mem=<n>` decorator (§A.6),
         // defaulting to index 0 when omitted (byte-identical to Phase-4).
         "mem.size" -> {
@@ -1530,6 +1555,41 @@ fn parse_map(
       Ok(#(MapOp(op, args), rest))
     }
     Error(_) -> Error(UnexpectedEnd("map op"))
+  }
+}
+
+/// Parses a term-shape guard (Phase-8 unit 06): the already-consumed dotted keyword `kw`
+/// (`term_test.is_number`, …) selects the `TermKind`, then a single operand value follows. `kw` is
+/// guaranteed one of the nine `term_test.*` keywords by the dispatch in `parse_expr`, so
+/// `string_to_termkind` never fails here; the `Error(_)` arm is defensive (fails closed).
+fn parse_term_test(
+  kw: String,
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  case string_to_termkind(kw) {
+    Ok(kind) -> {
+      use #(arg, rest) <- result.try(parse_value(toks))
+      Ok(#(ir.TermTest(kind, arg), rest))
+    }
+    Error(_) -> Error(UnexpectedEnd("term_test kind"))
+  }
+}
+
+/// Parses a native number-term op (Phase-8 unit 06): the already-consumed dotted keyword `kw`
+/// (`num_term.add`, …) selects the `NumTermOp`, then TWO operand values follow (`lhs`, `rhs`). `kw`
+/// is guaranteed one of the eight `num_term.*` keywords by the dispatch in `parse_expr`, so
+/// `string_to_numtermop` never fails here; the `Error(_)` arm is defensive (fails closed).
+fn parse_num_term(
+  kw: String,
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  case string_to_numtermop(kw) {
+    Ok(op) -> {
+      use #(lhs, rest) <- result.try(parse_value(toks))
+      use #(rhs, rest) <- result.try(parse_value(rest))
+      Ok(#(ir.NumTerm(op, lhs, rhs), rest))
+    }
+    Error(_) -> Error(UnexpectedEnd("num_term op"))
   }
 }
 
@@ -2440,6 +2500,42 @@ fn string_to_mapop(w: String) -> Result(ir.MapOp, Nil) {
     "map.has" -> Ok(ir.MapHas)
     "map.remove" -> Ok(ir.MapRemove)
     "map.size" -> Ok(ir.MapSize)
+    _ -> Error(Nil)
+  }
+}
+
+/// Parses a term-shape guard spelling (Phase-8 unit 06): the dotted keywords `term_test.is_int`,
+/// `term_test.is_float`, `term_test.is_number`, `term_test.is_atom`, `term_test.is_binary`,
+/// `term_test.is_tuple`, `term_test.is_map`, `term_test.is_fun`, `term_test.is_list`. Mirrors
+/// `printer.termkind_to_string`. Any other spelling is `Error(Nil)`.
+fn string_to_termkind(w: String) -> Result(ir.TermKind, Nil) {
+  case w {
+    "term_test.is_int" -> Ok(ir.IsInt)
+    "term_test.is_float" -> Ok(ir.IsFloat)
+    "term_test.is_number" -> Ok(ir.IsNumber)
+    "term_test.is_atom" -> Ok(ir.IsAtom)
+    "term_test.is_binary" -> Ok(ir.IsBinary)
+    "term_test.is_tuple" -> Ok(ir.IsTuple)
+    "term_test.is_map" -> Ok(ir.IsMap)
+    "term_test.is_fun" -> Ok(ir.IsFun)
+    "term_test.is_list" -> Ok(ir.IsList)
+    _ -> Error(Nil)
+  }
+}
+
+/// Parses a native number-term op spelling (Phase-8 unit 06): the dotted keywords `num_term.add`,
+/// `num_term.sub`, `num_term.mul`, `num_term.lt`, `num_term.le`, `num_term.gt`, `num_term.ge`,
+/// `num_term.eq`. Mirrors `printer.numtermop_to_string`. Any other spelling is `Error(Nil)`.
+fn string_to_numtermop(w: String) -> Result(ir.NumTermOp, Nil) {
+  case w {
+    "num_term.add" -> Ok(ir.NAdd)
+    "num_term.sub" -> Ok(ir.NSub)
+    "num_term.mul" -> Ok(ir.NMul)
+    "num_term.lt" -> Ok(ir.NLt)
+    "num_term.le" -> Ok(ir.NLe)
+    "num_term.gt" -> Ok(ir.NGt)
+    "num_term.ge" -> Ok(ir.NGe)
+    "num_term.eq" -> Ok(ir.NEq)
     _ -> Error(Nil)
   }
 }

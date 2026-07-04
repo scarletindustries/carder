@@ -812,6 +812,12 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
     ir.TermOp(op, args) -> ir.TermOp(op, subst_values(args, subs))
     // Phase-8 map layer: substitute into the `Value` operands (the `op` is static).
     ir.MapOp(op, args) -> ir.MapOp(op, subst_values(args, subs))
+    // Phase-8 term classification + native number arithmetic (unit 06): substitute into the `Value`
+    // operands (the `kind`/`op` are static).
+    ir.TermTest(kind, arg) -> ir.TermTest(kind, subst_value(arg, subs))
+    ir.TermTag(arg) -> ir.TermTag(subst_value(arg, subs))
+    ir.NumTerm(op, lhs, rhs) ->
+      ir.NumTerm(op, subst_value(lhs, subs), subst_value(rhs, subs))
     ir.MemSize(_) -> e
     ir.MemGrow(mem, delta) -> ir.MemGrow(mem, subst_value(delta, subs))
     ir.MemLoad(mem, op, addr, offset, result) ->
@@ -1014,6 +1020,11 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.TermOp(_, args) -> values_names(args)
     // Phase-8 map layer: collect the `Var` names in the map op's operands (the `op` is static).
     ir.MapOp(_, args) -> values_names(args)
+    // Phase-8 term classification + native number arithmetic (unit 06): collect the `Var` names in
+    // their operands (the `kind`/`op` are static).
+    ir.TermTest(_, arg) -> value_name(arg)
+    ir.TermTag(arg) -> value_name(arg)
+    ir.NumTerm(_, lhs, rhs) -> list.append(value_name(lhs), value_name(rhs))
     ir.MemSize(_) -> []
     ir.MemGrow(_, delta) -> value_name(delta)
     ir.MemLoad(_, _, addr, _, _) -> value_name(addr)

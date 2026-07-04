@@ -172,6 +172,74 @@ pub fn map_nodes_effect_classification_test() {
   assert can_reorder(a_store(), ir.MapOp(ir.MapNew, [])) == True
 }
 
+/// SPEC (Phase-8 K8, 06-numeric-fastpath.md §Effect): the term CLASSIFICATION nodes `TermTest` (all
+/// nine `TermKind`s) and `TermTag` are `Pure` non-barriers — a composition of TOTAL `erlang:is_*`
+/// BIFs (they inspect a term's shape, never trap, read/write no state, transfer no control), so
+/// CSE/DCE/reorder are sound, exactly like `TermOp`/`MapOp`. Each must be a non-barrier, classify
+/// `Pure`, and be shareable + eliminable-if-unused. Covers every `TermKind`, so it also proves the
+/// classifier is TOTAL over `TermTest`.
+pub fn term_classification_nodes_are_pure_test() {
+  let kinds = [
+    ir.IsInt,
+    ir.IsFloat,
+    ir.IsNumber,
+    ir.IsAtom,
+    ir.IsBinary,
+    ir.IsTuple,
+    ir.IsMap,
+    ir.IsFun,
+    ir.IsList,
+  ]
+  let nodes =
+    list.append(list.map(kinds, fn(k) { ir.TermTest(k, ir.Var("x")) }), [
+      ir.TermTag(ir.Var("x")),
+    ])
+  list.each(nodes, fn(e) {
+    assert is_effectful_node(e) == False
+    assert classify(e) == Pure
+    assert is_pure(e) == True
+    assert can_cse(e) == True
+    assert can_eliminate_if_unused(e) == True
+  })
+  // A pure guard commutes with a barrier (either-side-pure ⇒ reorderable).
+  assert can_reorder(ir.TermTest(ir.IsNumber, ir.Var("x")), a_store()) == True
+  assert can_reorder(a_store(), ir.TermTag(ir.Var("x"))) == True
+}
+
+/// SPEC (Phase-8 K8, 06-numeric-fastpath.md §Effect): `NumTerm` (every `NumTermOp` — arithmetic AND
+/// compare) is `Effectful` + a barrier, classified LIKE THE TRAPPING `Num` ops (`IDivS`/`IRemS`/…).
+/// It can raise a native BEAM `badarith` on a non-number operand — the frontend guards with
+/// `TermTest(IsNumber)`, but the IR can't prove it — so deleting one, or hoisting it onto a path
+/// where it did not originally evaluate, adds/removes a raise (an F2 observable). Hence never pure,
+/// never CSE'd, never eliminated-if-unused. A false `Pure` here would let a pass delete or hoist a
+/// raise (silently wrong), which this test forbids. Covers every op, proving totality over `NumTerm`.
+pub fn num_term_is_effectful_like_trapping_num_test() {
+  let ops = [
+    ir.NAdd,
+    ir.NSub,
+    ir.NMul,
+    ir.NLt,
+    ir.NLe,
+    ir.NGt,
+    ir.NGe,
+    ir.NEq,
+  ]
+  list.each(ops, fn(op) {
+    let e = ir.NumTerm(op, ir.Var("a"), ir.Var("b"))
+    // A shallow barrier (like trapping `Num(IDivS(..))`), so effectful/uneliminable/unshareable.
+    assert is_effectful_node(e) == True
+    assert classify(e) == Effectful
+    assert is_pure(e) == False
+    assert can_cse(e) == False
+    assert can_eliminate_if_unused(e) == False
+  })
+  // Two barriers do not reorder (a `NumTerm` and a store); the classification MATCHES trapping `Num`.
+  assert can_reorder(ir.NumTerm(ir.NAdd, ir.Var("a"), ir.Var("b")), a_store())
+    == False
+  assert is_effectful_node(ir.NumTerm(ir.NAdd, ir.Var("a"), ir.Var("b")))
+    == is_effectful_node(ir.Num(ir.IDivS(ir.W32), [ir.Var("a"), ir.Var("b")]))
+}
+
 // ─────────────────── §G.6 — purity is DEEP, not shallow ───────────────────
 
 /// A non-barrier SHELL (`Let`/`Block`/`If`/`Switch`) is `Pure` only when all its

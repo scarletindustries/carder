@@ -424,6 +424,14 @@ fn apply_rename_subst(
     // Phase-8 map layer: rewrite the `Value` operands (the `op` is static). Pure, so a pass may
     // hoist/CSE it (`ir/effect`); the operand rewrite happens here.
     ir.MapOp(op, args) -> ir.MapOp(op, rs_values(args, rename, subst))
+    // Phase-8 term classification + native number arithmetic (unit 06): rewrite the `Value`
+    // operands (the `kind`/`op` are static). `TermTest`/`TermTag` are pure; `NumTerm` is a barrier
+    // (`ir/effect`) — but this operand-rewrite is unconditional (it does not move the node), and
+    // none of the three calls user code, so no `has_any_call` arm is needed.
+    ir.TermTest(kind, arg) -> ir.TermTest(kind, rs_value(arg, rename, subst))
+    ir.TermTag(arg) -> ir.TermTag(rs_value(arg, rename, subst))
+    ir.NumTerm(op, lhs, rhs) ->
+      ir.NumTerm(op, rs_value(lhs, rename, subst), rs_value(rhs, rename, subst))
     ir.MemSize(_) -> e
     ir.MemGrow(mem, delta) -> ir.MemGrow(mem, rs_value(delta, rename, subst))
     ir.MemLoad(mem, op, addr, offset, result) ->

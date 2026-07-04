@@ -1078,6 +1078,16 @@ fn emit(
     // immutable, so no op traps or touches mutable state, and `sc` flows through unchanged. Neither
     // arises from WASM (K7). ──
     MapOp(op, args) -> emit_map_op(op, args, cont, sc, state, ctx)
+    // ── Phase-8 term classification + native number arithmetic (K2/K8, unit 06). `TermTest`/
+    // `TermTag` are PURE `TTerm → i32` guards/classifiers (a `case` over `erlang:is_*` BIFs);
+    // `NumTerm` is native BEAM arithmetic/compare on number terms (a bare `erlang:'+'/'-'/'*'`
+    // BIF call, or a compare `case` → i32). Each yields ONE value disposed through `cont` (like a
+    // `Num`); `sc` flows through unchanged. Neither arises from WASM (K7). This is the guarded hot
+    // arithmetic fast path: `TermTest(IsNumber)` guards, `NumTerm` computes native. ──
+    ir.TermTest(kind, arg) -> emit_term_test(kind, arg, cont, sc, state, ctx)
+    ir.TermTag(arg) -> emit_term_tag(arg, cont, sc, state, ctx)
+    ir.NumTerm(op, lhs, rhs) ->
+      emit_num_term(op, lhs, rhs, cont, sc, state, ctx)
   }
 }
 
@@ -1249,6 +1259,129 @@ fn emit_map_op(
     // Arity mismatch — impossible for a validated module (K7); fail closed.
     _, _ -> Error(UnsupportedNode("map_op"))
   }
+}
+
+/// Lower a `TermTest(kind, arg)` — a single Phase-8 BEAM term-shape guard (unit 06, K2/K8). Emits
+/// `case call 'erlang':'is_<kind>'(X) of 'true' -> 1; 'false' -> 0 end` — an **i32 truth value** (so
+/// it drops into `If`/`Switch`, exactly like `IsEmptyList`/`MapHas`). PURE and single-valued —
+/// disposed through `cont` via `apply_cont`; `sc` flows through unchanged (an `is_*` BIF touches no
+/// threaded instance state). `X` is the atomic operand (a `CVar`/literal), so it is referenced once
+/// and needs no fresh binder. `kind` selects the BIF via `term_test_bif` (a total map).
+fn emit_term_test(
+  kind: ir.TermKind,
+  arg: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let guard = bool_bif_to_i32(term_test_bif(kind), [emit_value(arg)])
+  apply_cont(cont, [guard], sc, state, ctx)
+}
+
+/// The `erlang:is_*` BIF name for a `TermKind` (Phase-8 unit 06): `IsInt`→`is_integer`,
+/// `IsFloat`→`is_float`, `IsNumber`→`is_number`, `IsAtom`→`is_atom`, `IsBinary`→`is_binary`,
+/// `IsTuple`→`is_tuple`, `IsMap`→`is_map`, `IsFun`→`is_function`, `IsList`→`is_list`. Total.
+fn term_test_bif(kind: ir.TermKind) -> String {
+  case kind {
+    ir.IsInt -> "is_integer"
+    ir.IsFloat -> "is_float"
+    ir.IsNumber -> "is_number"
+    ir.IsAtom -> "is_atom"
+    ir.IsBinary -> "is_binary"
+    ir.IsTuple -> "is_tuple"
+    ir.IsMap -> "is_map"
+    ir.IsFun -> "is_function"
+    ir.IsList -> "is_list"
+  }
+}
+
+/// Wrap a boolean-returning `erlang` BIF call (`fn_name(args)` → `'true'`/`'false'`) into an i32
+/// truth value: `case call 'erlang':'<fn_name>'(args) of 'true' -> 1; 'false' -> 0 end`. The BIF
+/// always returns a boolean atom, so the two clauses are exhaustive (no fresh wildcard needed).
+/// Shared by `TermTest` (an `is_*` test) and `NumTerm`'s comparisons (a relational BIF).
+fn bool_bif_to_i32(fn_name: String, args: List(CExpr)) -> CExpr {
+  CCase(CCall(CAtom("erlang"), CAtom(fn_name), args), [
+    CClause([PAtom("true")], CAtom("true"), CInt(1)),
+    CClause([PAtom("false")], CAtom("true"), CInt(0)),
+  ])
+}
+
+/// Lower a `TermTag(arg)` — the Phase-8 DENSE term classification (unit 06, K2/K8). Emits a nested
+/// `case` chain over the `erlang:is_*` BIFs returning the FIXED i32 code
+/// `0=int 1=float 2=atom 3=binary 4=tuple 5=map 6=fun 7=list 8=other` (the frontend's `Switch` ABI).
+/// PURE and single-valued — disposed through `cont` via `apply_cont`; `sc` flows through unchanged.
+/// The atomic operand `X` is referenced in each nested test (an atomic `CVar`/literal, so re-use is
+/// free — no binder). The chain is built inside-out (`term_tag_case`) so the tests are tried in the
+/// documented order and the innermost fall-through is `8` (other).
+fn emit_term_tag(
+  arg: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  apply_cont(cont, [term_tag_case(emit_value(arg))], sc, state, ctx)
+}
+
+/// Build the `TermTag` nested `case` over the atomic term `x`: for each `#(is_BIF, code)` (in the
+/// documented order int/float/atom/binary/tuple/map/fun/list), `case is_BIF(x) of 'true' -> code;
+/// 'false' -> <rest> end`, with the final fall-through `8` (other). Folded right-to-left so the
+/// first pair is the outermost `case` (tested first).
+fn term_tag_case(x: CExpr) -> CExpr {
+  let tests = [
+    #("is_integer", 0),
+    #("is_float", 1),
+    #("is_atom", 2),
+    #("is_binary", 3),
+    #("is_tuple", 4),
+    #("is_map", 5),
+    #("is_function", 6),
+    #("is_list", 7),
+  ]
+  list.fold_right(tests, CInt(8), fn(rest, pair) {
+    let #(bif, code) = pair
+    CCase(CCall(CAtom("erlang"), CAtom(bif), [x]), [
+      CClause([PAtom("true")], CAtom("true"), CInt(code)),
+      CClause([PAtom("false")], CAtom("true"), rest),
+    ])
+  })
+}
+
+/// Lower a `NumTerm(op, lhs, rhs)` — native BEAM arithmetic/compare on two number terms (unit 06,
+/// K2/K8), the JS-arithmetic FAST path. Yields ONE value disposed through `cont` via `apply_cont`;
+/// `sc` flows through unchanged (a bare `erlang` BIF touches no threaded instance state):
+/// - `NAdd`/`NSub`/`NMul` → `call 'erlang':'+'/'-'/'*'(A, B)` → a **number term** (`TTerm`).
+/// - `NLt`/`NLe`/`NGt`/`NGe`/`NEq` → `case A </=</>/>=/=:= B of 'true' -> 1; 'false' -> 0 end` → an
+///   i32 truth value (via `bool_bif_to_i32` — the relational BIFs return boolean atoms).
+///
+/// A non-number operand raises a NATIVE BEAM `badarith` at run time (the frontend guards with
+/// `TermTest(IsNumber)`; the IR's effect classifier marks `NumTerm` a barrier so the optimizer never
+/// moves the raise). No division/remainder (they trap on `/0`, unlike JS `1/0 = Infinity`).
+fn emit_num_term(
+  op: ir.NumTermOp,
+  lhs: Value,
+  rhs: Value,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let a = emit_value(lhs)
+  let b = emit_value(rhs)
+  let result = case op {
+    // arithmetic → a number term (a bare BIF call)
+    ir.NAdd -> CCall(CAtom("erlang"), CAtom("+"), [a, b])
+    ir.NSub -> CCall(CAtom("erlang"), CAtom("-"), [a, b])
+    ir.NMul -> CCall(CAtom("erlang"), CAtom("*"), [a, b])
+    // comparison → an i32 truth value (`=<` is Erlang's ≤; `=:=` is exact-equal)
+    ir.NLt -> bool_bif_to_i32("<", [a, b])
+    ir.NLe -> bool_bif_to_i32("=<", [a, b])
+    ir.NGt -> bool_bif_to_i32(">", [a, b])
+    ir.NGe -> bool_bif_to_i32(">=", [a, b])
+    ir.NEq -> bool_bif_to_i32("=:=", [a, b])
+  }
+  apply_cont(cont, [result], sc, state, ctx)
 }
 
 /// Lower `MakeClosure(fn_name, captures, arity)` — the Phase-8 native-closure constructor (K3/K8,
@@ -5868,6 +6001,11 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     // ── Phase-8 map layer: collect the `Var` names in the map op's `Value` operands so gensym
     // avoids them (over-approximating is safe). ──
     MapOp(_, args) -> collect_values(args, acc)
+    // ── Phase-8 term classification + native number arithmetic (unit 06): collect the `Var` names
+    // in their `Value` operands (the `kind`/`op` are static). Over-approximating is safe. ──
+    ir.TermTest(_, arg) -> collect_value(arg, acc)
+    ir.TermTag(arg) -> collect_value(arg, acc)
+    ir.NumTerm(_, lhs, rhs) -> collect_value(rhs, collect_value(lhs, acc))
     MemSize(_) -> acc
     MemGrow(_, delta) -> collect_value(delta, acc)
     MemLoad(_, _, addr, _, _) -> collect_value(addr, acc)

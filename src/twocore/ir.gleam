@@ -817,6 +817,49 @@ pub type Expr {
   /// so every op — including the reads — is a total, non-trapping, state-free value transform (see
   /// `MapOp` for per-op arities/lowering). **No WASM module produces one** (K7 — additive).
   MapOp(op: MapOp, args: List(Value))
+  // ── Phase-8 term classification + native number arithmetic (K2/K8, unit 06) — the two things a
+  // dynamic-language frontend needs to compile HOT arithmetic to NATIVE BEAM code: cheap `TTerm → i32`
+  // type guards + native BEAM arithmetic on number terms, so the guarded fast path is plain BEAM ops
+  // (no box/unbox, no `rt_js` round-trip) and only the cold JS edge cases deopt to `CallHost("js",…)`.
+  // NEUTRAL (K1): general BEAM-value classification/arithmetic, not JS semantics. No WASM module
+  // produces any of them (K7 — additive; `lower` never emits one, the WASM corpus stays byte-identical).
+  /// A single BEAM **term type guard** — `1` if the argument's runtime term shape matches `kind`,
+  /// else `0` (an **i32 truth value**, so it drops straight into `If`/`Switch`). Lowers to
+  /// `case 'erlang':'is_<kind>'(X) of 'true' -> 1; 'false' -> 0 end` (the `is_*` BIF for `kind`:
+  /// `IsInt`→`is_integer`, `IsFloat`→`is_float`, `IsNumber`→`is_number`, `IsAtom`→`is_atom`,
+  /// `IsBinary`→`is_binary`, `IsTuple`→`is_tuple`, `IsMap`→`is_map`, `IsFun`→`is_function`,
+  /// `IsList`→`is_list`). Result type `TI32`.
+  ///
+  /// **Pure** (K8): an `is_*` BIF reads/writes no state, never traps (it is total over ALL terms),
+  /// and transfers no control — so it is a non-barrier (CSE/DCE/reorder are sound), exactly like a
+  /// non-trapping `Num`. This is the guard the frontend puts in front of a `NumTerm` fast path.
+  TermTest(kind: TermKind, arg: Value)
+  /// A **dense term classification** of the single argument — one i32 code selecting the term's
+  /// runtime shape, for a one-shot `Switch` (cheaper than a chain of `TermTest`s when a frontend
+  /// dispatches on "what kind of value is this"). Lowers to a nested `case` over the `is_*` tests
+  /// returning the FIXED code: `0=int 1=float 2=atom 3=binary 4=tuple 5=map 6=fun 7=list 8=other`
+  /// (this encoding is the ABI — the frontend's `Switch` arms match these numbers; documented in the
+  /// handoff). Result type `TI32`.
+  ///
+  /// **Pure** (K8): the same reasoning as `TermTest` — a composition of total `is_*` BIFs, no state,
+  /// no trap, no control transfer, so a non-barrier.
+  TermTag(arg: Value)
+  /// **Native BEAM arithmetic / comparison on two number terms** (`float()`/`integer()`) — the JS
+  /// arithmetic FAST path. Lowers to native BEAM ops (NO box/unbox, NO `rt_js`):
+  /// - `NAdd`/`NSub`/`NMul` → `call 'erlang':'+'/'-'/'*'(A, B)` → a **number term** (`TTerm`); BEAM's
+  ///   mixed int/float arithmetic and bignums Just Work for the common case.
+  /// - `NLt`/`NLe`/`NGt`/`NGe`/`NEq` → `case A </=</>/>=/=:= B of 'true' -> 1; 'false' -> 0 end` → an
+  ///   i32 truth value (`TI32`, so it drops into `If`). (`NEq` is BEAM `=:=` on numbers; full JS
+  ///   `===`/`==` semantics stay in `rt_js` — this is the *guarded numeric* compare only.)
+  /// - **Division / remainder are intentionally OMITTED**: `erlang:'/'` raises `badarith` on `/0` but
+  ///   JS `1/0 = Infinity`, so the frontend routes `/`/`%` through `rt_js` (or a later guarded unit).
+  ///
+  /// **Effectful (K8) — like the trapping `Num` ops.** `NumTerm` can raise `badarith` on a
+  /// non-number operand: the frontend guards the operands with `TermTest(IsNumber)` first, but the IR
+  /// cannot prove that, so — exactly as the trapping `Num(IDivS/IRemS/…)` variants are classified — it
+  /// is a **barrier**, never freely `Pure`: no CSE, no DCE, no reorder that could add/remove/move the
+  /// raise (an F2 observable). Correctness first (default effectful).
+  NumTerm(op: NumTermOp, lhs: Value, rhs: Value)
 }
 
 /// One catch handler of a `Try` region (J2/T1 — the INLINE-HANDLER shape). `on` selects which
@@ -1274,6 +1317,46 @@ pub type MapOp {
   MapHas
   MapRemove
   MapSize
+}
+
+/// The nine BEAM **term-shape guards** carried by `TermTest(kind, arg)` (Phase-8 unit 06; K2/K8).
+/// Each names an `erlang:is_*` type-test BIF — the guard `emit_core` lowers to a `case … of 'true'
+/// -> 1; 'false' -> 0 end` i32 truth value:
+/// - `IsInt` → `is_integer`, `IsFloat` → `is_float`, `IsNumber` → `is_number` (integer OR float),
+/// - `IsAtom` → `is_atom`, `IsBinary` → `is_binary`, `IsTuple` → `is_tuple`, `IsMap` → `is_map`,
+/// - `IsFun` → `is_function`, `IsList` → `is_list`.
+/// All are **`Pure`** (an `is_*` BIF is total over every term — never traps, reads/writes no state).
+/// NEUTRAL (K1 — general BEAM type tests, not JS `typeof`). **No WASM module produces one** (K7).
+pub type TermKind {
+  IsInt
+  IsFloat
+  IsNumber
+  IsAtom
+  IsBinary
+  IsTuple
+  IsMap
+  IsFun
+  IsList
+}
+
+/// The eight **native BEAM number-term operations** carried by `NumTerm(op, lhs, rhs)` (Phase-8 unit
+/// 06; K2/K8) — the JS-arithmetic fast path on number terms (`float()`/`integer()`).
+/// - Arithmetic → a **number term** (`TTerm`): `NAdd` → `erlang:'+'`, `NSub` → `erlang:'-'`,
+///   `NMul` → `erlang:'*'`.
+/// - Comparison → an **i32 truth value** (`TI32`): `NLt` → `<`, `NLe` → `=<`, `NGt` → `>`,
+///   `NGe` → `>=`, `NEq` → `=:=` (exact-equal on numbers).
+/// Division/remainder are deliberately absent (they trap on `/0`; the frontend routes `/`/`%` through
+/// `rt_js`). Every op is **`Effectful`** — it can raise `badarith` on a non-number operand, so it is
+/// classified like the trapping `Num` ops (a barrier). **No WASM module produces one** (K7).
+pub type NumTermOp {
+  NAdd
+  NSub
+  NMul
+  NLt
+  NLe
+  NGt
+  NGe
+  NEq
 }
 
 /// Describes a linear-memory access (Phase-2; lock-now).

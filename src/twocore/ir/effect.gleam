@@ -59,10 +59,10 @@ import twocore/ir.{
   CallDirect, CallHost, CallImport, CallIndirect, Charge, Continue, Convert,
   DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
   Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize,
-  MemStore, Num, RefFunc, RefIsNull, Return, Simd, SimdLoad, SimdLoadLane,
-  SimdShuffle, SimdStore, SimdStoreLane, Switch, TableCopy, TableFill, TableGet,
-  TableGrow, TableInit, TableSet, TableSize, TermOp, Throw, ThrowRef, Trap,
-  TruncS, TruncU, Try, Values,
+  MemStore, Num, NumTerm, RefFunc, RefIsNull, Return, Simd, SimdLoad,
+  SimdLoadLane, SimdShuffle, SimdStore, SimdStoreLane, Switch, TableCopy,
+  TableFill, TableGet, TableGrow, TableInit, TableSet, TableSize, TermOp,
+  TermTag, TermTest, Throw, ThrowRef, Trap, TruncS, TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -152,7 +152,14 @@ pub fn is_effectful_node(e: Expr) -> Bool {
       // to arbitrary code (the same class as `CallIndirect`/`CallHost`/`CallImport`), so it is a
       // barrier: never reorder, CSE, or DCE it. (`MakeClosure` is NOT here — building a fun over
       // evaluated values is inert; it classifies `Pure` in the non-barrier arm below.) ──
-      CallClosure(_, _) -> True
+      CallClosure(_, _)
+    | // ── Phase-8 native number arithmetic (K8, unit 06): `NumTerm` is classified like the TRAPPING
+      // `Num` ops (`IDivS`/`IRemS`/…). It can raise a native BEAM `badarith` on a non-number operand
+      // — the frontend guards with `TermTest(IsNumber)`, but the IR can't prove it — so deleting one,
+      // or hoisting it onto a path where it did not originally evaluate, adds/removes a raise (an F2
+      // observable). Hence a barrier: no CSE, no DCE, no reorder. (`TermTest`/`TermTag` are PURE — the
+      // `is_*` BIFs are total, never trap — so they classify `Pure` in the non-barrier arm below.) ──
+      NumTerm(_, _, _) -> True
     Num(op, _) -> trapping_numop(op)
     Convert(op, _) -> trapping_convop(op)
     // ── Phase-6 PURE lane-wise SIMD (S7): `Simd`/`SimdShuffle` are TOTAL and DETERMINISTIC —
@@ -172,10 +179,17 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     // trap, and transfer no control. So it is a non-barrier like `TermOp`/`MakeClosure` (CSE/DCE/
     // reorder sound). It carries only `Value` operands (no sub-`Expr`), so `children_all_pure`
     // reaches its `_ -> True` catch-all vacuously. ──
+    // ── Phase-8 term classification (K8, unit 06): `TermTest`/`TermTag` are PURE — a composition of
+    // total `erlang:is_*` BIFs (they inspect a term's shape, never trap, read/write no state, transfer
+    // no control), so they are non-barriers exactly like `TermOp`/`MapOp` (CSE/DCE/reorder sound).
+    // They carry only `Value` operands (no sub-`Expr`), so `children_all_pure` reaches its `_ -> True`
+    // catch-all vacuously. (`NumTerm` is the barrier — see the `True` arm above.) ──
     Values(_)
     | TermOp(_, _)
     | MakeClosure(_, _, _)
     | MapOp(_, _)
+    | TermTest(_, _)
+    | TermTag(_)
     | Simd(_, _)
     | SimdShuffle(_, _, _)
     | Let(_, _, _)

@@ -243,7 +243,14 @@ fn lower_expr(
     | // Phase-8 map layer (unit 03) carries only `Value` operands (no `CallHost`, no `Loop`, no
       // sub-`Expr`), so this CallHost-gate + Loop-meter pass leaves it unchanged. Never arises from
       // WASM (K7).
-      ir.MapOp(_, _) -> Ok(expr)
+      ir.MapOp(_, _)
+    | // Phase-8 term classification + native number arithmetic (unit 06) carry only `Value`
+      // operands (no `CallHost`, no `Loop`, no sub-`Expr`), so this CallHost-gate + Loop-meter pass
+      // leaves them unchanged. `NumTerm` can raise a native `badarith` but that is not a `CallHost`
+      // (no capability-policy gate applies). Never arise from WASM (K7).
+      ir.TermTest(_, _)
+    | ir.TermTag(_)
+    | ir.NumTerm(_, _, _) -> Ok(expr)
 
     // THE capability boundary — gate it; the node is left unchanged for `emit_core` to route
     ir.CallHost(cap, name, args) ->

@@ -428,6 +428,28 @@ fn expr_corpus() -> List(ir.Expr) {
     ir.MakeClosure("g", [], 3),
     ir.CallClosure(ir.Var("g"), [ir.Var("x")]),
     ir.CallClosure(ir.Var("g"), []),
+    // Phase-8 term classification + native number arithmetic (unit 06): all three nodes round-trip
+    // textually. `term_test.<kind>` spans every `TermKind` (9); `term_tag` takes one value;
+    // `num_term.<op>` spans every `NumTermOp` (8 — arithmetic + compare), each with two operands.
+    ir.TermTest(ir.IsInt, ir.Var("x")),
+    ir.TermTest(ir.IsFloat, ir.Var("x")),
+    ir.TermTest(ir.IsNumber, ir.Var("x")),
+    ir.TermTest(ir.IsAtom, ir.Var("x")),
+    ir.TermTest(ir.IsBinary, ir.Var("x")),
+    ir.TermTest(ir.IsTuple, ir.Var("x")),
+    ir.TermTest(ir.IsMap, ir.Var("x")),
+    ir.TermTest(ir.IsFun, ir.Var("x")),
+    ir.TermTest(ir.IsList, ir.Var("x")),
+    ir.TermTag(ir.Var("x")),
+    ir.TermTag(ir.ConstI32(7)),
+    ir.NumTerm(ir.NAdd, ir.Var("a"), ir.Var("b")),
+    ir.NumTerm(ir.NSub, ir.Var("a"), ir.ConstI32(1)),
+    ir.NumTerm(ir.NMul, ir.Var("a"), ir.Var("b")),
+    ir.NumTerm(ir.NLt, ir.Var("a"), ir.Var("b")),
+    ir.NumTerm(ir.NLe, ir.Var("a"), ir.Var("b")),
+    ir.NumTerm(ir.NGt, ir.Var("a"), ir.Var("b")),
+    ir.NumTerm(ir.NGe, ir.Var("a"), ir.Var("b")),
+    ir.NumTerm(ir.NEq, ir.Var("a"), ir.Var("b")),
     // calls
     ir.CallDirect("foo", [ir.Var("a"), ir.Var("b")]),
     ir.CallIndirect(

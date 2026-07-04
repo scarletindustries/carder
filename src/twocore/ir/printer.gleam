@@ -566,6 +566,21 @@ fn print_expr(indent: Int, e: Expr) -> String {
     // a single dotted keyword (`map.new`/`map.get`/… — like the existing `mem.size`/`global.get`),
     // followed by the operand value list.
     MapOp(op, args) -> mapop_to_string(op) <> " " <> value_list(args)
+    // ── Phase-8 term classification + native number arithmetic (K2/K8, unit 06). No Phase-1..7
+    // module contains these, so the spelling is conformance-neutral by construction; `parser.
+    // parse_expr` reads each back. A dotted keyword selects the op (`term_test.is_number` /
+    // `num_term.add`, like `map.new`), then the operand value(s) follow — `term_test.<kind> <arg>`,
+    // `term_tag <arg>`, `num_term.<op> <lhs> <rhs>`. ──
+    ir.TermTest(kind, arg) ->
+      "term_test." <> termkind_to_string(kind) <> " " <> print_value(arg)
+    ir.TermTag(arg) -> "term_tag " <> print_value(arg)
+    ir.NumTerm(op, lhs, rhs) ->
+      "num_term."
+      <> numtermop_to_string(op)
+      <> " "
+      <> print_value(lhs)
+      <> " "
+      <> print_value(rhs)
     // The four existing memory nodes gain a trailing `mem=<n>` decorator, OMITTED when the
     // index is 0 (§A.6) — so a single-memory (index-0) module's `.ir` is byte-identical to
     // Phase-4 (H7); a non-zero index appends ` mem=<n>`.
@@ -1220,6 +1235,39 @@ fn mapop_to_string(op: ir.MapOp) -> String {
     ir.MapHas -> "map.has"
     ir.MapRemove -> "map.remove"
     ir.MapSize -> "map.size"
+  }
+}
+
+/// Renders a term-shape guard kind (Phase-8 unit 06) as the suffix of its dotted keyword: `is_int`,
+/// `is_float`, `is_number`, `is_atom`, `is_binary`, `is_tuple`, `is_map`, `is_fun`, `is_list` (so
+/// the full spelling is `term_test.<this>`). The parser's `string_to_termkind` reads each back.
+fn termkind_to_string(kind: ir.TermKind) -> String {
+  case kind {
+    ir.IsInt -> "is_int"
+    ir.IsFloat -> "is_float"
+    ir.IsNumber -> "is_number"
+    ir.IsAtom -> "is_atom"
+    ir.IsBinary -> "is_binary"
+    ir.IsTuple -> "is_tuple"
+    ir.IsMap -> "is_map"
+    ir.IsFun -> "is_fun"
+    ir.IsList -> "is_list"
+  }
+}
+
+/// Renders a native number-term op (Phase-8 unit 06) as the suffix of its dotted keyword: `add`,
+/// `sub`, `mul`, `lt`, `le`, `gt`, `ge`, `eq` (so the full spelling is `num_term.<this>`). The
+/// parser's `string_to_numtermop` reads each back.
+fn numtermop_to_string(op: ir.NumTermOp) -> String {
+  case op {
+    ir.NAdd -> "add"
+    ir.NSub -> "sub"
+    ir.NMul -> "mul"
+    ir.NLt -> "lt"
+    ir.NLe -> "le"
+    ir.NGt -> "gt"
+    ir.NGe -> "ge"
+    ir.NEq -> "eq"
   }
 }
 

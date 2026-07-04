@@ -158,7 +158,14 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | // Phase-8 map layer (unit 03) carries only `Value` operands (no sub-`Expr`), so like the
       // leaves it returns unchanged from this `Expr`-traversal combinator. It is pure (`ir/effect`);
       // a pass that rewrites its `Value` operands does so in its own per-node arm, not here.
-      ir.MapOp(..) -> e
+      ir.MapOp(..)
+    | // Phase-8 term classification + native number arithmetic (unit 06) carry only `Value`
+      // operands (no sub-`Expr`), so like the leaves they return unchanged here. `TermTest`/`TermTag`
+      // are pure; `NumTerm` is a barrier (`ir/effect`), so no pass hoists across it. A pass that
+      // rewrites their `Value` operands does so in its own per-node arm, not here.
+      ir.TermTest(..)
+    | ir.TermTag(..)
+    | ir.NumTerm(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
     // Phase-7 `Try` recurses into its `body` and each handler's inline `handler` expression
     // (both are sub-`Expr`s), so a traversal reaches an EH region's interior. The node itself is
