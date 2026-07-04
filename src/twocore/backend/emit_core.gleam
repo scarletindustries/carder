@@ -2002,8 +2002,18 @@ fn result_width(t: ValType) -> Int {
 /// demote/promote conversions route through `binding.num_module` (the same chokepoint) as a
 /// bare `call` (total — never traps). The TRAPPING float→int truncations (`TruncS`/`TruncU`)
 /// return `Result(Int, TrapReason)` and route through the verified `case`-and-`raise` shape
-/// (`emit_trapping_result`), exactly like `IDivS` — `is_trapping_conv` decides which. The
-/// four term↔numeric boxing conversions remain out of scope → `Error(UnsupportedNode)`.
+/// (`emit_trapping_result`), exactly like `IDivS` — `is_trapping_conv` decides which.
+///
+/// The four term↔numeric boxing conversions (`BoxInt`/`UnboxInt`/`BoxFloat`/`UnboxFloat`, the
+/// K5/D5 bridge) intercept BEFORE `conv_op_name` and lower to a PURE value pass-through — a
+/// static-type retag emitting no `num_module` call. This is bit-exact and total: 2core carries
+/// every scalar, floats INCLUDED, as its raw bit pattern (an Erlang integer — see `emit_value`
+/// for `ConstF64`/`ConstI64` and `rt_num`'s representation contract), so a `TF64`/`TI32`/… and
+/// the term that boxes it are the SAME Erlang value; boxing only changes the static IR type.
+/// A pass-through therefore round-trips ALL patterns (finite, denormal, NaN, ±Inf, the full
+/// i64 bignum range) exactly — where a bits→BEAM-`float()` reinterpret would be impossible,
+/// because NaN/±Inf bit patterns cannot be matched as a BEAM `float()` (`<<F:64/float>>` raises
+/// `badmatch` on them; this is the very reason D5 keeps floats as bits).
 fn emit_convert(
   op: ConvOp,
   arg: Value,
@@ -2012,15 +2022,35 @@ fn emit_convert(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  case conv_op_name(op) {
-    Error(node) -> Error(UnsupportedNode(node))
-    Ok(fn_name) -> {
-      let call = seam_call(ctx.binding.num_module, fn_name, [emit_value(arg)])
-      case is_trapping_conv(op) {
-        True -> emit_trapping_result(call, cont, sc, state, ctx)
-        False -> apply_cont(cont, [call], sc, state, ctx)
+  case is_boxing_conv(op) {
+    // Term↔numeric boxing bridge (K5/D5): identity on the carried bit pattern.
+    True -> apply_cont(cont, [emit_value(arg)], sc, state, ctx)
+    False ->
+      case conv_op_name(op) {
+        Error(node) -> Error(UnsupportedNode(node))
+        Ok(fn_name) -> {
+          let call =
+            seam_call(ctx.binding.num_module, fn_name, [emit_value(arg)])
+          case is_trapping_conv(op) {
+            True -> emit_trapping_result(call, cont, sc, state, ctx)
+            False -> apply_cont(cont, [call], sc, state, ctx)
+          }
+        }
       }
-    }
+  }
+}
+
+/// `True` for exactly the four term↔numeric boxing conversions (`BoxInt`/`UnboxInt`/
+/// `BoxFloat`/`UnboxFloat`) — the ONLY IR bridge between the unboxed numeric layer
+/// (`TI32`/`TI64`/`TF32`/`TF64`) and the term layer (`TTerm`) (K5). `emit_convert` lowers these
+/// as a pure value pass-through (a static-type retag), NEVER a `num_module` call, because
+/// 2core represents every scalar — floats as raw bits (D5) — as the same underlying Erlang
+/// value; boxing changes only the static type. `False` for every other `ConvOp` (a genuine
+/// `num_module` value transform routed via `conv_op_name`).
+fn is_boxing_conv(op: ConvOp) -> Bool {
+  case op {
+    BoxInt(_) | UnboxInt(_) | BoxFloat(_) | UnboxFloat(_) -> True
+    _ -> False
   }
 }
 
@@ -5627,8 +5657,12 @@ fn is_trapping(op: NumOp) -> Bool {
   }
 }
 
-/// Map a `ConvOp` to its `rt_num` function name, or `Error(node_tag)` for the term↔numeric
-/// boxing conversions (out of Phase-1 scope).
+/// Map a `ConvOp` to its `rt_num` function name. Every conversion that is a genuine numeric
+/// value transform maps to `Ok(name)`. The four term↔numeric boxing conversions
+/// (`BoxInt`/`UnboxInt`/`BoxFloat`/`UnboxFloat`) have NO `num_module` function — they are a
+/// pure value pass-through — and are intercepted by `is_boxing_conv` in `emit_convert` BEFORE
+/// this function is reached; their `Error(_)` arms below are therefore dead, retained only to
+/// keep the `case` exhaustive.
 fn conv_op_name(op: ConvOp) -> Result(String, String) {
   case op {
     I32WrapI64 -> Ok("i32_wrap_i64")

@@ -996,18 +996,31 @@ pub fn instantiate_entry_golden_test() {
 
 // ───────────────────────────── fail-closed error paths (never panic) ─────────────────────────────
 
-/// The remaining out-of-scope IR nodes return a typed `EmitError` — never a panic (D4
-/// fail-closed). Phase-8 unit 01 now lowers the whole term layer (`TermOp`), so only the four
-/// term↔numeric boxing `Convert`s (unit 04) stay unsupported.
-pub fn out_of_scope_nodes_error_test() {
-  assert emit_one(ir.Convert(ir.BoxInt(ir.W32), ir.Var("a")))
-    == Error(emit_core.UnsupportedNode("box_int"))
-  assert emit_one(ir.Convert(ir.UnboxInt(ir.W32), ir.Var("a")))
-    == Error(emit_core.UnsupportedNode("unbox_int"))
-  assert emit_one(ir.Convert(ir.BoxFloat(ir.FW32), ir.Var("a")))
-    == Error(emit_core.UnsupportedNode("box_float"))
-  assert emit_one(ir.Convert(ir.UnboxFloat(ir.FW32), ir.Var("a")))
-    == Error(emit_core.UnsupportedNode("unbox_float"))
+/// The four term↔numeric boxing `Convert`s (unit 04, K5/D5) lower to a PURE value
+/// pass-through — a static-type retag with NO `num_module` call. 2core carries every scalar,
+/// floats as raw bits (D5), as the same underlying Erlang value, so boxing/unboxing is the
+/// identity on the carried bits; a bits→BEAM-`float()` reinterpret would be impossible anyway
+/// (NaN/±Inf fail `<<F:64/float>>` matching). Emitting one now SUCCEEDS (retiring the old
+/// `UnsupportedNode` change-detector) and the pure worker `f/1` forwards its argument verbatim.
+/// The bit-exact round-trip (incl. NaN/±Inf/denormal/bignum) is proven end-to-end in
+/// `boxing_test.gleam`.
+pub fn boxing_convert_is_identity_passthrough_test() {
+  let cases = [
+    ir.Convert(ir.BoxInt(ir.W32), ir.Var("a")),
+    ir.Convert(ir.UnboxInt(ir.W64), ir.Var("a")),
+    ir.Convert(ir.BoxFloat(ir.FW32), ir.Var("a")),
+    ir.Convert(ir.UnboxFloat(ir.FW64), ir.Var("a")),
+  ]
+  list.each(cases, fn(expr) {
+    let assert Ok(cm) = emit_one(expr)
+    // The pure worker `f/1` = fun(A) -> A: the boxing bridge is the identity retag.
+    let assert Ok(FunDef(FName("f", 1), CFun(["a"], body))) =
+      list.find(cm.defs, fn(d) {
+        let FunDef(FName(n, _), _) = d
+        n == "f"
+      })
+    assert body == CVar("a")
+  })
 }
 
 /// A `CallDirect` to an undefined function is `Error(UnknownFunction)`.
