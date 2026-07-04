@@ -205,9 +205,10 @@ pub fn store_of_unknown_typed_value_is_not_a_source_test() {
   assert tail == i32_load(ir.Var("p"), 0)
 }
 
-pub fn no_forward_across_control_flow_boundary_test() {
-  // store(%p, %v); if (%c) {..} {..}; load(%p)  ⟹  memory knowledge does NOT cross a control-flow
-  // boundary (per straight-line region, M8), so the load is NOT forwarded.
+pub fn forwards_across_no_clobber_control_flow_test() {
+  // store(%p, %v); if (%c) {} {}; load(%p)  ⟹  Phase-10 cross-CF MemorySSA (N3): neither branch
+  // clobbers %p, so the load NOW forwards %v across the if. (Phase 9 reset at every boundary; this
+  // was that scope limit, lifted in Phase 10.)
   let body =
     ir.Let(
       [],
@@ -221,6 +222,34 @@ pub fn no_forward_across_control_flow_boundary_test() {
   let slots = [
     ir.Local("p", ir.TI32),
     ir.Local("v", ir.TI32),
+    ir.Local("c", ir.TI32),
+  ]
+  let assert ir.Let(_, _, ir.Let(_, _, tail)) = fwd(slots, body)
+  assert tail == ir.Values([ir.Var("v")])
+}
+
+pub fn no_forward_across_clobbering_branch_test() {
+  // store(%p, %v); if (%c) { store(%p, %w) } {}; load(%p)  ⟹  a branch that stores %p CLOBBERS the
+  // fact, so the load is NOT forwarded (the may-clobber analysis is the safety gate).
+  let body =
+    ir.Let(
+      [],
+      i32_store(ir.Var("p"), 0, ir.Var("v")),
+      ir.Let(
+        [],
+        ir.If(
+          ir.Var("c"),
+          [],
+          i32_store(ir.Var("p"), 0, ir.Var("w")),
+          ir.Values([]),
+        ),
+        i32_load(ir.Var("p"), 0),
+      ),
+    )
+  let slots = [
+    ir.Local("p", ir.TI32),
+    ir.Local("v", ir.TI32),
+    ir.Local("w", ir.TI32),
     ir.Local("c", ir.TI32),
   ]
   let assert ir.Let(_, _, ir.Let(_, _, tail)) = fwd(slots, body)

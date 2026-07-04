@@ -19,14 +19,16 @@
 //// guard (`store_writes_full_value`/`is_natural_width`) for why forwarding is bit-exact even across
 //// value types (D5: raw-bit-pattern scalars).
 ////
-//// ## The region discipline (M5/M8)
+//// ## The region discipline (M5/M8) + cross-control-flow MemorySSA (Phase-10 N3)
 ////
-//// The analysis is **per straight-line region**: the walk threads `avail` through a `Let`-chain but
-//// **resets it (empty) at every control-flow boundary** (`If`/`Switch`/`Loop`/`Block`/`Try`) — it
-//// recurses into those as fresh regions so their interiors are still optimized, but carries no
-//// memory knowledge across them (cross-control-flow MemorySSA is Phase-9 §6 deferred work). A
-//// `mem_ssa.is_memory_barrier` node (a call, `MemGrow`, a bulk/SIMD-mem op, a control transfer)
-//// clears the map. `Charge` is memory-transparent (fuel only), so `avail` threads through its body.
+//// The base analysis is **per straight-line region**: the walk threads `avail` through a `Let`-chain.
+//// Phase 10 relaxes the control-flow reset **only where a may-clobber proof allows** — at a
+//// **single-execution** `If`/`Block`/`Switch`, a dominating store's `avail[f]` SURVIVES for every
+//// footprint no branch clobbers (`mem_clobber.may_clobber(node, f) == False`), and the incoming
+//// `avail` is threaded INTO the branches (a load early in a branch forwards from it). A **re-entrant**
+//// `Loop` body and an exception `Try` region stay full barriers (fresh `avail`) — a dominating store
+//// need not survive the back-edge / a throw. A `mem_ssa.is_memory_barrier` node (a call, `MemGrow`, a
+//// bulk/SIMD-mem op, a control transfer) still clears the map. `Charge` is memory-transparent.
 ////
 //// Imports `{ir, ir/effect-free via mem_ssa, pass, mem_ssa, dict, list}` — all acyclic (none
 //// imports `ir_opt`). It performs no analysis of its own: `Footprint`/`alias`/`is_memory_barrier`/
@@ -35,6 +37,7 @@
 import gleam/dict.{type Dict}
 import gleam/list
 import twocore/ir.{type Expr, type ValType, type Value}
+import twocore/middle/ir_opt/mem_clobber
 import twocore/middle/ir_opt/mem_ssa.{type Avail, type Footprint, NoAlias}
 import twocore/middle/ir_opt/pass.{type Pass}
 
@@ -130,10 +133,17 @@ fn rewrite_rhs(
         Ok(f) -> #(rhs, store_update(avail, f, op, value, types))
         Error(_) -> #(rhs, dict.new())
       }
-    // control-flow head bound to a name: recurse into it FRESH, clear `avail` for the continuation
-    // (either branch may have written memory).
-    ir.If(..) | ir.Switch(..) | ir.Loop(..) | ir.Block(..) | ir.Try(..) -> #(
-      optimize_control(rhs, types, globals),
+    // ── Phase-10 cross-CF MemorySSA (N3): an `If`/`Block`/`Switch` is single-execution, so a
+    //    dominating store's value SURVIVES it for every footprint no branch clobbers. Recurse into
+    //    the branches carrying the incoming `avail` (the store dominates their entry), and carry the
+    //    UN-clobbered subset into the continuation (`keep_unclobbered`). A `Loop` (re-entrant back
+    //    edge) or `Try` (exception region) stays a full barrier — clear. ──
+    ir.If(..) | ir.Switch(..) | ir.Block(..) -> #(
+      optimize_control(rhs, avail, types, globals),
+      keep_unclobbered(avail, rhs),
+    )
+    ir.Loop(..) | ir.Try(..) -> #(
+      optimize_control(rhs, avail, types, globals),
       dict.new(),
     )
     // a rhs-position Charge (rare): recurse its inner FRESH and clear (conservative — the inner may
@@ -172,16 +182,19 @@ fn region_tail(
         _, _ -> e
       }
     ir.If(..) | ir.Switch(..) | ir.Loop(..) | ir.Block(..) | ir.Try(..) ->
-      optimize_control(e, types, globals)
+      optimize_control(e, avail, types, globals)
     _ -> e
   }
 }
 
-/// Recurse into a control-flow head's sub-expressions, optimizing each as a **fresh** region
-/// (empty `avail`, `types` carried in — loop params added). The per-straight-line-region reset
-/// (M5/M8): memory knowledge does not cross a control-flow boundary in Phase 9.
+/// Recurse into a control-flow head's sub-expressions (Phase-10 N3). For a **single-execution**
+/// `If`/`Block`/`Switch` a dominating store's `avail` holds at the sub-region's entry, so the
+/// incoming `avail` is threaded IN (a load early in a branch, before any branch-internal clobber,
+/// forwards from it). A **re-entrant** `Loop` body or an exception `Try` region starts FRESH (empty
+/// `avail`) — a dominating store's value need not survive the back-edge / a throw.
 fn optimize_control(
   e: Expr,
+  avail: Avail,
   types: Dict(String, ValType),
   globals: Dict(String, ValType),
 ) -> Expr {
@@ -190,21 +203,21 @@ fn optimize_control(
       ir.If(
         cond,
         result,
-        forward_region(then_branch, dict.new(), types, globals),
-        forward_region(else_branch, dict.new(), types, globals),
+        forward_region(then_branch, avail, types, globals),
+        forward_region(else_branch, avail, types, globals),
       )
     ir.Switch(selector, result, arms, default) ->
       ir.Switch(
         selector,
         result,
         list.map(arms, fn(a) {
-          ir.SwitchArm(
-            ..a,
-            body: forward_region(a.body, dict.new(), types, globals),
-          )
+          ir.SwitchArm(..a, body: forward_region(a.body, avail, types, globals))
         }),
-        forward_region(default, dict.new(), types, globals),
+        forward_region(default, avail, types, globals),
       )
+    ir.Block(label, result, body) ->
+      ir.Block(label, result, forward_region(body, avail, types, globals))
+    // re-entrant / exception regions: FRESH (a dominating store need not survive the back-edge / throw).
     ir.Loop(label, params, result, body) ->
       ir.Loop(
         label,
@@ -212,8 +225,6 @@ fn optimize_control(
         result,
         forward_region(body, dict.new(), add_params(types, params), globals),
       )
-    ir.Block(label, result, body) ->
-      ir.Block(label, result, forward_region(body, dict.new(), types, globals))
     ir.Try(result, body, handlers) ->
       ir.Try(
         result,
@@ -228,6 +239,13 @@ fn optimize_control(
     // not a control-flow head — unreachable from the call sites, returned unchanged for totality.
     _ -> e
   }
+}
+
+/// Keep only the `avail` entries that `node` (a single-execution `If`/`Block`/`Switch`) provably
+/// does NOT clobber — the cross-CF carry-past (N3): an `avail[f]` survives the control-flow node iff
+/// no branch of it could write bytes aliasing `f`, grow, or call out (`mem_clobber.may_clobber`).
+fn keep_unclobbered(avail: Avail, node: Expr) -> Avail {
+  dict.filter(avail, fn(f, _v) { !mem_clobber.may_clobber(node, f) })
 }
 
 // ───────────────────────────── the store transfer + truncation guard ─────────────────────────────
