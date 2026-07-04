@@ -455,6 +455,55 @@ tier-N; the memory optimizer; WASI as an `rt_host` impl.
 
 ---
 
+## Phase 9 — "The Memory Optimizer" (MemorySSA + alias-aware load/store rewriting)
+
+Goal & honest scope: see [`specs/phase-9/00-overview.md`](phase-9/00-overview.md) (decisions
+**M1–M8**) — the realization of the design note
+[`specs/future-work-memory-optimizer.md`](future-work-memory-optimizer.md) (the "memory optimizer"
+deferred all the way back in Phase 3). A **middle-end (`ir_opt`) SPEED phase** attacking the
+post-Phase-4 memory-access **residual** (fetch handle → bounds-compare+branch → O(1) access →
+decode). It adds a **MemorySSA + linear-memory alias analysis** and three alias-aware rewrites —
+**store→load forwarding**, **redundant-load elimination**, **dead-store elimination** — each
+**trap-preserving** (the WASM load/store is *trap-or-access*, M3) and therefore **trust-neutral**:
+they run at **`Baseline`** (Safe), so — because `ir_opt` sits upstream of tier + mode selection —
+**every tier (`paged`/`atomics`/`nif`) and both modes (Safe/Unsafe) win**, and every present/future
+frontend inherits them. **No new IR node types, no runtime touch** (M4): the passes only *remove* a
+`MemStore` (DSE) or *replace* a `MemLoad` with an already-bound `Value` (forwarding/RLE), so the
+phase is **result-identical** on the whole corpus (an optimized module legitimately has *fewer*
+accesses). Baseline entering Phase 9: **1734 tests, 0 failures, 0 warnings**.
+
+### Phase-9 freeze milestone
+
+| Milestone | Produced by | Status | Unblocks |
+|---|---|---|---|
+| `«MEM-SSA-FROZEN»` — `middle/ir_opt/mem_ssa.gleam` (`Footprint` + `AliasResult` + `alias/2` + `is_memory_barrier/1` + `Avail` + `byte_width/1` + `count_mem_ops/1`; imports `ir` + `ir/effect` ONLY → no cycle) | P9-01 | **FROZEN ✓** | 02, 03, 04 |
+
+### Phase-9 units
+
+| Unit | Doc | Owner / status | Depends on (freeze) | Leaves |
+|---|---|---|---|---|
+| **P9-01** MemorySSA + alias keystone | [`01`](phase-9/01-mem-ssa-keystone.md) | **done** | — | The frozen analysis surface (`mem_ssa.gleam`) + adversarial alias/barrier/truncation-guard fixtures. Lands GREEN with the pipeline STILL EMPTY (identity — corpus byte-identical). `alias` defaults `MayAlias`; `is_memory_barrier` defaults `True` (forgets memory on a call/grow/bulk/control/region-head; transparent for `MemLoad`/`MemStore`/`MemSize`/`Global*`/`Charge`/pure); `byte_width` rejects sub-width/truncating footprints; `count_mem_ops` = the `n_mem` measure. **Landed GREEN: 1752 tests (was 1734), 0 warnings, format clean, WASM byte-identical.** |
+| **P9-02** store→load forward + RLE | [`02`](phase-9/02-store-load-forward.md) | **unclaimed** | `«MEM-SSA-FROZEN»` | `mem_forward.gleam` — **one** unified pass `forwarding_pass()` (a scope-aware region walk threading `avail`) realizing both store→load forwarding AND redundant-load elimination; the name→`ValType` env for the truncation guard. Ships the pass + fixtures; **no** pipeline edit (corpus byte-identical). |
+| **P9-03** dead-store elimination | [`03`](phase-9/03-dead-store-elim.md) | **unclaimed** | `«MEM-SSA-FROZEN»` | `mem_dse.gleam` — one pass `dead_store_pass()` (a look-ahead peephole: drop a store shadowed by a `MustAlias` later store with only pure nodes between). The paged-tier headline. Ships the pass + fixtures; **no** pipeline edit (corpus byte-identical). |
+| **P9-04** wire pipeline + benchmark (capstone) | [`04`](phase-9/04-capstone.md) | **unclaimed** | 01, 02, 03 | Edit `ir_opt.pipeline/1` (the ONE registration point) — append `[mem_forward.forwarding_pass(), mem_dse.dead_store_pass()]` to `Baseline` (inherited by `Aggressive`). Corpus-wide differential (`OptNone ≡ Baseline ≡ Aggressive`, result-identical, EVERY tier + BOTH modes) + `count_mem_ops` monotonicity. The measured benchmark (deterministic elimination counts + wall-clock ns/call, DSE's paged advantage broken out) + `docs/phase-9-benchmark.md` (honest, pattern-dependent ceiling). |
+
+### High-level spec coverage this phase takes
+
+| High-level item | Taken by | Notes |
+|---|---|---|
+| §4 M2 optimizer (`ir_opt`) — memory dataflow | P9-01/02/03/04 | The Phase-3-deferred memory-dependence passes: MemorySSA-lite (forwarding/RLE) + DSE, trust-neutral (run in Safe), no LICM / standalone-BCE / cross-control-flow (§6 deferred). |
+| §10 tier ladder speedup | P9-04 | One sound IR pass speeds up `paged`/`atomics`/`nif` + `cell`/`threaded` (runs upstream of tier selection); DSE disproportionately closes the `paged`/`portable` gap. |
+
+### Deferred to a later phase (explicit)
+
+Standalone range-based **bounds-check elimination** (needs an unchecked-access IR form + `rt_mem`
+entry points); **LICM** of the loop-invariant handle fetch (needs the handle exposed as an IR
+value); **MemorySSA across control flow** (Phase 9 is per straight-line region — resets at every
+`If`/`Switch`/`Loop`/`Block`/`Try`); **escape analysis** for the term/object value path (object
+speed, not linear-memory speed — the Phase-8 value layer's future speed unit).
+
+---
+
 ## Change log
 
 - **P7-10 landed (capstone) — PHASE 7 PROVEN: JS ON THE BEAM via Porffor.** The platform reaches the
