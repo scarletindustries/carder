@@ -1,13 +1,9 @@
-//// `rt_js` — the JS runtime boundary **STUB** (Phase-8 unit 05, K6).
+//// `rt_js` — the JS runtime boundary (Phase-8 unit 05, K6; HANDOFF-arc-frontend.md §4).
 ////
-//// > **STUB.** The *real* `rt_js` — every JS semantic (property get with prototypes,
-//// > `ToPrimitive`/`ToNumber` coercion, `+` with `ToPrimitive`, `typeof`, builtins, mutable
-//// > cells, the `undefined`/`null` sentinels) — is the **frontend team's** deliverable. See
-//// > `specs/phase-8/HANDOFF-arc-frontend.md §4` for the full ABI they must provide. This module
-//// > ships only a handful of real ops so the *boundary* is testable now and the calling
-//// > convention is demonstrated end-to-end (IR → `emit_core` → `build_beam` → BEAM). Its number
-//// > semantics are deliberately NOT JS-correct; it exists to prove the boundary routes and
-//// > returns a value, not to be a JS runtime.
+//// The **real** JS-semantics runtime the arc frontend's emitter targets (v1 surface). Every
+//// JS *semantic* that is not a first-class IR node — coercion, sentinel-aware IEEE arithmetic,
+//// `typeof`, truthiness, mutable cells, objects, `console.log` — lives behind this module,
+//// reached ONLY via `CallHost("js", op, args)`.
 ////
 //// ## How the boundary reaches here (K6 / D3a — the capability chokepoint)
 ////
@@ -29,95 +25,173 @@
 //// recognises. Adding an op is: one literal arm in `emit_core.resolve_js` + the impl here (the
 //// `"js"` capability is already admitted wholesale in `ir_lower`, so no `ir_lower` change per op).
 ////
-//// ## The boxed-value ABI (K2/K5, unit 04)
+//// ## The value model (FIXED — shared with the arc emitter; twocore_rt_js_ffi.erl header)
 ////
-//// A JS value is a **BEAM term** (`TTerm` to the IR — opaque; `rt_js` picks the concrete
-//// encodings). 2core carries scalars as raw bit patterns and `BoxInt`/`BoxFloat` are identity
-//// retags (unit 04), so a "boxed 2" is just the BEAM integer `2`. The ops below therefore take
-//// and return ordinary BEAM terms directly, one result per call (K6 — a multi-result op would
-//// tuple-pack; none here does). Args arrive as the direct call arguments (`add(A, B)`), not a
-//// wrapped list — this is `rt_js`'s own ABI, distinct from `rt_host`'s `List(Int)` shape.
+//// A JS value is a **BEAM term** (`TTerm` to the IR — opaque): numbers are native BEAM
+//// integers/floats with the sentinel atoms `js_nan`/`js_inf`/`js_neg_inf` for the three
+//// unrepresentable doubles; booleans are `true`/`false`; `undefined`/`null` are those atoms;
+//// strings are UTF-8 binaries; **cells** (mutable storage) are `make_ref()`s keyed into the
+//// process dictionary (the `rt_state` `cell` model); **objects** are cells holding binary-keyed
+//// maps; functions are BEAM funs (the IR's `make_closure`). Errors raise
+//// `{js_error, Kind, Detail}` (JS try/catch integration is a later milestone).
+////
+//// ## Shape of this module
+////
+//// A typed FACADE: every op delegates 1:1 to `twocore_rt_js_ffi` (hand-written Erlang), because
+//// each op is dynamic by nature — it inspects arbitrary term shapes, catches `badarith` to
+//// resolve IEEE overflow into the sentinels, and touches the process dictionary. The FFI header
+//// documents the semantics per op and every known ECMAScript divergence; the doc comments here
+//// give the contract. Ops that answer a JS boolean return an **i32 term `1`/`0`** (the IR's
+//// truth-value convention, like `TermTest`).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
-import gleam/dynamic/decode
 import gleam/erlang/atom.{type Atom}
 
-/// `rt_js` `"add"` — the STUB numeric `+` (Phase-8 unit 05). Adds two boxed integer terms with
-/// the BEAM `+` (`erlang:'+'/2`). Because `BoxInt` is identity (unit 04), a boxed `2` is the
-/// integer `2`, so `add(2, 3) == 5` — enough to prove the boundary routes and returns a value.
-///
-/// - `a`, `b`: two boxed integer terms (the raw i32/i64 bit pattern = the BEAM integer, unit 04).
-/// - Returns: their integer sum, a single boxed value (K6). Total for integer inputs.
-///
-/// **STUB — NOT JS `+`.** The real `rt_js.add` implements ECMAScript `+`: string-or-number with
-/// `ToPrimitive`/`ToNumber`, NaN/±Infinity sentinels, `-0`, bignum, etc. (HANDOFF §4). This stub
-/// handles only the boxed-integer fast case (numeric add on boxed terms).
-pub fn add(a: Int, b: Int) -> Int {
-  a + b
-}
+// ───────────────────────── arithmetic (sentinel-aware IEEE) ─────────────────────────
 
-/// `rt_js` `"type_of"` — a `typeof`-style STUB classifier (Phase-8 unit 05). Inspects a boxed
-/// term's BEAM runtime shape and returns a **binary** (a JS-string-like term) naming a coarse
-/// kind, so the boundary returns a real, inspectable value.
-///
-/// - `x`: any boxed term.
-/// - Returns: a UTF-8 `BitArray` — `<<"number">>` (a BEAM integer or float), `<<"boolean">>`
-///   (the atoms `true`/`false`), `<<"string">>` (a binary), `<<"undefined">>` (the
-///   `undefined_sentinel/0` atom), else `<<"object">>`. Total; never panics.
-///
-/// **STUB — NOT ECMAScript `typeof`.** The real `rt_js.type_of` follows §12.5.5 exactly (its own
-/// sentinels for `undefined`/`function`/`symbol`/`bigint`, `null → "object"`, etc., HANDOFF §4).
-/// This stub only demonstrates a boxed term crossing the boundary and returning a binary.
-pub fn type_of(x: Dynamic) -> BitArray {
-  bit_array.from_string(classify(x))
-}
+/// JS `+`. Either operand a string → concatenation (the other coerced via `to_string`; an
+/// object/fun operand is a `type_error` — no ToPrimitive in v1). Otherwise numeric: NaN
+/// propagates, `Infinity + -Infinity` is NaN, float overflow resolves to ±Infinity.
+@external(erlang, "twocore_rt_js_ffi", "add")
+pub fn add(a: Dynamic, b: Dynamic) -> Dynamic
 
-/// The coarse BEAM-shape classifier behind `type_of` (STUB). Probes in a fixed order so the kinds
-/// are disjoint (BEAM integers/floats/booleans/binaries/atoms are distinct term shapes). The
-/// `undefined` sentinel (an atom) is checked before the catch-all `"object"`.
-fn classify(x: Dynamic) -> String {
-  case decode.run(x, decode.int) {
-    Ok(_) -> "number"
-    Error(_) ->
-      case decode.run(x, decode.float) {
-        Ok(_) -> "number"
-        Error(_) ->
-          case decode.run(x, decode.bool) {
-            Ok(_) -> "boolean"
-            Error(_) ->
-              case decode.run(x, decode.string) {
-                Ok(_) -> "string"
-                Error(_) ->
-                  case is_undefined(x) {
-                    True -> "undefined"
-                    False -> "object"
-                  }
-              }
-          }
-      }
-  }
-}
+/// JS binary `-` (numeric only; non-numbers are a `type_error`). Sentinel-aware; overflow
+/// resolves to ±Infinity by the minuend's sign.
+@external(erlang, "twocore_rt_js_ffi", "sub")
+pub fn sub(a: Dynamic, b: Dynamic) -> Dynamic
 
-/// `True` iff `x` is exactly the `undefined_sentinel/0` term (the atom `undefined`). Used by
-/// `classify` so `type_of(undefined_sentinel()) == <<"undefined">>`. Total; never panics.
-fn is_undefined(x: Dynamic) -> Bool {
-  case decode.run(x, atom.decoder()) {
-    Ok(a) -> a == atom.create("undefined")
-    Error(_) -> False
-  }
-}
+/// JS `*` (numeric only). `Infinity × 0` is NaN; overflow resolves to ±Infinity by the
+/// operands' signs.
+@external(erlang, "twocore_rt_js_ffi", "mul")
+pub fn mul(a: Dynamic, b: Dynamic) -> Dynamic
 
-/// `rt_js` `"undefined_sentinel"` — the STUB `undefined` value (Phase-8 unit 05). Returns the
-/// BEAM atom `undefined`, a single boxed sentinel term (K6). A JS frontend uses its own sentinel
-/// — an atom is a natural, cheap choice (HANDOFF §4: "your sentinels, e.g. atoms
-/// `'undefined'`/`'null'`"), and `type_of` recognises it via `is_undefined`.
-///
-/// - Returns: the `undefined` sentinel term (arity 0). Total.
-///
-/// **STUB.** The real `rt_js` fixes the concrete sentinel encoding and threads it through every
-/// op (coercion, `typeof`, comparisons, …); this stub only proves the 0-arg boundary call routes
-/// and returns the sentinel.
+/// JS unary `-` (numeric only). NaN stays NaN; the infinities flip sign.
+@external(erlang, "twocore_rt_js_ffi", "neg")
+pub fn neg(a: Dynamic) -> Dynamic
+
+/// JS `/` — always real division (`7/2` is `3.5`). `x/±0` → ±Infinity by the signs (`0/0` →
+/// NaN, honouring a float zero's sign bit so `1/-0.0` is `-Infinity`); `finite/±Infinity` → a
+/// signed zero; `±Inf/±Inf` → NaN; overflow → ±Infinity. (Erlang-reserved-word note: the op
+/// string is `"div"`; the function is named `divide`.)
+@external(erlang, "twocore_rt_js_ffi", "divide")
+pub fn divide(a: Dynamic, b: Dynamic) -> Dynamic
+
+/// JS `%` — fmod carrying the DIVIDEND's sign. `y = ±0` or non-finite `x` → NaN; finite `x`
+/// with infinite `y` → `x`. Integer pairs stay exact (`rem`). (Op string `"mod"`; function
+/// `modulo`.)
+@external(erlang, "twocore_rt_js_ffi", "modulo")
+pub fn modulo(a: Dynamic, b: Dynamic) -> Dynamic
+
+// ───────────────────────── comparisons (i32 term 1|0) ─────────────────────────
+
+/// JS `<` → i32 `1`/`0`. Two strings compare byte-wise lexicographically (diverges from JS's
+/// UTF-16 code-unit order only for astral-plane edge cases — FFI header note); anything else
+/// coerces to a number (undefined/objects → NaN); any NaN-involving compare is `0`.
+@external(erlang, "twocore_rt_js_ffi", "lt")
+pub fn lt(a: Dynamic, b: Dynamic) -> Int
+
+/// JS `<=` → i32 `1`/`0` (same coercion/NaN rules as `lt`).
+@external(erlang, "twocore_rt_js_ffi", "le")
+pub fn le(a: Dynamic, b: Dynamic) -> Int
+
+/// JS `>` → i32 `1`/`0` (same coercion/NaN rules as `lt`).
+@external(erlang, "twocore_rt_js_ffi", "gt")
+pub fn gt(a: Dynamic, b: Dynamic) -> Int
+
+/// JS `>=` → i32 `1`/`0` (same coercion/NaN rules as `lt`).
+@external(erlang, "twocore_rt_js_ffi", "ge")
+pub fn ge(a: Dynamic, b: Dynamic) -> Int
+
+/// JS `===` → i32 `1`/`0`: same JS type AND value. `NaN ≠ NaN`; `+0 == -0`; ints and floats
+/// are ONE number type (`1 === 1.0`); objects/cells/funs compare by identity.
+@external(erlang, "twocore_rt_js_ffi", "strict_eq")
+pub fn strict_eq(a: Dynamic, b: Dynamic) -> Int
+
+/// The JS `==` SUBSET → i32 `1`/`0`: `strict_eq`, plus `null == undefined`, number == string
+/// (string → number), and boolean → number coercion. An object against a primitive is `0`
+/// (no ToPrimitive in v1); object == object is reference identity.
+@external(erlang, "twocore_rt_js_ffi", "eq")
+pub fn eq(a: Dynamic, b: Dynamic) -> Int
+
+// ───────────────────────── truthiness / coercion ─────────────────────────
+
+/// JS ToBoolean → i32 `1`/`0`. Falsy: `false`, `null`, `undefined`, NaN, every numeric zero
+/// (`0`, `0.0`, `-0.0`), the empty string. Everything else — including empty objects and all
+/// funs — is truthy.
+@external(erlang, "twocore_rt_js_ffi", "truthy")
+pub fn truthy(v: Dynamic) -> Int
+
+/// JS ToString → a binary. Strings pass through; integral floats < 1e21 print integer-style
+/// (`String(5.0)` is `"5"`); other floats print shortest-round-trip (`[short]` — exponent
+/// FORMATTING diverges from Number::toString at the extremes, FFI header note); sentinels are
+/// `"NaN"`/`"Infinity"`/`"-Infinity"`; objects are `"[object Object]"`; funs are the
+/// `"function"` placeholder.
+@external(erlang, "twocore_rt_js_ffi", "to_string")
+pub fn to_string(v: Dynamic) -> BitArray
+
+/// JS `typeof` → a binary. The sentinel numbers are `"number"`; `null` is (famously)
+/// `"object"`; cells/objects (refs) are `"object"`; funs are `"function"`; the stub's
+/// number/boolean/string/undefined arms are preserved.
+@external(erlang, "twocore_rt_js_ffi", "type_of")
+pub fn type_of(x: Dynamic) -> BitArray
+
+/// The `undefined` sentinel — the BEAM atom `undefined` (arity 0; the one op kept verbatim
+/// from the Phase-8 stub).
 pub fn undefined_sentinel() -> Atom {
   atom.create("undefined")
 }
+
+// ───────────────────────── cells (mutable captures + object storage) ─────────────────────────
+
+/// A fresh mutable cell holding `init` — a `make_ref()` keyed into THIS process's dictionary
+/// (the same one-instance-one-process model as `rt_state`'s `cell` strategy). The handle is
+/// the capture value for a mutated (`is_boxed`) JS local.
+@external(erlang, "twocore_rt_js_ffi", "cell_new")
+pub fn cell_new(init: Dynamic) -> Dynamic
+
+/// The cell's current value. A non-reference receiver is a `type_error`.
+@external(erlang, "twocore_rt_js_ffi", "cell_get")
+pub fn cell_get(cell: Dynamic) -> Dynamic
+
+/// Store `v` in the cell; returns `undefined`.
+@external(erlang, "twocore_rt_js_ffi", "cell_set")
+pub fn cell_set(cell: Dynamic, v: Dynamic) -> Dynamic
+
+// ───────────────────────── objects ─────────────────────────
+
+/// A fresh empty object: a cell holding an empty map (binary keys → term values).
+@external(erlang, "twocore_rt_js_ffi", "new_object")
+pub fn new_object() -> Dynamic
+
+/// `obj[key]` → the stored value, or `undefined` when absent (own properties only — no
+/// prototype chain in v1). Keys are binaries; a NUMBER key normalizes to its JS string form
+/// (`5`, `5.0` and `"5"` are the same key). A non-object receiver is a `type_error`.
+@external(erlang, "twocore_rt_js_ffi", "get_prop")
+pub fn get_prop(obj: Dynamic, key: Dynamic) -> Dynamic
+
+/// `obj[key] = v` — stores and returns `v` (the value of a JS assignment).
+@external(erlang, "twocore_rt_js_ffi", "set_prop")
+pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
+
+/// `key in obj` → i32 `1`/`0` (own properties only, like `get_prop`).
+@external(erlang, "twocore_rt_js_ffi", "has_prop")
+pub fn has_prop(obj: Dynamic, key: Dynamic) -> Int
+
+// ───────────────────────── lists / console / misc ─────────────────────────
+
+/// The empty BEAM list `[]` (arity 0) — the nil tail an args-cons-list build starts from.
+/// Exists because the IR has no `[]` literal (`ConstNil` would be the upstream fix).
+@external(erlang, "twocore_rt_js_ffi", "empty_list")
+pub fn empty_list() -> Dynamic
+
+/// `console.log(...args)` — takes ONE term, the cons list of the arguments. Prints them
+/// space-separated on one line to stdout (strings bare, everything else via the `to_string`
+/// rules) and returns `undefined`. A non-list argument is a `type_error`.
+@external(erlang, "twocore_rt_js_ffi", "console_log")
+pub fn console_log(args: Dynamic) -> Dynamic
+
+/// The emitter's guard for `callee(...)` where the callee failed `is_fun`: ALWAYS raises
+/// `{js_error, type_error, <the value>}`. (Typed as returning `Dynamic` so a `Let` can bind
+/// it; it never returns.)
+@external(erlang, "twocore_rt_js_ffi", "not_callable")
+pub fn not_callable(v: Dynamic) -> Dynamic
