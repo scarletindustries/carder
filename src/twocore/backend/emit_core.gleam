@@ -184,6 +184,14 @@ pub type EmitError {
   /// built. Validation upstream already resolves tag references; this is the backend defence
   /// (never a panic).
   UnknownTag(name: String)
+  /// A `CallHost("js", op, args)` (Phase-8 unit 05, K6) whose `op` is NOT one of the
+  /// build-fixed `rt_js` ops (`resolve_js`). FAIL-CLOSED (K6/D3a): the JS runtime boundary is a
+  /// literal `case` bound at build time to the `js_runtime_module` atom — an unrecognised `op`
+  /// resolves to NO function, so no `call`/`apply` is emitted and the module is rejected here
+  /// rather than a data-derived op reaching an arbitrary MFA. Never a panic. The real `rt_js`
+  /// (the frontend's) will grow this op set; a new op is registered by adding one literal arm to
+  /// `resolve_js` (and the `ir_lower` "js" admit + the `rt_js` impl).
+  UnknownJsOp(op: String)
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -2745,18 +2753,25 @@ fn emit_threaded_call_unpack(
   ))
 }
 
-/// Lower a `CallHost` (the capability boundary, D9). Two fates:
+/// Lower a `CallHost` (the capability boundary, D9). THREE fates, all D3a-clean (the target
+/// module + function are always build-controlled literal atoms, never derived from `capability`/
+/// `name`/`args` data — no `apply(Mod,Fn,Args)`):
 ///
+/// - the reserved JS-runtime capability `"js"` (Phase-8 unit 05, K6) → a DIRECT
+///   `call '<js_runtime_module>':'<fn>'(args…)`, where `<fn>` is resolved from `name` by the
+///   build-fixed literal `case` `resolve_js`. An `op` outside that set is FAIL-CLOSED here as
+///   `UnknownJsOp` — no call is emitted, so a data-driven op cannot reach an arbitrary MFA.
 /// - a resolved `own`-stdlib triple (`resolve_stdlib`) → a DIRECT
 ///   `call '<stdlib_module>':'<fn>'(args…)` (a vetted call does not pass through the host);
 /// - otherwise (a genuine host import) → the deny-all
 ///   `call '<host_module>':'call_host'(Cap, Name, [args…])`, which under the Safe profile
 ///   fails closed.
 ///
-/// SEAM (for unit 11's `ir_lower`, the allowlist enforcer): `resolve_stdlib` here mirrors
-/// the pinned own-stdlib mapping. `ir_lower` is the canonical place the resolution +
-/// `rt_bif` allowlist is enforced; this table must stay aligned with it. `Cap`/`Name` are
-/// emitted as BINARY STRINGS — the exact type `rt_host.call_host` consumes, so its
+/// SEAM (for unit 11's `ir_lower`, the allowlist enforcer): `resolve_stdlib`/`resolve_js` here
+/// mirror the pinned stdlib / JS-runtime op mappings. `ir_lower` is the canonical place the
+/// capability provenance is enforced (the stdlib `rt_bif` allowlist and the `"js"` admit); this
+/// backend routing must stay aligned with it. `Cap`/`Name` for the host fate are emitted as
+/// BINARY STRINGS — the exact type `rt_host.call_host` consumes, so its
 /// `resolve_handler`/`HostWhitelist` string matching actually fires under a permissive
 /// (`HostOpen`/`HostWhitelist`) posture (F4), and the deny-all `{capability_denied, Cap,
 /// Name}` echoes them as binaries (consistent with a direct Gleam-side call). Emitting them
@@ -2772,30 +2787,77 @@ fn emit_call_host(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let cargs = list.map(args, emit_value)
-  case resolve_stdlib(capability, name) {
-    Some(fn_name) ->
-      // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`). State-neutral:
-      // the host boundary never touches the record, so `cur` flows through unchanged (§G).
-      apply_cont_call(
-        cont,
-        CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs),
-        1,
-        sc,
-        state,
-        ctx,
-      )
-    None -> {
-      // The host yields a single value or raises (`{capability_denied,…}`). `capability`/`name`
-      // are emitted as BINARY STRINGS so `rt_host`'s handler/whitelist matching (which pattern-
-      // matches Gleam `String`s) fires under a permissive posture, not just deny-all.
-      let call =
-        CCall(CAtom(ctx.binding.host_module), CAtom("call_host"), [
-          core_binary_string(capability),
-          core_binary_string(name),
-          core_list(cargs),
-        ])
-      apply_cont_call(cont, call, 1, sc, state, ctx)
-    }
+  case capability == js_capability {
+    // The reserved JS runtime boundary (K6): a build-fixed literal dispatch to `rt_js`.
+    True ->
+      case resolve_js(name) {
+        Some(fn_name) ->
+          // A vetted `rt_js` op yields exactly ONE value (K6/Phase-1). State-neutral: the JS
+          // runtime boundary never touches the instance record, so `cur` flows through unchanged.
+          apply_cont_call(
+            cont,
+            CCall(CAtom(ctx.binding.js_runtime_module), CAtom(fn_name), cargs),
+            1,
+            sc,
+            state,
+            ctx,
+          )
+        // Fail-closed (D3a): an unrecognised op resolves to no function — the dispatch is a
+        // literal `case`, not a data-driven target, so no `call`/`apply` is emitted.
+        None -> Error(UnknownJsOp(name))
+      }
+    False ->
+      case resolve_stdlib(capability, name) {
+        Some(fn_name) ->
+          // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`). State-neutral:
+          // the host boundary never touches the record, so `cur` flows through unchanged (§G).
+          apply_cont_call(
+            cont,
+            CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs),
+            1,
+            sc,
+            state,
+            ctx,
+          )
+        None -> {
+          // The host yields a single value or raises (`{capability_denied,…}`).
+          // `capability`/`name` are emitted as BINARY STRINGS so `rt_host`'s handler/whitelist
+          // matching (which pattern-matches Gleam `String`s) fires under a permissive posture,
+          // not just deny-all.
+          let call =
+            CCall(CAtom(ctx.binding.host_module), CAtom("call_host"), [
+              core_binary_string(capability),
+              core_binary_string(name),
+              core_list(cargs),
+            ])
+          apply_cont_call(cont, call, 1, sc, state, ctx)
+        }
+      }
+  }
+}
+
+/// The reserved capability string that names the JS runtime boundary (Phase-8 unit 05, K6).
+/// A `CallHost` whose capability equals this routes to the build-fixed `js_runtime_module`
+/// (`rt_js`) via `resolve_js`; it is NEVER treated as a stdlib call or a host import. Pinned
+/// with `ir_lower.js_capability` (the admit gate) and `specs/phase-8/05-js-runtime-boundary.md`.
+const js_capability: String = "js"
+
+/// The build-fixed JS-runtime op → `rt_js` function-name map (Phase-8 unit 05, K6). A LITERAL
+/// `case` in THIS module (D3a): the only input is the static `op` string and the result is one
+/// of a CLOSED set of compile-time-fixed function atoms — the target is NEVER constructed from
+/// program/runtime data, so no `op` value can reach an arbitrary `Mod:Fn`. Each op returns
+/// exactly one value (K6): `add`/2, `type_of`/1, `undefined_sentinel`/0 (the current STUB
+/// surface). `Some(fn_name)` for a known op, `None` (fail-closed → `UnknownJsOp`) otherwise.
+///
+/// Extending the boundary with a new `rt_js` op is exactly: (1) add one literal arm here, (2)
+/// implement the function in `runtime/rt_js.gleam`, (3) admit it in `ir_lower` (the `"js"`
+/// capability is already admitted wholesale, so no `ir_lower` change is needed per-op).
+fn resolve_js(op: String) -> Option(String) {
+  case op {
+    "add" -> Some("add")
+    "type_of" -> Some("type_of")
+    "undefined_sentinel" -> Some("undefined_sentinel")
+    _ -> None
   }
 }
 

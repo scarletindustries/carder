@@ -45,6 +45,11 @@ fn runtime_modules(b: instance.Binding) -> Set(String) {
     b.mem_module,
     b.table_module,
     b.state_module,
+    // Phase-8 (P8-05): the JS runtime boundary chokepoint (K6). A `CallHost("js", op, args)`
+    // emits `call '<js_runtime_module>':'<fn>'(args)` where `<fn>` is a build-fixed literal atom
+    // from `emit_core.resolve_js` (never derived from `op`/`args` data, D3a) — admitted here
+    // exactly like any other `binding.*_module`.
+    b.js_runtime_module,
     "twocore@runtime@rt_ref",
     "twocore@runtime@link",
     // Phase-6 (P6-06): the SIMD lane-op chokepoint — a fixed build-controlled atom `emit_core`
@@ -784,6 +789,90 @@ pub fn phase6_ops_have_no_ambient_authority_test() {
     // the v128 global routes to the BOXED accessor, not the numeric one.
     assert has_op(m, binding.state_module, "ref_global_set")
     assert has_call(m, binding.trap_module, "raise")
+  })
+}
+
+/// A Phase-8 module exercising the WHOLE JS runtime boundary surface (P8-05 §Tests, K6/D3a): all
+/// three build-fixed `rt_js` stub ops — `add/2` (two args), `type_of/1` (the `add` result), and
+/// `undefined_sentinel/0` (zero args) — chained so every emitted `"js"` `CallHost` is covered by
+/// the D3a walk, including the 0-arg dispatch.
+fn js_module() -> ir.Module {
+  let f =
+    ir.Function(
+      name: "f",
+      params: [ir.Local("p0", ir.TTerm), ir.Local("p1", ir.TTerm)],
+      result: [ir.TTerm],
+      locals: [],
+      body: ir.Let(
+        ["s"],
+        ir.CallHost("js", "add", [ir.Var("p0"), ir.Var("p1")]),
+        ir.Let(
+          ["t"],
+          ir.CallHost("js", "type_of", [ir.Var("s")]),
+          ir.Let(
+            ["u"],
+            ir.CallHost("js", "undefined_sentinel", []),
+            ir.Return([ir.Var("u")]),
+          ),
+        ),
+      ),
+    )
+  ir.Module(
+    name: "twocore@test@p8js",
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [],
+    functions: [f],
+    exports: [ir.ExportFn("f", "f")],
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: option.None,
+    tags: [],
+  )
+}
+
+/// EXTENDED D3a security invariant for the Phase-8 JS runtime boundary (P8-05 §Tests, K6): three
+/// `CallHost("js", op, args)` (`add`/`type_of`/`undefined_sentinel`), under Cell, Threaded, AND
+/// the Unsafe posture — all still ambient-free. (a) every `call` targets a fixed allow-set runtime
+/// atom (now including `js_runtime_module`) with a literal function atom; (b) every `apply` is a
+/// static local `FName`; (c) NO `erlang:*` call is emitted — the boundary is a `call` to the
+/// build-fixed `rt_js` atom, never `apply` from data; (d) each op routes to its build-fixed
+/// `rt_js` function (`resolve_js`), proving the `op` string is a selector among a CLOSED set of
+/// literal function atoms, never an MFA constructor. Because the boundary is bound to
+/// `binding.js_runtime_module`, the walk holds under every posture (the atom is identical across
+/// them, so passing IS the proof no posture coaxes a program-driven dispatch).
+pub fn js_runtime_boundary_has_no_ambient_authority_test() {
+  let cell = instance.safe_default()
+  let threaded =
+    instance.Binding(
+      ..instance.safe_default(),
+      state_strategy: instance.Threaded,
+    )
+  let unsafe = profiles.unsafe()
+  list.each([cell, threaded, unsafe], fn(binding) {
+    let assert Ok(m) = emit_core.emit_module(js_module(), binding)
+    // (a) every call → a fixed runtime/allow-set module + literal function atom.
+    assert_calls_are_runtime(m, binding)
+    // (b) every apply → a static local FName, never a runtime-module atom.
+    let allowed = runtime_modules(binding)
+    let applies =
+      list.flat_map(m.defs, fn(d) {
+        let core_erlang.FunDef(_, v) = d
+        applies_in(v)
+      })
+    list.each(applies, fn(name) {
+      let core_erlang.FName(n, _arity) = name
+      assert set.contains(allowed, n) == False
+    })
+    // (c) NO `erlang:*` is emitted — the JS boundary is a fixed-atom `call`, never `apply` of data.
+    assert has_call(m, "erlang", "apply") == False
+    assert erlang_calls(m) == []
+    // (d) each op routes to its build-fixed `rt_js` function on the bound `js_runtime_module`.
+    assert has_call(m, binding.js_runtime_module, "add")
+    assert has_call(m, binding.js_runtime_module, "type_of")
+    assert has_call(m, binding.js_runtime_module, "undefined_sentinel")
   })
 }
 

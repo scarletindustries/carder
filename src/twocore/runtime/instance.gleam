@@ -198,6 +198,12 @@ pub type TableTier {
 /// - `state_module`: implements the per-instance cell holder + mutable globals
 ///   (`rt_state`). `GlobalGet`/`GlobalSet` route here; the cell ABI is
 ///   `«CELL-STATE-ABI-FROZEN»` (the tier-O process-dictionary convention).
+/// - `js_runtime_module`: implements the JS runtime boundary (`rt_js`, Phase-8 unit 05, K6).
+///   A `CallHost("js", op, args)` routes to a BUILD-FIXED function in THIS module via a literal
+///   `case` in `emit_core` (never `apply(Mod,Fn,Args)` from data, D3a). Defaulted to the
+///   `twocore@runtime@rt_js` stub; the real `rt_js` (all JS semantics) is the frontend team's
+///   deliverable (see `specs/phase-8/HANDOFF-arc-frontend.md §4`). Inert for any module that
+///   never emits a `"js"` `CallHost` (conformance-neutral, K7).
 /// - `safe_max_pages`: the build-time Safe max-pages cap (E3) `emit_core` bakes into the
 ///   `instantiate/0` entry's `rt_mem:fresh(min, max, safe_cap)` call, so `memory.grow`
 ///   cannot allocate past it even when the module declares `max_pages: None`. A FINITE
@@ -244,6 +250,7 @@ pub type Binding {
     mem_module: String,
     table_module: String,
     state_module: String,
+    js_runtime_module: String,
     safe_max_pages: Int,
     /// The documented, spec-aligned RUNTIME page cap for a 64-bit (`Idx64`) memory (memory64,
     /// I4/S9). We do NOT reserve 2^64 bytes: the `paged` backend grows on demand, so this is a
@@ -289,6 +296,10 @@ pub fn safe_default() -> Binding {
     mem_module: "twocore@runtime@rt_mem",
     table_module: "twocore@runtime@rt_table",
     state_module: "twocore@runtime@rt_state",
+    // The JS runtime boundary (Phase-8 unit 05, K6). Defaulted to the `rt_js` STUB; a
+    // `CallHost("js", op, args)` routes here via a build-fixed literal `case` in `emit_core`
+    // (D3a — never `apply` from data). Inert unless the module emits a `"js"` CallHost (K7).
+    js_runtime_module: "twocore@runtime@rt_js",
     // The finite Safe max-pages cap baked into `rt_mem:fresh` (E3). `65536` = the i32 hard
     // cap (2^16 pages = 4 GiB), so the module's DECLARED max governs for conformance; unit
     // 11 lowers it to a real Safe resource bound.

@@ -14,9 +14,14 @@
 ////        `module.imports`) is **left unchanged** — it is rejected at RUN time by the
 ////        deny-all host (`rt_host`), so the capability boundary is exercised end-to-end,
 ////        not short-circuited at build time (overview pitfall #3).
+////      - a call into the reserved JS-runtime capability (`"js"`, Phase-8 unit 05 / K6) is
+////        **admitted** here (exactly as a resolved `"std"` call is) and **left unchanged** —
+////        its concrete `op → rt_js:<fn>` dispatch, and the fail-closed rejection of an unknown
+////        op, are the build-fixed literal `case` in `emit_core` (`resolve_js`/`UnknownJsOp`,
+////        D3a). This pass admits the *capability* (provenance); `emit_core` validates the *op*.
 ////      - a call to anything else — an un-allowlisted capability that is neither the
-////        stdlib capability nor a declared import — is **rejected here**, fail-closed
-////        (`ForbiddenHost`).
+////        stdlib capability, the JS-runtime capability, nor a declared import — is **rejected
+////        here**, fail-closed (`ForbiddenHost`).
 ////      `CallHost` nodes are not rewritten: the mechanical stdlib-vs-host routing is
 ////      `emit_core`'s `resolve_stdlib`/`call_host` split (unit 08). This pass is the
 ////      POLICY gate that decides which calls are *permitted* to reach that router; the
@@ -72,6 +77,16 @@ import twocore/runtime/rt_stdlib
 /// stdlib surface (or be rejected); every other capability is a (potential) host import.
 /// Pinned with unit 09 / state.md.
 pub const stdlib_capability: String = "std"
+
+/// The reserved capability string that names the JS runtime boundary (Phase-8 unit 05, K6).
+/// A `CallHost` whose capability equals this is ADMITTED here (exactly as a resolved `"std"`
+/// call is admitted) — its concrete `op → rt_js:<fn>` dispatch is the build-fixed literal `case`
+/// in `emit_core` (`resolve_js`), where an unknown op FAILS CLOSED (`UnknownJsOp`, D3a — never
+/// `apply` from data). This pass admits the CAPABILITY (provenance); `emit_core` validates the
+/// OP (dispatch). Every OTHER non-stdlib, non-imported capability still fails closed here
+/// (`ForbiddenHost`). Pinned with `emit_core.js_capability` /
+/// `specs/phase-8/05-js-runtime-boundary.md`.
+pub const js_capability: String = "js"
 
 /// The minimal cost charged once on entry to every function body. The value is arbitrary
 /// (D9 — only the metering *seam* matters in Phase 1); kept at `1` so the running fuel
@@ -343,9 +358,9 @@ fn classify_call_host(
   binding: Binding,
   imports: Set(#(String, String)),
 ) -> Result(Nil, LowerError) {
-  case capability == stdlib_capability {
+  case capability == stdlib_capability, capability == js_capability {
     // reserved stdlib capability → resolve posture-aware, then gate on `binding.bif_gate`
-    True ->
+    True, _ ->
       case resolve_stdlib_fn(name, list.length(args), binding) {
         Error(_) -> Error(UnknownStdlibFn(capability, name))
         Ok(target) ->
@@ -354,8 +369,14 @@ fn classify_call_host(
             Error(_) -> Error(BifNotAllowed(name))
           }
       }
+    // reserved JS runtime capability (K6) → ADMITTED (like a resolved `"std"` call). The concrete
+    // `op → rt_js:<fn>` dispatch — and the fail-closed rejection of an unknown op — is the
+    // build-fixed literal `case` in `emit_core` (`resolve_js`/`UnknownJsOp`, D3a). Admitting the
+    // capability here means a `"js"` call is NOT `ForbiddenHost`; it is NOT rewritten (the node is
+    // left for `emit_core` to route, exactly like a stdlib/host call).
+    _, True -> Ok(Nil)
     // any other capability → a declared host import is allowed (run-time deny); else reject
-    False ->
+    False, False ->
       case set.contains(imports, #(capability, name)) {
         True -> Ok(Nil)
         False -> Error(ForbiddenHost(capability, name))
