@@ -39,7 +39,8 @@ the IR only needs these to be *some* term. Recommended encodings (BEAM-native, f
 
 | JS | BEAM term | IR support |
 |---|---|---|
-| number | a BEAM `float` (and `integer` for smi/bitwise) | `Box/UnboxFloat`, `Box/UnboxInt`, `Num`, `TermTest(IsNumber)` |
+| number (finite) | a **native BEAM `float()`** (or `integer()` for a smi/bitwise) | `NumTerm` (native +/-/*/compare), `TermTest(IsNumber)` (guard) — **not** `Box/UnboxFloat` (see the number note below) |
+| number `NaN`/`±Infinity` | frontend **sentinels** (can't be BEAM floats) | `rt_js` produces/handles them on the cold path |
 | boolean | `'true'` / `'false'` atoms | `ConstAtom`, `TermTest(IsAtom)` |
 | `undefined` / `null` | your sentinels (e.g. atoms `'undefined'`/`'null'`) | `ConstAtom` or `rt_js.undefined_sentinel()` |
 | string | a **binary** | `ConstBinary`, `TermTest(IsBinary)` |
@@ -48,6 +49,16 @@ the IR only needs these to be *some* term. Recommended encodings (BEAM-native, f
 | function | a **native BEAM `fun`** | `MakeClosure` / `CallClosure` |
 | bignum | a BEAM `integer` (arbitrary precision — free) | `BoxInt(W64)` won't fit >64b; use `rt_js` for bigint ops |
 | symbol | your encoding (e.g. a tagged tuple / unique ref) | `MakeTuple` / `rt_js` |
+
+> **The number note (important — two different float layers).** 2core has *two* float representations:
+> (1) the IR's unboxed `TF64` layer is a **raw IEEE-754 bit pattern in an integer** (WASM semantics,
+> D5), bridged to/from a term losslessly by `Box/UnboxFloat` — use this only for **raw f64 storage**
+> (e.g. a `Float64Array` element), never as a JS `number`, because a bit-pattern integer answers
+> `is_float`→false and NaN/±Inf can't become BEAM floats; (2) a **JS `number` is a native BEAM
+> `float()`** (finite) so `TermTest(IsNumber)` guards work and `NumTerm` does native BEAM arithmetic
+> with no box/unbox. Represent NaN/±Infinity as your own sentinels and handle them on the `rt_js` cold
+> path. Hot arithmetic: guard with `TermTest(IsNumber)`, fast-path with `NumTerm`, deopt to
+> `CallHost("js",…)` for string-`+`/NaN/Inf/`/0`/mixed — see unit 06's composed proof.
 
 ### Calling convention (recommended, you may choose your own)
 Compile every JS function to a same-module 2core `Function` of a **uniform shape**, e.g.
@@ -83,17 +94,21 @@ internal records / shaped objects.
 `cell_set(c, MapPut(cell_get(c), k, v))`.
 
 ### Boxing bridge (unit 04) — `Expr = Convert(op, arg)`
-`BoxFloat(fw)`(f64→term) · `UnboxFloat(fw)`(term→f64) · `BoxInt(w)`(iN→term) · `UnboxInt(w)`(term→iN).
-Keep hot arithmetic unboxed; box only at boundaries.
+`BoxFloat/UnboxFloat`(raw f64 ↔ term, **bit-exact, lossless**) · `BoxInt/UnboxInt`(iN ↔ term). This
+bridges the IR's **raw-bit-pattern** `TF64`/`TI32` layer ↔ terms — use for **raw f64/iN storage** (typed
+arrays, wasm interop). **Not** the JS-`number` path (see the number note in §2).
 
-### Term classification (unit 06) — `Expr`
-`TermTest(kind, arg)`→i32 for `IsInt/IsFloat/IsNumber/IsAtom/IsBinary/IsTuple/IsMap/IsFun/IsList`;
+### Term classification + native arithmetic (unit 06) — `Expr`
+`TermTest(kind, arg)`→i32 for `IsInt/IsFloat/IsNumber/IsAtom/IsBinary/IsTuple/IsMap/IsFun/IsList` (guards);
 `TermTag(arg)`→i32 dense code (`0=int 1=float 2=atom 3=binary 4=tuple 5=map 6=fun 7=list 8=other`) for a
-one-shot `Switch` on type. Use for guarded fast paths + inline-cache shape checks.
+one-shot `Switch`; **`NumTerm(op, lhs, rhs)`** — native BEAM arithmetic/compare on **number terms**
+(`NAdd/NSub/NMul`→number term; `NLt/NLe/NGt/NGe/NEq`→i32). **This is your JS-arithmetic fast path**:
+guard with `TermTest(IsNumber)`, compute with `NumTerm`, deopt to `rt_js` for `/`,`%`, NaN/Inf, string-`+`.
 
-### Numeric (existing) — `Expr = Num(op, args)` / `Convert(op, arg)`
-Width-tagged native arithmetic on `TI32/TI64/TF32/TF64` (`f64.add`, `i32.and`, …). This is your
-**unboxed fast path**; wrap with `TermTest` guards + `Box/Unbox`.
+### Numeric raw layer (existing) — `Expr = Num(op, args)` / `Convert(op, arg)`
+Width-tagged **raw-bit-pattern** arithmetic on `TI32/TI64/TF32/TF64` (`f64.add`, `i32.and`, …). This is
+the WASM numeric layer (bit-exact wasm semantics) — use for wasm interop / raw f64/iN math, **not** JS
+numbers (use `NumTerm`). Cross to/from terms via the unit-04 boxing bridge.
 
 ### Control (existing, structured — emit from arc's structured AST, **not** flat jumps)
 `Let` (SSA bind) · `Block(label, result, body)` + `Break(label, vs)` · `Loop(label, params, result,
@@ -149,8 +164,9 @@ exact IR).
 | captured read (arc `Local(boxed)`) | capture the **cell**; `CallHost("js","cell_get",[cell])` |
 | `x = e` (mutated capture) | `CallHost("js","cell_set",[cell, e])` |
 | global read/write | `CallHost("js","global_get"/"global_set",…)` (or a module map) |
-| `a + b` | guarded fast path (unit 06) → `Num(f64.add)` else `CallHost("js","add",[a,b])` |
-| `a < b`, `a === b` | same guarded pattern, else `rt_js` |
+| `a + b` | `If(TermTest(IsNumber,a) && TermTest(IsNumber,b), NumTerm(NAdd,a,b), CallHost("js","add",[a,b]))` |
+| `a < b`, `a === b` | guarded `NumTerm(NLt,…)`/`NumTerm(NEq,…)` (numbers) else `rt_js` |
+| `a / b`, `a % b` | always `CallHost("js","div"/"mod",…)` (BEAM `/0` traps; JS `1/0=Infinity`) |
 | `!x`, `x && y`, `x ? … : …` | `TermTest`/`rt_js.to_boolean` → `If`/`Switch` |
 | `function f(){…}` / arrow | a same-module `Function(This, Args)`; the *value* is `MakeClosure("f", captures, 2)` |
 | `g(a,b)` | `Args=MakeCons(a,MakeCons(b,[]))`; `CallClosure(g,[This,Args])` (or `rt_js.call` if `g` may be non-fun) |
