@@ -221,6 +221,33 @@ pub fn store(
   }
 }
 
+/// UNCHECKED cell load (Phase-10, N5) — `load` MINUS the bounds check/`Result`. Reads the `Mem` from
+/// the pdict cell. Returns the raw bit pattern directly. See `mem_load_unchecked` (BEAM-safe on OOB).
+pub fn load_unchecked(
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  mem_load_unchecked(current_mem(), bytes, signed, result_width, addr, offset)
+}
+
+/// UNCHECKED cell store (Phase-10, N5) — `store` MINUS the bounds check/`Result`. Writes the new
+/// `Mem` back to the pdict cell; returns `Nil`. See `mem_store_unchecked` (BEAM-safe on OOB).
+pub fn store_unchecked(bytes: Int, addr: Int, value: Int, offset: Int) -> Nil {
+  rt_state.mem_put(
+    mem_to_dynamic(mem_store_unchecked(
+      current_mem(),
+      bytes,
+      addr,
+      value,
+      offset,
+    )),
+  )
+  Nil
+}
+
 /// The current size of this process's memory, in 64 KiB pages (`memory.size`).
 ///
 /// - Returns the page count. Total. Reads the `Mem` from the cell.
@@ -468,6 +495,47 @@ pub fn t_store(
     Ok(updated) -> Ok(rt_state.with_mem(st, mem_to_dynamic(updated)))
     Error(reason) -> Error(reason)
   }
+}
+
+/// UNCHECKED threaded load (Phase-10, N5) — `t_load` MINUS the bounds check/`Result`. Reads the
+/// `Mem` from the record; `st` unchanged. Returns the raw bit pattern.
+pub fn t_load_unchecked(
+  st: rt_state.InstanceState,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  mem_load_unchecked(
+    from_dynamic(rt_state.mem(st)),
+    bytes,
+    signed,
+    result_width,
+    addr,
+    offset,
+  )
+}
+
+/// UNCHECKED threaded store (Phase-10, N5) — `t_store` MINUS the bounds check/`Result`. Rebinds
+/// `st.mem` to the written `Mem` and returns the updated record.
+pub fn t_store_unchecked(
+  st: rt_state.InstanceState,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> rt_state.InstanceState {
+  rt_state.with_mem(
+    st,
+    mem_to_dynamic(mem_store_unchecked(
+      from_dynamic(rt_state.mem(st)),
+      bytes,
+      addr,
+      value,
+      offset,
+    )),
+  )
 }
 
 /// Threaded `memory.size` (read-only): the page count of `st.mem`; `st` unchanged.
@@ -754,6 +822,39 @@ pub fn mem_store(
     False -> Error(MemoryOutOfBounds)
     True -> Ok(write_bytes(m, ea, encode_le(value, bytes)))
   }
+}
+
+/// Pure UNCHECKED load against an explicit `Mem` (Phase-10 range-BCE, N5) — `mem_load` MINUS the
+/// `in_bounds` compare. The caller (the versioned fast loop, unit 06) has PROVEN `ea + bytes` in
+/// bounds via a runtime range-guard, so no `MemoryOutOfBounds` path is needed. BEAM-SAFE even on an
+/// (guard-impossible) OOB: `read_bytes` returns ZEROS for absent sparse chunks (a contained wrong
+/// value), NEVER a crash or corruption. Returns the raw bit pattern.
+pub fn mem_load_unchecked(
+  m: Mem,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  let raw = read_bytes(m, addr + offset, bytes)
+  case signed {
+    True -> decode_signed(raw, bytes, result_width)
+    False -> decode_unsigned(raw, bytes)
+  }
+}
+
+/// Pure UNCHECKED store against an explicit `Mem` (Phase-10, N5) — `mem_store` MINUS the `in_bounds`
+/// compare. Returns the rebuilt `Mem`. BEAM-SAFE even on an (guard-impossible) OOB: `write_bytes`
+/// writes into the process-local sparse chunk map (a contained write), NEVER corrupting other data.
+pub fn mem_store_unchecked(
+  m: Mem,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Mem {
+  write_bytes(m, addr + offset, encode_le(value, bytes))
 }
 
 /// Pure `memory.size`: the current page count of `m`.
