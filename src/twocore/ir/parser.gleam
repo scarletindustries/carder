@@ -1211,6 +1211,22 @@ fn parse_value(
             _ -> Error(BadNumberLiteral(l, c, "v128.const (need 16 bytes)"))
           }
         }
+        // Phase-8 term literals (K2, unit 01), mirroring `printer.print_value`. An atom literal is
+        // `atom "<name>"` — the `atom` keyword followed by a quoted string carrying the atom's
+        // characters. A binary literal is `binary 0x<hex>` — the `binary` keyword followed by the
+        // shared `0x`-hexbytes form (reusing `parse_hexbytes`).
+        "atom" ->
+          case rest {
+            [PToken(TStr(name), _, _), ..rest2] ->
+              Ok(#(ir.ConstAtom(name), rest2))
+            [PToken(t, l2, c2), ..] ->
+              Error(UnexpectedToken(l2, c2, "atom name string", describe(t)))
+            [] -> Error(UnexpectedEnd("atom name string"))
+          }
+        "binary" -> {
+          use #(bytes, rest) <- result.try(parse_hexbytes(rest))
+          Ok(#(ir.ConstBinary(bytes), rest))
+        }
         _ -> Error(UnexpectedToken(l, c, "value", w))
       }
     [PToken(t, l, c), ..] -> Error(UnexpectedToken(l, c, "value", describe(t)))
@@ -2338,11 +2354,17 @@ fn ty_fwidth(s: String) -> Result(FloatWidth, Nil) {
   }
 }
 
-/// Parses a term-layer op spelling (`make_tuple`, `make_cons`, `tuple_get.<index>`).
+/// Parses a term-layer op spelling (Phase-8 unit 01): `make_tuple`, `make_cons`, `tuple_size`,
+/// `list_head`, `list_tail`, `is_empty_list`, or `tuple_get.<index>`. Mirrors
+/// `printer.termop_to_string`.
 fn string_to_termop(w: String) -> Result(TermOp, Nil) {
   case w {
     "make_tuple" -> Ok(MakeTuple)
     "make_cons" -> Ok(MakeCons)
+    "tuple_size" -> Ok(ir.TupleSize)
+    "list_head" -> Ok(ir.ListHead)
+    "list_tail" -> Ok(ir.ListTail)
+    "is_empty_list" -> Ok(ir.IsEmptyList)
     _ ->
       case string.split(w, ".") {
         ["tuple_get", idx] ->

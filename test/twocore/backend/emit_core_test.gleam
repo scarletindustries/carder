@@ -997,11 +997,9 @@ pub fn instantiate_entry_golden_test() {
 // ───────────────────────────── fail-closed error paths (never panic) ─────────────────────────────
 
 /// The remaining out-of-scope IR nodes return a typed `EmitError` — never a panic (D4
-/// fail-closed). Phase 2 lowers the stateful ops + numeric `Convert`s, so only the term
-/// layer (`TermOp`) and the four term↔numeric boxing `Convert`s stay unsupported.
+/// fail-closed). Phase-8 unit 01 now lowers the whole term layer (`TermOp`), so only the four
+/// term↔numeric boxing `Convert`s (unit 04) stay unsupported.
 pub fn out_of_scope_nodes_error_test() {
-  assert emit_one(ir.TermOp(ir.MakeTuple, [ir.Var("a")]))
-    == Error(emit_core.UnsupportedNode("term_op"))
   assert emit_one(ir.Convert(ir.BoxInt(ir.W32), ir.Var("a")))
     == Error(emit_core.UnsupportedNode("box_int"))
   assert emit_one(ir.Convert(ir.UnboxInt(ir.W32), ir.Var("a")))

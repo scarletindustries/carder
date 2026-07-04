@@ -2918,6 +2918,10 @@ fn value_type(st: LState, v: ir.Value) -> ir.ValType {
     ir.ConstNull(ty) -> ir.reftype_to_valtype(ty)
     // A `v128.const` literal is self-describing (I1).
     ir.ConstV128(_) -> ir.TV128
+    // Phase-8 term literals (K2) are boxed BEAM terms (`TTerm`). No WASM instruction produces
+    // one (K7 — additive), so these arms are unreachable on the WASM path; present only to keep
+    // the `Value` match exhaustive (fail-closed, D4).
+    ir.ConstAtom(_) | ir.ConstBinary(_) -> ir.TTerm
     ir.Var(n) -> dict.get(st.var_types, n) |> result.unwrap(ir.TI32)
   }
 }

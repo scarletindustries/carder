@@ -482,6 +482,17 @@ pub type Value {
   /// Pure (it is a `Value`). Invariant (validate/lower/emit uphold it): `bit_size(bytes) == 128`.
   /// This is the analogue of `ConstF32(bits)`'s raw-bit representation, one level wider (I1/I2).
   ConstV128(bytes: BitArray)
+  /// A literal BEAM **atom** term (K2, Phase-8 unit 01) — e.g. the booleans `'true'`/`'false'`,
+  /// or a dynamic-frontend sentinel. `name` is the atom's logical characters (the backend
+  /// quotes/escapes them into a Core `CAtom`). A `TTerm`-typed operand; pure (it is a `Value`,
+  /// constructs an immutable term, never traps). **No WASM module produces one** (K7 — additive;
+  /// the WASM `validate` surface rejects it, and `lower` never emits it).
+  ConstAtom(name: String)
+  /// A literal BEAM **binary** term (K2, Phase-8 unit 01) — e.g. a JS string literal. `bytes` is
+  /// the raw payload, emitted verbatim as a Core binary literal (byte-exact, like a data-segment
+  /// payload). A `TTerm`-typed operand; pure (it is a `Value`). **No WASM module produces one**
+  /// (K7 — additive; the WASM `validate` surface rejects it, and `lower` never emits it).
+  ConstBinary(bytes: BitArray)
 }
 
 // ───────────────────── Expressions (yield value lists) ─────────────────────
@@ -1150,17 +1161,32 @@ pub type ConvOp {
   F64PromoteF32
 }
 
-/// Term-layer operations (Phase-2; lock-now placeholder so the term frontends do not
-/// retrofit the IR). Extended in Phase 2.
+/// Term-layer operations — the BEAM-native value construction/destructuring surface a
+/// dynamic-language frontend lowers to (Phase-8 unit 01; K2/K8). All are **`Pure`** (they
+/// construct or inspect immutable BEAM terms — tuples and lists are immutable on the BEAM — so
+/// even the reads never trap and never touch mutable instance state). Carried by the `TermOp(op,
+/// args)` `Expr`. **No WASM module produces one** (K7 — additive; the WASM `validate` surface
+/// rejects them, `lower` never emits them, so the WASM corpus stays byte-identical).
 ///
-/// - `MakeTuple`: build a tuple from its argument values.
-/// - `TupleGet(index)`: project the element at `index` from a tuple.
-/// - `MakeCons`: build a list cons cell (head, tail).
+/// Arities (validate/frontend uphold; `emit_core` pattern-matches them):
+/// - `MakeTuple`: build a tuple from its N `args` (`{V₁,…,Vₙ}`). Result `TTerm`.
+/// - `TupleGet(index)`: project the element at 0-based `index` from the single tuple arg
+///   (lowers to 1-based `erlang:element/2`). Result `TTerm`. Exactly 1 arg.
+/// - `TupleSize`: the arity of the single tuple arg (`erlang:tuple_size/1`). Result `TI32`.
+///   Exactly 1 arg.
+/// - `MakeCons`: build a cons cell `[H|T]` from exactly 2 args (head, tail). Result `TTerm`.
+/// - `ListHead`: the head of the single cons arg (`erlang:hd/1`). Result `TTerm`. Exactly 1 arg.
+/// - `ListTail`: the tail of the single cons arg (`erlang:tl/1`). Result `TTerm`. Exactly 1 arg.
+/// - `IsEmptyList`: `1` if the single list arg is `[]`, else `0` — an **i32 truth value** (so it
+///   drops into `If`/`Switch`). Result `TI32`. Exactly 1 arg.
 pub type TermOp {
   MakeTuple
   TupleGet(index: Int)
   MakeCons
-  // … extend in Phase 2
+  TupleSize
+  ListHead
+  ListTail
+  IsEmptyList
 }
 
 /// Describes a linear-memory access (Phase-2; lock-now).

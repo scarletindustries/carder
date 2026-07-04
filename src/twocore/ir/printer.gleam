@@ -512,6 +512,11 @@ fn print_value(v: Value) -> String {
     // digits (D5, §A.2). Byte-exact, so NaN-payload / `-0.0` / `±Inf` lanes survive; the parser
     // (`parse_value`) reads them back and enforces the 16-byte length. No legacy module has it.
     ir.ConstV128(bytes) -> "v128.const " <> print_hexbytes(bytes)
+    // Phase-8 term literals (K2, unit 01). An atom prints `atom "<escaped-name>"`; a binary
+    // prints `binary 0x<hex>` (the same hex-bytes form a data-segment payload uses). The parser
+    // (`parse_value`) reads both back. No WASM module produces one (K7).
+    ir.ConstAtom(name) -> "atom \"" <> escape(name) <> "\""
+    ir.ConstBinary(bytes) -> "binary " <> print_hexbytes(bytes)
   }
 }
 
@@ -1171,13 +1176,18 @@ fn convop_to_string(op: ConvOp) -> String {
   }
 }
 
-/// Renders a term-layer op (Phase-2 lock-now): `make_tuple`, `make_cons`, or
-/// `tuple_get.<index>` (the index encoded in the spelling).
+/// Renders a term-layer op (Phase-8 unit 01): `make_tuple`, `make_cons`, `tuple_size`,
+/// `list_head`, `list_tail`, `is_empty_list`, or `tuple_get.<index>` (the index encoded in the
+/// spelling). The parser's `string_to_termop` reads each back.
 fn termop_to_string(op: TermOp) -> String {
   case op {
     MakeTuple -> "make_tuple"
     MakeCons -> "make_cons"
     TupleGet(index) -> "tuple_get." <> int.to_string(index)
+    ir.TupleSize -> "tuple_size"
+    ir.ListHead -> "list_head"
+    ir.ListTail -> "list_tail"
+    ir.IsEmptyList -> "is_empty_list"
   }
 }
 

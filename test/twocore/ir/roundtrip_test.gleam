@@ -388,10 +388,17 @@ fn expr_corpus() -> List(ir.Expr) {
       ir.ConstF32(0x7fc00000),
       ir.ConstF64(0x8000000000000000),
     ]),
-    // term ops
+    // term ops (Phase-8 unit 01: the full TermOp surface round-trips textually)
     ir.TermOp(ir.MakeTuple, [ir.Var("a"), ir.Var("b")]),
     ir.TermOp(ir.TupleGet(3), [ir.Var("t")]),
     ir.TermOp(ir.MakeCons, [ir.Var("h"), ir.Var("t")]),
+    ir.TermOp(ir.TupleSize, [ir.Var("t")]),
+    ir.TermOp(ir.ListHead, [ir.Var("l")]),
+    ir.TermOp(ir.ListTail, [ir.Var("l")]),
+    ir.TermOp(ir.IsEmptyList, [ir.Var("l")]),
+    // Phase-8 term literals as forwarded values: a literal atom and a literal binary.
+    ir.Values([ir.ConstAtom("ok"), ir.ConstBinary(<<"hi">>)]),
+    ir.Values([ir.ConstAtom("true"), ir.ConstBinary(<<>>)]),
     // memory: size/grow (Phase-2), a plain i32.load and a sign-extending i64.load8_s
     // (distinct result widths prove the new `result` field round-trips and discriminates
     // i32.load8_s vs i64.load8_s — same bytes+sign, different result type).

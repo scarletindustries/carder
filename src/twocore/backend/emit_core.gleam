@@ -1052,9 +1052,87 @@ fn emit(
     ir.Try(result, body, handlers) ->
       emit_try(result, body, handlers, cont, sc, state, ctx)
     ir.ThrowRef(exnref) -> emit_throw_ref(exnref, state)
-    // Out of scope — typed error, never a panic. The term layer (`TermOp`) + the term↔numeric
-    // boxing `Convert`s remain unlowered (still a later-phase deferral).
-    TermOp(..) -> Error(UnsupportedNode("term_op"))
+    // ── Phase-8 term layer (K2/K8, unit 01): PURE BEAM-term construction/destructuring. Each
+    // op yields ONE value disposed through `cont` (like a non-trapping `Num`); tuples/lists are
+    // immutable, so none traps or touches mutable state. The term↔numeric boxing `Convert`s
+    // remain a later-unit deferral (unit 04). ──
+    TermOp(op, args) -> emit_term_op(op, args, cont, sc, state, ctx)
+  }
+}
+
+/// Lower a `TermOp(op, args)` — the Phase-8 term construction/destructuring layer (unit 01, K2).
+///
+/// Every variant is PURE and yields exactly ONE value, disposed through `cont` via `apply_cont`
+/// (the same continuation-passing shape as a non-trapping `Num`; `sc` flows through unchanged
+/// since no term op touches threaded instance state). Lowerings (unit-01 table):
+/// - `MakeTuple` (N args) → `{V₁,…,Vₙ}` (`CTuple`).
+/// - `TupleGet(i)` (1 arg) → `call 'erlang':'element'(i+1, T)` (IR index 0-based; `element/2`
+///   1-based).
+/// - `TupleSize` (1 arg) → `call 'erlang':'tuple_size'(T)`.
+/// - `MakeCons` (2 args) → `[H|T]` (`CCons`).
+/// - `ListHead` (1 arg) → `call 'erlang':'hd'(L)`.
+/// - `ListTail` (1 arg) → `call 'erlang':'tl'(L)`.
+/// - `IsEmptyList` (1 arg) → `case L of [] -> 1; _ -> 0 end` (an i32 truth value).
+///
+/// A wrong operand arity is an impossible state for a validated module (validate/frontend uphold
+/// the arities, K7); it fails closed with `Error(UnsupportedNode("term_op"))`, never a panic.
+fn emit_term_op(
+  op: ir.TermOp,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case op, args {
+    ir.MakeTuple, _ ->
+      apply_cont(cont, [CTuple(list.map(args, emit_value))], sc, state, ctx)
+    ir.TupleGet(i), [t] ->
+      apply_cont(
+        cont,
+        [CCall(CAtom("erlang"), CAtom("element"), [CInt(i + 1), emit_value(t)])],
+        sc,
+        state,
+        ctx,
+      )
+    ir.TupleSize, [t] ->
+      apply_cont(
+        cont,
+        [CCall(CAtom("erlang"), CAtom("tuple_size"), [emit_value(t)])],
+        sc,
+        state,
+        ctx,
+      )
+    ir.MakeCons, [h, t] ->
+      apply_cont(cont, [CCons(emit_value(h), emit_value(t))], sc, state, ctx)
+    ir.ListHead, [l] ->
+      apply_cont(
+        cont,
+        [CCall(CAtom("erlang"), CAtom("hd"), [emit_value(l)])],
+        sc,
+        state,
+        ctx,
+      )
+    ir.ListTail, [l] ->
+      apply_cont(
+        cont,
+        [CCall(CAtom("erlang"), CAtom("tl"), [emit_value(l)])],
+        sc,
+        state,
+        ctx,
+      )
+    ir.IsEmptyList, [l] -> {
+      // `case L of [] -> 1; _ -> 0 end` — one i32 value (fresh wildcard binder for the `_` arm).
+      let #(wild, state2) = fresh_var(state)
+      let is_empty =
+        CCase(emit_value(l), [
+          CClause([PNil], CAtom("true"), CInt(1)),
+          CClause([PVar(wild)], CAtom("true"), CInt(0)),
+        ])
+      apply_cont(cont, [is_empty], sc, state2, ctx)
+    }
+    // Arity mismatch — impossible for a validated module (K7); fail closed.
+    _, _ -> Error(UnsupportedNode("term_op"))
   }
 }
 
@@ -3849,6 +3927,11 @@ fn emit_value(v: Value) -> CExpr {
     // The `v128.const` literal (I1/D5) — the 16 raw little-endian bytes as a Core binary
     // literal, verbatim (like `ConstF32`'s raw bits, one level wider). Pure; no `rt_simd` call.
     ir.ConstV128(bytes) -> core_binary_bytes(bytes)
+    // Phase-8 term literals (K2, unit 01): a literal atom lowers to a Core `CAtom` (the backend
+    // quotes/escapes `name`); a literal binary lowers to a byte-exact Core binary literal (the
+    // same renderer a data-segment payload uses). Both pure — no runtime call.
+    ir.ConstAtom(name) -> CAtom(name)
+    ir.ConstBinary(bytes) -> core_binary_bytes(bytes)
   }
 }
 
@@ -5282,6 +5365,13 @@ fn const_value_bits(v: Value) -> Result(Int, EmitError) {
     // seeded via `ref_globals` (S6, P6-06/08/09), never through this numeric path.
     ir.ConstV128(_) ->
       Error(NonConstInit("v128 constant in numeric constant init/offset"))
+    // Phase-8 term literals (K2) are boxed BEAM terms, not scalar `Int`s, so they have no
+    // numeric bit pattern for a memory offset / numeric-global seed; they never appear in a
+    // WASM numeric const init (K7). Fail-closed like `ConstNull`/`ConstV128`.
+    ir.ConstAtom(_) ->
+      Error(NonConstInit("atom constant in numeric constant init/offset"))
+    ir.ConstBinary(_) ->
+      Error(NonConstInit("binary constant in numeric constant init/offset"))
   }
 }
 
