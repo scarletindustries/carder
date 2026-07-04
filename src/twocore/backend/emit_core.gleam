@@ -83,28 +83,28 @@ import gleam/set.{type Set}
 import gleam/string
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
-  type FunDef, CApply, CAtom, CBinary, CBitSeg, CCall, CCase, CClause, CCons,
-  CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, FName,
-  FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
+  type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase,
+  CClause, CCons, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/ir.{
   type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
   type Module, type NumOp, type SwitchArm, type TrapReason, type ValType,
-  type Value, Block, BoxFloat, BoxInt, Break, CallDirect, CallHost, CallIndirect,
-  Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, ConvertS,
-  ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq,
-  FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub,
-  FTrunc, FW32, FW64, FuelExhausted, FuncType, GlobalGet, GlobalSet,
-  I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
-  I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz,
-  IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS,
-  IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
-  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Loop, MemGrow, MemLoad, MemSize, MemStore,
-  MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch,
-  SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap,
-  TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt, UndefinedElement,
-  UninitializedElement, Unreachable, Values, Var, W32, W64,
+  type Value, Block, BoxFloat, BoxInt, Break, CallClosure, CallDirect, CallHost,
+  CallIndirect, Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue,
+  Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
+  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
+  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
+  GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S,
+  I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz,
+  ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU,
+  IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub,
+  IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  InvalidConversionToInteger, Let, Loop, MakeClosure, MemGrow, MemLoad, MemSize,
+  MemStore, MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return,
+  Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds, TermOp,
+  Trap, TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt,
+  UndefinedElement, UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
   type Binding, type HostPolicy, HostDenyAll, HostOpen, HostWhitelist, MeterFuel,
@@ -1057,6 +1057,14 @@ fn emit(
     // immutable, so none traps or touches mutable state. The term↔numeric boxing `Convert`s
     // remain a later-unit deferral (unit 04). ──
     TermOp(op, args) -> emit_term_op(op, args, cont, sc, state, ctx)
+    // ── Phase-8 native closures (K3/K8, unit 02) — THE HEADLINE. `MakeClosure` builds a BEAM
+    // `fun` closing over already-evaluated captures (PURE, one value); `CallClosure` applies a fun
+    // VALUE via a native `apply F(Args)` (EFFECTFUL barrier, one value). Neither arises from WASM
+    // (K7). A closure over an enclosing local — Porffor's wall — is here just a `fun`. ──
+    MakeClosure(fn_name, captures, arity) ->
+      emit_make_closure(fn_name, captures, arity, cont, sc, state, ctx)
+    CallClosure(callee, args) ->
+      emit_call_closure(callee, args, cont, sc, state, ctx)
   }
 }
 
@@ -1134,6 +1142,79 @@ fn emit_term_op(
     // Arity mismatch — impossible for a validated module (K7); fail closed.
     _, _ -> Error(UnsupportedNode("term_op"))
   }
+}
+
+/// Lower `MakeClosure(fn_name, captures, arity)` — the Phase-8 native-closure constructor (K3/K8,
+/// unit 02, THE HEADLINE). Builds a Core Erlang
+/// `fun (A_1, …, A_arity) -> apply 'fn_name'/(m+arity)(C_1, …, C_m, A_1, …, A_arity)`
+/// (m = `list.length(captures)`): the captured values are PREPENDED to `arity` fresh runtime
+/// params, so the emitted `fun` closes over them by BEAM value capture (nothing else to do). PURE
+/// and single-valued — disposed through `cont` via `apply_cont` (like a `TermOp`); `sc` flows
+/// through unchanged (building a fun touches no threaded instance state).
+///
+/// Resolution mirrors `CallDirect` (D3a — the EXACT same-module `apply 'f'/n(…)` shape, never a
+/// new call form): `fn_name` must be a defined same-module function (`ctx.fn_arity`), else
+/// `Error(UnknownFunction)`. Its parameter count must equal `m + arity` (it takes the captures,
+/// then the runtime args), else `Error(ArityMismatch(expected, got))` — a TYPED error, never a
+/// panic. `arity = 0` yields a nullary `fun () -> apply 'fn_name'/m(captures…)`; `captures = []`
+/// yields a plain `fun` forwarding all args.
+///
+/// NOTE: the closure body is the UN-threaded direct call. A state-threaded build whose closure
+/// target is state-reaching is out of scope — Phase-8 closures arise only in the direct-IR JS
+/// path, which threads no instance state (K7); no WASM module produces this node.
+fn emit_make_closure(
+  fn_name: String,
+  captures: List(Value),
+  arity: Int,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case dict.get(ctx.fn_arity, fn_name) {
+    Error(_) -> Error(UnknownFunction(fn_name))
+    Ok(fn_params) -> {
+      let expected = list.length(captures) + arity
+      case fn_params == expected {
+        False -> Error(ArityMismatch(expected, fn_params))
+        True -> {
+          let #(param_names, state2) = fresh_n_vars(state, arity)
+          let body =
+            CApply(
+              FName(fn_name, fn_params),
+              list.append(
+                list.map(captures, emit_value),
+                list.map(param_names, CVar),
+              ),
+            )
+          apply_cont(cont, [CFun(param_names, body)], sc, state2, ctx)
+        }
+      }
+    }
+  }
+}
+
+/// Lower `CallClosure(callee, args)` — apply a native fun VALUE (K3/K8, unit 02). Emits a Core
+/// Erlang `apply <callee>(A_1, …, A_n)` (`CApplyExpr` — a first-class value application, never a
+/// data-named `apply(Mod, Fn, Args)`, never the list-spreading `erlang:apply/2`). EFFECTFUL
+/// barrier (it transfers to arbitrary code, like `CallIndirect`), yielding ONE value.
+///
+/// State-NEUTRAL under `Threading(cur)`: a native BEAM fun does not carry our `InstanceState`, so
+/// `cur` flows through unchanged (like `CallHost`/`CallImport`). The single result is disposed
+/// through `cont` by `apply_cont_call` with `r = 1` — which under `Threading` re-pairs the value
+/// with `cur` at a tail `KReturn`, and under `NoState`/`KReturn` yields the `apply` straight
+/// through (a single value packaged is itself, §apply_cont_call). A callee arity mismatch is a
+/// BEAM `badarity` error at RUN time (the IR carries no static fun arity — K1).
+fn emit_call_closure(
+  callee: Value,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let applied = CApplyExpr(emit_value(callee), list.map(args, emit_value))
+  apply_cont_call(cont, applied, 1, sc, state, ctx)
 }
 
 /// Lower `Return(vs)` (the non-continuation transfer). Under `NoState` it yields the bare
@@ -5583,6 +5664,12 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Num(_, args) -> collect_values(args, acc)
     Convert(_, arg) -> collect_value(arg, acc)
     TermOp(_, args) -> collect_values(args, acc)
+    // ── Phase-8 native closures: collect the `Var` names in their `Value` operands (the captures /
+    // the callee + args) so gensym avoids them. `MakeClosure`'s `fn_name` is a function name, not a
+    // `Var`. Over-approximating is safe. ──
+    MakeClosure(_, captures, _) -> collect_values(captures, acc)
+    CallClosure(callee, args) ->
+      collect_values(args, collect_value(callee, acc))
     MemSize(_) -> acc
     MemGrow(_, delta) -> collect_value(delta, acc)
     MemLoad(_, _, addr, _, _) -> collect_value(addr, acc)

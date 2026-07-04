@@ -6,7 +6,21 @@
 %% OTP 29 has no generic exception-rescue in this dependency set). It does not touch
 %% any unit-owned source file.
 -module(twocore_emit_test_ffi).
--export([catch_apply/3, apply3/3]).
+-export([catch_apply/3, apply3/3, apply_fun/2]).
+
+%% Apply a fun VALUE to an argument list: `erlang:apply(Fun, Args)`. On a normal
+%% return yield `{ok, V}` (a Gleam `Ok`); a raise/exit/throw is captured as
+%% `{error, Reason}` (Reason as a UTF-8 binary), mirroring `catch_apply/3`. Used by
+%% the Phase-8 unit-02 closure tests to apply a `MakeClosure` fun that was RETURNED
+%% from an exported function — proving a native BEAM `fun` outlives its creating
+%% frame and is applied via `erlang:apply` from outside the generated module.
+apply_fun(Fun, Args) ->
+    try erlang:apply(Fun, Args) of
+        V -> {ok, V}
+    catch
+        _Class:Reason ->
+            {error, unicode:characters_to_binary(io_lib:format("~0p", [Reason]))}
+    end.
 
 %% Raw `erlang:apply(M, F, Args)` with NO trap capture — the value is returned
 %% directly and any raise/exit/throw PROPAGATES. Used by the P6-06 cross-module

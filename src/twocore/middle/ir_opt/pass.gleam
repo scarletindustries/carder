@@ -148,7 +148,13 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`), so like the leaves
       // they return unchanged. They are barriers (`ir/effect`), so no pass hoists across them.
       ir.Throw(..)
-    | ir.ThrowRef(..) -> e
+    | ir.ThrowRef(..)
+    | // Phase-8 native closures carry only `Value` operands (no sub-`Expr`), so like the leaves
+      // they return unchanged from this `Expr`-traversal combinator. `CallClosure` is a barrier
+      // (`ir/effect`), so no pass hoists across it; `MakeClosure` is pure. A pass that rewrites
+      // their `Value` operands does so in its own per-node arm, not here.
+      ir.MakeClosure(..)
+    | ir.CallClosure(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
     // Phase-7 `Try` recurses into its `body` and each handler's inline `handler` expression
     // (both are sub-`Expr`s), so a traversal reaches an EH region's interior. The node itself is

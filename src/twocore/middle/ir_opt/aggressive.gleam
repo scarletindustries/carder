@@ -505,6 +505,15 @@ fn apply_rename_subst(
       ir.GlobalSet(name, rs_value(value, rename, subst))
     ir.CallDirect(fn_name, cargs) ->
       ir.CallDirect(fn_name, rs_values(cargs, rename, subst))
+    // ── Phase-8 native closures: rewrite their `Value` operands so an inlined callee's params are
+    // substituted into the captures / callee / args (the `fn_name` and `arity` are static). ──
+    ir.MakeClosure(fn_name, captures, arity) ->
+      ir.MakeClosure(fn_name, rs_values(captures, rename, subst), arity)
+    ir.CallClosure(callee, cargs) ->
+      ir.CallClosure(
+        rs_value(callee, rename, subst),
+        rs_values(cargs, rename, subst),
+      )
     ir.CallIndirect(table, index, ty, cargs) ->
       ir.CallIndirect(
         table,
@@ -721,8 +730,12 @@ fn module_node_count(funcs: List(ir.Function)) -> Int {
 /// leaf callee (always inlining-eligible).
 fn has_any_call(e: ir.Expr) -> Bool {
   case e {
-    ir.CallDirect(_, _) | ir.CallIndirect(_, _, _, _) | ir.CallHost(_, _, _) ->
-      True
+    // A `CallClosure` applies a fun value — a call, like the other three (Phase-8, K3).
+    // `MakeClosure` merely BUILDS a fun (no transfer of control), so it is NOT a call.
+    ir.CallDirect(_, _)
+    | ir.CallIndirect(_, _, _, _)
+    | ir.CallHost(_, _, _)
+    | ir.CallClosure(_, _) -> True
     ir.Let(_, rhs, body) -> has_any_call(rhs) || has_any_call(body)
     ir.Block(_, _, body) -> has_any_call(body)
     ir.Loop(_, _, _, body) -> has_any_call(body)

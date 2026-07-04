@@ -761,6 +761,56 @@ pub type Expr {
   /// `rt_exn.throw_ref(exnref)` (P7-06/07). Effectful (a non-local transfer — §effect).
   /// Porffor-INERT (Porffor never emits it — spec-conformance surface only, T9).
   ThrowRef(exnref: Value)
+  // ── Phase-8 native closures (K3/K8, unit 02) — THE HEADLINE. A closure over an
+  // enclosing-function local is just a BEAM `fun` here: the exact thing a WASM target (Porffor)
+  // cannot build (WASM has no closures, so it must hand-build heap environments — the wall). The
+  // backend already emits `CFun`/`apply`, and the BEAM owns the closure's environment, lifetime,
+  // and GC (no heap environments, no relooping, no linear memory). NEUTRAL (K1): the calling
+  // convention ("captures first, then the `arity` runtime args") is the frontend's — the IR fixes
+  // only that shape. No WASM module produces either node (K7 — additive; `lower` never emits one).
+  /// Build a native BEAM closure (`fun`) of runtime arity `arity` that closes over the
+  /// already-evaluated `captures` and tail-forwards to the same-module function `fn_name`.
+  ///
+  /// Lowers to a Core Erlang `fun (A_1, …, A_arity) -> apply 'fn_name'/(m+arity)(C_1, …, C_m,
+  /// A_1, …, A_arity)` (m = `list.length(captures)`): the captured values are textually PREPENDED
+  /// to the fresh runtime params, so the emitted `fun` closes over them by BEAM value capture —
+  /// nothing else to do. The direct call reuses the EXACT `apply 'f'/n(…)` shape `CallDirect`
+  /// emits (D6/D3a — a static local name, never a new call shape). Result type: `TTerm` (a fun IS
+  /// a term).
+  ///
+  /// - `fn_name`: a DEFINED same-module `Function` whose parameter count MUST equal
+  ///   `list.length(captures) + arity` (it receives the captures, then the runtime args). Joins
+  ///   the same `UnknownFunction` resolution set as `CallDirect`/`ExportFn`; an undefined name is
+  ///   `Error(UnknownFunction)` and an arity disagreement is `Error(ArityMismatch)` at `emit_core`
+  ///   — a TYPED backend error, never a panic.
+  /// - `captures`: the already-evaluated values the closure captures, in the order `fn_name`
+  ///   expects them as its LEADING parameters. May be `[]` (a plain `fun` forwarding all args —
+  ///   still valid, just no closed-over values). Immutable captures are the common case and the
+  ///   whole headline; a MUTATED JS `let` is captured as an opaque `TTerm` CELL HANDLE by the
+  ///   frontend (via `rt_js`), never as an IR-level mutable cell (K1 — out of scope here).
+  /// - `arity`: the closure's runtime arity — how many arguments a later `CallClosure` supplies.
+  ///   May be `0` (a nullary fun whose body is `apply 'fn_name'/m(captures…)`).
+  ///
+  /// **Pure** (K8): building a fun over evaluated values reads/writes no state and cannot trap, so
+  /// it is a non-barrier — CSE/DCE/hoist are sound (`ir/effect`).
+  MakeClosure(fn_name: String, captures: List(Value), arity: Int)
+  /// Apply the closure value `callee` (a fun `TTerm` — e.g. produced by `MakeClosure`) to `args`,
+  /// yielding the callee's single result value. Result type: `TTerm`.
+  ///
+  /// Lowers to a Core Erlang `apply <callee> (A_1, …, A_n)` — a native application of a
+  /// first-class fun value. NOT `apply(Mod, Fn, Args)` of a data-named `module:atom` (D3a), and
+  /// NOT the list-spreading `erlang:apply/2`: `callee` is a value already in hand.
+  ///
+  /// - `callee`: the fun value to apply (any `TTerm` that is a fun at runtime). Its arity must
+  ///   equal `list.length(args)`; a mismatch is a BEAM `badarity` error at RUN time — the IR
+  ///   carries no static fun-arity to check (K1: arity is the frontend's calling-convention
+  ///   concern). The callee is expected to return exactly one value (the frontend's uniform
+  ///   single-result convention).
+  /// - `args`: the runtime arguments, in order (`[]` for a nullary closure).
+  ///
+  /// **Effectful + barrier** (K8): applying a fun transfers control to arbitrary code — the same
+  /// class as `CallIndirect`/`CallHost`, so it is never reordered, CSE'd, or eliminated.
+  CallClosure(callee: Value, args: List(Value))
 }
 
 /// One catch handler of a `Try` region (J2/T1 — the INLINE-HANDLER shape). `on` selects which

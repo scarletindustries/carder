@@ -36,9 +36,9 @@ import gleam/string
 import gleam/string_tree.{type StringTree}
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
-  type FunDef, CApply, CAtom, CBinary, CCall, CCase, CCons, CFloat, CFun, CInt,
-  CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, PAtom, PCons, PInt,
-  PNil, PTuple, PVar,
+  type FunDef, CApply, CApplyExpr, CAtom, CBinary, CCall, CCase, CCons, CFloat,
+  CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, PAtom,
+  PCons, PInt, PNil, PTuple, PVar,
 }
 
 /// One indentation step. Whitespace is insignificant to the Core Erlang scanner,
@@ -171,6 +171,16 @@ fn print_expr(e: CExpr, ind: String) -> StringTree {
       string_tree.concat([
         st("apply "),
         print_fname(name),
+        st("("),
+        list.map(args, print_expr(_, ind)) |> string_tree.join(", "),
+        st(")"),
+      ])
+    // `apply Op(Args)` applied to a fun VALUE (Phase-8 `CallClosure`). `Op` is an arbitrary
+    // expression (a `CVar` bound to a `fun`, or an inline `fun`) rather than a static `'f'/N`.
+    CApplyExpr(op, args) ->
+      string_tree.concat([
+        st("apply "),
+        print_expr(op, ind),
         st("("),
         list.map(args, print_expr(_, ind)) |> string_tree.join(", "),
         st(")"),

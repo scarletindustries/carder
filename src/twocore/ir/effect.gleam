@@ -55,14 +55,14 @@
 
 import gleam/list
 import twocore/ir.{
-  type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallDirect,
-  CallHost, CallImport, CallIndirect, Charge, Continue, Convert, DataDrop,
-  ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let, Loop,
-  MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize, MemStore, Num, RefFunc,
-  RefIsNull, Return, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
-  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
-  TableSet, TableSize, TermOp, Throw, ThrowRef, Trap, TruncS, TruncU, Try,
-  Values,
+  type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallClosure,
+  CallDirect, CallHost, CallImport, CallIndirect, Charge, Continue, Convert,
+  DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
+  Loop, MakeClosure, MemCopy, MemFill, MemGrow, MemInit, MemLoad, MemSize,
+  MemStore, Num, RefFunc, RefIsNull, Return, Simd, SimdLoad, SimdLoadLane,
+  SimdShuffle, SimdStore, SimdStoreLane, Switch, TableCopy, TableFill, TableGet,
+  TableGrow, TableInit, TableSet, TableSize, TermOp, Throw, ThrowRef, Trap,
+  TruncS, TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -147,7 +147,12 @@ pub fn is_effectful_node(e: Expr) -> Bool {
       // an unclassified EH node can never be silently optimized. ──
       Throw(_, _)
     | Try(_, _, _)
-    | ThrowRef(_) -> True
+    | ThrowRef(_)
+    | // ── Phase-8 native closures (K8): `CallClosure` applies a fun VALUE — it transfers control
+      // to arbitrary code (the same class as `CallIndirect`/`CallHost`/`CallImport`), so it is a
+      // barrier: never reorder, CSE, or DCE it. (`MakeClosure` is NOT here — building a fun over
+      // evaluated values is inert; it classifies `Pure` in the non-barrier arm below.) ──
+      CallClosure(_, _) -> True
     Num(op, _) -> trapping_numop(op)
     Convert(op, _) -> trapping_convop(op)
     // ── Phase-6 PURE lane-wise SIMD (S7): `Simd`/`SimdShuffle` are TOTAL and DETERMINISTIC —
@@ -157,8 +162,14 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     // sub-`Expr`), so `children_all_pure` reaches its `_ -> True` catch-all vacuously. A
     // deliberate, argued improvement over Phase-5's conservatism (spec §4.4: vector instructions
     // are total value transforms), enabling SIMD const-fold/DCE later. ──
+    // ── Phase-8 native closures (K8): `MakeClosure` builds a `fun` over already-evaluated pure
+    // `Value` captures — no state read/write, no trap, no control transfer — so it is a
+    // non-barrier and classifies `Pure` like `TermOp` (CSE/DCE/hoist of a fun literal are sound).
+    // It carries only `Value` operands (no sub-`Expr`), so `children_all_pure` reaches its
+    // `_ -> True` catch-all vacuously. (`CallClosure` is the barrier — see the `True` arm above.) ──
     Values(_)
     | TermOp(_, _)
+    | MakeClosure(_, _, _)
     | Simd(_, _)
     | SimdShuffle(_, _, _)
     | Let(_, _, _)

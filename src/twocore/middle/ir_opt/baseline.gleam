@@ -883,6 +883,12 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
     ir.GlobalSet(name, value) -> ir.GlobalSet(name, subst_value(value, subs))
     ir.CallDirect(fn_name, cargs) ->
       ir.CallDirect(fn_name, subst_values(cargs, subs))
+    // ── Phase-8 native closures: substitute into their `Value` operands (captures / callee +
+    // args); the `fn_name` and `arity` are static. ──
+    ir.MakeClosure(fn_name, captures, arity) ->
+      ir.MakeClosure(fn_name, subst_values(captures, subs), arity)
+    ir.CallClosure(callee, cargs) ->
+      ir.CallClosure(subst_value(callee, subs), subst_values(cargs, subs))
     ir.CallIndirect(table, index, ty, cargs) ->
       ir.CallIndirect(
         table,
@@ -1053,6 +1059,11 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.GlobalGet(_) -> []
     ir.GlobalSet(_, value) -> value_name(value)
     ir.CallDirect(_, args) -> values_names(args)
+    // ── Phase-8 native closures: collect the `Var` names in their operands (captures / callee +
+    // args); the `fn_name` is a function name, not a `Var`. ──
+    ir.MakeClosure(_, captures, _) -> values_names(captures)
+    ir.CallClosure(callee, args) ->
+      list.append(value_name(callee), values_names(args))
     ir.CallIndirect(_, index, _, args) ->
       list.append(value_name(index), values_names(args))
     ir.CallHost(_, _, args) -> values_names(args)

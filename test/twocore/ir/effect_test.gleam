@@ -117,6 +117,33 @@ pub fn non_trapping_arithmetic_is_pure_test() {
   assert can_eliminate_if_unused(a_pure_add()) == True
 }
 
+/// SPEC (Phase-8 K8, 02-closures.md §Effect): `MakeClosure` is `Pure` — building a `fun` over
+/// already-evaluated `Value` captures reads/writes no state and cannot trap, so it is a
+/// non-barrier and is shareable/eliminable (CSE/DCE/hoist OK, a fun literal is inert).
+/// `CallClosure` is `Effectful` + a barrier — applying a fun VALUE transfers control to arbitrary
+/// code (the same class as `CallIndirect`/`CallHost`/`CallImport`), so it is never CSE'd,
+/// eliminated-if-unused, or reordered. A misclassification here (a false `Pure` on `CallClosure`)
+/// would let a pass delete or hoist a call — silently wrong, which this test forbids.
+pub fn closure_nodes_effect_classification_test() {
+  let make = ir.MakeClosure("f", [ir.Var("c")], 1)
+  let call = ir.CallClosure(ir.Var("g"), [ir.Var("x")])
+  // MakeClosure: pure, non-barrier, shareable, eliminable-if-unused.
+  assert is_effectful_node(make) == False
+  assert classify(make) == Pure
+  assert is_pure(make) == True
+  assert can_cse(make) == True
+  assert can_eliminate_if_unused(make) == True
+  // CallClosure: effectful barrier — never pure/shareable/eliminable.
+  assert is_effectful_node(call) == True
+  assert classify(call) == Effectful
+  assert is_pure(call) == False
+  assert can_cse(call) == False
+  assert can_eliminate_if_unused(call) == False
+  // A pure MakeClosure commutes with the barrier call; two barriers do not reorder.
+  assert can_reorder(make, call) == True
+  assert can_reorder(call, call) == False
+}
+
 // ─────────────────── §G.6 — purity is DEEP, not shallow ───────────────────
 
 /// A non-barrier SHELL (`Let`/`Block`/`If`/`Switch`) is `Pure` only when all its

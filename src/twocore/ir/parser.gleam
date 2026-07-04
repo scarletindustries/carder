@@ -43,10 +43,10 @@ import twocore/ir.{
   type ImportDecl, type IntWidth, type Local, type LoopParam, type MemAccess,
   type MemoryDecl, type Module, type NumOp, type SwitchArm, type TableDecl,
   type TermOp, type TrapReason, type ValType, type Value, Block, BoxFloat,
-  BoxInt, Break, CallDirect, CallHost, CallIndirect, Charge, ConstF32, ConstF64,
-  ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU, DataSegment,
-  ElementSegment, ExportFn, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
-  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
+  BoxInt, Break, CallClosure, CallDirect, CallHost, CallIndirect, Charge,
+  ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU,
+  DataSegment, ElementSegment, ExportFn, F32DemoteF64, F64PromoteF32, FAbs, FAdd,
+  FCeil, FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
   FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
   Function, GlobalDecl, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S,
   I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S,
@@ -54,12 +54,13 @@ import twocore/ir.{
   IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU,
   IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If, ImportFn,
   IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeCons, MakeTuple,
-  MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl, MemoryOutOfBounds,
-  Module, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32,
-  TF64, TI32, TI64, TTerm, TableDecl, TableOutOfBounds, TermOp, Trap, TruncS,
-  TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement,
-  UninitializedElement, Unreachable, Values, Var, W32, W64,
+  InvalidConversionToInteger, Let, Local, Loop, LoopParam, MakeClosure, MakeCons,
+  MakeTuple, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryDecl,
+  MemoryOutOfBounds, Module, Num, ReinterpretFToI, ReinterpretIToF, Return,
+  Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableDecl, TableOutOfBounds,
+  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat,
+  UnboxInt, UndefinedElement, UninitializedElement, Unreachable, Values, Var,
+  W32, W64,
 }
 
 // ───────────────────────────── error type (D4 — this stage's own) ────────────────
@@ -1389,6 +1390,21 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           use #(args, rest) <- result.try(parse_value_list(rest))
           Ok(#(CallDirect(fname, args), rest))
         }
+        // ── Phase-8 native closures (K3, unit 02) — the inverse of `printer.print_expr`'s
+        // `MakeClosure`/`CallClosure` arms. `make_closure @f (captures…) arity=<n>` reads the
+        // target name, the capture value list, then the mandatory `arity=` decorator;
+        // `call_closure <callee> (args…)` reads the fun value then the argument list. ──
+        "make_closure" -> {
+          use #(fname, rest) <- result.try(parse_at_name(rest))
+          use #(captures, rest) <- result.try(parse_value_list(rest))
+          use #(arity, rest) <- result.try(parse_arity(rest))
+          Ok(#(MakeClosure(fname, captures, arity), rest))
+        }
+        "call_closure" -> {
+          use #(callee, rest) <- result.try(parse_value(rest))
+          use #(args, rest) <- result.try(parse_value_list(rest))
+          Ok(#(CallClosure(callee, args), rest))
+        }
         "call_indirect" -> parse_call_indirect(rest)
         "call_host" -> parse_call_host(rest)
         "let" -> parse_let(rest)
@@ -1937,6 +1953,16 @@ fn parse_offset(
 /// immediately followed by `=`, so it cannot swallow a following statement. TOTAL.
 fn parse_lane(toks: List(PToken)) -> Result(#(Int, List(PToken)), ParseError) {
   use rest <- result.try(expect_word(toks, "lane"))
+  use rest <- result.try(expect(rest, TEquals, "="))
+  expect_number(rest)
+}
+
+/// Parses a MANDATORY ` arity=<int>` decorator — the runtime arity of a `MakeClosure`'s fun
+/// (Phase-8 unit 02). Mirrors `parse_lane`/`parse_seg`: `arity` is recognised only when
+/// immediately followed by `=`. Returns the arity, or a typed `ParseError` (never a panic) on a
+/// missing `arity`/`=`/number. TOTAL.
+fn parse_arity(toks: List(PToken)) -> Result(#(Int, List(PToken)), ParseError) {
+  use rest <- result.try(expect_word(toks, "arity"))
   use rest <- result.try(expect(rest, TEquals, "="))
   expect_number(rest)
 }

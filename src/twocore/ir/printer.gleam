@@ -36,22 +36,22 @@ import twocore/ir.{
   type ConvOp, type Expr, type FloatWidth, type FuncType, type Function,
   type IntWidth, type Local, type LoopParam, type MemAccess, type Module,
   type NumOp, type SwitchArm, type TermOp, type TrapReason, type ValType,
-  type Value, Block, BoxFloat, BoxInt, Break, CallDirect, CallHost, CallIndirect,
-  Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue, Convert, ConvertS,
-  ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq,
-  FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub,
-  FTrunc, FW32, FW64, FuelExhausted, FuncType, Function, GlobalGet, GlobalSet,
-  I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
-  I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz,
-  IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS,
-  IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
-  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Loop, LoopParam, MakeCons, MakeTuple,
-  MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryOutOfBounds, Num,
-  ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64, TI32,
-  TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS, TruncSatU,
-  TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement, UninitializedElement,
-  Unreachable, Values, Var, W32, W64,
+  type Value, Block, BoxFloat, BoxInt, Break, CallClosure, CallDirect, CallHost,
+  CallIndirect, Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue,
+  Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
+  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
+  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
+  Function, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64,
+  I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd,
+  IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU,
+  ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS,
+  IShrU, ISub, IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  InvalidConversionToInteger, Let, Loop, LoopParam, MakeClosure, MakeCons,
+  MakeTuple, MemAccess, MemGrow, MemLoad, MemSize, MemStore, MemoryOutOfBounds,
+  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
+  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS,
+  TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt, UndefinedElement,
+  UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 
 // ───────────────────────────── public entry point ─────────────────────────────
@@ -672,6 +672,20 @@ fn print_expr(indent: Int, e: Expr) -> String {
     GlobalSet(name, value) ->
       "global.set @" <> name <> " " <> print_value(value)
     CallDirect(fn_name, args) -> "call @" <> fn_name <> " " <> value_list(args)
+    // ── Phase-8 native closures (K3, unit 02). No Phase-1..7 module contains these, so any
+    // spelling is conformance-neutral by construction; this is the round-trip spelling
+    // (`parser.parse_expr` reads it back). `make_closure @f (captures…) arity=<n>` prints the
+    // target function name, the capture value list, then the mandatory runtime-arity decorator;
+    // `call_closure <callee> (args…)` prints the fun value then the argument list. ──
+    MakeClosure(fn_name, captures, arity) ->
+      "make_closure @"
+      <> fn_name
+      <> " "
+      <> value_list(captures)
+      <> " arity="
+      <> int.to_string(arity)
+    CallClosure(callee, args) ->
+      "call_closure " <> print_value(callee) <> " " <> value_list(args)
     CallIndirect(table, index, ty, args) ->
       "call_indirect @"
       <> table

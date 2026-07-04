@@ -411,6 +411,15 @@ fn expr_corpus() -> List(ir.Expr) {
     // globals
     ir.GlobalGet("g"),
     ir.GlobalSet("g", ir.ConstI32(5)),
+    // Phase-8 native closures (unit 02): both nodes round-trip textually. `make_closure`
+    // spells the target `@fn`, the capture value list, and the mandatory `arity=<n>` decorator
+    // (incl. the empty-captures and `arity=0` edges); `call_closure` spells the fun value + args.
+    ir.MakeClosure("f", [ir.Var("c")], 1),
+    ir.MakeClosure("add", [ir.ConstI32(10), ir.ConstI32(20)], 2),
+    ir.MakeClosure("k", [ir.Var("c")], 0),
+    ir.MakeClosure("g", [], 3),
+    ir.CallClosure(ir.Var("g"), [ir.Var("x")]),
+    ir.CallClosure(ir.Var("g"), []),
     // calls
     ir.CallDirect("foo", [ir.Var("a"), ir.Var("b")]),
     ir.CallIndirect(

@@ -218,7 +218,13 @@ fn lower_expr(
     | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`, no `CallHost`, no
       // `Loop`), so this CallHost-gate + Loop-meter pass leaves them unchanged.
       ir.Throw(_, _)
-    | ir.ThrowRef(_) -> Ok(expr)
+    | ir.ThrowRef(_)
+    | // Phase-8 native closures carry only `Value` operands (captures / callee + args) — no
+      // `CallHost`, no `Loop`, no sub-`Expr` — so this CallHost-gate + Loop-meter pass leaves them
+      // unchanged. `CallClosure` is a call but NOT a `CallHost` (no capability-policy gate: it
+      // applies a fun VALUE already in hand, K3). Neither arises from WASM (K7).
+      ir.MakeClosure(_, _, _)
+    | ir.CallClosure(_, _) -> Ok(expr)
 
     // THE capability boundary — gate it; the node is left unchanged for `emit_core` to route
     ir.CallHost(cap, name, args) ->

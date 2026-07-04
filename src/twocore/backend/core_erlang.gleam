@@ -138,6 +138,15 @@ pub type CExpr {
   /// names a function in scope (a module def or an enclosing `letrec` def);
   /// `args` length should equal `name.arity`.
   CApply(name: FName, args: List(CExpr))
+  /// Application of a fun VALUE (a first-class closure), printed `apply Op(Args)`
+  /// where `Op` is an arbitrary expression — typically a `CVar` bound to a `fun`,
+  /// or an inline `CFun`. DISTINCT from `CApply`, whose operand is a static `FName`
+  /// (`'f'/N`, a same-module / `letrec` name): this node applies a *runtime fun
+  /// value* (Phase-8 `CallClosure` — the native-closure headline). The BEAM checks
+  /// the value's arity against `list.length(args)` (a `badarity` error on mismatch).
+  /// It is NOT `erlang:apply(Mod, Fn, Args)` from data (D3a) — the operand is a
+  /// value already in hand, never a program-chosen `module:atom`.
+  CApplyExpr(op: CExpr, args: List(CExpr))
   /// An inter-module / BIF call, printed `call 'M':'F'(Args)`. `module` and
   /// `function` are `CExpr` for grammar fidelity (Core allows a computed
   /// module/fun), but per D3a the binding chokepoint ALWAYS supplies `CAtom`s
