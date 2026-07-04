@@ -74,6 +74,12 @@ WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a 
   coexistence is **B3 monomorphization** only — Safe.beam ≠ Unsafe.beam, threaded ≠ cell, nif ≠ paged,
   distinct atoms sharing identical `rt_*` names. B1 would let one `.beam` pick its runtime at instance
   time (the instance-as-unit-of-policy at runtime rather than build time).
+- **Self-contained output — `--link` (runtime *inclusion*).** ⏳ **Now Phase 11, in flight** — see
+  [`phase-11/00-overview.md`](phase-11/00-overview.md). An optional flag that merges the runtime
+  dependency closure into the generated module (whole-program Core-Erlang merge + DCE) → a single
+  `.beam` that runs on a bare Erlang/OTP node. Distinct from B1 (which is runtime *selection*).
+  Requires a clean runtime/compiler layer split first (the runtime currently imports `twocore/ir` and
+  `twocore/middle/ir_opt`). tier-P/O only.
 
 ---
 
