@@ -13,6 +13,8 @@ import gleam/list
 import twocore/ir.{type Module}
 import twocore/middle/ir_opt/aggressive
 import twocore/middle/ir_opt/baseline
+import twocore/middle/ir_opt/bce
+import twocore/middle/ir_opt/licm
 import twocore/middle/ir_opt/mem_dse
 import twocore/middle/ir_opt/mem_forward
 import twocore/middle/ir_opt/pass.{type Pass, run_pipeline}
@@ -89,11 +91,27 @@ fn pipeline(level: OptLevel) -> List(Pass) {
   }
 }
 
-/// The Phase-9 memory-optimizer passes, in order (M2/M4): store→load forwarding + redundant-load
-/// elimination (`mem_forward.forwarding_pass()`), then dead-store elimination
-/// (`mem_dse.dead_store_pass()`). Each is trap-preserving and trust-neutral, consumes the frozen
-/// `mem_ssa` alias analysis, and only *removes* a `MemStore` or *replaces* a `MemLoad` with an
-/// already-bound value — never adds a node or reorders an effect. Total.
+/// The memory-optimizer passes, in order. Phase-9 (M2/M4): store→load forwarding + redundant-load
+/// elimination (`mem_forward.forwarding_pass()` — now also cross-control-flow, Phase-10 N3), then
+/// dead-store elimination (`mem_dse.dead_store_pass()`). Phase-10 (N2/N4): loop-invariant code
+/// motion (`licm.licm_pass()`) then range-based bounds-check elimination via loop versioning
+/// (`bce.bce_pass()`).
+///
+/// **Ordering rationale.** The value passes (forwarding/RLE/DSE) run first so const/copy-prop has
+/// already unified bases and exposed redundancy; **LICM** next, so the invariant work it hoists to a
+/// preheader stages `base`/bound as loop-external lets that improve BCE's invariance test; **BCE
+/// last**, because it *clones* a loop (node-adding) — it is idempotent (a `$bce$` guard marks an
+/// already-versioned `If` its walk will not re-version), so the `run_pipeline` fixpoint converges
+/// even though `n_mem` rises at a versioning (N7). Each pass is trap-preserving and trust-neutral,
+/// so running them at `Baseline` means Safe + every tier + both modes inherit them. They never touch
+/// a `Charge` node (LICM hoists only PURE non-`Charge` work; BCE clones any per-iteration `Charge`
+/// faithfully into BOTH arms, of which exactly one runs), so the deterministic fuel bound is
+/// unchanged (F5). Total.
 fn memory_passes() -> List(Pass) {
-  [mem_forward.forwarding_pass(), mem_dse.dead_store_pass()]
+  [
+    mem_forward.forwarding_pass(),
+    mem_dse.dead_store_pass(),
+    licm.licm_pass(),
+    bce.bce_pass(),
+  ]
 }
