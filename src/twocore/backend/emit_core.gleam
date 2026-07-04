@@ -3112,17 +3112,53 @@ const js_capability: String = "js"
 /// `case` in THIS module (D3a): the only input is the static `op` string and the result is one
 /// of a CLOSED set of compile-time-fixed function atoms — the target is NEVER constructed from
 /// program/runtime data, so no `op` value can reach an arbitrary `Mod:Fn`. Each op returns
-/// exactly one value (K6): `add`/2, `type_of`/1, `undefined_sentinel`/0 (the current STUB
-/// surface). `Some(fn_name)` for a known op, `None` (fail-closed → `UnknownJsOp`) otherwise.
+/// exactly one value (K6). This is the v1 surface of the REAL `rt_js` (HANDOFF §4): arithmetic
+/// (`add`/`sub`/`mul` /2, `neg`/1, `div`/`mod` /2), comparisons (`lt`/`le`/`gt`/`ge`/
+/// `strict_eq`/`eq` /2 → i32 1|0), coercion (`truthy`/`to_string`/`type_of` /1,
+/// `undefined_sentinel`/0), cells (`cell_new`/`cell_get` /1, `cell_set`/2), objects
+/// (`new_object`/0, `get_prop`/`has_prop` /2, `set_prop`/3), `empty_list`/0, `console_log`/1,
+/// and `not_callable`/1. The op strings `"div"`/`"mod"` map to the function names
+/// `divide`/`modulo` because `div` is an Erlang reserved word (the op spelling the frontend
+/// emits is unchanged). `Some(fn_name)` for a known op, `None` (fail-closed → `UnknownJsOp`)
+/// otherwise.
 ///
 /// Extending the boundary with a new `rt_js` op is exactly: (1) add one literal arm here, (2)
 /// implement the function in `runtime/rt_js.gleam`, (3) admit it in `ir_lower` (the `"js"`
 /// capability is already admitted wholesale, so no `ir_lower` change is needed per-op).
 fn resolve_js(op: String) -> Option(String) {
   case op {
+    // arithmetic (sentinel-aware IEEE; see rt_js / twocore_rt_js_ffi)
     "add" -> Some("add")
+    "sub" -> Some("sub")
+    "mul" -> Some("mul")
+    "neg" -> Some("neg")
+    "div" -> Some("divide")
+    "mod" -> Some("modulo")
+    // comparisons → i32 1|0
+    "lt" -> Some("lt")
+    "le" -> Some("le")
+    "gt" -> Some("gt")
+    "ge" -> Some("ge")
+    "strict_eq" -> Some("strict_eq")
+    "eq" -> Some("eq")
+    // truthiness / coercion
+    "truthy" -> Some("truthy")
+    "to_string" -> Some("to_string")
     "type_of" -> Some("type_of")
     "undefined_sentinel" -> Some("undefined_sentinel")
+    // cells (mutable captures + object storage)
+    "cell_new" -> Some("cell_new")
+    "cell_get" -> Some("cell_get")
+    "cell_set" -> Some("cell_set")
+    // objects
+    "new_object" -> Some("new_object")
+    "get_prop" -> Some("get_prop")
+    "set_prop" -> Some("set_prop")
+    "has_prop" -> Some("has_prop")
+    // lists / console / misc
+    "empty_list" -> Some("empty_list")
+    "console_log" -> Some("console_log")
+    "not_callable" -> Some("not_callable")
     _ -> None
   }
 }
