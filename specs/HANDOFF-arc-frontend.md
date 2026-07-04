@@ -5,7 +5,7 @@
 > convention, every IR node you emit, the compiled-code↔`rt_js` ABI, and how to lower each JS
 > construct. You never touch `emit_core`/`build_beam` — you produce a `twocore/ir.Module` and hand it
 > to the existing pipeline (`decode`-free direct-IR entry → `ir_lower` → `emit_core` → `build_beam` →
-> BEAM). 2core team owns the IR + backend (`specs/phase-8/00..06`); **you own the emitter + `rt_js`**.
+> BEAM). 2core team owns the IR + backend (the Phase-8 value layer, now shipped — see `specs/01-status.md` §3); **you own the emitter + `rt_js`**.
 
 ---
 
