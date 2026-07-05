@@ -19,13 +19,15 @@ reference types + bulk memory + multiple memories + memory64 + SIMD + cross-modu
 exception handling), runs in two named modes (**Safe** sandbox / **Unsafe** near-native), across a
 **trust-tier ladder** (tier-P pure "runs-anywhere", tier-O OTP-native, tier-N NIF-skeleton), carries a
 **trust-neutral IR memory optimizer**, and **reaches the JS-on-the-BEAM goal**: real Porffor-compiled
-JavaScript runs on the BEAM byte-identically to `porf run`.
+JavaScript runs on the BEAM byte-identically to `porf run`. As of Phase 11 an optional **`--link`** flag
+emits a **single self-contained `.beam`** — the generated module with its whole runtime closure merged
+in — that loads and runs on a **bare Erlang/OTP node** (§5).
 
 **Live metrics (authoritative, from `gleam test` on `main`):**
 
 | | |
 |---|---|
-| Gleam tests | **1827 pass / 0 fail** |
+| Gleam tests | **1922 pass / 0 fail** |
 | Build | `gleam build` **zero warnings**, `gleam format --check` clean |
 | WASM spec conformance | **46,529 pass / 1,768 skip / 0 fail** — identical under Safe **and** Unsafe, and `fail=0` under every shipped `(state_strategy × mem_tier)` combo |
 | JS-on-BEAM (Porffor 0.61.13 → 2core → BEAM) | **52 pass / 0 fail / 3 skip** over a 55-program corpus (all 3 skips are Porffor's own `-0`/closure bugs, reproduced byte-for-byte — they bound Porffor, not 2core) |
@@ -54,8 +56,8 @@ place that knows which concrete runtime a build links (decision D3b).
 
 ## 3. What each phase delivered (condensed history)
 
-All ten phases are **done and proven** on `main`. This is the compacted ledger; the per-phase decision
-codes (`D/E/F/G/H/I/J/M/N` and the `R/S/T` reconciliations) now live in the code and tests, with the
+All eleven phases are **done and proven** on `main`. This is the compacted ledger; the per-phase decision
+codes (`D/E/F/G/H/I/J/M/N/O` and the `R/S/T` reconciliations) now live in the code and tests, with the
 *permanent* ones lifted into [`03-phase-workflow.md`](03-phase-workflow.md) §4.
 
 | Phase | Delivered | Proven at close |
@@ -70,6 +72,7 @@ codes (`D/E/F/G/H/I/J/M/N` and the `R/S/T` reconciliations) now live in the code
 | **8 — Native JS IR (arc frontend track)** | The **second road to JS-on-BEAM**: a BEAM-native value layer in the IR (term construction, native closures `MakeClosure`/`CallClosure`, maps/objects, the term↔numeric boxing bridge, the `rt_js` fail-closed boundary, guarded native arithmetic) so a from-scratch JS frontend (reusing arc's parser + scope analysis) can emit 2core IR directly — making closures/GC/maps/bignums *native* and bypassing Porffor's closure wall. IR value-layer units shipped; the frontend + real `rt_js` are a **separate team's** deliverable per [`HANDOFF-arc-frontend.md`](HANDOFF-arc-frontend.md). *(Not tracked in the old `state.md`; kept in project memory.)* | ~1734 tests; WASM byte-identical |
 | **9 — The memory optimizer** | The middle-end memory-dataflow passes (deferred all the way from Phase 3): **MemorySSA + linear-memory alias analysis** (`mem_ssa`), **store→load forwarding + redundant-load elimination** (`mem_forward`), **dead-store elimination** (`mem_dse`). Trap-preserving ⇒ trust-neutral ⇒ run at Baseline ⇒ every tier & both modes win. No new IR nodes, no runtime touch. | 1783 tests; ~3–4× faster on paged |
 | **10 — The memory optimizer, completed** | The three Phase-9 deferrals: **LICM** (hoist pure loop-invariant work to a preheader), **cross-control-flow MemorySSA** (forwarding/RLE/DSE survive `If`/`Block`/`Switch` via a may-clobber gate), and **range-based bounds-check elimination via loop versioning** (an unchecked fast loop guarded by a runtime range-proof, else the checked slow loop — values *and* traps preserved). First memory opt since Phase 4 to grow the runtime ABI (unchecked access, paged+atomics; nif stays checked). | **1827 tests**; LICM ~3.5×, BCE ~1.1× on paged |
+| **11 — Self-contained output (`--link`)** | A **whole-program Core-Erlang linker** behind an optional `--link` flag on `to-beam-wasm` (`beam_link.link_program` over the `cerl` FFI `twocore_linker_ffi.erl`, pinned OTP 29): acquire every `twocore@`/`gleam@`/FFI closure member's Core (`beam_lib` `debug_info(core_v1)`), reachability-DCE from the exports **+ `instantiate/N`** across calls/applies/**`fun M:F/A` captures**, mangle to local `'M__F'/A`, rewrite all in-closure remotes/captures to local, deterministic `from_core` → **one self-contained `.beam` that runs on a bare OTP node**. Prereq: a clean runtime/compiler **layer split** (`OptLevel`→leaf, runtime reaches zero compiler modules). tier-P/O only (tier-N/import-bearing/`on_load` are fail-closed link-time rejections); **D3a preserved** (no data-driven `apply`, no off-allowlist remote — structural `cerl` check refuses to emit); default output **byte-identical**. §5. | **1922 tests**; linked ≡ non-linked (bit/trap-identical) over corpus × mode × state × tier P/O, in-process **and** on an actually-booted bare `erl`; deterministic (link-twice byte-identical) |
 
 ---
 
@@ -123,11 +126,40 @@ deliberate (decisions D3a/D3d/D10) and load-bearing.
 **Why it's this way:** it is what makes *"generated code is pure Core Erlang"* true while the runtime
 underneath swaps per-tier native implementations — the emitted module is tier-agnostic and just calls
 the shared `rt_*` names. It is also what makes **B3 monomorphization** cheap (Safe.beam ≠ Unsafe.beam ≠
-threaded.beam are all tiny modules sharing one loaded runtime). A genuinely standalone artifact is
-therefore an **OTP release** of the `twocore` app + deps, *not* a runtime inlined into each module
-(which would defeat the shared-runtime and hot-reload properties). The deferred **single-`.beam`
-runtime-dispatch binding (B1)** ([`02-roadmap.md`](02-roadmap.md) §D) would let one module pick its
-runtime at instance time, but it still would not inline the runtime.
+threaded.beam are all tiny modules sharing one loaded runtime). The default shared-runtime artifact is
+loaded in-process (D10), which works because that VM *is* the running `twocore` app.
+
+**`--link` — the shipped, proven self-contained path (Phase 11).** For a genuinely standalone artifact
+there is now an optional `--link` flag on `to-beam-wasm` that **merges the runtime dependency closure
+into the generated module**, producing a **single `.beam` that loads and runs on a bare Erlang/OTP node**
+with no `twocore@*`/`gleam@*` beams reachable. `--link` runs the same compile pipeline, then a
+whole-program **Core Erlang merge** (`beam_link.link_program` over the `cerl` FFI `twocore_linker_ffi.erl`,
+pinned OTP 29): acquire every closure member's Core (`beam_lib` `debug_info(core_v1)` from the resident
+`.beam`s), compute reachability from the exports **+ `instantiate/N`** across calls, intra-module applies
+and `fun M:F/A` captures, DCE the rest, mangle every discovered def to a local `'M__F'/A`, rewrite all
+in-closure remotes/captures to local names, and deterministically `compile:forms([from_core,binary,
+deterministic])`. The only remaining remote calls are to the **fixed 15-module OTP-ambient allowlist**
+(`erlang, lists, maps, binary, math, ets, atomics, unicode, string, io, io_lib, io_lib_format, base64,
+rand, uri_string`).
+
+- **Default output is unchanged and byte-identical** — `--link` absent ⇒ today's thin module (proven).
+- **Scope is tier-P/O, fail-closed.** tier-N (`nif`), import-bearing modules, and any `-on_load`/
+  behaviour in the closure are **link-time rejections** (typed `LinkError`, non-zero exit) — a missing
+  dependency surfaces at link time, never as a runtime `undef` on the target node.
+- **D3a preserved.** No data-driven `apply`, no `erlang:apply`, no remote call off the ambient allowlist
+  survives the merge — enforced by a built-in structural `cerl` check that refuses to emit, **and**
+  independently asserted over the whole corpus by the capstone.
+- **Behaviour-identical.** The linked artifact is a pure packaging transform: bit-pattern- and
+  trap-identical to the in-process path across every pure-BEAM `(mode × state_strategy × mem_tier)`,
+  proven in-process (L1) and by **actually booting** the merged `.beam` on a scrubbed isolated `erl`
+  (L2). See [`../docs/phase-11-linking.md`](../docs/phase-11-linking.md) and the three-way `link`
+  disambiguation (`profiles.link/1` = instantiation, `runtime/link.gleam` = import weaving,
+  `beam_link.link_program` = whole-program merge).
+
+The deferred **single-`.beam` runtime-dispatch binding (B1)** ([`02-roadmap.md`](02-roadmap.md) §D) is
+distinct — it would let one module pick its runtime *at instance time* (runtime *selection*), whereas
+`--link` bakes the chosen runtime *in* (runtime *inclusion*). An **OTP release** of the `twocore` app +
+deps remains the alternative for the shared-runtime, hot-reloadable deployment.
 
 ---
 
