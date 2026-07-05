@@ -19,7 +19,6 @@ import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
-import gleam/option
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
@@ -331,7 +330,7 @@ pub fn object_roundtrip_test() {
 pub fn object_numeric_key_normalisation_test() {
   // o[5], o[5.0] and o["5"] are the same property (§6.1.7 keys are strings).
   let o = js.new_object()
-  let assert _ = js.set_prop(o, d(5), d("x"))
+  let _ = js.set_prop(o, d(5), d("x"))
   assert js.get_prop(o, d(5.0)) == d("x")
   assert js.get_prop(o, d("5")) == d("x")
   assert js.has_prop(o, d(5)) == 1
