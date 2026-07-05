@@ -780,7 +780,15 @@ fn nth(xs: List(a), index: Int) -> Result(a, Nil) {
 /// record); a `CallIndirect` TARGET is reached via the table (not a `CallDirect` edge), so a
 /// pure table target stays pure and only the closure adapter absorbs the ABI (§C). Under
 /// `Cell` the result is unused.
-fn state_reaching_closure(functions: List(Function)) -> Set(String) {
+///
+/// **PUBLIC — the Phase-12 keystone cross-file reach (P12-01, «IFACE-DESC-FROZEN»).**
+/// `backend/iface.describe/2` reuses THIS exact function to derive each export's
+/// `touches_state`, so the typed host binding's arity/threading always agrees with the emitted
+/// `.beam` ABI. It MUST stay the single source of truth for state-reachingness — the shallow
+/// `expr_touches_state` (below) is NOT the descriptor's input (a pure-*bodied* export that
+/// `CallDirect`s a memory helper is emitted at `n+1` and threads `St`, which only the transitive
+/// closure captures). Promoting it changes no emitted output (same callers, same result).
+pub fn state_reaching_closure(functions: List(Function)) -> Set(String) {
   let seeds =
     list.filter_map(functions, fn(f) {
       case expr_touches_state(f.body) {
