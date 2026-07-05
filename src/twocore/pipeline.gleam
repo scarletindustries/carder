@@ -470,9 +470,47 @@ pub fn optimize_ir(m: ir.Module, binding: Binding) -> ir.Module {
   ir_opt.optimize(m, binding.opt_level)
 }
 
+/// IR → `#(lowered_optimized_module, core_text)`: run `lower_ir` (Safe policy pass / metering)
+/// then `optimize_ir` (level from `binding.opt_level`) ONCE, then `emit_core` + `core_printer`,
+/// returning BOTH the exact `ir.Module` `emit_core` consumed AND its printed `.core` text.
+///
+/// This is the **lower-ONCE seam** (Phase-12 · R17) for any consumer that must run a second
+/// analysis over the module the `.beam` is generated from — chiefly the bindings driver, which
+/// hands the returned module to `iface.describe` while the returned `core_text` becomes the `.beam`
+/// (`core_to_beam`). Because both see the IDENTICAL lowered+optimized function bodies, a derived
+/// property (`touches_state`, emitted arity) can never diverge from the `.beam` ABI — the failure
+/// mode R17 guards against (a mutation-carrying export misclassified pure, silently dropping `St'`).
+/// `ir_to_core/2` is exactly this seam with the module discarded.
+///
+/// - `m`: the IR module to compile (e.g. from `source_to_ir` or `ir/parser`).
+/// - `binding`: the build-time runtime binding (chokepoint module names + policy mode + the
+///   optimizer level).
+/// - Return: `Ok(#(lowered_optimized_module, core_text))`, or `Error(IrLowerFailed/EmitFailed)`.
+///   The module's `.name` (the compiled atom, `twocore@wasm@<base>`) is preserved by `lower_ir`/
+///   `optimize_ir` — it is the atom the `.beam` loads under and the binding dispatches into. Total.
+pub fn ir_to_lowered_core(
+  m: ir.Module,
+  binding: Binding,
+) -> Result(#(ir.Module, String), PipelineError) {
+  case lower_ir(m, binding) {
+    Error(e) -> Error(e)
+    Ok(lowered) -> {
+      let optimized = optimize_ir(lowered, binding)
+      case emit_core.emit_module(optimized, binding) {
+        Error(e) -> Error(EmitFailed(e))
+        Ok(cmod) -> Ok(#(optimized, core_printer.print_module(cmod)))
+      }
+    }
+  }
+}
+
 /// IR → `.core` text: `ir_lower` (Safe policy pass / metering) → `ir_opt` (level from
 /// `binding.opt_level`, F1) → `emit_core`, printed by `core_printer`. The canonical
 /// "IR → backend" path the CLI's `to-core`/`run` use, now with the optimizer in-chain.
+///
+/// Delegates to `ir_to_lowered_core/2` (the same three stages) and discards the module, so the
+/// `.core` text is byte-identical to the standalone chain — proven by the CLI default-off
+/// byte-identity test.
 ///
 /// - `m`: the IR module to compile.
 /// - `binding`: the build-time runtime binding (chokepoint module names + policy mode + the
@@ -482,16 +520,8 @@ pub fn ir_to_core(
   m: ir.Module,
   binding: Binding,
 ) -> Result(String, PipelineError) {
-  case lower_ir(m, binding) {
-    Error(e) -> Error(e)
-    Ok(lowered) -> {
-      let optimized = optimize_ir(lowered, binding)
-      case emit_core.emit_module(optimized, binding) {
-        Error(e) -> Error(EmitFailed(e))
-        Ok(cmod) -> Ok(core_printer.print_module(cmod))
-      }
-    }
-  }
+  ir_to_lowered_core(m, binding)
+  |> result.map(fn(pair) { pair.1 })
 }
 
 /// Compile `.core` text to an in-memory `.beam` binary (unit 04), WITHOUT loading it.

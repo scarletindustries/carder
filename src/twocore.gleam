@@ -55,6 +55,7 @@ import gleam/result
 import gleam/string
 import simplifile
 import twocore/backend/beam_link
+import twocore/backend/bindings
 import twocore/backend/build_beam
 import twocore/backend/core_printer
 import twocore/backend/emit_core
@@ -101,16 +102,18 @@ pub fn run(args: List(String)) -> Result(String, String) {
     ["opt", "--unsafe", path] -> cmd_opt(path, profiles.unsafe())
     ["opt", path] -> cmd_opt(path, profiles.safe())
     ["emit", ..rest] ->
-      with_binding(rest, fn(binding, link, pos) {
-        use <- reject_link(link, "emit")
+      with_binding(rest, fn(binding, axes, pos) {
+        use <- reject_link(axes.link, "emit")
+        use <- reject_output_flags(axes, "emit")
         case pos {
           [path] -> cmd_emit(path, binding)
           _ -> Error(usage())
         }
       })
     ["to-core", ..rest] ->
-      with_binding(rest, fn(binding, link, pos) {
-        use <- reject_link(link, "to-core")
+      with_binding(rest, fn(binding, axes, pos) {
+        use <- reject_link(axes.link, "to-core")
+        use <- reject_output_flags(axes, "to-core")
         case pos {
           [path] -> cmd_to_core(path, binding)
           _ -> Error(usage())
@@ -133,15 +136,13 @@ pub fn run(args: List(String)) -> Result(String, String) {
           }
       }
     ["to-beam-wasm", ..rest] ->
-      with_binding(rest, fn(binding, link, pos) {
-        case pos {
-          [input, output] -> cmd_to_beam_wasm(input, output, binding, link)
-          _ -> Error(usage())
-        }
+      with_binding(rest, fn(binding, axes, pos) {
+        cmd_to_beam_wasm(binding, axes.link, axes.bindings, axes.out, pos)
       })
     ["run", ..rest] ->
-      with_binding(rest, fn(binding, link, pos) {
-        use <- reject_link(link, "run")
+      with_binding(rest, fn(binding, axes, pos) {
+        use <- reject_link(axes.link, "run")
+        use <- reject_output_flags(axes, "run")
         case pos {
           [path, export, ..arg_strs] -> cmd_run(path, export, arg_strs, binding)
           _ -> Error(usage())
@@ -175,6 +176,11 @@ type BaseSel {
 ///   posture/tier axes and defaults to `False` — absent, output is byte-identical to today. It is
 ///   consumed ONLY by `to-beam-wasm` (R13); every other compile verb rejects `link == True`
 ///   fail-closed so the flag can never silently no-op.
+/// - `bindings`: the `--bindings <langs>` selection (Phase 12 · P12-05), a canonical deduped list
+///   (default `[]` = none). Consumed ONLY by `to-beam-wasm`; the binding-flag-irrelevant verbs
+///   reject a non-empty selection via `reject_output_flags`.
+/// - `out`: the `--out <dir>` folder (Phase 12 · P12-05), `None` when absent. Absent both flags ⇒
+///   `to-beam-wasm` behaves byte-identically to today; consumed ONLY by `to-beam-wasm`.
 type Axes {
   Axes(
     base: BaseSel,
@@ -183,6 +189,8 @@ type Axes {
     table: Option(TableTier),
     cap: Option(Int),
     link: Bool,
+    bindings: List(bindings.BindingLang),
+    out: Option(String),
   )
 }
 
@@ -190,11 +198,13 @@ type Axes {
 /// (order-independent among the flags; the positionals keep their given order). Total.
 ///
 /// Recognised flags: `--portable`/`--ceiling`/`--unsafe` (mutually-exclusive base — at most
-/// one), `--threaded`, `--link`, `--tier <t>`, `--table-tier <t>`, `--cap <pages>`. A `--tier`/
-/// `--table-tier`/`--cap` with no following value, an unknown `--flag`, an unrecognised tier
-/// token, a non-integer cap, or a second base flag all yield `Error(msg)` (fail-closed — the
-/// caller exits non-zero). Any non-`--` token is a positional. `--link` (P11-04) only sets the
-/// `Axes.link` bit here; whether it is HONORED or REJECTED is decided per-verb by the caller.
+/// one), `--threaded`, `--link`, `--tier <t>`, `--table-tier <t>`, `--cap <pages>`,
+/// `--bindings <langs>` (P12-05), `--out <dir>` (P12-05). A `--tier`/`--table-tier`/`--cap`/
+/// `--bindings`/`--out` with no following value, an unknown `--flag`, an unrecognised tier or
+/// language token, a non-integer cap, a second base/`--bindings`/`--out` flag all yield
+/// `Error(msg)` (fail-closed — the caller exits non-zero). Any non-`--` token is a positional.
+/// `--link`/`--bindings`/`--out` only set their `Axes` fields here; whether each is HONORED or
+/// REJECTED is decided per-verb by the caller (`--bindings`/`--out` are `to-beam-wasm`-only).
 ///
 /// - `tokens`: the verb's arguments after the verb (e.g. `["--tier", "atomics", "f.wasm"]`).
 /// - Returns `Ok(#(axes, positionals))` or `Error(msg)`.
@@ -203,7 +213,7 @@ fn split_axis_flags(
 ) -> Result(#(Axes, List(String)), String) {
   do_split_axis_flags(
     tokens,
-    Axes(BaseSafe, False, None, None, None, False),
+    Axes(BaseSafe, False, None, None, None, False, [], None),
     [],
   )
 }
@@ -239,6 +249,22 @@ fn do_split_axis_flags(
       do_split_axis_flags(rest, Axes(..acc, threaded: True), positionals)
     ["--link", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, link: True), positionals)
+    ["--bindings", v, ..rest] ->
+      // A second `--bindings` is rejected (fail-closed). A value-LESS `--bindings` (no following
+      // token) does not match this arm and falls through to the `"--"` catch-all below.
+      case acc.bindings {
+        [] ->
+          result.try(bindings.parse_langs(v), fn(langs) {
+            do_split_axis_flags(rest, Axes(..acc, bindings: langs), positionals)
+          })
+        _ -> Error("--bindings given more than once")
+      }
+    ["--out", v, ..rest] ->
+      case acc.out {
+        None ->
+          do_split_axis_flags(rest, Axes(..acc, out: Some(v)), positionals)
+        Some(_) -> Error("--out given more than once")
+      }
     ["--tier", v, ..rest] ->
       result.try(parse_mem_tier(v), fn(t) {
         do_split_axis_flags(rest, Axes(..acc, mem: Some(t)), positionals)
@@ -385,17 +411,17 @@ fn describe_link_error(e: profiles.LinkError) -> String {
 /// flag-parse or link error short-circuits to `Error(msg)` (exit non-zero); `k` receives only a
 /// coherent binding.
 ///
-/// The `--link` scoping (R13) is NOT enforced here: this passes `axes.link` through unchanged so
-/// each verb decides — `to-beam-wasm` honors it, every other verb calls `reject_link` to refuse
-/// it fail-closed. Enforcing scope centrally would need the verb name, which the continuation
-/// already knows.
+/// The flag scoping (R13 · P12-05) is NOT enforced here: this passes the whole `axes` through so
+/// each verb decides — `to-beam-wasm` honors `--link`/`--bindings`/`--out`, every other verb calls
+/// `reject_link` + `reject_output_flags` to refuse them fail-closed. Enforcing scope centrally would
+/// need the verb name, which the continuation already knows.
 ///
 /// - `tokens`: the verb's arguments after the verb.
-/// - `k`: the subcommand body, given the validated `binding`, the `--link` bit, and the
-///   positional operands.
+/// - `k`: the subcommand body, given the validated `binding`, the parsed `axes` (for the per-verb
+///   `--link`/`--bindings`/`--out` scoping), and the positional operands.
 fn with_binding(
   tokens: List(String),
-  k: fn(Binding, Bool, List(String)) -> Result(String, String),
+  k: fn(Binding, Axes, List(String)) -> Result(String, String),
 ) -> Result(String, String) {
   use #(axes, positionals) <- result.try(split_axis_flags(tokens))
   use binding <- result.try(resolve_binding(
@@ -405,7 +431,7 @@ fn with_binding(
     axes.table,
     axes.cap,
   ))
-  k(binding, axes.link, positionals)
+  k(binding, axes, positionals)
 }
 
 /// Refuse `--link` on a verb that does not support it (R13 — `--link` is scoped to
@@ -425,6 +451,30 @@ fn reject_link(
     True ->
       Error("--link is only valid on to-beam-wasm, not " <> verb <> " (R13/O6)")
     False -> k()
+  }
+}
+
+/// Refuse `--bindings`/`--out` on a verb that does not support them (P12-05 — the folder-output
+/// flags are scoped to `to-beam-wasm`), fail-closed so neither can silently no-op. `use`-shaped: it
+/// runs `k` only when BOTH are unset (empty binding list + no `--out`), else short-circuits to a
+/// typed `Error` naming `verb`.
+///
+/// - `axes`: the parsed axis flags for this invocation (its `bindings`/`out` fields are read).
+/// - `verb`: the verb name for the diagnostic (e.g. `"emit"`).
+/// - `k`: the rest of the subcommand body, run only when neither output flag was given.
+fn reject_output_flags(
+  axes: Axes,
+  verb: String,
+  k: fn() -> Result(String, String),
+) -> Result(String, String) {
+  case axes.bindings, axes.out {
+    [], None -> k()
+    _, _ ->
+      Error(
+        "--bindings/--out are only valid on to-beam-wasm, not "
+        <> verb
+        <> " (P12-05)",
+      )
   }
 }
 
@@ -626,22 +676,60 @@ fn describe_beam_link_error(e: beam_link.LinkError) -> String {
   }
 }
 
-/// `to-beam-wasm [axes] [--link] <in.wasm> <out.beam>` — compile a `.wasm` all the way to a
-/// `.beam` under the selected profile (Safe = Baseline optimizer + enforcing fuel; `--unsafe` =
-/// Aggressive optimizer + `MeterOff` + open runtime), and write it. This is the profile-selecting
-/// compile-to-`.beam`-from-`.wasm` path the Phase-3 benchmark (`smoke/bench.sh`) needs: `run`
-/// re-compiles every call and `to-beam` takes only `.core`, so neither can produce a persisted,
-/// profile-specific `.beam` to hand to `exec`. Prints a confirmation line.
+/// `to-beam-wasm [axes] [--link] [--bindings <langs> --out <dir>] <in.wasm> [<out.beam>]` — compile
+/// a `.wasm` to a `.beam` under the selected profile (Safe = Baseline optimizer + enforcing fuel;
+/// `--unsafe` = Aggressive optimizer + `MeterOff` + open runtime), and optionally emit typed
+/// companion host-language bindings (Phase 12 · P12-05). Prints a confirmation line.
 ///
-/// - `link == False` (the default): today's path EXACTLY — `source_to_ir → ir_to_core →
-///   core_to_beam → write`. Byte-identical to before P11-04 (proven by
-///   `cli_link_flag_test.default_off_byte_identical_test`).
-/// - `link == True` (P11-04): after `source_to_ir`, run the fail-closed `link_gate` (tier-N /
-///   import-bearing rejection), emit the generated `.core`, then merge it with its whole runtime
-///   closure into ONE self-contained `.beam` via `build_beam.link_beam` and write that. A gate or
-///   link failure is surfaced as a stderr diagnostic (exit non-zero); no partial artifact is
-///   written.
+/// Branches on `#(out, positionals)` — the two positional forms are mutually exclusive:
+/// - **LEGACY** (`out == None`, two positionals `<in> <out.beam>`): today's path EXACTLY
+///   (`legacy_to_beam_wasm`) — byte-identical to before P12-05 (no directory, `describe` never
+///   reached). `--bindings` here is an error (it needs the `--out` folder). Wrong positional arity
+///   is the usage error.
+/// - **FOLDER** (`out == Some(dir)`, one positional `<in>`): compile+emit into `dir` — lower ONCE
+///   (R17), write `<dir>/<module.name>.beam` + one companion file per requested language. Two-or-more
+///   positionals is an error (the `.beam` name derives from the module atom, not a positional).
+///
+/// `--bindings` requires `--threaded` (the default `Cell` binding has no typed-binding surface this
+/// phase — `describe` rejects it with the R12 "re-run with `--threaded`" hint). Composes with
+/// `--link` on both paths.
+///
+/// - `binding`: the resolved build binding.
+/// - `link`: the `--link` bit (P11-04) — merge the runtime closure into one self-contained `.beam`.
+/// - `langs`: the `--bindings` selection (canonical/deduped; `[]` = none).
+/// - `out`: the `--out <dir>` folder (`None` = legacy two-positional mode).
+/// - `positionals`: the verb's positional operands.
 fn cmd_to_beam_wasm(
+  binding: Binding,
+  link: Bool,
+  langs: List(bindings.BindingLang),
+  out: Option(String),
+  positionals: List(String),
+) -> Result(String, String) {
+  case out, positionals {
+    // LEGACY — the exact two-positional path (byte-identical); `--bindings` needs `--out`.
+    None, [input, output] ->
+      case langs {
+        [] -> legacy_to_beam_wasm(input, output, binding, link)
+        _ ->
+          Error(
+            "--bindings requires --out <dir> (the companion binding files are written into a folder alongside the .beam)",
+          )
+      }
+    None, _ -> Error(usage())
+    // FOLDER — one positional; the .beam name derives from the module atom.
+    Some(dir), [input] -> folder_to_beam_wasm(input, dir, binding, link, langs)
+    Some(_), _ ->
+      Error(
+        "with --out, pass only <in.wasm>; the .beam name derives from the module atom (twocore@wasm@<base>.beam)",
+      )
+  }
+}
+
+/// The LEGACY `to-beam-wasm` body (P11-04, unchanged) — `source_to_ir → ir_to_core → core_to_beam →
+/// write` (or the `--link` merge). Extracted verbatim so the two-positional path stays
+/// byte-identical (proven by `cli_link_flag_test.default_off_byte_identical_test`).
+fn legacy_to_beam_wasm(
   input: String,
   output: String,
   binding: Binding,
@@ -675,6 +763,71 @@ fn cmd_to_beam_wasm(
                     Ok(#(_atom, beam)) -> write_beam(output, beam)
                   }
               }
+          }
+      }
+  }
+}
+
+/// The FOLDER `to-beam-wasm` path (P12-05): compile `<input>` into `<dir>`, emitting the `.beam` +
+/// one typed companion binding per requested language. The R17 lower-ONCE seam is the crux —
+/// `pipeline.ir_to_lowered_core` lowers+optimizes ONCE and returns BOTH the module and its `.core`;
+/// the SAME lowered module is handed to `bindings.emit_bindings` (which runs `iface.describe` over
+/// it) while its `.core` becomes the `.beam`. So `describe` and the `.beam` ABI see identical bodies
+/// — a mutation-carrying export cannot be misclassified pure (dropping `St'`). Fail-closed: a
+/// rejected module (Cell / import-bearing / mutable-tier) writes NOTHING (describe runs before any
+/// IO); a link-gate/link failure surfaces before emit.
+///
+/// - `input`: the `.wasm` source path.
+/// - `dir`: the `--out` output folder (created if absent).
+/// - `binding`: the resolved build binding (must be Threaded + Paged/TablePaged for `--bindings`).
+/// - `link`: the `--link` bit — merge the runtime closure into the emitted `.beam`.
+/// - `langs`: the requested target languages (`[]` = write only the `.beam`, no describe/emit).
+fn folder_to_beam_wasm(
+  input: String,
+  dir: String,
+  binding: Binding,
+  link: Bool,
+  langs: List(bindings.BindingLang),
+) -> Result(String, String) {
+  use bytes <- result.try(read_bits(input))
+  use m <- result.try(
+    pipeline.source_to_ir(bytes) |> result.map_error(pipeline.describe),
+  )
+  // R17: lower + optimize ONCE; the returned `lowered` module is exactly what the `.core` (hence the
+  // `.beam`) is generated from, and it is what `emit_bindings` runs `describe` over.
+  use #(lowered, core) <- result.try(
+    pipeline.ir_to_lowered_core(m, binding)
+    |> result.map_error(pipeline.describe),
+  )
+  use beam <- result.try(beam_of_lowered(core, lowered, binding, link))
+  case bindings.emit_bindings(lowered, binding, beam, dir, langs) {
+    Error(be) -> Error(bindings.describe_error(be))
+    Ok(paths) -> Ok("wrote " <> string.join(paths, ", "))
+  }
+}
+
+/// Compile lowered `.core` text into the `.beam` bytes for the FOLDER path, honoring `--link`. With
+/// `link == False` it is a plain `core_to_beam`; with `link == True` it runs the fail-closed
+/// `link_gate` (tier-N / import-bearing) then merges the runtime closure via `build_beam.link_beam`.
+/// Returns the bytes or the rendered CLI diagnostic. `mod`'s `.name`/`.imports` drive the gate + the
+/// baked module atom (it is the SAME lowered module `describe` sees).
+fn beam_of_lowered(
+  core: String,
+  mod: ir.Module,
+  binding: Binding,
+  link: Bool,
+) -> Result(BitArray, String) {
+  case link {
+    False ->
+      pipeline.core_to_beam(core, mod.name)
+      |> result.map_error(pipeline.describe)
+    True ->
+      case link_gate(binding, mod) {
+        Error(ge) -> Error(describe_link_gate_error(ge))
+        Ok(Nil) ->
+          case build_beam.link_beam(bit_array.from_string(core), mod.name) {
+            Error(le) -> Error(describe_beam_link_error(le))
+            Ok(#(_atom, beam)) -> Ok(beam)
           }
       }
   }
@@ -817,6 +970,7 @@ fn usage() -> String {
       "  gleam run -- to-core  <in.ir> [axes]            ir_lower + optimize + emit_core → .core",
       "  gleam run -- to-beam  <in.core> [out.beam]      compile → .beam (alias: build; no profile)",
       "  gleam run -- to-beam-wasm [axes] [--link] <in.wasm> <out.beam>  .wasm → .beam under a profile (bench)",
+      "  gleam run -- to-beam-wasm [axes] --bindings <langs> --out <dir> <in.wasm>  + typed host bindings",
       "  gleam run -- run      [axes] <in.wasm> <export> <args…>  compile + invoke on the BEAM",
       "  gleam run -- exec     [-n N] <in.beam> <export> <args…>  invoke a prebuilt .beam (bench, no compile)",
       "",
@@ -828,6 +982,10 @@ fn usage() -> String {
       "    --cap PAGES               bounded page cap (required to engage atomics / --ceiling)",
       "    --link                    (to-beam-wasm only) merge the runtime closure into one",
       "                              self-contained .beam; tier-P/O + import-free only, else rejected",
+      "    --bindings <langs>        (to-beam-wasm only, with --out) emit typed host bindings —",
+      "                              a comma list of gleam|erlang|elixir; requires --threaded",
+      "    --out <dir>               (to-beam-wasm only) write <dir>/<module-atom>.beam + the binding",
+      "                              files into <dir> (pass only <in.wasm>; the .beam name is derived)",
       "  A non-default posture must be NAMED; Safe + --tier nif and an uncapped atomics/ceiling",
       "  build are rejected fail-closed (exit non-zero), never silently downgraded.",
       "  opt takes only --unsafe; to-beam/build take no profile (they compile .core — no Binding).",
