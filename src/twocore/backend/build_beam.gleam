@@ -16,6 +16,8 @@
 
 import gleam/erlang/atom.{type Atom}
 import gleam/result
+import twocore/backend/beam_link
+import twocore/backend/link_manifest
 
 /// This stage's own error type (D4 — there is no shared `StageError`; each
 /// stage owns its errors and the top-level driver composes them).
@@ -94,6 +96,35 @@ pub fn load_module(
   beam: BitArray,
 ) -> Result(Atom, String) {
   ffi_load_module(module, filename, beam)
+}
+
+/// Merge a generated module's Core Erlang with its whole runtime dependency closure into ONE
+/// self-contained `.beam` — the `--link` path (the linked analog of `compile_core/1`).
+///
+/// This is the single composition point that binds "which OTP modules stay remote" (the frozen
+/// manifest's `ambient_allowlist/0`, R7) to a whole-program link — the CLI never re-spells the
+/// allowlist. It is a one-way dependency onto `beam_link` (P11-03) + `link_manifest` (P11-02);
+/// neither imports `build_beam`, so there is no cycle.
+///
+/// - `generated_core`: the emitted `.core` TEXT for the generated module (UTF-8, byte-aligned),
+///   exactly as `pipeline.ir_to_core` produced it — its `module` header names the merged module.
+/// - `module_name`: the generated module's name (`ir.Module.name`); passed through so the linker
+///   can locate the generated module within the acquired closure and name the merged output. It
+///   MUST equal the `.core` `module` header (a mismatch is `Error(MalformedCore(_))`).
+/// - Returns `Ok(#(merged_module_atom, merged_beam))` — one self-contained binary that loads on a
+///   bare OTP node, whose declared module atom equals `merged_module_atom` — or the linker's typed
+///   `beam_link.LinkError` (off-allowlist remote, unmergeable construct, Core-acquisition failure,
+///   D3a authority, …). Fail-closed: never emits a partial or authority-bearing artifact, and
+///   never panics on malformed input (it becomes a typed `Error`).
+pub fn link_beam(
+  generated_core: BitArray,
+  module_name: String,
+) -> Result(#(Atom, BitArray), beam_link.LinkError) {
+  beam_link.link_program(
+    generated_core,
+    module_name,
+    link_manifest.ambient_allowlist(),
+  )
 }
 
 /// Convenience: compile `core_text` then load the resulting binary, folding a

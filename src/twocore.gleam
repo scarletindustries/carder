@@ -54,11 +54,13 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import simplifile
+import twocore/backend/beam_link
 import twocore/backend/build_beam
 import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/frontend/wasm/decode
 import twocore/frontend/wasm/validate
+import twocore/ir
 import twocore/ir/printer as ir_printer
 import twocore/pipeline
 import twocore/runtime/instance.{
@@ -99,32 +101,47 @@ pub fn run(args: List(String)) -> Result(String, String) {
     ["opt", "--unsafe", path] -> cmd_opt(path, profiles.unsafe())
     ["opt", path] -> cmd_opt(path, profiles.safe())
     ["emit", ..rest] ->
-      with_binding(rest, fn(binding, pos) {
+      with_binding(rest, fn(binding, link, pos) {
+        use <- reject_link(link, "emit")
         case pos {
           [path] -> cmd_emit(path, binding)
           _ -> Error(usage())
         }
       })
     ["to-core", ..rest] ->
-      with_binding(rest, fn(binding, pos) {
+      with_binding(rest, fn(binding, link, pos) {
+        use <- reject_link(link, "to-core")
         case pos {
           [path] -> cmd_to_core(path, binding)
           _ -> Error(usage())
         }
       })
-    ["to-beam", input] | ["build", input] ->
-      cmd_to_beam(input, default_beam(input))
-    ["to-beam", input, output] | ["build", input, output] ->
-      cmd_to_beam(input, output)
+    ["to-beam", ..rest] | ["build", ..rest] ->
+      // R13: the `.core`-input verbs carry no `Binding`/profile, so `--link` cannot be gated
+      // (tier-N / import-bearing are undecidable here). Reject the token explicitly rather than
+      // silently no-op it or mistake it for a positional path.
+      case list.contains(rest, "--link") {
+        True ->
+          Error(
+            "--link is only valid on to-beam-wasm; the .core-input to-beam/build verbs carry no Binding to gate (R13)",
+          )
+        False ->
+          case rest {
+            [input] -> cmd_to_beam(input, default_beam(input))
+            [input, output] -> cmd_to_beam(input, output)
+            _ -> Error(usage())
+          }
+      }
     ["to-beam-wasm", ..rest] ->
-      with_binding(rest, fn(binding, pos) {
+      with_binding(rest, fn(binding, link, pos) {
         case pos {
-          [input, output] -> cmd_to_beam_wasm(input, output, binding)
+          [input, output] -> cmd_to_beam_wasm(input, output, binding, link)
           _ -> Error(usage())
         }
       })
     ["run", ..rest] ->
-      with_binding(rest, fn(binding, pos) {
+      with_binding(rest, fn(binding, link, pos) {
+        use <- reject_link(link, "run")
         case pos {
           [path, export, ..arg_strs] -> cmd_run(path, export, arg_strs, binding)
           _ -> Error(usage())
@@ -153,6 +170,11 @@ type BaseSel {
 /// A parsed axis-flag set: the CLI's requested profile/strategy/tier selection (§B). Each
 /// field is set by an EXPLICIT named token — the fail-closed default (`BaseSafe`, no overrides)
 /// is the value with no flags. `None` on `mem`/`table`/`cap` means "keep the base profile's".
+///
+/// - `link`: `True` iff `--link` was named (Phase 11 · P11-04). It is ORTHOGONAL to the
+///   posture/tier axes and defaults to `False` — absent, output is byte-identical to today. It is
+///   consumed ONLY by `to-beam-wasm` (R13); every other compile verb rejects `link == True`
+///   fail-closed so the flag can never silently no-op.
 type Axes {
   Axes(
     base: BaseSel,
@@ -160,6 +182,7 @@ type Axes {
     mem: Option(MemTier),
     table: Option(TableTier),
     cap: Option(Int),
+    link: Bool,
   )
 }
 
@@ -167,17 +190,22 @@ type Axes {
 /// (order-independent among the flags; the positionals keep their given order). Total.
 ///
 /// Recognised flags: `--portable`/`--ceiling`/`--unsafe` (mutually-exclusive base — at most
-/// one), `--threaded`, `--tier <t>`, `--table-tier <t>`, `--cap <pages>`. A `--tier`/
+/// one), `--threaded`, `--link`, `--tier <t>`, `--table-tier <t>`, `--cap <pages>`. A `--tier`/
 /// `--table-tier`/`--cap` with no following value, an unknown `--flag`, an unrecognised tier
 /// token, a non-integer cap, or a second base flag all yield `Error(msg)` (fail-closed — the
-/// caller exits non-zero). Any non-`--` token is a positional.
+/// caller exits non-zero). Any non-`--` token is a positional. `--link` (P11-04) only sets the
+/// `Axes.link` bit here; whether it is HONORED or REJECTED is decided per-verb by the caller.
 ///
 /// - `tokens`: the verb's arguments after the verb (e.g. `["--tier", "atomics", "f.wasm"]`).
 /// - Returns `Ok(#(axes, positionals))` or `Error(msg)`.
 fn split_axis_flags(
   tokens: List(String),
 ) -> Result(#(Axes, List(String)), String) {
-  do_split_axis_flags(tokens, Axes(BaseSafe, False, None, None, None), [])
+  do_split_axis_flags(
+    tokens,
+    Axes(BaseSafe, False, None, None, None, False),
+    [],
+  )
 }
 
 /// Tail-recursive worker for `split_axis_flags`, accumulating `acc` (the axes so far) and
@@ -209,6 +237,8 @@ fn do_split_axis_flags(
       ))
     ["--threaded", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, threaded: True), positionals)
+    ["--link", ..rest] ->
+      do_split_axis_flags(rest, Axes(..acc, link: True), positionals)
     ["--tier", v, ..rest] ->
       result.try(parse_mem_tier(v), fn(t) {
         do_split_axis_flags(rest, Axes(..acc, mem: Some(t)), positionals)
@@ -350,15 +380,22 @@ fn describe_link_error(e: profiles.LinkError) -> String {
 }
 
 /// Parse a compile verb's tokens, resolve+validate the composed `Binding`, and hand it to `k`
-/// alongside the positional operands. The single wiring point where the axis flags become a
-/// validated `Binding` (so the fail-closed gate runs once per verb). A flag-parse or link error
-/// short-circuits to `Error(msg)` (exit non-zero); `k` receives only a coherent binding.
+/// alongside the parsed `--link` bit and the positional operands. The single wiring point where
+/// the axis flags become a validated `Binding` (so the fail-closed gate runs once per verb). A
+/// flag-parse or link error short-circuits to `Error(msg)` (exit non-zero); `k` receives only a
+/// coherent binding.
+///
+/// The `--link` scoping (R13) is NOT enforced here: this passes `axes.link` through unchanged so
+/// each verb decides — `to-beam-wasm` honors it, every other verb calls `reject_link` to refuse
+/// it fail-closed. Enforcing scope centrally would need the verb name, which the continuation
+/// already knows.
 ///
 /// - `tokens`: the verb's arguments after the verb.
-/// - `k`: the subcommand body, given the validated `binding` + the positional operands.
+/// - `k`: the subcommand body, given the validated `binding`, the `--link` bit, and the
+///   positional operands.
 fn with_binding(
   tokens: List(String),
-  k: fn(Binding, List(String)) -> Result(String, String),
+  k: fn(Binding, Bool, List(String)) -> Result(String, String),
 ) -> Result(String, String) {
   use #(axes, positionals) <- result.try(split_axis_flags(tokens))
   use binding <- result.try(resolve_binding(
@@ -368,7 +405,27 @@ fn with_binding(
     axes.table,
     axes.cap,
   ))
-  k(binding, positionals)
+  k(binding, axes.link, positionals)
+}
+
+/// Refuse `--link` on a verb that does not support it (R13 — `--link` is scoped to
+/// `to-beam-wasm`), fail-closed so the flag can never silently no-op. `use`-shaped: on
+/// `link == False` it runs the continuation `k`; on `link == True` it short-circuits to a typed
+/// `Error` naming `verb`.
+///
+/// - `link`: the parsed `Axes.link` bit for this invocation.
+/// - `verb`: the verb name for the diagnostic (e.g. `"emit"`).
+/// - `k`: the rest of the subcommand body, run only when `--link` was NOT given.
+fn reject_link(
+  link: Bool,
+  verb: String,
+  k: fn() -> Result(String, String),
+) -> Result(String, String) {
+  case link {
+    True ->
+      Error("--link is only valid on to-beam-wasm, not " <> verb <> " (R13/O6)")
+    False -> k()
+  }
 }
 
 // ─────────────────────────────── subcommands ───────────────────────────────
@@ -480,36 +537,157 @@ fn cmd_to_beam(input: String, output: String) -> Result(String, String) {
   }
 }
 
-/// `to-beam-wasm [--unsafe] <in.wasm> <out.beam>` — compile a `.wasm` all the way to a `.beam`
-/// under the selected profile (Safe = Baseline optimizer + enforcing fuel; `--unsafe` = Aggressive
-/// optimizer + `MeterOff` + open runtime), and write it. This is the profile-selecting
+// ───────────────────────── Phase 11 · P11-04 — the `--link` fail-closed gate ─────────────────────────
+
+/// Why the pre-link gate refuses a `--link` build (R13/R14). Each is a fail-closed refusal
+/// surfaced as a non-zero-exit CLI error, NEVER a silent downgrade to a non-linked or
+/// bare-node-broken artifact. The gate is a CLI/linker-boundary check (R13) — it is NOT folded
+/// into `profiles.link/1`, which is runtime instantiation and legitimately admits the shapes
+/// rejected here for the ordinary (non-`--link`) build path.
+pub type LinkGateError {
+  /// The linear-memory tier is tier-N (`Nif`): native code cannot be merged into a `.beam`
+  /// (O4/O8), and its C ceiling does not exist yet. DISTINCT from `profiles.SafeForbidsNif` —
+  /// this fires for tier-N under ANY mode (Unsafe+Nif too), because "no NIF under `--link`" is a
+  /// packaging constraint, not a runtime-posture one.
+  LinkTierNif
+  /// The module declares ≥1 import → it compiles to `instantiate/1(Imports)`, which needs
+  /// providers a bare node lacks (R14). `count` is the number of declared imports (diagnostic).
+  /// Conservative superset: rejects even an import that is never called (whose arity would in
+  /// fact stay 0) — fail-closed.
+  LinkImportBearing(count: Int)
+}
+
+/// Fail-closed gate run BEFORE a `--link` build (R13/R14). Two checks, in order:
+///   1. `Error(LinkTierNif)` iff `binding.mem_tier == Nif` — input-independent; deliberately NOT
+///      delegated to `profiles.link/1` (R13), which legitimately ADMITS Unsafe+Nif for the
+///      non-linked path.
+///   2. `Error(LinkImportBearing(n))` iff `m.imports != []` — any import decl means unmet
+///      external providers on a bare node (conservative: also rejects import-but-uncalled).
+/// Returns `Ok(Nil)` for a tier-P/O, import-free module. Total; reads only build-time fields, so
+/// it is testable without spawning a process.
+///
+/// - `binding`: the resolved, `profiles.link`-validated build binding (its `mem_tier` is the
+///   declared linear-memory trust tier).
+/// - `m`: the source `ir.Module` (its `imports` field carries the import decls).
+pub fn link_gate(binding: Binding, m: ir.Module) -> Result(Nil, LinkGateError) {
+  case binding.mem_tier {
+    Nif -> Error(LinkTierNif)
+    _ ->
+      case m.imports {
+        [] -> Ok(Nil)
+        imports -> Error(LinkImportBearing(list.length(imports)))
+      }
+  }
+}
+
+/// Human-readable rendering of a `LinkGateError` for CLI stderr (mirrors `describe_link_error/1`).
+/// Diagnostic only; total.
+fn describe_link_gate_error(e: LinkGateError) -> String {
+  case e {
+    LinkTierNif ->
+      "--link cannot merge the nif memory tier (tier-N runs native code that cannot be baked into a .beam); --link supports tier-P/O only (name a non-nif --tier)"
+    LinkImportBearing(n) ->
+      "--link cannot link an import-bearing module ("
+      <> int.to_string(n)
+      <> " import(s)): a bare node has no providers for the external imports"
+  }
+}
+
+/// Human-readable rendering of a `beam_link.LinkError` for CLI stderr — the user-facing face of
+/// the whole-program linker's fail-closed refusals (P11-03). DISTINCT from `describe_link_error/1`
+/// (which renders `profiles.LinkError`, the runtime-binding gate). Diagnostic only; total.
+fn describe_beam_link_error(e: beam_link.LinkError) -> String {
+  case e {
+    beam_link.OffAllowlistRemote(m, f) ->
+      "link failed: a call to "
+      <> m
+      <> ":"
+      <> f
+      <> " survived to a module outside the OTP-ambient allowlist (missing from the merged closure)"
+    beam_link.MissingClosureModule(m) ->
+      "link failed: the in-closure module "
+      <> m
+      <> " could not be located (its .beam was not on the code path)"
+    beam_link.AmbientAuthorityFound(detail) ->
+      "link failed: refusing to bake ambient authority into the artifact (D3a): "
+      <> detail
+    beam_link.UnmergeableConstruct(detail) ->
+      "link failed: a closure module carries a construct that cannot be merged into a .beam: "
+      <> detail
+    beam_link.MangleCollision(a, b) ->
+      "link failed: mangle-injectivity violated (a module atom contains \"__\"): "
+      <> a
+      <> " / "
+      <> b
+    beam_link.MalformedCore(detail) ->
+      "link failed: malformed Core Erlang: " <> detail
+    beam_link.CoreAcquisitionFailed(m, reason) ->
+      "link failed: could not acquire Core for " <> m <> ": " <> reason
+  }
+}
+
+/// `to-beam-wasm [axes] [--link] <in.wasm> <out.beam>` — compile a `.wasm` all the way to a
+/// `.beam` under the selected profile (Safe = Baseline optimizer + enforcing fuel; `--unsafe` =
+/// Aggressive optimizer + `MeterOff` + open runtime), and write it. This is the profile-selecting
 /// compile-to-`.beam`-from-`.wasm` path the Phase-3 benchmark (`smoke/bench.sh`) needs: `run`
 /// re-compiles every call and `to-beam` takes only `.core`, so neither can produce a persisted,
 /// profile-specific `.beam` to hand to `exec`. Prints a confirmation line.
+///
+/// - `link == False` (the default): today's path EXACTLY — `source_to_ir → ir_to_core →
+///   core_to_beam → write`. Byte-identical to before P11-04 (proven by
+///   `cli_link_flag_test.default_off_byte_identical_test`).
+/// - `link == True` (P11-04): after `source_to_ir`, run the fail-closed `link_gate` (tier-N /
+///   import-bearing rejection), emit the generated `.core`, then merge it with its whole runtime
+///   closure into ONE self-contained `.beam` via `build_beam.link_beam` and write that. A gate or
+///   link failure is surfaced as a stderr diagnostic (exit non-zero); no partial artifact is
+///   written.
 fn cmd_to_beam_wasm(
   input: String,
   output: String,
   binding: Binding,
+  link: Bool,
 ) -> Result(String, String) {
   use bytes <- result.try(read_bits(input))
   case pipeline.source_to_ir(bytes) {
     Error(e) -> Error(pipeline.describe(e))
     Ok(m) ->
-      case pipeline.ir_to_core(m, binding) {
-        Error(e) -> Error(pipeline.describe(e))
-        Ok(core) ->
-          case pipeline.core_to_beam(core, m.name) {
+      case link {
+        False ->
+          case pipeline.ir_to_core(m, binding) {
             Error(e) -> Error(pipeline.describe(e))
-            Ok(beam) ->
-              case simplifile.write_bits(output, beam) {
-                Error(fe) ->
-                  Error(
-                    "write " <> output <> ": " <> simplifile.describe_error(fe),
-                  )
-                Ok(Nil) -> Ok("wrote " <> output)
+            Ok(core) ->
+              case pipeline.core_to_beam(core, m.name) {
+                Error(e) -> Error(pipeline.describe(e))
+                Ok(beam) -> write_beam(output, beam)
+              }
+          }
+        True ->
+          case link_gate(binding, m) {
+            Error(ge) -> Error(describe_link_gate_error(ge))
+            Ok(Nil) ->
+              case pipeline.ir_to_core(m, binding) {
+                Error(e) -> Error(pipeline.describe(e))
+                Ok(core) ->
+                  case
+                    build_beam.link_beam(bit_array.from_string(core), m.name)
+                  {
+                    Error(le) -> Error(describe_beam_link_error(le))
+                    Ok(#(_atom, beam)) -> write_beam(output, beam)
+                  }
               }
           }
       }
+  }
+}
+
+/// Write a compiled `.beam` binary to `output`, mapping an IO error to a CLI diagnostic and
+/// returning the `"wrote <output>"` confirmation on success. Shared by the linked and non-linked
+/// `to-beam-wasm` branches so both report identically.
+fn write_beam(output: String, beam: BitArray) -> Result(String, String) {
+  case simplifile.write_bits(output, beam) {
+    Error(fe) ->
+      Error("write " <> output <> ": " <> simplifile.describe_error(fe))
+    Ok(Nil) -> Ok("wrote " <> output)
   }
 }
 
@@ -638,7 +816,7 @@ fn usage() -> String {
       "  gleam run -- emit     <in.ir> [axes]            emit_core only → .core",
       "  gleam run -- to-core  <in.ir> [axes]            ir_lower + optimize + emit_core → .core",
       "  gleam run -- to-beam  <in.core> [out.beam]      compile → .beam (alias: build; no profile)",
-      "  gleam run -- to-beam-wasm [axes] <in.wasm> <out.beam>  .wasm → .beam under a profile (bench)",
+      "  gleam run -- to-beam-wasm [axes] [--link] <in.wasm> <out.beam>  .wasm → .beam under a profile (bench)",
       "  gleam run -- run      [axes] <in.wasm> <export> <args…>  compile + invoke on the BEAM",
       "  gleam run -- exec     [-n N] <in.beam> <export> <args…>  invoke a prebuilt .beam (bench, no compile)",
       "",
@@ -648,6 +826,8 @@ fn usage() -> String {
       "    --tier paged|atomics|nif  linear-memory trust tier (nif is Unsafe-only)",
       "    --table-tier paged|ets|atomics   funcref-table trust tier",
       "    --cap PAGES               bounded page cap (required to engage atomics / --ceiling)",
+      "    --link                    (to-beam-wasm only) merge the runtime closure into one",
+      "                              self-contained .beam; tier-P/O + import-free only, else rejected",
       "  A non-default posture must be NAMED; Safe + --tier nif and an uncapped atomics/ceiling",
       "  build are rejected fail-closed (exit non-zero), never silently downgraded.",
       "  opt takes only --unsafe; to-beam/build take no profile (they compile .core — no Binding).",
