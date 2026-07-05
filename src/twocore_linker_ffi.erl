@@ -36,10 +36,13 @@
 %%%    no in-closure atom contains `__`, R12). The three node classes are then
 %%%    rewritten: (1) in-closure remote `#c_call` → local `apply` of the mangled
 %%%    name; (2) intra-module local `apply` on an `fname` → the self-mangled
-%%%    name; (3) fun-capture literals → an explicit `erlang:make_fun(MergedMod,
-%%%    Mangled, A)` (a STATIC local funref — printable, compilable, and D3a-safe:
-%%%    literal self-module + literal local name, never `erlang:apply`). Ambient
-%%%    remote calls / captures are left untouched.
+%%%    name; (3) fun-captures — EVERY external `fun M:F/A` embedded in a literal,
+%%%    whether bare or nested inside a compound term (tuple/list/map, e.g. gleam's
+%%%    `{decoder, fun …/1}`) — an in-closure target becomes a bare LOCAL funref
+%%%    `'M__F'/A` (a `c_fname` value the compiler sees as a call-graph edge, so
+%%%    it does NOT DCE the target back out — an `erlang:make_fun` of a literal
+%%%    local name WOULD be silently stripped), an ambient target stays external
+%%%    as `erlang:make_fun(M,F,A)`. Ambient remote calls are left untouched.
 %%% 5. DCE: only reached defs are assembled — everything else is dropped.
 %%% 6. ASSEMBLE one `#c_module{}` (R11): strip every source `module_info/{0,1}`
 %%%    and all module attributes; synthesize exactly one `module_info/{0,1}`
@@ -280,30 +283,42 @@ ensure_acquired(M, St) ->
 %%   - remote `#c_call` to a literal in-closure module → {TgtM, {TgtF, arity}}
 %%     (ambient targets stop — no edge);
 %%   - intra-module `apply` on an `fname` → {M, {F, A}};
-%%   - fun-capture literal `fun TgtM:TgtF/A` to an in-closure module →
-%%     {TgtM, {TgtF, A}} (ambient captures stop).
+%%   - EVERY fun-capture embedded in a literal (`fun TgtM:TgtF/A`), whether a
+%%     bare `#c_literal{val=Fun}` OR nested inside a compound literal term (a
+%%     tuple/list/map — e.g. gleam's `{decoder, fun …:decode_int/1}`), to an
+%%     in-closure module → {TgtM, {TgtF, A}} (ambient captures stop). Missing the
+%%     NESTED form both strips the target (DCE) and leaves a dangling off-closure
+%%     capture — the R4 edge-(a) requirement.
 edges(Body, M, St) ->
     Ambient = maps:get(ambient, St),
     cerl_trees:fold(
       fun(Node, Acc) ->
-              case classify(Node) of
-                  {remote, TgtM, TgtF, Ar} ->
-                      case sets:is_element(TgtM, Ambient) of
-                          true -> Acc;
-                          false -> [{TgtM, {TgtF, Ar}} | Acc]
-                      end;
-                  {local_apply, F, A} -> [{M, {F, A}} | Acc];
-                  {capture, TgtM, TgtF, Ar} ->
-                      case sets:is_element(TgtM, Ambient) of
-                          true -> Acc;
-                          false -> [{TgtM, {TgtF, Ar}} | Acc]
-                      end;
-                  other -> Acc
+              case cerl:type(Node) of
+                  literal ->
+                      lists:foldl(
+                        fun({TgtM, TgtF, Ar}, A) ->
+                                case sets:is_element(TgtM, Ambient) of
+                                    true -> A;
+                                    false -> [{TgtM, {TgtF, Ar}} | A]
+                                end
+                        end, Acc, term_ext_funs(cerl:concrete(Node)));
+                  _ ->
+                      case classify(Node) of
+                          {remote, TgtM, TgtF, Ar} ->
+                              case sets:is_element(TgtM, Ambient) of
+                                  true -> Acc;
+                                  false -> [{TgtM, {TgtF, Ar}} | Acc]
+                              end;
+                          {local_apply, F, A} -> [{M, {F, A}} | Acc];
+                          other -> Acc
+                      end
               end
       end, [], Body).
 
-%% Classify a Core node as a reachability/rewrite-relevant edge, or `other`.
-%% Shared by `edges/3` (walk) and the rewriter so the two never diverge.
+%% Classify a NON-literal Core node as a reachability/rewrite-relevant edge, or
+%% `other`. Shared by `edges/3` (walk) and the rewriter so the two never diverge.
+%% Fun-capture LITERALs are handled separately (a single literal can carry zero
+%% or many captures — see `term_ext_funs/1`).
 classify(Node) ->
     case cerl:type(Node) of
         call ->
@@ -321,27 +336,30 @@ classify(Node) ->
                 true -> {local_apply, cerl:fname_id(Op), cerl:fname_arity(Op)};
                 false -> other
             end;
-        literal ->
-            case ext_fun(cerl:concrete(Node)) of
-                {ok, {TgtM, TgtF, Ar}} -> {capture, TgtM, TgtF, Ar};
-                error -> other
-            end;
         _ -> other
     end.
 
-%% If a literal's concrete value is an EXTERNAL fun value (`fun M:F/A`), return
-%% {ok,{M,F,A}}; else `error`. This is how `debug_info core_v1` reconstructs a
-%% `fun M:F/A` capture (R4) — as a `literal` node wrapping the actual fun term.
-ext_fun(V) when is_function(V) ->
+%% Every EXTERNAL fun (`fun M:F/A`) embedded ANYWHERE in a constant term value —
+%% bare, or nested inside a tuple/list/map. This is how `debug_info core_v1`
+%% reconstructs `fun M:F/A` captures (R4): as a `literal` node wrapping the
+%% actual fun term (which may itself be wrapped in a data structure such as
+%% gleam's `Decoder` record `{decoder, Fun}`). Returns `[{M, F, A}]`.
+term_ext_funs(V) when is_function(V) ->
     case erlang:fun_info(V, type) of
         {type, external} ->
             {module, M} = erlang:fun_info(V, module),
             {name, F} = erlang:fun_info(V, name),
             {arity, A} = erlang:fun_info(V, arity),
-            {ok, {M, F, A}};
-        _ -> error
+            [{M, F, A}];
+        _ -> []
     end;
-ext_fun(_) -> error.
+term_ext_funs(V) when is_tuple(V) ->
+    lists:flatmap(fun term_ext_funs/1, tuple_to_list(V));
+term_ext_funs(V) when is_map(V) ->
+    lists:flatmap(fun term_ext_funs/1, maps:keys(V)) ++
+        lists:flatmap(fun term_ext_funs/1, maps:values(V));
+term_ext_funs([H | T]) -> term_ext_funs(H) ++ term_ext_funs(T);
+term_ext_funs(_) -> [].
 
 %% ── (3) Mergeability guard (R15) ──────────────────────────────────────────
 
@@ -430,12 +448,6 @@ mangle(M, {F, A}, MergedName) when M =:= MergedName -> cerl:c_fname(F, A);
 mangle(M, {F, A}, _MergedName) ->
     cerl:c_fname(list_to_atom(atom_to_list(M) ++ ?SEP ++ atom_to_list(F)), A).
 
-%% The mangled ATOM (not the fname) for a target `M:F` — used to build the
-%% self-module funref in a rewritten capture.
-mangle_atom(M, F, MergedName) when M =:= MergedName -> F;
-mangle_atom(M, F, _MergedName) ->
-    list_to_atom(atom_to_list(M) ++ ?SEP ++ atom_to_list(F)).
-
 %% Rewrite the THREE node classes (R5) in a function body defined in module `M`,
 %% via a single bottom-up `cerl_trees:map`. `RCtx` carries the merged name and
 %% the ambient set.
@@ -444,33 +456,70 @@ rewrite(Body, M, RCtx) ->
     Ambient = maps:get(ambient, RCtx),
     cerl_trees:map(
       fun(Node) ->
-              case classify(Node) of
-                  {remote, TgtM, TgtF, Ar} ->
-                      case sets:is_element(TgtM, Ambient) of
-                          true -> Node;   %% ambient remote → untouched
-                          false ->
-                              %% (1) in-closure remote call → local mangled apply
-                              Name = mangle(TgtM, {TgtF, Ar}, MergedName),
-                              cerl:c_apply(Name, cerl:call_args(Node))
+              case cerl:type(Node) of
+                  literal ->
+                      %% (3) fun-captures — bare OR nested in a compound literal.
+                      case term_ext_funs(cerl:concrete(Node)) of
+                          [] -> Node;
+                          _ ->
+                              term_to_expr(cerl:concrete(Node), MergedName,
+                                           Ambient)
                       end;
-                  {local_apply, F, A} ->
-                      %% (2) intra-module apply → self-mangled name
-                      NewOp = mangle(M, {F, A}, MergedName),
-                      cerl:c_apply(NewOp, cerl:apply_args(Node));
-                  {capture, TgtM, TgtF, Ar} ->
-                      %% (3) fun-capture literal → explicit static make_fun
-                      {TgtMod, TgtName} =
-                          case sets:is_element(TgtM, Ambient) of
-                              true -> {TgtM, TgtF};  %% ambient capture kept
-                              false -> {MergedName,
-                                        mangle_atom(TgtM, TgtF, MergedName)}
-                          end,
-                      cerl:c_call(cerl:c_atom(erlang), cerl:c_atom(make_fun),
-                                  [cerl:c_atom(TgtMod), cerl:c_atom(TgtName),
-                                   cerl:c_int(Ar)]);
-                  other -> Node
+                  _ ->
+                      case classify(Node) of
+                          {remote, TgtM, TgtF, Ar} ->
+                              case sets:is_element(TgtM, Ambient) of
+                                  true -> Node;   %% ambient remote → untouched
+                                  false ->
+                                      %% (1) in-closure remote → local mangled apply
+                                      Name = mangle(TgtM, {TgtF, Ar}, MergedName),
+                                      cerl:c_apply(Name, cerl:call_args(Node))
+                              end;
+                          {local_apply, F, A} ->
+                              %% (2) intra-module apply → self-mangled name
+                              NewOp = mangle(M, {F, A}, MergedName),
+                              cerl:c_apply(NewOp, cerl:apply_args(Node));
+                          other -> Node
+                      end
               end
       end, Body).
+
+%% Rebuild a constant term `V` (which contains at least one embedded external
+%% fun) as a Core EXPRESSION, replacing every embedded `fun M:F/A` capture:
+%%   - an IN-CLOSURE target → a bare LOCAL funref `'M__F'/A` (a `c_fname` used as
+%%     a value). This is critical: `erlang:make_fun('Merged','M__F',A)` is opaque
+%%     to the Erlang compiler's OWN reachability so `compile:forms` would DCE the
+%%     (non-exported) target back out → runtime `undef`; a bare local funref IS a
+%%     call-graph edge, so the target survives the compile (verified).
+%%   - an AMBIENT target → `erlang:make_fun(M, F, A)` (stays external; the
+%%     compiler needs to keep nothing local, and the module is on every node).
+%% Compound structure (tuple/list/map) is reconstructed with `c_tuple`/`c_cons`/
+%% `c_map`; leaves with no fun are re-abstracted verbatim. So a nested capture
+%% like `{decoder, fun …:decode_int/1}` becomes `{'decoder', 'M__decode_int'/1}`.
+term_to_expr(V, MergedName, Ambient) when is_function(V) ->
+    case erlang:fun_info(V, type) of
+        {type, external} ->
+            {module, M} = erlang:fun_info(V, module),
+            {name, F} = erlang:fun_info(V, name),
+            {arity, A} = erlang:fun_info(V, arity),
+            case sets:is_element(M, Ambient) of
+                true ->
+                    cerl:c_call(cerl:c_atom(erlang), cerl:c_atom(make_fun),
+                                [cerl:c_atom(M), cerl:c_atom(F), cerl:c_int(A)]);
+                false -> mangle(M, {F, A}, MergedName)
+            end;
+        _ -> cerl:abstract(V)
+    end;
+term_to_expr(V, MergedName, Ambient) when is_tuple(V) ->
+    cerl:c_tuple([term_to_expr(E, MergedName, Ambient) || E <- tuple_to_list(V)]);
+term_to_expr(V, MergedName, Ambient) when is_map(V) ->
+    cerl:c_map([cerl:c_map_pair(term_to_expr(K, MergedName, Ambient),
+                                term_to_expr(Val, MergedName, Ambient))
+                || {K, Val} <- maps:to_list(V)]);
+term_to_expr([H | T], MergedName, Ambient) ->
+    cerl:c_cons(term_to_expr(H, MergedName, Ambient),
+                term_to_expr(T, MergedName, Ambient));
+term_to_expr(V, _MergedName, _Ambient) -> cerl:abstract(V).
 
 %% Recursively clear every node annotation (file/line metadata) so identical
 %% merges are byte-identical (R10) regardless of source location.
@@ -564,18 +613,18 @@ d3a_node(Node, MergedName, Ambient) ->
                     end
             end;
         literal ->
-            %% A residual fun-capture VALUE to an off-closure/off-allowlist module
-            %% (should have been rewritten to a self make_fun in step 4).
-            case ext_fun(cerl:concrete(Node)) of
-                {ok, {M, F, _A}} ->
-                    case M =:= MergedName orelse sets:is_element(M, Ambient) of
-                        true -> ok;
-                        false ->
-                            fail(<<"ambient_authority">>,
-                                 io_lib:format("residual off-closure capture ~s:~s",
-                                               [M, F]), <<>>)
-                    end;
-                error -> ok
+            %% After the rewrite NO literal should carry an external fun (bare OR
+            %% nested in a compound term) to an off-closure/off-allowlist module —
+            %% those all became local funrefs / `make_fun` calls (step 4). A
+            %% residual one is a rewrite MISS and a D3a hole (it would resolve to a
+            %% shadowable off-node module), so fail closed (R4/R9).
+            case [MF || {Mc, _, _} = MF <- term_ext_funs(cerl:concrete(Node)),
+                        Mc =/= MergedName, not sets:is_element(Mc, Ambient)] of
+                [] -> ok;
+                [{Mc, Fc, _} | _] ->
+                    fail(<<"ambient_authority">>,
+                         io_lib:format("residual off-closure capture ~s:~s",
+                                       [Mc, Fc]), <<>>)
             end;
         _ -> ok
     end.

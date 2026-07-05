@@ -25,6 +25,7 @@ import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/backend/link_manifest
 import twocore/ir
+import twocore/pipeline
 import twocore/runtime/instance
 
 // ───────────────────────── test-only externals ─────────────────────────
@@ -157,6 +158,36 @@ pub fn returned_atom_matches_beam_name_test() {
   let assert Ok(loaded) = build_beam.load_module(mod, "x.beam", beam)
   assert atom.to_string(loaded) == name
   assert catch_apply(mod, atom.create("add"), [40, 2]) == Ok(42)
+}
+
+/// R4 edge-(a) regression (the metering-closure blocker): a Safe-mode
+/// (`MeterFuel`) tier-P import-free module lowered through the REAL pipeline
+/// (`ir_lower` inserts `charge` metering, so the fuel/metering runtime is
+/// reached) whose `rt_meter` closure CAPTURES `fun gleam@dynamic@decode:
+/// decode_int/1`. The capture's TARGET def (and everything it transitively
+/// reaches, e.g. `gleam@dynamic@decode:run/2`) must survive DCE — a capture is
+/// a reachability EDGE, not only a rewrite target (R4 (a)). Before the fix the
+/// linked module traps `undef` (`…decode__run/2 → decode__decode_int/1`) on the
+/// first `charge`; after, it runs and returns the spec-correct WASM values. This
+/// is the case the direct-`emit_core` smoke never exercised (no `ir_lower` ⇒ no
+/// metering closure).
+pub fn safe_metered_fun_capture_target_survives_dce_test() {
+  let name = "twocore@link@metered"
+  let assert Ok(core_text) =
+    pipeline.ir_to_core(
+      num_module(name, [clz_fn(), add_fn()]),
+      instance.safe_default(),
+    )
+  let core = bit_array.from_string(core_text)
+  let assert Ok(#(mod, beam)) = beam_link.link_program(core, name, ambient())
+  let assert Ok(_) = build_beam.load_module(mod, "metered.beam", beam)
+
+  // seed the metered instance, then call exports — the fuel-metering closure
+  // path (which applies the captured decode_int) must not `undef`.
+  let assert Ok(_) = catch_apply(mod, atom.create("instantiate"), [])
+  assert catch_apply(mod, atom.create("clz"), [1]) == Ok(31)
+  assert catch_apply(mod, atom.create("add"), [2_147_483_647, 1])
+    == Ok(2_147_483_648)
 }
 
 // ════════════════════ 2. R6 — instantiate is a DCE root; state runtime survives ════════════════════
