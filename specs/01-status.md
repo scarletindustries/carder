@@ -56,8 +56,8 @@ place that knows which concrete runtime a build links (decision D3b).
 
 ## 3. What each phase delivered (condensed history)
 
-All eleven phases are **done and proven** on `main`. This is the compacted ledger; the per-phase decision
-codes (`D/E/F/G/H/I/J/M/N/O` and the `R/S/T` reconciliations) now live in the code and tests, with the
+All twelve phases are **done and proven** on `main`. This is the compacted ledger; the per-phase decision
+codes (`D/E/F/G/H/I/J/M/N/O/P` and the `R/S/T` reconciliations) now live in the code and tests, with the
 *permanent* ones lifted into [`03-phase-workflow.md`](03-phase-workflow.md) §4.
 
 | Phase | Delivered | Proven at close |
@@ -73,6 +73,7 @@ codes (`D/E/F/G/H/I/J/M/N/O` and the `R/S/T` reconciliations) now live in the co
 | **9 — The memory optimizer** | The middle-end memory-dataflow passes (deferred all the way from Phase 3): **MemorySSA + linear-memory alias analysis** (`mem_ssa`), **store→load forwarding + redundant-load elimination** (`mem_forward`), **dead-store elimination** (`mem_dse`). Trap-preserving ⇒ trust-neutral ⇒ run at Baseline ⇒ every tier & both modes win. No new IR nodes, no runtime touch. | 1783 tests; ~3–4× faster on paged |
 | **10 — The memory optimizer, completed** | The three Phase-9 deferrals: **LICM** (hoist pure loop-invariant work to a preheader), **cross-control-flow MemorySSA** (forwarding/RLE/DSE survive `If`/`Block`/`Switch` via a may-clobber gate), and **range-based bounds-check elimination via loop versioning** (an unchecked fast loop guarded by a runtime range-proof, else the checked slow loop — values *and* traps preserved). First memory opt since Phase 4 to grow the runtime ABI (unchecked access, paged+atomics; nif stays checked). | **1827 tests**; LICM ~3.5×, BCE ~1.1× on paged |
 | **11 — Self-contained output (`--link`)** | A **whole-program Core-Erlang linker** behind an optional `--link` flag on `to-beam-wasm` (`beam_link.link_program` over the `cerl` FFI `twocore_linker_ffi.erl`, pinned OTP 29): acquire every `twocore@`/`gleam@`/FFI closure member's Core (`beam_lib` `debug_info(core_v1)`), reachability-DCE from the exports **+ `instantiate/N`** across calls/applies/**`fun M:F/A` captures**, mangle to local `'M__F'/A`, rewrite all in-closure remotes/captures to local, deterministic `from_core` → **one self-contained `.beam` that runs on a bare OTP node**. Prereq: a clean runtime/compiler **layer split** (`OptLevel`→leaf, runtime reaches zero compiler modules). tier-P/O only (tier-N/import-bearing/`on_load` are fail-closed link-time rejections); **D3a preserved** (no data-driven `apply`, no off-allowlist remote — structural `cerl` check refuses to emit); default output **byte-identical**. §5. | **1922 tests**; linked ≡ non-linked (bit/trap-identical) over corpus × mode × state × tier P/O, in-process **and** on an actually-booted bare `erl`; deterministic (link-twice byte-identical) |
+| **12 — Typed host-language bindings (`--bindings`)** | Alongside the `.beam`, emit **companion typed source files** (`.gleam`/`.erl`/`.ex`) giving a native-typed API over a compiled module: one language-neutral **`Iface` descriptor** (`iface.describe` on the lowered+optimized module — the transitive state-reaching closure decides the host surface) rendered by three sibling emitters + the `--bindings <langs> --out <dir>` folder driver. Value ABI: i32/i64 ⇄ signed `Int`, f32/f64 ⇄ a `Finite|NonFinite` sum type (NaN/±Inf bit-exact), v128 ⇄ 16-byte binary, refs ⇄ opaque handle, multi-value ⇄ tuple, trap ⇄ `Result`/tagged-tuple caught structurally on `{wasm_trap,_}`. Two-shape API (Stateless pure file vs Threaded pure-value `Instance`); Gleam two-file drop + `.erl` catch-shim + README, Erlang/Elixir catch in-language (Elixir zero `Elixir.*` runtime deps, best-effort). Threaded/export-only/pure-value-tier this phase; the `.beam` is **unchanged** & default output **byte-identical**; composes with `--link` for a self-contained typed artifact. §5. | **1978 tests**; every binding **compiled by its real toolchain** (`gleam build`/`erlc`/`elixirc`) and **called**, bit-identical to the in-process oracle across the full type matrix + threaded state + a genuine trap; Elixir best-effort (skips cleanly if absent); determinism byte-checked; conformance unchanged 46,529/1,768/0 |
 
 ---
 
@@ -160,6 +161,41 @@ The deferred **single-`.beam` runtime-dispatch binding (B1)** ([`02-roadmap.md`]
 distinct — it would let one module pick its runtime *at instance time* (runtime *selection*), whereas
 `--link` bakes the chosen runtime *in* (runtime *inclusion*). An **OTP release** of the `twocore` app +
 deps remains the alternative for the shared-runtime, hot-reloadable deployment.
+
+**`--bindings` — typed host-language bindings, the shipped & proven ergonomic surface (Phase 12).** The
+raw run-ABI above is correct but hostile (args/results are raw unsigned bit patterns — an i32 `-1`
+arrives as `4294967295`, an f64 as its raw IEEE bits-in-an-integer, a trap as an uncaught exception).
+`--bindings <langs> --out <dir>` on `to-beam-wasm` (comma list of `gleam`/`erlang`/`elixir`) emits,
+alongside the compiled `.beam`, **companion typed source files** that present a **native-typed** API —
+`Int`/`Float`/`BitArray`, traps as `Result`/tagged tuple, one typed function per export — over the same
+`.beam` (which is **unchanged**; bindings are companions). Deterministic output; default (no-`--bindings`)
+emission is byte-identical. See [`../docs/phase-12-bindings.md`](../docs/phase-12-bindings.md).
+
+- **Value ABI (`iface.value_abi`, one source all emitters render).** i32/i64 ⇄ `Int` (signed
+  two's-complement; host bignums, so i64 round-trips exactly); f32/f64 ⇄ a `Finite(Float) | NonFinite(BitArray)`
+  sum type (a BEAM `float()` cannot hold NaN/±Inf, so non-finite values ride raw IEEE bytes — bit-exact,
+  D5-safe); v128 ⇄ 16-byte `BitArray`/`binary()`; funcref/externref ⇄ an **opaque** handle; multi-value
+  ⇄ a tuple; a trap ⇄ the language error idiom, caught **structurally** on `{wasm_trap, _}` (never a
+  bare catch-all; a WASM `throw`/`exnref` is a distinct term class, out of the typed-error surface this
+  phase).
+- **Two-shape API.** A **Stateless** module (no export reaches instance state) is the beautiful pure
+  file — no `Instance`, each export `fn(args) -> Result(T, Trap)`. A **Threaded** module exposes
+  `instantiate() -> Result(Instance, Trap)` and threads the `Instance` as a **pure value** (no process;
+  an old `Instance` observes no later write).
+- **Per-language idioms.** Gleam = a two-file drop under `src/` (the typed `.gleam` + a tiny `.erl`
+  catch-shim, since Gleam cannot rescue a BEAM exception in-language) + a README; Erlang = one `.erl`
+  (`-spec`/`-doc`, catches in-language, no shim); Elixir = one `.ex` (`@spec`/`@doc`, **zero `Elixir.*`
+  runtime deps** — Erlang-style catch, so it runs on a bare BEAM), best-effort (gated on `elixirc`).
+- **Scope & composition.** Threaded (tier-P, pure-value `Paged`/`TablePaged`) + export-only this phase
+  (`Cell`, import-bearing, and mutable tiers are typed `describe/2` rejections). `--bindings` **requires
+  `--threaded`**. The un-linked `.beam` still needs the `twocore@`/`gleam@` runtime on the path — a
+  **droppable self-contained** typed artifact = `--bindings` **+** Phase-11 `--link`.
+- **Proven — compile + call, not golden strings.** Every emitted binding is compiled by its **real
+  toolchain** (`gleam build` / in-VM `erlc` / `elixirc`) and an export is called through the compiled
+  native surface, asserted **bit-identical** to the in-process pipeline oracle across the full type
+  matrix + threaded state + a genuine trap. Files: `src/twocore/backend/{iface,bindings,
+  emit_gleam_bindings,emit_erlang_bindings,emit_elixir_bindings}.gleam`; proof:
+  `test/twocore/backend/bindings_compile_call_test.gleam` (the capstone compile+call differential).
 
 ---
 

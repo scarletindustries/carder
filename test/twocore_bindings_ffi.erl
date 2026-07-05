@@ -21,6 +21,8 @@
 %%%   compile_load_gleam/2  — stage a temp Gleam project, `gleam build`, load the beams.
 %%%   compile_load_elixir/2 — `elixirc` the emitted `.ex` source(s), load the beams.
 %%%   call/3                — apply `M:F(Args)`, exceptions captured as `{error, Text}`.
+%%%   purge/1               — fully unload a binding module between per-language runs (R16).
+%%%   is_loaded/1           — whether a module atom currently has code resident (R16 probe).
 %%%
 %%% Each `compile_load_*` takes `Files :: [{FileName :: binary(), Content :: binary()}]` (the
 %%% on-disk basename WITH extension, e.g. `<<"foo_bindings.gleam">>`, and its UTF-8 source) plus
@@ -30,7 +32,7 @@
 %%% (a UTF-8 binary of the toolchain diagnostics) — repo `Result(_, _)` convention.
 -module(twocore_bindings_ffi).
 -export([which/1, compile_load_erlang/2, compile_load_gleam/2,
-         compile_load_elixir/2, call/3]).
+         compile_load_elixir/2, call/3, purge/1, is_loaded/1]).
 
 %% Wall-clock bound (ms) on a single toolchain spawn (`gleam build`/`elixirc`). Cold starts are
 %% sub-second here; this is a generous CI-robustness ceiling so a hung child is reaped rather
@@ -198,6 +200,41 @@ call(M, F, Args) ->
         Class:Reason:_ ->
             {error, unicode:characters_to_binary(
                 io_lib:format("~p:~p on ~p:~p/~p", [Class, Reason, M, F, length(Args)]))}
+    end.
+
+%% ─────────────────────────── purge/1 ───────────────────────────
+
+%% Fully unload module `Mod` from the VM so a subsequent load of a DIFFERENT-language
+%% binding under the SAME module atom cannot leave stale code resident (R16). The
+%% Gleam binding `<base>_bindings` and the Erlang binding `<base>_bindings` share ONE
+%% BEAM atom; the capstone loads them into one VM in sequence, so between per-language
+%% runs it MUST unload the previous language's binding — otherwise the two co-reside
+%% (BEAM keeps current+old code per module) and a later reload either dispatches into
+%% the wrong-language module (a silent false green — observed) or fails `{error,
+%% not_purged}`. `purge` removes any old code, deletes the current export, then removes
+%% that too, leaving the atom unloaded and safe to reload fresh.
+%%
+%% Params: `Mod :: atom()` (the binding module atom, e.g. `twocore_wasm_x_bindings`).
+%% Returns (Gleam `Nil`): the atom `nil`. Idempotent + total: purging/deleting an
+%% already-absent module is a harmless `false`, never an error.
+purge(Mod) ->
+    _ = code:purge(Mod),
+    _ = code:delete(Mod),
+    _ = code:purge(Mod),
+    nil.
+
+%% ─────────────────────────── is_loaded/1 ───────────────────────────
+
+%% Whether module atom `Mod` currently has code resident (loaded) in the VM. Used by the R16
+%% clobber test to distinguish "resident (possibly the wrong-language binding)" from "fully
+%% unloaded by `purge`". `code:is_loaded/1` yields `{file, _}` when loaded and `false` when not.
+%%
+%% Params: `Mod :: atom()`.
+%% Returns (Gleam `Bool`): `true` iff `Mod` is loaded, else `false`.
+is_loaded(Mod) ->
+    case code:is_loaded(Mod) of
+        false -> false;
+        _ -> true
     end.
 
 %% ─────────────────────────── internal helpers ───────────────────────────
