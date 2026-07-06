@@ -27,9 +27,9 @@ in — that loads and runs on a **bare Erlang/OTP node** (§5).
 
 | | |
 |---|---|
-| Gleam tests | **2049 pass / 0 fail** |
+| Gleam tests | **2080 pass / 0 fail** |
 | Build | `gleam build` **zero warnings**, `gleam format --check` clean |
-| WASM spec conformance | **46,646 pass / 1,771 skip / 0 fail** — identical under Safe **and** Unsafe, and `fail=0` under every shipped `(state_strategy × mem_tier)` combo |
+| WASM spec conformance | **47,734 pass / 683 skip / 0 fail** — identical under Safe **and** Unsafe, and `fail=0` under every shipped `(state_strategy × mem_tier)` combo |
 | JS-on-BEAM (Porffor 0.61.13 → 2core → BEAM) | **52 pass / 0 fail / 3 skip** over a 55-program corpus (all 3 skips are Porffor's own `-0`/closure bugs, reproduced byte-for-byte — they bound Porffor, not 2core) |
 | Every skip | categorized (never false-green); `fail=0` is an absolute invariant |
 
@@ -75,6 +75,7 @@ codes (`D/E/F/G/H/I/J/M/N/O/P/Q` and the `R/S/T` reconciliations) now live in th
 | **11 — Self-contained output (`--link`)** | A **whole-program Core-Erlang linker** behind an optional `--link` flag on `to-beam-wasm` (`beam_link.link_program` over the `cerl` FFI `twocore_linker_ffi.erl`, pinned OTP 29): acquire every `twocore@`/`gleam@`/FFI closure member's Core (`beam_lib` `debug_info(core_v1)`), reachability-DCE from the exports **+ `instantiate/N`** across calls/applies/**`fun M:F/A` captures**, mangle to local `'M__F'/A`, rewrite all in-closure remotes/captures to local, deterministic `from_core` → **one self-contained `.beam` that runs on a bare OTP node**. Prereq: a clean runtime/compiler **layer split** (`OptLevel`→leaf, runtime reaches zero compiler modules). tier-P/O only (tier-N/import-bearing/`on_load` are fail-closed link-time rejections); **D3a preserved** (no data-driven `apply`, no off-allowlist remote — structural `cerl` check refuses to emit); default output **byte-identical**. §5. | **1922 tests**; linked ≡ non-linked (bit/trap-identical) over corpus × mode × state × tier P/O, in-process **and** on an actually-booted bare `erl`; deterministic (link-twice byte-identical) |
 | **12 — Typed host-language bindings (`--bindings`)** | Alongside the `.beam`, emit **companion typed source files** (`.gleam`/`.erl`/`.ex`) giving a native-typed API over a compiled module: one language-neutral **`Iface` descriptor** (`iface.describe` on the lowered+optimized module — the transitive state-reaching closure decides the host surface) rendered by three sibling emitters + the `--bindings <langs> --out <dir>` folder driver. Value ABI: i32/i64 ⇄ signed `Int`, f32/f64 ⇄ a `Finite|NonFinite` sum type (NaN/±Inf bit-exact), v128 ⇄ 16-byte binary, refs ⇄ opaque handle, multi-value ⇄ tuple, trap ⇄ `Result`/tagged-tuple caught structurally on `{wasm_trap,_}`. Two-shape API (Stateless pure file vs Threaded pure-value `Instance`); Gleam two-file drop + `.erl` catch-shim + README, Erlang/Elixir catch in-language (Elixir zero `Elixir.*` runtime deps, best-effort). Threaded/export-only/pure-value-tier this phase; the `.beam` is **unchanged** & default output **byte-identical**; composes with `--link` for a self-contained typed artifact. §5. | **1978 tests**; every binding **compiled by its real toolchain** (`gleam build`/`erlc`/`elixirc`) and **called**, bit-identical to the in-process oracle across the full type matrix + threaded state + a genuine trap; Elixir best-effort (skips cleanly if absent); determinism byte-checked; conformance unchanged 46,529/1,768/0 |
 | **13 — WebAssembly tail calls (`return_call`/`return_call_indirect`)** | The tail-call proposal (`0x12`/`0x13`) end to end — decode + WAT + validate (result-type-equality rule, stack-polymorphic like `return`) + `Return`-shape bottom-transfer lowering + `emit_core` — lowered to **genuine constant-stack BEAM tail calls**: direct reuses the `KReturn` tail path; **indirect** goes through a new `rt_table.call_indirect_lookup` seam (the 3 ordered fail-closed guards, returning the target) then **tail-applies** the package-ABI target, D3a-clean; imports reuse the import path under `KReturn` (value-correct, **bounded frame** — not a cross-module constant-stack claim, Q8). The funcref stored closure became **package-ABI + tail-transparent** (the non-tail `call_indirect` re-wraps package→list inside `rt_table`), so funcref/`elem` modules are **result-identical**; non-funcref output stays **byte-identical**. No new trap, no optimizer/tier/state change. §9. | **2049 tests**; official `return_call.wast`+`return_call_indirect.wast` driven green (**+117** pass → 46,646/1,771/0); constant stack proven to **1,000,000** (direct + mutual + indirect, both table tiers); `OptNone ≡ Baseline ≡ Aggressive` + result-identical across every combo; the 2 `return_call`-blocked legacy EH files now **convert** (driving-green deferred on a deeper non-tail-call scope — measured, R16) |
+| **14 — Cross-module funcref-in-`elem`-segment init** | `ref.func` of an **imported** function (the new `RefFuncImport(slot, ty)` IR distinction, produced by the `lower_call`-style import-split, a **pure barrier** in the optimizer) made a table-storable, `call_indirect`-able funcref that dispatches through the D3a import capability — an inline **adapter closure** capturing only the literal slot integer, routing `link.call_import(rt_state.func_import_at(slot), args)` (Cell) / threading `St` unchanged (Threaded), **never** `erlang:apply` on table data. Import-bearing detection became **one public predicate** (`emit_core.needs_func_imports`, extended to scan element segments) that `driver.module_calls_import` **delegates to**, so `instantiate/0`↔`instantiate/1` can't desync (R3). The funcref slot ABI `#(FuncType, closure)` is unchanged; a module with no imported `ref.func` compiles **byte-identically**, and modules driving the new surface are **result-identical** across `OptNone ≡ Baseline ≡ Aggressive` and the full state/tier matrix. No new trap, no runtime shape change, no optimizer/tier/state change; `link.gleam` untouched. §9. | **2080 tests**; flips the project's once-largest residual — `table_copy.wast` **569/~1,080 → 1,649/0/0** — for a headline **+1,088** pass → **47,734/683/0**; authored `corpus/xlink` backstop driven e2e across Cell/Threaded × `TablePaged`/`TableEts`/`TableAtomics` (`via_ci == direct`, cross-combo bit-identical, 3 ordered guards); D3a + arity-lockstep re-run green; audits tightened (`"UnknownFunction"`/`"call_indirect_table"` removed measure-then-remove, ceiling 1,900→750, pass floor 47,700 added) |
 
 ---
 
@@ -279,7 +280,7 @@ src/twocore/runtime/rt_js.gleam           JS runtime boundary — STUB (real imp
 src/twocore/runtime/porffor_abi.gleam     pure Porffor (f64,i32) typed-value ABI
 ```
 
-Docs (measured writeups, kept): `docs/phase-{3,4,9,10}-benchmark.md`, `docs/phase-{5,6,13}-surface.md`,
+Docs (measured writeups, kept): `docs/phase-{3,4,9,10}-benchmark.md`, `docs/phase-{5,6,13,14}-surface.md`,
 `docs/js-on-the-beam.md`, `docs/wasm-conformance.svg`.
 
 ---
@@ -291,13 +292,18 @@ a `wasmtime`/`wast2json`/rebuild-oracle engine), held across the full `(mode × 
 mem_tier)` matrix — every combo byte-identical, `fail=0` everywhere. Toolchain pins: Porffor 0.61.13,
 Node 22, wabt 1.0.41, wasmtime 46.0.1 (see `vendor.sh` + `PIN`).
 
-The **1,771 skips are all categorized** (`residual_audit_test` fails red if any skip matches no
-enumerated bucket). Phase 13 folded the two official tail-call `.wast` into the driven allowlist, so
+The **683 skips are all categorized** (`residual_audit_test` fails red if any skip matches no
+enumerated bucket). Phase 14 flipped the once-largest bucket — `table_copy.wast`'s cross-module
+funcref-in-`elem` init — to **fully driven** (1,649/0/0, +1,088 pass), so its
+`"UnknownFunction"`/`"call_indirect_table"` phrases are **removed** (a regression re-skipping those goes
+red). Phase 13 folded the two official tail-call `.wast` into the driven allowlist, so
 `return_call`/`return_call_indirect` are **no longer out-of-scope** — they run green (+117 pass). The
 buckets map directly onto [`02-roadmap.md`](02-roadmap.md):
 
-- **~1,088** — cross-module funcref-in-elem-segment init (`table_copy.wast` verifier): a deeper
-  cross-module feature than the `CallImport` direct dispatch Phase 6 landed.
+- **cross-module funcref-in-`elem` init** (`table_copy.wast` verifier) — **CLOSED in Phase 14**: `ref.func`
+  of an *imported* function placed in a table and reached via `call_indirect` now builds + dispatches
+  (the `RefFuncImport` distinction + the D3a import-adapter closure); `table_copy.wast` runs green
+  (see `docs/phase-14-surface.md`).
 - **~511** — SIMD *text-format* assertions the WAT parser can't read (the binary SIMD path proves them e2e).
 - **+3** (Phase 13) — one host-import tail/direct call per tail-call file (`spectest.print_i32_f32`)
   **denied under the deny-all Safe host** (a categorized POLICY denial, not a spec trap — it passes

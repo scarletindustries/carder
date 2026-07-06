@@ -13,29 +13,28 @@
 ////       stated once the two quantified engine gaps are discounted.
 ////
 //// ## The MEASURED headline (Safe profile, full re-vendored allowlist WITH the SIMD file set — P6-10;
-//// Phase-13 re-measured)
+//// Phase-14 re-measured)
 ////
-//// pass = 46646 (+117 over the Phase-6 close 46529 — the two official tail-call `.wast` lit up:
-//// return_call.wast +43, return_call_indirect.wast +74), fail = 0, skip = 1771 (+3 over 1768 — one
-//// host-import tail/direct call per tail-call file DENIED under the deny-all Safe host, a categorised
-//// POLICY denial that PASSES under `unsafe`; plus one already-categorised text-format residual in
-//// return_call_indirect). The pre-Phase-13 baseline was pass = 46529 (+25004 over the 21525 Phase-5
-//// close — the 59 `simd_*` files, the single largest movement in the project's history). The skip is
-//// dominated by two MEASURED, categorised residuals (never a false green — R16/S11):
-////   1. `table_copy.wast`'s **1080** cross-module funcref-in-`elem`-segment asserts — its verifier
-////      imports module `a`'s functions and initialises `elem` segments with `ref.func` of those
-////      IMPORTED functions, then dispatches via `call_indirect`. That is a DEEPER cross-module
-////      funcref-elem-init feature than the `CallImport` direct-dispatch this phase landed; it is
-////      categorised-deferred (surfaces as `emit: UnknownFunction`/`imported-global element-init`).
-////      table_copy's OTHER **569** asserts (same-module + multi-table `call_indirect`) PASS — so the
-////      honest accounting is "569 pass / 1080 residual", NOT the impossible "1649 flip" (S11).
+//// pass = 47734 (+1088 over the Phase-13 close 46646 — Phase 14 DROVE `table_copy.wast`'s cross-module
+//// funcref-in-`elem`-segment asserts, which now BUILD + DISPATCH instead of skipping), fail = 0,
+//// skip = 683 (−1088 over 1771 — the ~1080 `table_copy` cross-module residual is CLOSED). The
+//// pre-Phase-13 baseline was pass = 46529 (+25004 over the 21525 Phase-5 close — the 59 `simd_*`
+//// files, the single largest movement in the project's history). The remaining skip is dominated by
+//// one MEASURED, categorised residual (never a false green — R16/S11):
+////   1. **CLOSED by Phase 14 (measured):** `table_copy.wast`'s cross-module funcref-in-`elem`-segment
+////      asserts — its verifier imports module `a`'s functions, initialises `elem` segments with
+////      `ref.func` of those IMPORTED functions, then dispatches via `call_indirect`. Phase 14 landed
+////      the `RefFuncImport` IR distinction + the D3a import-adapter closure (`link.call_import` over
+////      the func-import slot), so the file is now FULLY driven — `table_copy.wast` = 1649/0/0, a
+////      positive movement, NOT a residual. (The old "569 pass / 1080 residual" accounting is history.)
 ////   2. the ~511 SIMD **text-format** frontend asserts (`assert_malformed`/`assert_invalid` whose
 ////      `module_type` is `.wat`) — the WAT parser rejects SIMD text (S13: SIMD text is out of scope
 ////      for the parser), so they are a categorised parse-skip, never a silent drop. Every BINARY
 ////      SIMD assert (24281 `assert_return` + 54 `assert_trap`) PASSES.
-//// Every other residual skip is a categorised out-of-scope construct (GC-proposal reftypes,
-//// extended-const, cross-module state import, `assert_exhaustion`). The multi-table `call_indirect`
-//// gap (Phase-5's label) is GONE (landed in aa89228) — asserted empty below.
+//// Every other residual skip is a categorised out-of-scope construct (const-expr / imported-global
+//// element-init, GC-proposal reftypes, `assert_exhaustion`). The multi-table `call_indirect` gap
+//// (Phase-5's label) is GONE (landed in aa89228) — asserted empty below; the `UnknownFunction`
+//// cross-module funcref-in-`elem` gap (Phase-14's) is CLOSED and MEASURED empty below.
 
 import gleam/int
 import gleam/io
@@ -55,13 +54,23 @@ const phase4_baseline_pass: Int = 15_749
 /// over this once the SIMD file set is present (SIMD alone adds ~25k execution passes).
 const phase5_baseline_pass: Int = 21_525
 
-/// The total-skip regression ceiling under the full re-vendored allowlist WITH SIMD (measured 1771
-/// after Phase 13 folded the two tail-call `.wast` in — +3 over the pre-Phase-13 1768; headroom for
-/// minor drift). A FURTHER inflation goes red. It is dominated by the two MEASURED
-/// residuals: table_copy's ~1080 cross-module funcref-elem-init + the ~511 SIMD text-format frontend
-/// asserts (S13). Without SIMD vendored (a curated-subset checkout) the skip is far lower (~1257),
-/// still under this ceiling — so the ceiling holds for both fixture sets.
-const max_residual_skips: Int = 1900
+/// The Phase-14 MEASURED pass floor WITH the SIMD file set (measured 47734 after the `table_copy.wast`
+/// cross-module funcref-in-`elem` flip; `−34` headroom for minor benign drift, and pass only GROWS).
+/// A regression that RE-SKIPS `table_copy`'s ~1080 cross-module asserts drops pass by ~1080 (→ ~46654,
+/// far below this floor) → RED. Asserted only when SIMD is vendored (the full CI suite), since the
+/// figure includes SIMD's 25004 execution passes; a curated no-SIMD checkout skips it (like the
+/// `phase5_baseline_pass` rise). Prior-phase floors (`phase4`/`phase5`) are UNTOUCHED history — they
+/// stay far below and keep holding because pass only grows.
+const phase14_pass_floor: Int = 47_700
+
+/// The total-skip regression ceiling under the full re-vendored allowlist WITH SIMD. Phase 14 CLOSED
+/// the ~1080 `table_copy` cross-module funcref-in-`elem` residual, so the measured skip DROPPED from
+/// 1771 (Phase 13) to 683 — dominated now by the ~511 SIMD text-format frontend asserts (S13) + the
+/// const-expr / imported-global element-init residual. The ceiling is LOWERED from 1900 to 750 (683 +
+/// small headroom): a regression that RE-SKIPS the flipped `table_copy` asserts inflates skip well
+/// past 750 → RED. Without SIMD vendored (a curated-subset checkout) the skip is far lower (~172),
+/// still under this ceiling — so the lowered ceiling holds for both fixture sets.
+const max_residual_skips: Int = 750
 
 /// A stable-phrase membership test: a residual skip is HONEST iff its reason matches one of the
 /// enumerated categories. A skip matching none is UNCATEGORISED — a construct that quietly went
@@ -72,11 +81,13 @@ fn in_allowed_category(reason: String) -> Bool {
 
 fn allowed_phrases() -> List(String) {
   [
-    // ── the two KNOWN EMIT GAPS (quantified separately; a follow-up for the manager) ──
-    "call_indirect_table",
-    // multi-table call_indirect
+    // ── the KNOWN EMIT GAP: const-expr / imported-global element-init (a DIFFERENT residual from
+    //    Phase-14's — an element/data segment initialised from an imported global's `global.get`,
+    //    NOT a `ref.func` of an imported function). Phase 14 REMOVED `"UnknownFunction"` (cross-module
+    //    funcref-in-`elem`, now driven) and `"call_indirect_table"` (multi-table, GONE) — reconciled
+    //    toward the tighter `residual_audit` set (§3.2/§3.3), so a re-skip of those goes RED. ──
     "UnsupportedNode", "imported-global element-init", "NonConstInit",
-    "NonConstantExpr", "UnknownFunction",
+    "NonConstantExpr",
     // ── out-of-scope constructs (H8 / R12 categorised skips) ──
     "v128", "simd", "lane",
     // SIMD → Phase 6
@@ -115,8 +126,11 @@ fn is_multi_table_ci(reason: String) -> Bool {
   || string.contains(reason, "UnsupportedNode")
 }
 
-/// The imported-global element-init emit gap (an element/data segment initialised from an imported
-/// global's `global.get`, or a `ref.func` through an unresolved declarative segment).
+/// The cross-module funcref-in-`elem` bucket the flip CLOSED (was `table_copy`'s ~1080 residual,
+/// surfaced as `emit: UnknownFunction`). After Phase 14 landed the `RefFuncImport` distinction + the
+/// D3a adapter, this bucket collapses to 0 — kept as a MEASURED report (printed, never asserted empty,
+/// S11) so a future reader sees the movement. Still matches the (distinct, deferred) imported-global
+/// element-init gap (`global.get` of an imported global in a segment offset) via its own phrases.
 fn is_imported_global_elem(reason: String) -> Bool {
   string.contains(reason, "imported-global element-init")
   || string.contains(reason, "NonConstInit")
@@ -169,7 +183,7 @@ pub fn skip_count_dropped_and_residual_is_honest_test() {
     <> int.to_string(n_multi_table)
     <> " (GONE — landed aa89228);  table_copy cross-module funcref-elem-init: "
     <> int.to_string(n_imported_global)
-    <> " (categorised-deferred);  SIMD text-format frontend (S13 out-of-scope): "
+    <> " (CLOSED by Phase 14 — measured);  SIMD text-format frontend (S13 out-of-scope): "
     <> int.to_string(list.length(simd_text)),
   )
   case uncategorised {
@@ -208,8 +222,13 @@ pub fn skip_count_dropped_and_residual_is_honest_test() {
   case simd_present {
     // (g) SIMD roughly doubled the suite — the Phase-6 material rise (only when SIMD is vendored;
     //     a curated-subset checkout stays at the Phase-5 pass level and skips this).
+    // (h) the Phase-14 MEASURED pass floor: `table_copy.wast`'s ~1080 cross-module funcref-in-`elem`
+    //     asserts are DRIVEN + passing, so `pass` sits above `phase14_pass_floor`. A regression that
+    //     re-skips them drops `pass` by ~1080, below the floor → RED. Guarded on SIMD presence because
+    //     the measured figure includes SIMD's 25004 execution passes.
     True -> {
       assert total.pass > phase5_baseline_pass
+      assert total.pass >= phase14_pass_floor
       Nil
     }
     False -> Nil

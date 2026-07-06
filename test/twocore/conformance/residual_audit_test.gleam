@@ -3,13 +3,15 @@
 //// and asserts the measured composition is HONEST — every residual skip is one of the enumerated
 //// Phase-6 categories (never an uncategorised / mislabelled skip, D9), and `fail == 0`.
 ////
-//// This resolves the Phase-5 `~1088-assert` residual ambiguity by MEASUREMENT (S11): the residual is
-//// `table_copy.wast` needing cross-module funcref-in-`elem`-segment init (a DEEPER cross-module
-//// feature than the `CallImport` direct dispatch this phase landed) — NOT the impossible "1649 flip".
-//// table_copy's same-module + multi-table `call_indirect` asserts PASS; only its cross-module
-//// funcref-elem asserts remain, categorised-deferred. The SIMD text-format frontend asserts (S13:
-//// SIMD text is out of scope for the WAT parser) are the other named residual. The audit prints the
-//// TRUE cause per file so a future reader never sees a guessed label.
+//// Phase 14 CLOSED the once-largest residual by MEASUREMENT (S11): `table_copy.wast`'s cross-module
+//// funcref-in-`elem`-segment init — `ref.func` of an IMPORTED function placed in a table and reached
+//// via `call_indirect` — now BUILDS + DISPATCHES (the `RefFuncImport` IR distinction + the D3a
+//// import-adapter closure), so the file runs FULLY (`table_copy.wast` = 1649/0/0). The `"UnknownFunction"`
+//// / `"call_indirect_table"` phrases that categorised that gap are REMOVED below (measured empty first),
+//// so a `RefFuncImport`-shaped regression goes RED instead of hiding. The remaining named residuals are
+//// the SIMD text-format frontend asserts (S13: SIMD text is out of scope for the WAT parser) and the
+//// DISTINCT const-expr / imported-global element-init gap. The audit prints the TRUE cause per file so
+//// a future reader never sees a guessed label.
 
 import gleam/dict
 import gleam/int
@@ -29,9 +31,17 @@ const fixtures_dir = "test/twocore/conformance/fixtures"
 /// construct that quietly went dark — and fails the audit.
 fn allowed_phrases() -> List(String) {
   [
-    // cross-module funcref-in-elem-segment init (table_copy) — deeper than CallImport dispatch (S11)
-    "UnknownFunction", "imported-global element-init", "NonConstInit",
-    "NonConstantExpr", "call_indirect_table", "UnsupportedNode",
+    // NOTE (Phase 14): the cross-module funcref-in-`elem`-segment gap is CLOSED — `table_copy.wast`
+    // now BUILDS + DISPATCHES its `ref.func`-of-an-imported-function asserts (the `RefFuncImport` IR
+    // distinction + the D3a import-adapter closure landed), so the `"UnknownFunction"` and
+    // `"call_indirect_table"` phrases that categorised it are DELIBERATELY GONE. MEASURED before
+    // removal: no residual skip carries either phrase (`table_copy.wast` = 1649/0/0). Removing them
+    // means a `RefFuncImport`-shaped regression that re-skips these asserts goes RED (uncategorised)
+    // instead of hiding. The DISTINCT, still-deferred const-expr / imported-global element-init gap
+    // (a segment initialised from an *imported global*'s `global.get`, NOT a `ref.func` of an imported
+    // *function*) keeps its own phrases below.
+    "imported-global element-init", "NonConstInit", "NonConstantExpr",
+    "UnsupportedNode",
     // SIMD text-format frontend asserts — SIMD text out of scope for the WAT parser (S13)
     "out-of-scope text", "v128", "simd", "lane",
     "text parser+validator accepted",

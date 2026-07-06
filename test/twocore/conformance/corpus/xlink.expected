@@ -1,0 +1,12 @@
+# Phase-14 cross-module funcref-in-elem. Values spec-obvious; trap phrases per rt_trap.spec_trap_message.
+# ef0(x)=x+10, ef1(x)=x*2, defined(x)=x-1. Single table: slot 0=ef0(import), 1=defined, 2=ef1(import),
+# 3=null. Driven by combos.evaluate_linked (module $a registered as provider "a"); values cross-checked
+# with wasmtime 46.0.1 at authoring time.
+invoke via_ci  i32:0 i32:5   => return i32:15    # slot 0 = imported ef0 → 5+10
+invoke via_ci  i32:2 i32:5   => return i32:10    # slot 2 = imported ef1 → 5*2
+invoke via_ci  i32:1 i32:5   => return i32:4     # slot 1 = defined     → 5-1  (mixed segment)
+invoke direct  i32:5         => return i32:15    # DIRECT call of ef0 — MUST equal via_ci(0,5)
+# The three ordered fail-closed guards on import-routed slots (spec order: bounds → null → type).
+invoke ci_oob  i32:0         => trap undefined element
+invoke ci_null i32:0         => trap uninitialized element
+invoke ci_type i32:0         => trap indirect call type mismatch

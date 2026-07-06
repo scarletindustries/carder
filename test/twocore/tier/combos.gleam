@@ -26,12 +26,13 @@ import twocore/conformance/fixture.{
 }
 import twocore/conformance/oracle
 import twocore/conformance/runner.{
-  type Driver, type Instance, DriverError, Returned, Trapped,
+  type Driver, type Instance, DriverError, ImportEnv, Returned, Trapped,
+  provider_from_instance,
 }
 import twocore/runtime/instance.{
   type Binding, type MemTier, type Mode, type StateStrategy, type TableTier,
-  Atomics, Binding, Cell, Nif, Paged, Safe, TableAtomics, TablePaged, Threaded,
-  Unsafe,
+  Atomics, Binding, Cell, Nif, Paged, Safe, TableAtomics, TableEts, TablePaged,
+  Threaded, Unsafe,
 }
 import twocore/runtime/profiles
 
@@ -126,6 +127,19 @@ pub const threaded_atomics = Combo(
 /// keeps the point node-safe. Included because the skeleton loads on a bare BEAM.
 pub const cell_nif = Combo("cell×nif", Cell, Nif, TablePaged, Unsafe)
 
+/// The tier-O `ets`-backed table (`TableEts`) under the `Cell` calling convention, Safe. Not a
+/// Phase-4 `shipped` point (so no tier suite ripples), but a policy-legal Safe binding — `ets` is
+/// node-safe, no native code — added so the Phase-14 cross-module funcref backstop (`xlink`) is
+/// driven end-to-end on ALL three table tiers (`TablePaged`/`TableEts`/`TableAtomics`), matching
+/// the §4 "End-to-end dispatch" claim that every tier is proven e2e (not only via R14-03's
+/// hand-built substrate differential).
+pub const cell_ets = Combo("cell×ets", Cell, Paged, TableEts, Safe)
+
+/// The tier-O `ets`-backed table under the `Threaded` calling convention, Safe — the Threaded ×
+/// `TableEts` point (a Threaded build threads `St` unchanged through the import-routed adapter
+/// closure, R2, so the imported funcref must dispatch to the same value on `ets` as on paged).
+pub const threaded_ets = Combo("threaded×ets", Threaded, Paged, TableEts, Safe)
+
 /// The `portable` deployment profile as a `Combo` — an alias of `threaded_paged` (Safe, tier-P
 /// on every axis), the point proofs 3/4 name directly.
 pub const portable = threaded_paged
@@ -146,6 +160,30 @@ pub const shipped: List(Combo) = [
 pub const metered: List(Combo) = [
   cell_paged,
   threaded_paged,
+  cell_atomics,
+  threaded_atomics,
+]
+
+/// The Phase-14 cross-module funcref backstops — corpus programs that place a `ref.func` of an
+/// IMPORTED function into a table via an active `elem` segment and dispatch it through
+/// `call_indirect`. An imported funcref REQUIRES a `(register)`ed provider (a single self-contained
+/// module cannot express it, and a single-module import is fail-closed rejected under the deny-all
+/// Safe host — the invariant that keeps `corpus/hostimport` a `reject`), so these are driven by
+/// `evaluate_linked` (which registers a provider first), NEVER the single-module `evaluate` /
+/// `whole_corpus_tier_differential_test` (which supplies no provider and would `Rejected` them).
+pub const cross_module_programs: List(String) = ["xlink"]
+
+/// The `(state_strategy × table_tier)` matrix the cross-module funcref backstop is driven across:
+/// Cell AND Threaded × every table tier (`TablePaged`/`TableEts`/`TableAtomics`), all Safe. This is
+/// the §4 "End-to-end dispatch" matrix — an imported funcref reached via `call_indirect` must return
+/// the same value (and trap identically) on every point, since the state strategy and table tier are
+/// non-observable. (`cell_nif` is deliberately absent — the cross-module drive proves the Safe
+/// registered-provider path; the tier/state substrate is separately proven by R14-03.)
+pub const cross_module_combos: List(Combo) = [
+  cell_paged,
+  threaded_paged,
+  cell_ets,
+  threaded_ets,
   cell_atomics,
   threaded_atomics,
 ]
@@ -249,6 +287,59 @@ pub fn evaluate(d: Driver, name: String) -> #(List(Outcome), List(String)) {
             #(list.append(outs, [o]), list.append(fails, f))
           })
       }
+  }
+}
+
+/// Drive a CROSS-MODULE corpus program (a `cross_module_programs` member) under a `Driver` already
+/// bound to one combo, registering a provider first — the Phase-14 imported-funcref path. It mirrors
+/// `evaluate` (same `#(outcomes, failures)` shape, so `identity_across` compares combos unchanged)
+/// but supplies the `(register)`ed provider an imported funcref needs:
+///   1. instantiate the provider from `provider_bytes` (`d.instantiate`),
+///   2. publish its exports as a cross-module capability (`runner.provider_from_instance`),
+///   3. instantiate the `importer` corpus `.wasm` WITH that provider
+///      (`d.instantiate_env(bytes, ImportEnv([provider]))` — the provider-carrying seam),
+///   4. reduce every `.expected` point through the SAME `run_point` machinery `evaluate` uses.
+///
+/// - `d`: a `Driver` bound to one `Combo` (via `driver.pipeline_with(binding_for(combo))`).
+/// - `provider_name`: the link-name to `(register)` the provider under (e.g. `"a"`).
+/// - `provider_bytes`: the provider module's `.wasm` bytes.
+/// - `importer`: the corpus program stem whose `.wasm`/`.expected` are read (e.g. `"xlink"`).
+/// - Returns `#(outcomes, failures)`: one `Outcome` per `.expected` point (the input to
+///   `identity_across`) and the spec-correctness violations at THIS combo (empty ⇒ all matched). A
+///   provider- or importer-instantiation failure is itself a recorded `Rejected` outcome + failure
+///   (never a panic), so a combo that fails to link shows up in both checks.
+pub fn evaluate_linked(
+  d: Driver,
+  provider_name: String,
+  provider_bytes: BitArray,
+  importer: String,
+) -> #(List(Outcome), List(String)) {
+  let assert Ok(importer_bytes) = read_wasm(importer)
+  let assert Ok(text) = read_expected(importer)
+  let assert Ok(expects) = corpus.parse(text)
+
+  case d.instantiate(provider_bytes) {
+    Error(reason) -> #([Rejected], [
+      importer
+      <> ": provider '"
+      <> provider_name
+      <> "' failed to instantiate: "
+      <> reason,
+    ])
+    Ok(inst_a) -> {
+      let provider = provider_from_instance(provider_name, inst_a)
+      case d.instantiate_env(importer_bytes, ImportEnv([provider])) {
+        Error(reason) -> #([Rejected], [
+          importer <> ": importer failed to instantiate: " <> reason,
+        ])
+        Ok(inst) ->
+          list.fold(expects, #([], []), fn(acc, ex) {
+            let #(outs, fails) = acc
+            let #(o, f) = run_point(d, inst, importer, ex)
+            #(list.append(outs, [o]), list.append(fails, f))
+          })
+      }
+    }
   }
 }
 

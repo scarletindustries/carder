@@ -20,8 +20,11 @@ a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
   tail calls; +117 conformance pass, 46,646/1,771/0; constant stack proven to 1,000,000). *Measurement
   correction (R16): the 2 `return_call`-blocked legacy EH files now **convert** but do **not** run green —
   a deeper non-tail-call scope, newly deferred in §G.*
-- ⏳ **Phases 14–15 in flight** — cross-module funcref-in-elem init (§C), production C NIF for tier-N
-  memory (§D). Still listed below, tagged **in flight**, until their capstones prove out.
+- ✅ **Phase 14 — cross-module funcref-in-`elem` init** (`RefFuncImport` + an inline D3a adapter over
+  `link.call_import`; the `table_copy.wast` residual **fully flipped 569/1080 → 1649/0/0**, headline
+  47,734/683/0, +1,088 pass — the single largest categorized residual, now CLOSED).
+- ⏳ **Phase 15 in flight** — production C NIF for tier-N memory (§D). Still listed below, tagged **in
+  flight**, until its capstone proves out.
 
 ---
 
@@ -69,12 +72,19 @@ WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a 
 
 ## C. Cross-module (deeper than what Phase 6 landed)
 
-- **Cross-module funcref-in-elem-segment init.** ⏳ **Now Phase 14, in flight** — see
-  [`phase-14/00-overview.md`](phase-14/00-overview.md). elem segments initialized with `ref.func` of
-  *imported* functions + `call_indirect` (the `table_copy.wast` verifier, **~1,080 categorized skips —
-  the single largest residual bucket**). Deeper than the `CallImport` *direct* dispatch Phase 6 shipped:
-  it requires an imported function to become a table-storable, `call_indirect`-able funcref that still
-  routes through the D3a import capability (never `erlang:apply` from table data).
+- ✅ **Cross-module funcref-in-elem-segment init.** **Done — Phase 14** (see
+  [`01-status.md`](01-status.md) §3, row 14). `elem` segments initialized with `ref.func` of *imported*
+  functions + `call_indirect`: the `table_copy.wast` residual **fully flipped 569/1080 → 1649/0/0** (the
+  single largest categorized bucket, CLOSED). An imported `ref.func` lowers to a distinct `RefFuncImport`
+  node → an inline D3a adapter funcref `#(FuncType, fun(Args) -> link:call_import(func_import_at(slot),
+  Args))` (reshaped to the package-ABI the post-Phase-13 `rt_table` expects), tier/strategy-uniform.
+- **`rt_table_ets` multi-table instances.** ⓘ **Newly found by Phase 14 (pre-existing, orthogonal).**
+  `twocore_rt_table_ets_ffi:new/0` uses a single process-dictionary slot for its
+  delete-prior-on-reinstantiation discipline, so a module declaring **2+ tables** under `TableEts`
+  deletes the first ETS table on the second `new` → `instantiate: badarg`. Independent of imported
+  funcrefs (a plain two-table *defined*-funcref module fails identically); never surfaced before because
+  no shipped combo used `TableEts` end-to-end. Fix belongs to the table-tier owner (per-table keyed
+  storage). Documented in `docs/phase-14-surface.md`; single-table `TableEts` is proven.
 - **Cross-module EH tags** — a qualified `{module, idx}` tag identity across module boundaries.
   Porffor-inert (single-module scope), deferred by Phase 7.
 - **Threaded cross-instance linking** — Phase 6 proved cross-module linking under `cell`; the invasive

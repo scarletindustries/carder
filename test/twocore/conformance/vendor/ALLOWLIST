@@ -191,10 +191,12 @@ return_call_indirect	--enable-tail-call
 #     globals (GC syntax, line 99). Per R16 they route through OUR WAT parser (P5-10) where the
 #     parser accepts the in-scope subset, categorizing the out-of-scope modules as parse-skips. Driven
 #     by wat_fixture.gleam (NOT this list) — kept OUT of the wast2json allowlist deliberately.
-#   * table_copy.wast (allowlisted above): 569 asserts PASS; ~1080 remain a CATEGORIZED residual —
-#     its verifier imports module `a`'s functions and inits `elem` segments with `ref.func` of those
-#     IMPORTED functions (cross-module funcref-in-elem-segment init), a DEEPER feature than the
-#     `CallImport` direct dispatch this phase landed. NOT the impossible "1649 flip" (S11).
+#   * table_copy.wast (allowlisted above): CLOSED in Phase 14 — now FULLY DRIVEN, 1649/0/0 (measured).
+#     Its verifier imports module `a`'s functions and inits `elem` segments with `ref.func` of those
+#     IMPORTED functions (cross-module funcref-in-elem-segment init) then dispatches via call_indirect;
+#     Phase 14 landed the `RefFuncImport` IR distinction + the D3a import-adapter closure
+#     (link.call_import over the func-import slot), so the once-~1080 residual is GONE — a positive
+#     movement, not a residual (docs/phase-14-surface.md). NOT the impossible "1649 flip" framing (S11).
 #   * TAIL CALL (return_call.wast / return_call_indirect.wast) is now DRIVEN (Phase 13, allowlisted
 #     above with `--enable-tail-call`) — no longer deferred. The remaining post-2.0 proposals stay
 #     categorized-deferred (S12): GC (typed refs / struct/array/i31), stack-switching, the component
