@@ -56,9 +56,10 @@ tier-O posture** (Safe permits tier P **or** O, never N — G6), not an Unsafe-o
    from Phase 3.
 3. **native NIF ceiling** — `crypto:hash(sha256, _)` and `zlib` for SHA-256/DEFLATE. **NIF-backed C,
    NOT hand-written Erlang** — a raw *ceiling*, clearly labelled; 2core is expected to sit below it.
-   The tier-N `nif` memory tier that would attack this gap is **Phase-4-deferred** (unit 05 ships the
-   interface + Safe-forbidden status only; the C impl needs a native toolchain), so there is **no
-   `nif` column** — the native figures remain the raw ceiling.
+   The tier-N `nif` **memory** tier that attacks the *memory* gap **shipped in Phase 15** (a real
+   `erl_nif` C backend over a reserved raw byte buffer) and is now measured as **the `nif` column**
+   below (§Results); the `crypto`/`zlib` native figures remain the raw *numeric* ceiling that tier-N
+   *memory* does not attack (tier-N numerics is out of scope). See `docs/phase-15-tier-n.md`.
 4. **`wasmtime`** — **correctness only** (bit-exact, cross-checked by `smoke/run.sh` and by the
    per-build gate below). Per-call *timing* stays **omitted**: `wasmtime run --invoke` measures a
    whole process (startup + JIT + one invoke), not comparable to `exec`'s pure-invocation timing — a
@@ -99,20 +100,37 @@ tier-O posture** (Safe permits tier P **or** O, never N — G6), not an Unsafe-o
 
 Every 2core build below was **correctness-gated bit-exact vs `wasmtime` before it was timed.**
 
-| kernel | safe / paged | atomics-safe | portable (thr/paged) | unsafe-paged | ceiling (uns/atomics) | hand-Erl / native |
-|---|---:|---:|---:|---:|---:|---:|
-| `crc32(4096)`        |  3,806,310 |  **1,639,040** |  3,821,660 |  3,640,300 |  **1,341,650** | **51,800** (hand-Erl) |
-| `sha256_word(4096)`  | 20,087,860 |  **7,865,480** | 18,297,580 | 20,545,810 |  **8,052,920** | 40,800 (native `crypto`) |
-| `deflate_rt(2000)`   | 61,464,300 | **21,454,000** | 57,061,800 | 56,201,350 | **13,586,750** | 40,900 (native `zlib`) |
+| kernel | safe / paged | atomics-safe | portable (thr/paged) | unsafe-paged | ceiling (uns/atomics) | nif (uns/native) † | hand-Erl / native |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `crc32(4096)`        |  3,806,310 |  **1,639,040** |  3,821,660 |  3,640,300 |  **1,341,650** |  **1,027,780** | **51,800** (hand-Erl) |
+| `sha256_word(4096)`  | 20,087,860 |  **7,865,480** | 18,297,580 | 20,545,810 |  **8,052,920** |  **5,254,520** | 40,800 (native `crypto`) |
+| `deflate_rt(2000)`   | 61,464,300 | **21,454,000** | 57,061,800 | 56,201,350 | **13,586,750** | **10,687,900** | 40,900 (native `zlib`) |
+
+**† The `nif` column (Phase 15) — the tier-N `--ceiling --tier nif --cap 1024` build over the real
+`erl_nif` C backend.** It is a **same-run re-measurement** (`./smoke/bench.sh 100 1024 300`, toolchain-gated,
+correctness-gated bit-exact vs `wasmtime` before timing — a dash absent `cc`); that run reproduced the
+other five committed columns within run-to-run variance (±~10%, light machine load: this run's
+`safe/paged` = 4,248,190 / 20,760,650 / 67,447,650, `atomics-safe` = 1,762,850 / 7,815,700 / 20,277,250,
+`ceiling` = 1,403,480 / 7,900,290 / 13,439,700 — all within variance of the committed figures), so the
+`nif` column and its ratios are drawn **same-run** to stay honest. tier-N native is the **fastest** build
+on all three kernels, most on store-heavy DEFLATE. `gleam build` has no native pre-build hook, so the
+`.so` is compiled out of band (the production `priv/*.so` packaging in miniature — S8).
 
 **Derived ratios per kernel** (`paged→atomics` = the pure tier-O speedup; `→ref` = the residual to
 hand-written-Erlang / native):
 
-| kernel | `paged→atomics` (× faster) | `safe→ref` (× slower) | `atomics→ref` (× slower) | `ceiling→ref` (× slower) |
-|---|---:|---:|---:|---:|
-| `crc32(4096)`        | **2.3×** | 73.5× |  **31.6×** |  25.9× |
-| `sha256_word(4096)`  | **2.6×** | 492×  | **192.8×** | 197.4× |
-| `deflate_rt(2000)`   | **2.9×** | 1503× | **524.5×** | 332.2× |
+| kernel | `paged→atomics` (× faster) | `safe→ref` (× slower) | `atomics→ref` (× slower) | `ceiling→ref` (× slower) | `atomics→nif` (× faster) ‡ | `nif→ref` (× slower) ‡ |
+|---|---:|---:|---:|---:|---:|---:|
+| `crc32(4096)`        | **2.3×** | 73.5× |  **31.6×** |  25.9× | **1.7×** |  **19.2×** |
+| `sha256_word(4096)`  | **2.6×** | 492×  | **192.8×** | 197.4× | **1.5×** | **131.2×** |
+| `deflate_rt(2000)`   | **2.9×** | 1503× | **524.5×** | 332.2× | **1.9×** | **267.2×** |
+
+**‡ The `atomics→nif` and `nif→ref` ratios are same-run** (the `nif` build and its `atomics`/`ref`
+baselines from `./smoke/bench.sh 100 1024 300`, †) — the pure tier-O→tier-N *memory* delta and the
+residual to hand-Erl/native. `atomics → nif` is **1.5×–1.9×** (largest on store-heavy DEFLATE, where the
+64-bit-word read-modify-write of `atomics` becomes a raw byte `memcpy`); `nif → ref` is still **19.2×**
+on the pure CRC-32 head-to-head — tier-N *memory* does **not** reach hand-written Erlang, because the
+tier-P `bif` numeric floor and the per-access seam-call floor remain.
 
 `crc32(4096)`: 2core (every build) = `2538352202` = hand-written-Erlang `2538352202` = `wasmtime`. A
 clean, bit-identical head-to-head.
@@ -177,6 +195,32 @@ phase. Two honest sub-findings:
   from ~525× to ~332×. So the Aggressive-vs-Baseline delta, `n/a` in Phase 3, is now **measurable on
   a real module** — and it matters most exactly where there is non-memory work left to optimize.
 
+**4. tier-N `nif` — the native-memory ceiling (Phase 15, measured, no hero number).** The previously
+Phase-4-deferred `nif` column is now a real `erl_nif` C backend over a reserved raw byte buffer (see
+`docs/phase-15-tier-n.md`), measured same-run (†). The honest reading, with **no hero number**:
+
+- **`atomics → nif` is a real, store-intensity-tracking win of 1.5×–1.9×.** It removes the two costs
+  `atomics` leaves on the table: the 64-bit-word read-modify-write mask on sub-word/unaligned stores
+  (§2 above) becomes a raw byte `memcpy` — so store-heavy DEFLATE gains most (**1.9×**), load-heavy
+  CRC-32 least (**1.7×**); and on the loop-versioned fast arms tier-N now emits **native unchecked
+  derefs** (the bounds compare elided — the Phase-15 unchecked lever). tier-N native is in fact the
+  **fastest build measured this phase**, beating even `ceiling` on tier-O `atomics` on all three
+  kernels (crc `1.03` vs `1.40` ms; sha `5.25` vs `7.90` ms; deflate `10.7` vs `13.4` ms).
+- **The cleanest isolation — the *same* `nif` `.beam`, same session, toggling ONLY whether the `.so` is
+  loaded** (native vs the paged-delegate fallback on the identical compiled artifact, both bit-exact) —
+  is **3.10× / 4.00× / 5.73×** (crc / sha / deflate). That is exactly what native linear memory buys,
+  isolated from every other variable, and the store-intensity ordering (deflate > sha > crc) holds
+  precisely.
+- **The floor that remains — why `nif → ref` is still 19.2× on CRC-32.** The **per-access inter-module
+  seam call** (`call 'twocore@runtime@rt_mem_nif':'<op>'(...)`, a build-controlled module atom **never
+  inlined**) is present in **every** tier including `nif`; the NIF removes it **only** for the unchecked
+  loop bodies the optimizer strips to a raw deref, never for the checked per-op seam. And **tier-P `bif`
+  numerics are untouched** (tier-N numerics is out of scope, G8) — so on the numerics-dominated,
+  load-heavy CRC-32 the residual is dominated by the bignum ops native *memory* cannot touch. **State
+  plainly: the tier-N memory ceiling does NOT reach hand-written Erlang** — it removes the *memory*
+  constant, not the *numeric* one and not the *seam*. SHA-256 / DEFLATE remain ~131× / ~267× below the
+  native `crypto`/`zlib` **ceiling** — a ceiling, not a peer.
+
 **Threading overhead (G4) is small.** `portable` (`Threaded` + `Paged`) is within a few percent of
 `safe` (`Cell` + `Paged`) on every kernel — sometimes marginally faster (noise). The purely-functional
 instance-state record threaded through generated code is a fixed-size handle; it is not a speed lever
@@ -201,9 +245,14 @@ beside it — and it is honestly still short.**
 2. **Tier-P `bif` numerics unchanged.** `rt_num` remains pure Gleam over BEAM bignums. This is the
    dominant residual on CRC-32 and is **out of Phase-4 scope** (G8) — tier-N `nif` numerics is the
    biggest remaining lever the residual analysis points at, and it is deferred.
-3. **No `nif` memory column.** Tier-N `nif` memory (the raw O(1) native ceiling for a 2core build) is
-   unit-05 interface-only; the C impl needs a native build toolchain and is **documented-deferred**.
-   The native `crypto`/`zlib` figures are therefore the raw ceiling, not a 2core tier.
+3. **The `nif` memory column shipped in Phase 15 (measured).** Tier-N `nif` memory (the raw O(1)
+   native ceiling for a 2core build) is now a real `erl_nif` C backend, measured as the `nif` column
+   above: **1.5×–1.9× over `atomics`** (most on store-heavy DEFLATE), and **3.10×–5.73×** on the clean
+   same-`.beam` native-vs-paged-delegate isolation. It is measured **same-run** (†, toolchain-gated;
+   a categorized dash absent `cc`, never a fabricated number). It does **not** reach hand-written
+   Erlang (`nif → ref` still ~19.2× on CRC-32): tier-N *memory* removes the memory constant, not the
+   tier-P `bif` **numeric** floor (still out of scope, G8) nor the per-access inter-module **seam-call**
+   floor. The native `crypto`/`zlib` figures remain the raw *numeric* ceiling, not a 2core tier.
 4. **`atomics` requires a bounded cap.** The reported `atomics` numbers depend on a `--cap` (here
    1024 pages) that exceeds the kernels' 18–22-page working set. A crate whose memory cannot be
    bounded to the reserve cap (`4096` pages) without changing the crate could not be measured under
@@ -225,8 +274,9 @@ paged gap (most on store-heavy kernels, as predicted), the runs-anywhere `thread
 nothing, and the Aggressive optimizer becomes measurable on a real module for the first time — but
 2core is **still not faster than hand-written Erlang**, held above the floor by the two costs
 `atomics` does not touch. The residual analysis names the next levers precisely: **tier-N `bif→nif`
-numerics** (the biggest remaining constant, and the dominant CRC-32 residual), a **tier-N `nif`
-memory** backend (the raw ceiling, deferred until a native toolchain lands), and a **smarter inliner
-cost model** (so the Aggressive-vs-Baseline delta the `deflate/ceiling` column now reveals can be
+numerics** (the biggest remaining constant, and the dominant CRC-32 residual, still out of scope), a
+**tier-N `nif` memory** backend (the raw memory ceiling — **shipped and measured in Phase 15**: 1.5×–1.9×
+over `atomics`, 3.10×–5.73× native-vs-paged-delegate; see `docs/phase-15-tier-n.md`), and a **smarter
+inliner cost model** (so the Aggressive-vs-Baseline delta the `deflate/ceiling` column now reveals can be
 realized without a 1.7 MB `.beam`). The capstone (unit 11) cites these findings as Phase 4's one
-measured claim about the outside world.
+measured claim about the outside world; Phase 15 measured the `nif`-memory lever it named.

@@ -23,8 +23,13 @@ a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
 - ✅ **Phase 14 — cross-module funcref-in-`elem` init** (`RefFuncImport` + an inline D3a adapter over
   `link.call_import`; the `table_copy.wast` residual **fully flipped 569/1080 → 1649/0/0**, headline
   47,734/683/0, +1,088 pass — the single largest categorized residual, now CLOSED).
-- ⏳ **Phase 15 in flight** — production C NIF for tier-N memory (§D). Still listed below, tagged **in
-  flight**, until its capstone proves out.
+- ✅ **Phase 15 — production tier-N C NIF** (a real `erl_nif` backend over a reserved ERTS-resource
+  buffer, bit-identical to paged by an ~800-step differential, node-safe by a 16-test C-bounds fuzz
+  incl. memory64 overflow vectors; unchecked fast path wired; **3.10–5.73× faster than the paged
+  delegate** on the same `.beam`, native-when-loaded / paged-otherwise). *Honest scope, §D: the
+  conformance `cell_nif` point runs the bit-identical paged delegate (a test-harness resource-lifecycle
+  constraint), imported-memory native load/store is a documented gap, and a prebuilt `priv/*.so`
+  packaging step is a follow-on.*
 
 ---
 
@@ -100,14 +105,22 @@ WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a 
 
 ## D. Runtime tiers & binding
 
-- **Production C NIF for tier-N memory.** ⏳ **Now Phase 15, in flight** — see
-  [`phase-15/00-overview.md`](phase-15/00-overview.md). Phase 4 shipped the uniform interface + a
-  node-safe reference skeleton (`rt_mem_nif` delegates to paged today); this phase fills it with a real
-  `erl_nif` C backend over a reserved raw byte buffer — the raw O(1) memory ceiling (Unsafe-only,
-  Safe-forbidden), **plus** the unchecked fast path tier-N currently lacks (§E). The C source ships with
-  a test-time compile-gate (`cc -shared -fPIC` → `load_nif`, skip-categorized when no toolchain, like
-  the Elixir binding arm); a prebuilt per-platform `priv/*.so` packaging step is a documented follow-on
-  (Gleam has no native pre-build hook).
+- ✅ **Production C NIF for tier-N memory.** **Done — Phase 15** (see [`01-status.md`](01-status.md) §3,
+  row 15). A real `erl_nif` C backend over a reserved ERTS-resource byte buffer, bit-identical to the
+  paged reference (~800-step differential), node-safe (16-test C-bounds fuzz incl. memory64 overflow +
+  cross-resource copy vectors — the C bounds-check is the tested trust boundary), with the unchecked
+  fast path wired (§E). Unsafe-only, Safe-forbidden (4 gates preserved), un-`--link`-able. Built at test
+  time via a `cc`-gated harness (`-undefined dynamic_lookup` mandatory on macOS; a robust `erts_include`
+  resolver since `code:lib_dir(erts,include)` is header-less on homebrew OTP), proven on CI gcc + macOS
+  clang. Measured **3.10–5.73× over the paged delegate** (store-heavy gains most); still 19.2× off
+  hand-written Erlang (the inter-module seam-call floor + tier-P `bif` numeric floor remain).
+  **Follow-ups (documented):** (1) a prebuilt per-platform `priv/*.so` so native is active without a
+  test-time build (Gleam has no native pre-build hook — native-when-loaded, paged-delegate otherwise);
+  (2) native `load`/`store`/`size`/`grow`/SIMD on an *imported* (paged) memory — currently delegated to
+  `rt_mem` (only `init_data` on imported memory was exercised, and is fixed); (3) letting the conformance
+  `cell_nif` matrix point run native (blocked by the keystone probe's `RT_CREATE`-only resource type +
+  the conformance harness's orphan-spawn resource lifecycle — the native tier is proven via the
+  differential + fuzz + corpus tier differential instead).
 - **tier-N numerics / tier-N SIMD (real hardware SIMD).** `rt_num`/`rt_simd` are tier-P only; SIMD is
   emulated lane-wise (faithful, no hardware/speed claim). A hardware-SIMD NIF is deferred.
 - **Single-`.beam` runtime-dispatch binding (B1).** Perpetually deferred (Phases 3–7, restated by
@@ -147,9 +160,10 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 - **A general (polyhedral) range solver.** Phase-10 BCE handles the single-affine-induction-variable
   loop only; a real range solver would cover more.
 - **Nested / multi-dimensional BCE.**
-- **tier-N unchecked memory access.** The Phase-10 unchecked path ships on paged/atomics only; `nif`
-  stays checked — **being lifted by Phase 15** (§D), which adds `*_unchecked` heads to `rt_mem_nif` and
-  the one-line `emit_core` whitelist entry.
+- ✅ **tier-N unchecked memory access.** **Done — Phase 15.** `rt_mem_nif` gained `*_unchecked` heads
+  (native raw deref; paged-delegate fallback when the `.so` isn't loaded) and `Nif` was added to the
+  `emit_core.mem_supports_unchecked` whitelist, so the Phase-10 loop-versioned BCE fast arm now runs
+  unchecked on tier-N (trap-preservation held — the guard proves in-bounds before the unchecked arm).
 - **Pure-call CSE.** Deferred since Phase 3 (loads deliberately never CSE'd until the memory optimizer;
   pure calls remain a candidate).
 
@@ -205,12 +219,18 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 The current 2core-team menu, roughly by leverage. **The native JS frontend is arc's, not on this menu**
 (§A); the value-layer + escape-analysis follow-ups unlock once arc emits IR.
 
-1. **Tail-call proposal** (§B) — ⏳ Phase 13. Small, high-yield: BEAM-native fit + clears the 2
-   pure-`return_call` EH files.
-2. **Cross-module funcref-in-elem init** (§C) — ⏳ Phase 14. Closes the single biggest conformance
-   residual (~1,080).
-3. **Production C NIF** (§D) — ⏳ Phase 15. Establishes the real tier-N ceiling + unchecked tier-N, and
-   makes the benchmark story honest (the missing nif column).
-4. **Escape analysis** (§E) — only once arc's frontend emits object-heavy IR to measure against.
-5. **`fe_beam` Erlang/Gleam frontend** (§A) or **B1 runtime-dispatch binding** (§D) — larger strategic
+**Done (Phases 13–15):** ✅ tail-call (§B), ✅ cross-module funcref-in-`elem` (§C — largest residual
+closed), ✅ production C NIF + unchecked tier-N (§D/§E — real ceiling measured). The next menu, by
+leverage:
+
+1. **EH-lowering unit** (§G) — drive the 2 legacy EH `.wast` files green (the `return_call`-inside-`try`
+   dynamic-scope fix + legacy-`delegate` label fix + the cross-module EH import). Small-to-medium, closes
+   Phase-13's honest deferral.
+2. **Escape analysis** (§E) — object-speed; only once arc's frontend emits object-heavy IR to measure
+   against (the same gate as the §A value-layer follow-ups).
+3. **Cross-module EH tags / threaded cross-instance linking** (§C) or the remaining post-2.0 proposals
+   (GC, tail-call's `try_table`/`tag` dependants, stack-switching — §B).
+4. **`fe_beam` Erlang/Gleam frontend** (§A) or **B1 runtime-dispatch binding** (§D) — larger strategic
    moves when prioritized.
+5. **Smaller cleanups:** the `rt_table_ets` multi-table fix (§C), tier-N imported-memory native path +
+   `priv/*.so` packaging (§D), the polyhedral range solver / nested BCE / pure-call CSE (§E).
