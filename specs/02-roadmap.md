@@ -1,37 +1,46 @@
 # What's planned but not built
 
 > The honest "not-yet" list — everything that was designed, scoped, or explicitly deferred across
-> Phases 1–10 and is still open. Nothing here is a vague wish: each item names *what it is*, *why it
+> Phases 1–12 and is still open. Nothing here is a vague wish: each item names *what it is*, *why it
 > was deferred*, and *what it needs*. Pick the next phase from this file, scope it per
 > [`03-phase-workflow.md`](03-phase-workflow.md), and record it in [`state.md`](state.md).
 >
 > Companion to [`01-status.md`](01-status.md) (what *is* built) and [`00-high-level.md`](00-high-level.md)
-> (the vision each item serves). **Last consolidated:** 2026-07-04.
+> (the vision each item serves). **Last consolidated:** 2026-07-06 (after Phases 11 & 12 landed and as
+> Phases 13–15 were scoped).
 
 Rule of the house: **deferrals are categorized, never false-green.** Every item below corresponds to a
 real, tested boundary — a categorized conformance skip, a `Memory64Unsupported`-style typed rejection,
 a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
 
+**Recently completed — moved out of this list** (see [`01-status.md`](01-status.md) §3):
+- ✅ **Phase 11 — `--link` self-contained output** (runtime *inclusion* → one `.beam` on a bare OTP node).
+- ✅ **Phase 12 — typed host-language bindings** (companion `.gleam`/`.erl`/`.ex` typed API).
+- ⏳ **Phases 13–15 in flight** — tail-call (§B), cross-module funcref-in-elem init (§C), production C
+  NIF for tier-N memory (§D). Still listed below, tagged **in flight**, until their capstones prove out.
+
 ---
 
 ## A. Frontends (the biggest strategic moves)
 
-- **Native JS frontend (the arc track — Phase 8's payoff).** The IR value layer is built (native
-  closures, maps/objects, boxing bridge, guarded arithmetic, the `rt_js` boundary). What remains is the
-  **frontend itself** (`emit_2core` reusing arc's parser + scope/capture analysis) and the **real
-  `rt_js` runtime** holding JS semantics — both are a *separate team's* deliverable against
-  [`HANDOFF-arc-frontend.md`](HANDOFF-arc-frontend.md). This is the way past Porffor's ~⅓-of-ECMA
-  ceiling and its closure wall, because targeting the BEAM makes closures/GC/maps/bignums native.
-  *De-risk first:* Milestone 0 — benchmark hand-written IR vs arc's interpreter before the frontend
-  invests. `rt_js` is currently a **stub** in `src/twocore/runtime/rt_js.gleam`.
+- **Native JS frontend + real `rt_js` — the arc track. NOT 2core-team scope.** The IR value layer this
+  project owns is built and shipped (native closures, maps/objects, boxing bridge, guarded arithmetic,
+  the `rt_js` boundary) — that was Phase 8's payoff and it stays here. **The frontend itself
+  (`emit_2core` reusing arc's parser + scope/capture analysis) and the real `rt_js` runtime holding JS
+  semantics are the arc project's deliverable, built on the arc side against**
+  [`HANDOFF-arc-frontend.md`](HANDOFF-arc-frontend.md) — not work 2core picks up as a phase. The
+  `src/twocore/runtime/rt_js.gleam` boundary stub in this repo was **merged in by an arc maintainer**;
+  leave it alone (it is arc's to grow, not ours to fill). This is the way past Porffor's ~⅓-of-ECMA
+  ceiling and its closure wall, because targeting the BEAM makes closures/GC/maps/bignums native — but
+  the 2core side of that contract (the IR) is already met.
   - **Value-layer follow-ups (deferred from the Phase-8 IR work):** shaped-object inline caches (needs
-    a `CMap` literal IR node), guarded division, first-class mutable cells (currently `rt_js`'s job),
-    and generators/async/`eval` (frontend CPS transform or an arc-VM hybrid). These sharpen the term
-    path once the frontend exists and has a workload.
+    a `CMap` literal IR node), guarded division, first-class mutable cells, and generators/async/`eval`.
+    These sharpen the term path **once arc's frontend exists and emits a workload** — 2core would take
+    them then, driven by measured object-heavy IR (see §E escape analysis, same gate).
 - **Erlang/Gleam frontend (`fe_beam`, spec §8.3).** Ingest Core Erlang / Gleam, restrict unsafe
   functionality (the Safe allowlist as a *frontend* security boundary that fails closed), emit IR.
   Never taken by any phase — deferred since Phase 1. The payoff: write Gleam, deploy sandboxed,
-  provably unable to take over the VM.
+  provably unable to take over the VM. (2core scope, when prioritized.)
 
 ---
 
@@ -39,12 +48,16 @@ a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
 
 WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a categorized skip today:
 
-- **Tail-call proposal (`return_call` / `return_call_indirect`).** Flagged a *plausible fast-follow* —
-  it maps cleanly onto BEAM native tail calls, and it **unblocks the 4 non-convertible official EH
-  `.wast` files** (they're blocked on tail-call + GC types, not on an EH gap). Deferred by Phases 6 & 7.
+- **Tail-call proposal (`return_call` / `return_call_indirect`).** ⏳ **Now Phase 13, in flight** — see
+  [`phase-13/00-overview.md`](phase-13/00-overview.md). Maps cleanly onto BEAM native tail calls
+  (direct calls already emit in tail position; `return_call_indirect` needs a raise-or-tail-apply
+  `rt_table` seam to stay constant-stack). It **unblocks the 2 pure-`return_call` official EH `.wast`
+  files** (`legacy/try_catch`, `legacy/try_delegate`) and is a necessary-but-not-sufficient unblock for
+  `try_table` (also needs typed refs / GC). Flagged a plausible fast-follow by Phases 6 & 7.
 - **GC proposal + GC reference types** (`anyref`, typed function refs, `struct`/`array`/`i31`, `(rec)`
   recursive types). Out of the funcref/externref scope shipped in Phase 5. Porffor confirmed it does
-  **not** need GC, so this is spec-completeness, not a JS blocker.
+  **not** need GC, so this is spec-completeness, not a JS blocker. (Also gates the `try_table` /
+  `tag.wast` EH files, which are blocked on `(rec …)` + typed refs, not on an EH gap.)
 - **Stack-switching**, **the component model**, **relaxed-SIMD**, **extended-const** (arithmetic in
   const-init expressions). All separate proposals, all deferred, all categorized.
 
@@ -52,34 +65,58 @@ WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a 
 
 ## C. Cross-module (deeper than what Phase 6 landed)
 
-- **Cross-module funcref-in-elem-segment init** — elem segments initialized with `ref.func` of
-  *imported* functions + `call_indirect` (the `table_copy.wast` verifier, **~1,088 skips**). Deeper
-  than the `CallImport` *direct* dispatch Phase 6 shipped. This is the single largest categorized
-  residual bucket.
+- **Cross-module funcref-in-elem-segment init.** ⏳ **Now Phase 14, in flight** — see
+  [`phase-14/00-overview.md`](phase-14/00-overview.md). elem segments initialized with `ref.func` of
+  *imported* functions + `call_indirect` (the `table_copy.wast` verifier, **~1,080 categorized skips —
+  the single largest residual bucket**). Deeper than the `CallImport` *direct* dispatch Phase 6 shipped:
+  it requires an imported function to become a table-storable, `call_indirect`-able funcref that still
+  routes through the D3a import capability (never `erlang:apply` from table data).
 - **Cross-module EH tags** — a qualified `{module, idx}` tag identity across module boundaries.
   Porffor-inert (single-module scope), deferred by Phase 7.
 - **Threaded cross-instance linking** — Phase 6 proved cross-module linking under `cell`; the invasive
   threaded-state edge is a named category, not a claim.
+- **`.core`-input `--link` on `to-beam`** (Phase-11 deferral, R13) — `--link` is scoped to
+  `to-beam-wasm` because a raw `.core` input carries no `Binding` to gate tier-N/imports.
+- **Import-bearing bare-node linking** (Phase-11 deferral, R14) — `--link` rejects import-bearing
+  modules; a provider-baking story (seed imports into the merged `instantiate/1`) is a follow-up.
+- **Multi-module `--link`** — merging several generated WASM modules into one artifact (Phase-11
+  deferral).
 
 ---
 
 ## D. Runtime tiers & binding
 
-- **Production C NIF for tier-N memory.** Phase 4 shipped the uniform interface + a reference
-  *skeleton*; the real C impl needs a native toolchain. This is the raw O(1) ceiling (Unsafe-only,
-  Safe-forbidden). Its absence is honest — tier-N is *not* currently the measured ceiling.
+- **Production C NIF for tier-N memory.** ⏳ **Now Phase 15, in flight** — see
+  [`phase-15/00-overview.md`](phase-15/00-overview.md). Phase 4 shipped the uniform interface + a
+  node-safe reference skeleton (`rt_mem_nif` delegates to paged today); this phase fills it with a real
+  `erl_nif` C backend over a reserved raw byte buffer — the raw O(1) memory ceiling (Unsafe-only,
+  Safe-forbidden), **plus** the unchecked fast path tier-N currently lacks (§E). The C source ships with
+  a test-time compile-gate (`cc -shared -fPIC` → `load_nif`, skip-categorized when no toolchain, like
+  the Elixir binding arm); a prebuilt per-platform `priv/*.so` packaging step is a documented follow-on
+  (Gleam has no native pre-build hook).
 - **tier-N numerics / tier-N SIMD (real hardware SIMD).** `rt_num`/`rt_simd` are tier-P only; SIMD is
   emulated lane-wise (faithful, no hardware/speed claim). A hardware-SIMD NIF is deferred.
-- **Single-`.beam` runtime-dispatch binding (B1).** Perpetually deferred (Phases 3–7). Today
-  coexistence is **B3 monomorphization** only — Safe.beam ≠ Unsafe.beam, threaded ≠ cell, nif ≠ paged,
-  distinct atoms sharing identical `rt_*` names. B1 would let one `.beam` pick its runtime at instance
-  time (the instance-as-unit-of-policy at runtime rather than build time).
-- **Self-contained output — `--link` (runtime *inclusion*).** ⏳ **Now Phase 11, in flight** — see
-  [`phase-11/00-overview.md`](phase-11/00-overview.md). An optional flag that merges the runtime
-  dependency closure into the generated module (whole-program Core-Erlang merge + DCE) → a single
-  `.beam` that runs on a bare Erlang/OTP node. Distinct from B1 (which is runtime *selection*).
-  Requires a clean runtime/compiler layer split first (the runtime currently imports `twocore/ir` and
-  `twocore/middle/ir_opt`). tier-P/O only.
+- **Single-`.beam` runtime-dispatch binding (B1).** Perpetually deferred (Phases 3–7, restated by
+  Phase 11). Today coexistence is **B3 monomorphization** only — Safe.beam ≠ Unsafe.beam, threaded ≠
+  cell, nif ≠ paged, distinct atoms sharing identical `rt_*` names. B1 would let one `.beam` pick its
+  runtime at instance time (the instance-as-unit-of-policy at runtime rather than build time). Distinct
+  from Phase-11 `--link` (runtime *inclusion*, now landed) — B1 is runtime *selection*.
+
+---
+
+## D′. Typed bindings — deferred follow-ups (Phase 12 landed export-only/threaded)
+
+Phase 12 shipped typed `.gleam`/`.erl`/`.ex` bindings for **threaded (tier-P), export-only** modules.
+Deferred (each a categorized rejection today, not a false green):
+
+- **Cell / tier-O process-wrapped *server* bindings** — a stateful module exposed as a generated
+  process/server API (the value-threaded model needs no process; the cell model does).
+- **A typed import/provider surface** — import-bearing modules are binding-rejected (as `--link` rejects
+  them); a typed `instantiate/1(Providers)` surface is a follow-up.
+- **Cross-language `funcref`/`externref` construction** — refs are opaque passthrough today, not
+  host-constructible callable values.
+- **Async / streaming binding surfaces**, and additional binding languages (the
+  `twocore_bindings_ffi.erl` compile+call harness is reusable for any new emitter).
 
 ---
 
@@ -89,13 +126,16 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 
 - **Escape analysis for the term/object value path.** *Not* a linear-memory lever (our process-local,
   one-instance-one-process design already pre-satisfies its linear-memory payoff). This is **object
-  speed** — scalar-replace objects, avoid boxing closures — gated on a frontend (JS/Gleam) that emits
-  object-heavy code. Deferred by Phases 9 & 10 for want of a workload.
+  speed** — scalar-replace objects, avoid boxing closures — gated on **arc's frontend emitting
+  object-heavy IR to measure against (coming soon).** 2core takes this once that workload exists; until
+  then there is nothing to measure and the pass would be speculative. Deferred by Phases 9 & 10 for want
+  of a workload.
 - **A general (polyhedral) range solver.** Phase-10 BCE handles the single-affine-induction-variable
   loop only; a real range solver would cover more.
 - **Nested / multi-dimensional BCE.**
 - **tier-N unchecked memory access.** The Phase-10 unchecked path ships on paged/atomics only; `nif`
-  stays checked (and is itself gated on the deferred C NIF, §D).
+  stays checked — **being lifted by Phase 15** (§D), which adds `*_unchecked` heads to `rt_mem_nif` and
+  the one-line `emit_core` whitelist entry.
 - **Pure-call CSE.** Deferred since Phase 3 (loads deliberately never CSE'd until the memory optimizer;
   pure calls remain a candidate).
 
@@ -110,8 +150,8 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
   hardwires `profiles.porffor()`; a `run_porffor_with(binding)` seam is left to a later phase.
 - **The 3 JS skips are Porffor's own bugs** (measured: `-0` rendering + broken lexical closures in
   0.61.13, which Porffor's authors call the "closure wall" / "terminal"). 2core reproduces `porf run`
-  byte-for-byte on them — they bound Porffor, and are the reason the arc frontend (§A) is the real JS
-  road forward.
+  byte-for-byte on them — they bound Porffor, and are the reason the **arc frontend (§A, arc-owned)** is
+  the real JS road forward.
 
 ---
 
@@ -137,11 +177,15 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 
 ## Suggested sequencing (not binding)
 
-A reasonable next-phase menu, roughly by leverage:
+The current 2core-team menu, roughly by leverage. **The native JS frontend is arc's, not on this menu**
+(§A); the value-layer + escape-analysis follow-ups unlock once arc emits IR.
 
-1. **Native JS frontend + real `rt_js`** (§A) — the strategic unlock; the IR is ready and the handoff
-   is written. Biggest payoff, largest effort, needs the separate frontend team.
-2. **Tail-call proposal** (§B) — small, high-yield: BEAM-native fit + clears the last 4 EH files.
-3. **Cross-module funcref-in-elem init** (§C) — closes the single biggest conformance residual (~1,088).
-4. **Production C NIF** (§D) — establishes the real tier-N ceiling and makes the benchmark story honest.
-5. **Escape analysis** (§E) — only once a frontend emits object-heavy code to measure against.
+1. **Tail-call proposal** (§B) — ⏳ Phase 13. Small, high-yield: BEAM-native fit + clears the 2
+   pure-`return_call` EH files.
+2. **Cross-module funcref-in-elem init** (§C) — ⏳ Phase 14. Closes the single biggest conformance
+   residual (~1,080).
+3. **Production C NIF** (§D) — ⏳ Phase 15. Establishes the real tier-N ceiling + unchecked tier-N, and
+   makes the benchmark story honest (the missing nif column).
+4. **Escape analysis** (§E) — only once arc's frontend emits object-heavy IR to measure against.
+5. **`fe_beam` Erlang/Gleam frontend** (§A) or **B1 runtime-dispatch binding** (§D) — larger strategic
+   moves when prioritized.
