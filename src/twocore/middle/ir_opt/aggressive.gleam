@@ -392,7 +392,14 @@ fn eligible(fname: String, ctx: InlineCtx) -> Bool {
   case dict.get(ctx.by_name, fname) {
     Error(Nil) -> False
     Ok(f) ->
-      case set.contains(ctx.recursive, fname) {
+      // Phase-13 (Q13-05): a callee whose body contains ANY tail-call node (`ReturnCall*`) is NOT
+      // inline-eligible — treated exactly like a recursive function. Inlining a tail-call-containing
+      // body would splice a FUNCTION-level bottom transfer into the caller (wrong value + broken
+      // stack, since `rewrite_returns` rewrites `Return` but not `ReturnCall*`), and the
+      // `CallDirect`-only recursion detector cannot see a `return_call` cycle (it would look
+      // non-recursive → wrongly eligible). Excluding it sidesteps BOTH in one stroke — correctness-
+      // preserving (OptNone ≡ Baseline ≡ Aggressive), costing at most a missed inline.
+      case set.contains(ctx.recursive, fname) || has_tail_call(f.body) {
         True -> False
         False -> {
           let leaf = !has_any_call(f.body)
@@ -401,6 +408,29 @@ fn eligible(fname: String, ctx: InlineCtx) -> Bool {
           leaf || small || single
         }
       }
+  }
+}
+
+/// Does `e` contain ANY Phase-13 tail-call node (`ReturnCall` / `ReturnCallIndirect` /
+/// `ReturnCallImport`)? Recurses into EVERY sub-expression (including `Try`), so the exclusion is
+/// fail-closed: a tail call anywhere in the body makes the callee inline-ineligible (§Q13-05).
+fn has_tail_call(e: ir.Expr) -> Bool {
+  case e {
+    ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _) -> True
+    ir.Let(_, rhs, body) -> has_tail_call(rhs) || has_tail_call(body)
+    ir.Block(_, _, body) -> has_tail_call(body)
+    ir.Loop(_, _, _, body) -> has_tail_call(body)
+    ir.If(_, _, then_branch, else_branch) ->
+      has_tail_call(then_branch) || has_tail_call(else_branch)
+    ir.Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) { has_tail_call(a.body) }) || has_tail_call(default)
+    ir.Charge(_, body) -> has_tail_call(body)
+    ir.Try(_, body, handlers) ->
+      has_tail_call(body)
+      || list.any(handlers, fn(h) { has_tail_call(h.handler) })
+    _ -> False
   }
 }
 
@@ -778,7 +808,11 @@ fn has_any_call(e: ir.Expr) -> Bool {
     ir.CallDirect(_, _)
     | ir.CallIndirect(_, _, _, _)
     | ir.CallHost(_, _, _)
-    | ir.CallClosure(_, _) -> True
+    | ir.CallClosure(_, _)
+    | // Phase-13 (Q13-05): the tail-call nodes are calls too (a body containing one is not a leaf).
+      ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _) -> True
     ir.Let(_, rhs, body) -> has_any_call(rhs) || has_any_call(body)
     ir.Block(_, _, body) -> has_any_call(body)
     ir.Loop(_, _, _, body) -> has_any_call(body)

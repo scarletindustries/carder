@@ -49,7 +49,9 @@ import twocore/ir.{
 import twocore/runtime/rt_meter
 import twocore/runtime/rt_ref
 import twocore/runtime/rt_state.{type InstanceState}
-import twocore/runtime/rt_table.{type RefValue, effective_max}
+import twocore/runtime/rt_table.{
+  type RefValue, effective_max, package_to_list, result_arity,
+}
 
 /// The ETS-backed typed reference-table handle (opaque; carried as `Dynamic` in a `tables`-vector
 /// slot). Phase-5 generalises the funcref store to a typed REFERENCE store (§A).
@@ -102,29 +104,32 @@ fn ets_to_dynamic(t: EtsTable) -> Dynamic
 @external(erlang, "gleam_stdlib", "identity")
 fn dynamic_to_ets(value: Dynamic) -> EtsTable
 
-/// Box a CELL-family entry (`#(FuncType, fn(List(Int)) -> List(Int))`) as the opaque `Dynamic`
+/// Box a CELL-family entry (`#(FuncType, fn(List(Int)) -> Dynamic)`) as the opaque `Dynamic`
 /// ETS stores. Identity at run time; the cell family is the sole reader of what it inserts.
+/// PACKAGE-ABI (Phase-13): the closure returns the callee's `function_return` package (see
+/// `rt_table.package_to_list`).
 @external(erlang, "gleam_stdlib", "identity")
-fn cell_entry_to_dynamic(e: #(FuncType, fn(List(Int)) -> List(Int))) -> Dynamic
+fn cell_entry_to_dynamic(e: #(FuncType, fn(List(Int)) -> Dynamic)) -> Dynamic
 
 /// Unbox a stored entry back to the CELL-family shape. Identity at run time; sound because a
-/// cell-inserted entry is only ever read by the cell family.
+/// cell-inserted entry is only ever read by the cell family. Package-ABI (see above).
 @external(erlang, "gleam_stdlib", "identity")
-fn dynamic_to_cell_entry(d: Dynamic) -> #(FuncType, fn(List(Int)) -> List(Int))
+fn dynamic_to_cell_entry(d: Dynamic) -> #(FuncType, fn(List(Int)) -> Dynamic)
 
 /// Box a THREADED-family entry as the opaque `Dynamic` ETS stores. Identity at run time; the
-/// threaded family is the sole reader of what it inserts.
+/// threaded family is the sole reader of what it inserts. Package-ABI (Phase-13): the closure
+/// returns `#(package, st')`.
 @external(erlang, "gleam_stdlib", "identity")
 fn threaded_entry_to_dynamic(
-  e: #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)),
+  e: #(FuncType, fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)),
 ) -> Dynamic
 
 /// Unbox a stored entry back to the THREADED-family shape. Identity at run time; sound because a
-/// threaded-inserted entry is only ever read by the threaded family.
+/// threaded-inserted entry is only ever read by the threaded family. Package-ABI (see above).
 @external(erlang, "gleam_stdlib", "identity")
 fn dynamic_to_threaded_entry(
   d: Dynamic,
-) -> #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState))
+) -> #(FuncType, fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState))
 
 /// Read just a stored entry's `FuncType` tag (for `to_canon`), leaving the closure opaque.
 /// Identity at run time; sound for any family (the type tag is element 0 regardless of ABI).
@@ -166,7 +171,7 @@ pub fn new(min: Int, max: Option(Int)) -> Dynamic {
 ///   an un-seeded cell.
 pub fn init_elem(
   offset: Int,
-  entries: List(#(FuncType, fn(List(Int)) -> List(Int))),
+  entries: List(#(FuncType, fn(List(Int)) -> Dynamic)),
 ) -> Result(Nil, TrapReason) {
   let table = current_ets()
   case offset < 0 || offset + list.length(entries) > table.size {
@@ -210,8 +215,10 @@ pub fn call_indirect(
           // Guard 3 — exact structural FuncType match.
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            // Build-controlled invocation: invoke the STORED closure directly.
-            True -> Ok(target(args))
+            // Build-controlled invocation: invoke the STORED closure directly, then re-wrap its
+            // package-ABI result into the frozen result list (Phase-13, see `rt_table`).
+            True ->
+              Ok(package_to_list(target(args), result_arity(expected_type)))
           }
         }
       }
@@ -239,7 +246,9 @@ pub fn call_indirect_at(
           let #(entry_type, target) = dynamic_to_cell_entry(entry)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(args))
+            // Package-ABI re-wrap (Phase-13) — see `call_indirect`.
+            True ->
+              Ok(package_to_list(target(args), result_arity(expected_type)))
           }
         }
       }
@@ -267,7 +276,7 @@ pub fn t_init_elem(
   st: InstanceState,
   offset: Int,
   entries: List(
-    #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)),
+    #(FuncType, fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)),
   ),
 ) -> Result(InstanceState, TrapReason) {
   let table = project(st)
@@ -306,7 +315,11 @@ pub fn t_call_indirect(
           let #(entry_type, target) = dynamic_to_threaded_entry(entry)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(st, args))
+            // Package-ABI re-wrap (Phase-13) — see `rt_table.t_call_indirect`.
+            True -> {
+              let #(pkg, st2) = target(st, args)
+              Ok(#(package_to_list(pkg, result_arity(expected_type)), st2))
+            }
           }
         }
       }
@@ -334,7 +347,11 @@ pub fn t_call_indirect_at(
           let #(entry_type, target) = dynamic_to_threaded_entry(entry)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(st, args))
+            // Package-ABI re-wrap (Phase-13) — see `rt_table.t_call_indirect`.
+            True -> {
+              let #(pkg, st2) = target(st, args)
+              Ok(#(package_to_list(pkg, result_arity(expected_type)), st2))
+            }
           }
         }
       }
@@ -345,6 +362,114 @@ pub fn t_call_indirect_at(
 /// and coerce it. Read-only.
 fn project(st: InstanceState) -> EtsTable {
   dynamic_to_ets(rt_state.table(st))
+}
+
+// ───────────────────────────── the constant-stack tail-call lookup seam (Phase-13) ─────────────────────────────
+
+/// Look up (WITHOUT applying) the `call_indirect` target in THIS process's cell table, running the
+/// 3 fail-closed guards IN ORDER and RETURNING the package-ABI target so `emit_core` can TAIL-APPLY
+/// it (a real BEAM tail call). The ETS-tier twin of `rt_table.call_indirect_lookup` — same guards,
+/// same order, same package-ABI contract.
+pub fn call_indirect_lookup(
+  index: Int,
+  expected_type: FuncType,
+) -> Result(fn(List(Int)) -> Dynamic, TrapReason) {
+  lookup_cell(current_ets(), index, expected_type)
+}
+
+/// `call_indirect_lookup` through table `table_idx` — the multi-table twin. See
+/// `rt_table.call_indirect_lookup_at`.
+pub fn call_indirect_lookup_at(
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(fn(List(Int)) -> Dynamic, TrapReason) {
+  lookup_cell(
+    dynamic_to_ets(rt_state.table_at(table_idx)),
+    index,
+    expected_type,
+  )
+}
+
+/// Threaded `call_indirect_lookup` over `st`'s default table — returns the package-ABI THREADED
+/// target. See `rt_table.t_call_indirect_lookup`.
+pub fn t_call_indirect_lookup(
+  st: InstanceState,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(
+  fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
+  TrapReason,
+) {
+  lookup_threaded(project(st), index, expected_type)
+}
+
+/// Threaded `call_indirect_lookup` through table `table_idx` — the indexed threaded twin. See
+/// `rt_table.t_call_indirect_lookup_at`.
+pub fn t_call_indirect_lookup_at(
+  st: InstanceState,
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(
+  fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
+  TrapReason,
+) {
+  lookup_threaded(
+    dynamic_to_ets(rt_state.t_table_at(st, table_idx)),
+    index,
+    expected_type,
+  )
+}
+
+/// The shared 3-fault fail-closed lookup over a resolved `EtsTable` (guard 1 bounds →
+/// `UndefinedElement`; guard 2 present ETS key → `UninitializedElement`; guard 3 exact `FuncType`
+/// → `IndirectCallTypeMismatch`, same order as `call_indirect`), returning the cell-ABI target
+/// closure on success (never applying it).
+fn lookup_cell(
+  table: EtsTable,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(fn(List(Int)) -> Dynamic, TrapReason) {
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case ets_lookup(table.tid, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(entry) -> {
+          let #(entry_type, target) = dynamic_to_cell_entry(entry)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target)
+          }
+        }
+      }
+  }
+}
+
+/// The threaded twin of `lookup_cell` — same 3 guards, same order, returning the threaded target.
+fn lookup_threaded(
+  table: EtsTable,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(
+  fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
+  TrapReason,
+) {
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case ets_lookup(table.tid, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(entry) -> {
+          let #(entry_type, target) = dynamic_to_threaded_entry(entry)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target)
+          }
+        }
+      }
+  }
 }
 
 // ───────────────────────────── cell-backed reference/bulk surface (§B) ─────────────────────────────

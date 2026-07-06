@@ -43,6 +43,10 @@ import twocore/runtime/rt_trap
 @external(erlang, "twocore_rt_state_test_ffi", "catch_thunk")
 fn catch_thunk(thunk: fn() -> a) -> Result(a, String)
 
+/// Box a value as the package `Dynamic` a Phase-13 funcref closure returns (identity at run time).
+@external(erlang, "gleam_stdlib", "identity")
+fn to_pkg(v: a) -> dynamic.Dynamic
+
 // ── test helpers ───────────────────────────────────────────────────────────────
 
 /// Seed a fresh cell whose table has `size` null slots (no mem, no globals). Every test
@@ -62,10 +66,10 @@ fn ii_i() -> FuncType {
 }
 
 /// A build-controlled closure adding its two i32 args (raw bits; small positives here).
-fn add_closure() -> fn(List(Int)) -> List(Int) {
+fn add_closure() -> fn(List(Int)) -> dynamic.Dynamic {
   fn(args) {
     case args {
-      [a, b] -> [a + b]
+      [a, b] -> to_pkg(a + b)
       _ -> panic as "add_closure: expected exactly two args"
     }
   }
@@ -91,10 +95,10 @@ pub fn call_indirect_zero_and_multi_result_test() {
   let pair = FuncType([TI32], [TI32, TI32])
   let assert Ok(Nil) =
     rt_table.init_elem(0, [
-      #(nullary, fn(_args) { [] }),
+      #(nullary, fn(_args) { to_pkg(0) }),
       #(pair, fn(args) {
         case args {
-          [x] -> [x, x + 1]
+          [x] -> to_pkg(#(x, x + 1))
           _ -> panic as "pair: expected one arg"
         }
       }),
@@ -144,7 +148,7 @@ pub fn wrong_type_slot_is_type_mismatch_test() {
       #(ii_i(), add_closure()),
       #(FuncType([TI32], [TI32]), fn(args) {
         case args {
-          [a] -> [a]
+          [a] -> to_pkg(a)
           _ -> panic as "id: expected one arg"
         }
       }),
@@ -207,7 +211,7 @@ pub fn structurally_distinct_types_mismatch_test() {
     rt_table.init_elem(0, [
       #(FuncType([TI32], [TI32]), fn(args) {
         case args {
-          [a] -> [a]
+          [a] -> to_pkg(a)
           _ -> panic as "id"
         }
       }),
@@ -319,7 +323,7 @@ pub fn dispatch_invokes_supplied_closure_test() {
     rt_table.init_elem(0, [
       #(ii_i(), fn(args) {
         case args {
-          [a, b] -> [a + b + captured]
+          [a, b] -> to_pkg(a + b + captured)
           _ -> panic as "expected two args"
         }
       }),
@@ -352,10 +356,10 @@ pub fn spec_trap_messages_test() {
 // record. Same three guards, same TrapReasons as the cell surface (§F).
 
 /// A threaded add-closure adding its two i32 args and threading `st` unchanged.
-fn t_add() -> fn(InstanceState, List(Int)) -> #(List(Int), InstanceState) {
+fn t_add() -> fn(InstanceState, List(Int)) -> #(dynamic.Dynamic, InstanceState) {
   fn(st, args) {
     case args {
-      [a, b] -> #([a + b], st)
+      [a, b] -> #(to_pkg(a + b), st)
       _ -> panic as "t_add: expected two args"
     }
   }
@@ -428,7 +432,7 @@ pub fn threaded_call_returns_callee_state_test() {
     ))
   let bump = fn(st: InstanceState, args: List(Int)) {
     case args {
-      [x] -> #([x], rt_state.t_global_set(st, "g", x))
+      [x] -> #(to_pkg(x), rt_state.t_global_set(st, "g", x))
       _ -> panic as "one arg"
     }
   }

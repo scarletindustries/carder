@@ -20,6 +20,10 @@ import twocore/runtime/rt_table
 import twocore/runtime/rt_table_atomics as atom
 import twocore/runtime/rt_table_ets as ets
 
+/// Box a value as the package `Dynamic` a Phase-13 funcref closure returns (identity at run time).
+@external(erlang, "gleam_stdlib", "identity")
+fn to_pkg(v: a) -> dynamic.Dynamic
+
 /// The size of every table in the trace.
 const size: Int = 4
 
@@ -45,25 +49,28 @@ type TOp {
   TInit(
     offset: Int,
     entries: List(
-      #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)),
+      #(
+        FuncType,
+        fn(InstanceState, List(Int)) -> #(dynamic.Dynamic, InstanceState),
+      ),
     ),
   )
   TCall(index: Int, expected: FuncType, args: List(Int))
 }
 
-fn t_add() -> fn(InstanceState, List(Int)) -> #(List(Int), InstanceState) {
+fn t_add() -> fn(InstanceState, List(Int)) -> #(dynamic.Dynamic, InstanceState) {
   fn(st, args) {
     case args {
-      [a, b] -> #([a + b], st)
+      [a, b] -> #(to_pkg(a + b), st)
       _ -> panic as "t_add"
     }
   }
 }
 
-fn t_id() -> fn(InstanceState, List(Int)) -> #(List(Int), InstanceState) {
+fn t_id() -> fn(InstanceState, List(Int)) -> #(dynamic.Dynamic, InstanceState) {
   fn(st, args) {
     case args {
-      [a] -> #([a], st)
+      [a] -> #(to_pkg(a), st)
       _ -> panic as "t_id"
     }
   }
@@ -181,23 +188,26 @@ fn threaded_loop(
 
 /// A cell op (closures are the cell ABI).
 type COp {
-  CInit(offset: Int, entries: List(#(FuncType, fn(List(Int)) -> List(Int))))
+  CInit(
+    offset: Int,
+    entries: List(#(FuncType, fn(List(Int)) -> dynamic.Dynamic)),
+  )
   CCall(index: Int, expected: FuncType, args: List(Int))
 }
 
-fn c_add() -> fn(List(Int)) -> List(Int) {
+fn c_add() -> fn(List(Int)) -> dynamic.Dynamic {
   fn(args) {
     case args {
-      [a, b] -> [a + b]
+      [a, b] -> to_pkg(a + b)
       _ -> panic as "c_add"
     }
   }
 }
 
-fn c_id() -> fn(List(Int)) -> List(Int) {
+fn c_id() -> fn(List(Int)) -> dynamic.Dynamic {
   fn(args) {
     case args {
-      [a] -> [a]
+      [a] -> to_pkg(a)
       _ -> panic as "c_id"
     }
   }
@@ -223,7 +233,7 @@ fn cell_trace() -> List(COp) {
 /// `seed`.
 fn collect_cell(
   seed: fn() -> Nil,
-  init: fn(Int, List(#(FuncType, fn(List(Int)) -> List(Int)))) ->
+  init: fn(Int, List(#(FuncType, fn(List(Int)) -> dynamic.Dynamic))) ->
     Result(Nil, TrapReason),
   call: fn(Int, FuncType, List(Int)) -> Result(List(Int), TrapReason),
   canon: fn() -> List(Option(FuncType)),
@@ -234,7 +244,7 @@ fn collect_cell(
 }
 
 fn collect_loop(
-  init: fn(Int, List(#(FuncType, fn(List(Int)) -> List(Int)))) ->
+  init: fn(Int, List(#(FuncType, fn(List(Int)) -> dynamic.Dynamic))) ->
     Result(Nil, TrapReason),
   call: fn(Int, FuncType, List(Int)) -> Result(List(Int), TrapReason),
   canon: fn() -> List(Option(FuncType)),

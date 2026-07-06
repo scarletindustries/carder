@@ -25,6 +25,10 @@ import twocore/runtime/rt_table.{type RefValue}
 import twocore/runtime/rt_table_atomics as atom
 import twocore/runtime/rt_table_ets as ets
 
+/// Box a value as the package `Dynamic` a Phase-13 funcref closure returns (identity at run time).
+@external(erlang, "gleam_stdlib", "identity")
+fn to_pkg(v: a) -> dynamic.Dynamic
+
 const init_size: Int = 5
 
 fn ii_i() -> FuncType {
@@ -40,7 +44,7 @@ fn ext(n: Int) -> RefValue {
 fn fref() -> RefValue {
   rt_table.funcref(ii_i(), fn(args) {
     case args {
-      [a, b] -> [a + b]
+      [a, b] -> to_pkg(a + b)
       _ -> panic as "add"
     }
   })

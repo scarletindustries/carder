@@ -98,26 +98,36 @@ fn dynamic_to_table(value: Dynamic) -> Table
 
 /// Coerce a cell-ABI funcref entry `#(FuncType, closure)` into a `RefValue`. Identity at run time;
 /// a funcref value *is* a table-entry shape (R1), so this is a no-op box.
+///
+/// **Package-ABI (Phase-13).** The stored closure is now `fn(List(Int)) -> Dynamic`: applied over
+/// an args LIST it returns the callee's `function_return` PACKAGE (bare `v` for one result, the
+/// dummy `'ok'` for zero, a tuple for `N≥2`) — NOT a result list. This makes the closure
+/// tail-transparent for `call_indirect_lookup` (a constant-stack tail apply); the non-tail
+/// `call_indirect*` re-wraps the package back into the result list via `package_to_list`.
 @external(erlang, "gleam_stdlib", "identity")
-fn cell_funcref_to_ref(e: #(FuncType, fn(List(Int)) -> List(Int))) -> RefValue
+fn cell_funcref_to_ref(e: #(FuncType, fn(List(Int)) -> Dynamic)) -> RefValue
 
 /// Coerce a `RefValue` back to a cell-ABI funcref entry. Identity at run time; sound only after a
 /// `classify_ref`/absence check has established the value is a funcref (never a null/externref).
+/// Package-ABI: the closure returns the callee's `function_return` package (see `cell_funcref_to_ref`).
 @external(erlang, "gleam_stdlib", "identity")
-fn ref_to_cell_funcref(v: RefValue) -> #(FuncType, fn(List(Int)) -> List(Int))
+fn ref_to_cell_funcref(v: RefValue) -> #(FuncType, fn(List(Int)) -> Dynamic)
 
-/// Coerce a threaded-ABI funcref entry into a `RefValue`. Identity at run time.
+/// Coerce a threaded-ABI funcref entry into a `RefValue`. Identity at run time. Package-ABI: the
+/// closure is `fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)`, returning the callee's
+/// `{package, St'}` (see `cell_funcref_to_ref`).
 @external(erlang, "gleam_stdlib", "identity")
 fn threaded_funcref_to_ref(
-  e: #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)),
+  e: #(FuncType, fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)),
 ) -> RefValue
 
 /// Coerce a `RefValue` back to a threaded-ABI funcref entry. Identity at run time; sound after a
 /// non-null/funcref check (the threaded family is the sole reader of a threaded-written slot).
+/// Package-ABI: the closure returns `{package, St'}`.
 @external(erlang, "gleam_stdlib", "identity")
 fn ref_to_threaded_funcref(
   v: RefValue,
-) -> #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState))
+) -> #(FuncType, fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState))
 
 /// Read just a funcref `RefValue`'s `FuncType` tag (element 0), leaving the closure opaque —
 /// ABI-agnostic (the type tag is element 0 regardless of cell/threaded closure). For `to_canon`.
@@ -139,12 +149,15 @@ pub fn new(min: Int, max: Option(Int)) -> Dynamic {
 }
 
 /// Construct a `funcref` reference value from a cell-ABI closure (R1) — `#(ty, closure)`. Used by
-/// `emit_core`'s `RefFunc` lowering (cell strategy) and by tests to build funcref operands.
+/// tests to build funcref operands (`emit_core` builds its funcref closures directly in Core).
 ///
 /// - `ty`: the function's structural `FuncType` (guard 3 of `call_indirect` matches it).
-/// - `closure`: the build-controlled `fn(List(Int)) -> List(Int)` over the referenced function.
+/// - `closure`: the build-controlled `fn(List(Int)) -> Dynamic` over the referenced function. It
+///   is PACKAGE-ABI (Phase-13): applied over the args LIST it returns the callee's
+///   `function_return` package — the bare value for one result, the dummy `'ok'` for zero, a tuple
+///   for `N≥2` — NOT a result list. The non-tail `call_indirect` re-wraps it via `package_to_list`.
 /// - Returns the funcref `RefValue`. Total; never fails.
-pub fn funcref(ty: FuncType, closure: fn(List(Int)) -> List(Int)) -> RefValue {
+pub fn funcref(ty: FuncType, closure: fn(List(Int)) -> Dynamic) -> RefValue {
   cell_funcref_to_ref(#(ty, closure))
 }
 
@@ -152,11 +165,12 @@ pub fn funcref(ty: FuncType, closure: fn(List(Int)) -> List(Int)) -> RefValue {
 /// `funcref`, for the `Threaded` state strategy.
 ///
 /// - `ty`: the function's structural `FuncType`.
-/// - `closure`: the threaded closure `fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)`.
+/// - `closure`: the threaded PACKAGE-ABI closure
+///   `fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)`, returning `{package, St'}`.
 /// - Returns the funcref `RefValue`. Total.
 pub fn funcref_t(
   ty: FuncType,
-  closure: fn(InstanceState, List(Int)) -> #(List(Int), InstanceState),
+  closure: fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
 ) -> RefValue {
   threaded_funcref_to_ref(#(ty, closure))
 }
@@ -176,7 +190,7 @@ pub fn funcref_t(
 /// - Failure modes: `Error(TableOutOfBounds)`; raises (fail-closed) on an un-seeded cell.
 pub fn init_elem(
   offset: Int,
-  entries: List(#(FuncType, fn(List(Int)) -> List(Int))),
+  entries: List(#(FuncType, fn(List(Int)) -> Dynamic)),
 ) -> Result(Nil, TrapReason) {
   let table = dynamic_to_table(rt_state.table_get())
   case offset < 0 || offset + list.length(entries) > table.size {
@@ -215,7 +229,11 @@ pub fn call_indirect(
           let #(entry_type, target) = ref_to_cell_funcref(value)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(args))
+            // Package-ABI (Phase-13): `target` returns the callee's `function_return` package;
+            // re-wrap it back into the result LIST (the frozen `call_indirect` contract) using the
+            // guard-checked `FuncType`'s result arity, so the emitted seam stays observably identical.
+            True ->
+              Ok(package_to_list(target(args), result_arity(expected_type)))
           }
         }
       }
@@ -254,7 +272,198 @@ pub fn call_indirect_at(
           let #(entry_type, target) = ref_to_cell_funcref(value)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(args))
+            // Package-ABI re-wrap (Phase-13) — see `call_indirect`.
+            True ->
+              Ok(package_to_list(target(args), result_arity(expected_type)))
+          }
+        }
+      }
+  }
+}
+
+// ───────────────────────────── the package-ABI ⇄ result-list bridge (Phase-13) ─────────────────────────────
+
+/// Convert a callee's `function_return` PACKAGE back into the WebAssembly result value LIST — the
+/// bridge between the Phase-13 package-ABI funcref closure and the frozen `call_indirect` list
+/// contract (overview §2 ⚠ ABI reconciliation note).
+///
+/// After the funcref-construction ABI change, a stored funcref closure applied over an args LIST
+/// returns the callee's `function_return` package: the dummy atom `'ok'` for `result_count == 0`,
+/// the BARE value for `result_count == 1`, and an `N`-tuple `{v1,…,vn}` for `result_count >= 2`
+/// (the shape `emit_core.function_return` produces). This inverts that packaging so the non-tail
+/// `call_indirect*` family keeps returning the same result list it did in Phase 12 (its emitted
+/// seam is observably identical). The tail path (`call_indirect_lookup*`) does NOT call this — it
+/// tail-applies the package-ABI target directly, so the caller's package is returned in constant
+/// stack space.
+///
+/// - `pkg`: the callee's package (opaque `Dynamic`; interpreted per `result_count` only).
+/// - `result_count`: the guard-checked callee result arity (`result_arity(expected_type)`).
+/// - Returns the `result_count`-length value list: `[]` for 0, `[v]` for 1,
+///   `tuple_to_list(pkg)` for `N≥2`. Total; never fails for a well-formed package.
+pub fn package_to_list(pkg: Dynamic, result_count: Int) -> List(Int) {
+  case result_count {
+    0 -> []
+    1 -> [package_as_int(pkg)]
+    _ -> package_tuple_to_list(pkg)
+  }
+}
+
+/// Coerce a single-result `function_return` package (the bare value) into the raw-bit `Int` the
+/// result list holds. Identity at run time (a WASM value is already the raw Erlang integer).
+@external(erlang, "gleam_stdlib", "identity")
+fn package_as_int(pkg: Dynamic) -> Int
+
+/// Explode a multi-result `function_return` package (the `N`-tuple `{v1,…,vn}`) into its value
+/// list `[v1,…,vn]`. `erlang:tuple_to_list/1`; sound because a `result_count >= 2` package is
+/// exactly the `emit_core.function_return` tuple.
+@external(erlang, "erlang", "tuple_to_list")
+fn package_tuple_to_list(pkg: Dynamic) -> List(Int)
+
+/// The callee RESULT ARITY carried by a `call_indirect` type argument — the count `package_to_list`
+/// needs to invert the callee's package.
+///
+/// **Why this is not `list.length(ty.results)`.** The `call_indirect*` `expected_type` parameter is
+/// declared `FuncType`, but it takes TWO different runtime shapes at this boundary: the emitted seam
+/// passes the compile-time `func_type_term` TAG `{params, results}` (a bare 2-tuple), while a direct
+/// Gleam caller (tests) passes a real `FuncType` record `{func_type, params, results}` (a 3-tuple).
+/// Reading the record field `ty.results` (`element(3, …)`) is a `badarg` on the 2-tuple tag. In BOTH
+/// shapes, however, the results list is the LAST tuple element — so its length is the arity whichever
+/// shape arrived. Used only for the non-tail re-wrap (guard 3 has already equated both sides).
+pub fn result_arity(ty: FuncType) -> Int {
+  let term = func_type_to_dynamic(ty)
+  erl_length(erl_element(erl_tuple_size(term), term))
+}
+
+/// Coerce a `FuncType` to its opaque runtime term (identity) so `result_arity` can read its last
+/// tuple element regardless of whether it is a `func_type_term` tag or a `FuncType` record.
+@external(erlang, "gleam_stdlib", "identity")
+fn func_type_to_dynamic(ty: FuncType) -> Dynamic
+
+/// `erlang:tuple_size/1` — the term's tuple arity.
+@external(erlang, "erlang", "tuple_size")
+fn erl_tuple_size(term: Dynamic) -> Int
+
+/// `erlang:element/2` — the `n`-th (1-based) element of `term`.
+@external(erlang, "erlang", "element")
+fn erl_element(n: Int, term: Dynamic) -> Dynamic
+
+/// `erlang:length/1` — the length of the (results) list.
+@external(erlang, "erlang", "length")
+fn erl_length(items: Dynamic) -> Int
+
+/// Look up (WITHOUT applying) the `call_indirect` target in THIS process's default table (index 0),
+/// running the 3 fail-closed guards IN ORDER, and RETURN the target so `emit_core` can TAIL-APPLY it
+/// (a real BEAM tail call in constant stack). This is the tail-call twin of `call_indirect`.
+///
+/// After the funcref-ABI change the returned target is PACKAGE-ABI: applied over an args LIST it
+/// yields the callee's `function_return` package DIRECTLY (bare `v` for one result, `'ok'` for zero,
+/// a tuple for `N≥2`), so tail-applying it in the caller's tail position returns the caller's package
+/// with NO unpack/re-wrap. D3a-clean: the returned closure is the build-controlled slot capability;
+/// only the integer `index` is program-derived (never an `erlang:apply` of a data-named atom).
+///
+/// - `index`: the table entry index (the only runtime-data input).
+/// - `expected_type`: the call site's required `FuncType` (guard 3, exact structural `==`).
+/// - Returns `Ok(target)` — the package-ABI closure — or an `Error(reason)` in guard order:
+///   `UndefinedElement` (bounds), `UninitializedElement` (absent/null slot),
+///   `IndirectCallTypeMismatch` (type). Raises (fail-closed) on an un-seeded cell.
+pub fn call_indirect_lookup(
+  index: Int,
+  expected_type: FuncType,
+) -> Result(fn(List(Int)) -> Dynamic, TrapReason) {
+  lookup_cell(dynamic_to_table(rt_state.table_get()), index, expected_type)
+}
+
+/// `call_indirect_lookup` through table `table_idx` — the multi-table twin (reads
+/// `rt_state.table_at`). Behaviourally identical for `table_idx == 0`. See `call_indirect_lookup`.
+pub fn call_indirect_lookup_at(
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(fn(List(Int)) -> Dynamic, TrapReason) {
+  lookup_cell(
+    dynamic_to_table(rt_state.table_at(table_idx)),
+    index,
+    expected_type,
+  )
+}
+
+/// Threaded `call_indirect_lookup` over `st`'s default table — returns the package-ABI THREADED
+/// target `fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)`, which tail-applied yields
+/// `{package, St'}`. The table read is read-only, so the SAME `st` is threaded into the target
+/// apply by `emit_core`. See `call_indirect_lookup`.
+pub fn t_call_indirect_lookup(
+  st: InstanceState,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(
+  fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
+  TrapReason,
+) {
+  lookup_threaded(dynamic_to_table(rt_state.table(st)), index, expected_type)
+}
+
+/// Threaded `call_indirect_lookup` through table `table_idx` — the indexed threaded twin. See
+/// `t_call_indirect_lookup`.
+pub fn t_call_indirect_lookup_at(
+  st: InstanceState,
+  table_idx: Int,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(
+  fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
+  TrapReason,
+) {
+  lookup_threaded(
+    dynamic_to_table(rt_state.t_table_at(st, table_idx)),
+    index,
+    expected_type,
+  )
+}
+
+/// The shared 3-fault fail-closed lookup over a resolved cell-ABI `Table`: guard 1 bounds
+/// (`UndefinedElement`), guard 2 non-null (`UninitializedElement`), guard 3 exact `FuncType`
+/// (`IndirectCallTypeMismatch`) — the SAME order as `call_indirect` — returning the target closure
+/// on success (never applying it).
+fn lookup_cell(
+  table: Table,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(fn(List(Int)) -> Dynamic, TrapReason) {
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case dict.get(table.slots, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(value) -> {
+          let #(entry_type, target) = ref_to_cell_funcref(value)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target)
+          }
+        }
+      }
+  }
+}
+
+/// The threaded twin of `lookup_cell` — same 3 guards, same order, returning the threaded target.
+fn lookup_threaded(
+  table: Table,
+  index: Int,
+  expected_type: FuncType,
+) -> Result(
+  fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState),
+  TrapReason,
+) {
+  case index < 0 || index >= table.size {
+    True -> Error(UndefinedElement)
+    False ->
+      case dict.get(table.slots, index) {
+        Error(Nil) -> Error(UninitializedElement)
+        Ok(value) -> {
+          let #(entry_type, target) = ref_to_threaded_funcref(value)
+          case entry_type == expected_type {
+            False -> Error(IndirectCallTypeMismatch)
+            True -> Ok(target)
           }
         }
       }
@@ -394,7 +603,7 @@ pub fn t_init_elem(
   st: InstanceState,
   offset: Int,
   entries: List(
-    #(FuncType, fn(InstanceState, List(Int)) -> #(List(Int), InstanceState)),
+    #(FuncType, fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)),
   ),
 ) -> Result(InstanceState, TrapReason) {
   let table = dynamic_to_table(rt_state.table(st))
@@ -431,7 +640,13 @@ pub fn t_call_indirect(
           let #(entry_type, target) = ref_to_threaded_funcref(value)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(st, args))
+            // Package-ABI re-wrap (Phase-13): the threaded target returns `#(package, st')`;
+            // re-wrap the package into the result list, keeping the frozen `#(List(Int), st')`
+            // contract observably identical.
+            True -> {
+              let #(pkg, st2) = target(st, args)
+              Ok(#(package_to_list(pkg, result_arity(expected_type)), st2))
+            }
           }
         }
       }
@@ -459,7 +674,11 @@ pub fn t_call_indirect_at(
           let #(entry_type, target) = ref_to_threaded_funcref(value)
           case entry_type == expected_type {
             False -> Error(IndirectCallTypeMismatch)
-            True -> Ok(target(st, args))
+            // Package-ABI re-wrap (Phase-13) — see `t_call_indirect`.
+            True -> {
+              let #(pkg, st2) = target(st, args)
+              Ok(#(package_to_list(pkg, result_arity(expected_type)), st2))
+            }
           }
         }
       }

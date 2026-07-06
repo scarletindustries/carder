@@ -881,7 +881,14 @@ fn expr_touches_state(expr: Expr) -> Bool {
     | ir.SimdStore(..)
     | ir.SimdLoadLane(..)
     | ir.SimdStoreLane(..)
-    | ir.CallImport(..) -> True
+    | ir.CallImport(..)
+    | // Phase-13 (Q13-05): a tail `return_call_indirect` READS the table capability and a tail
+      // `return_call_import` READS the func-import capability — exactly like their non-tail twins
+      // `CallIndirect`/`CallImport` — so a function containing one is state-reaching under `Threaded`
+      // (it threads `cur` into the lookup + tail apply). `ReturnCall` (direct) is NOT a seed — like
+      // `CallDirect` its state-reachingness flows through the `direct_callees` closure below.
+      ir.ReturnCallIndirect(..)
+    | ir.ReturnCallImport(..) -> True
     Let(_, rhs, body) -> expr_touches_state(rhs) || expr_touches_state(body)
     If(_, _, t, e) -> expr_touches_state(t) || expr_touches_state(e)
     Switch(_, _, arms, default) ->
@@ -910,6 +917,10 @@ fn expr_touches_state(expr: Expr) -> Bool {
 fn direct_callees(expr: Expr, acc: Set(String)) -> Set(String) {
   case expr {
     CallDirect(name, _) -> set.insert(acc, name)
+    // Phase-13 (Q13-05): a DIRECT `return_call` is a real call-graph edge exactly like `CallDirect`
+    // — a function that tail-calls a state-reaching callee must itself be state-reaching (so it is
+    // emitted under `Threading` and emits `apply 'g'/(n+1)(cur, args)`, the callee's threaded arity).
+    ir.ReturnCall(name, _) -> set.insert(acc, name)
     Let(_, rhs, body) -> direct_callees(body, direct_callees(rhs, acc))
     If(_, _, t, e) -> direct_callees(e, direct_callees(t, acc))
     Switch(_, _, arms, default) -> {
@@ -3416,24 +3427,25 @@ fn emit_call_import(
 }
 
 // ─────────────────────────── Phase-13 tail calls (§Q1/Q5) ───────────────────────────
-// CONSERVATIVE-SOUND, VALUE-CORRECT, NON-CONSTANT-STACK PLACEHOLDERS. Each routes the matching
-// ordinary-call emitter under `KBind(fresh_names, Return(vars), KReturn)` — the call is bound to
-// fresh result names, then those names are function-returned, so the `apply`/seam sits in a `let`
-// RHS (a REAL frame, NOT tail position). Result-identical to the genuine tail call (same values,
-// same traps, same order via the SAME unchanged non-tail seam) — differing only in stack growth,
-// which is not WASM-observable. Q13-05 completes these as forced-`KReturn` genuine tail calls +
-// the `rt_table.call_indirect_lookup` seam + the funcref-ABI change (overview §2 ⚠ ABI note); the
-// keystone deliberately does NOT claim the constant-stack property, keeping the completion boundary
-// crisp. No `rt_table`/`link` function is added or edited here (their tail seam is Q13-05's).
+// GENUINE BEAM TAIL CALLS in constant stack space (Q13-05). Each forces `cont = KReturn` internally
+// — a tail call is a bottom transfer to the FUNCTION's result, so the enclosing `cont` is DISCARDED
+// (like `Return`/`Trap`/`Break`). The direct case reuses the existing direct-call tail path; the
+// indirect case emits the `rt_table.call_indirect_lookup` seam then tail-applies the package-ABI
+// target in the ok-arm; the imported case reuses the existing import path under `KReturn`
+// (value-correct with a bounded caller frame — Q8 honest-scope sub-case, no `link` change). The loop
+// tail-`apply` back-edge (`emit_loop`/`emit_continue`) is orthogonal and UNTOUCHED (invariant §8).
 
-/// Emit `ir.ReturnCall(fn_name, args)` — the DIRECT tail-call PLACEHOLDER. Routes the direct-call
-/// logic through `emit_call_direct` under `KBind(fresh_names, Return(vars), KReturn)`: the call is
-/// bound to fresh result names, then function-returned. Value-correct (the callee's results become
-/// this function's results, value-typed by the Q13-03 result-equality rule) but NON-constant-stack.
-/// `r` — the callee's result count, from `ctx.fn_results` (defaulting to 1 like `emit_call_direct`)
-/// — sizes the fresh-name/`Return` vector. `Error(UnknownFunction)` if `fn_name` is undefined
-/// (fail-closed; only reachable on an unvalidated module). Q13-05 completes it as a forced-`KReturn`
-/// bare tail `apply`.
+/// Emit `ir.ReturnCall(fn_name, args)` — a DIRECT tail call. A `CallDirect` under `KReturn` is
+/// ALREADY a genuine BEAM tail call (`emit_call_direct`), so a tail call is exactly "the direct-call
+/// logic with `cont` forced to `KReturn`". The incoming enclosing `cont` is DISCARDED (a bottom
+/// transfer returns to the FUNCTION, not the block). Reachable shapes:
+/// - `NoState` + `KReturn` → the fast path yields a bare `apply 'f'/n(Args)` — a real tail call,
+///   constant stack (the direct self-`return_call` constant-stack proof, Q1).
+/// - `Threading(cur)` to a STATE-REACHING callee → a bare `apply 'f'/(n+1)(cur, Args)` returning
+///   `{Package, St'}` — the threaded return shape, constant stack.
+/// - `Threading(cur)` to a PURE callee → the pure result re-paired with the unchanged `cur`
+///   (bounded; a pure callee cannot tail-recurse back through a state-reaching frame).
+/// `Error(UnknownFunction)` if `fn_name` is undefined (only reachable on an unvalidated module).
 fn emit_return_call(
   fn_name: String,
   args: List(Value),
@@ -3441,24 +3453,20 @@ fn emit_return_call(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let r = result.unwrap(dict.get(ctx.fn_results, fn_name), 1)
-  let #(names, state2) = fresh_n_vars(state, r)
-  emit_call_direct(
-    fn_name,
-    args,
-    KBind(names, Return(list.map(names, Var)), KReturn),
-    sc,
-    state2,
-    ctx,
-  )
+  emit_call_direct(fn_name, args, KReturn, sc, state, ctx)
 }
 
-/// Emit `ir.ReturnCallIndirect(table, index, ty, args)` — the INDIRECT tail-call PLACEHOLDER.
-/// Routes the EXISTING non-tail `emit_call_indirect` (the frozen 3-guard `rt_table` dispatch —
-/// `UndefinedElement` → `UninitializedElement` → `IndirectCallTypeMismatch`, same traps, same
-/// order) under `KBind(fresh_names, Return(vars), KReturn)`. Value-correct but NON-constant-stack.
-/// `r = list.length(ty.results)` sizes the fresh-name/`Return` vector. Q13-05 completes it with the
-/// `rt_table.call_indirect_lookup` seam then a tail-apply of the package-ABI target in the ok-arm.
+/// Emit `ir.ReturnCallIndirect(table, index, ty, args)` — an INDIRECT tail call. Emits the
+/// `rt_table.call_indirect_lookup` seam (the 3-fault fail-closed dispatch that RETURNS the
+/// PACKAGE-ABI target instead of applying it) as the WHOLE `case` expression, then APPLIES the
+/// target in the ok-arm's TAIL position — a real BEAM tail call in constant stack (Q1). Because the
+/// target is package-ABI, its tail-application yields the caller's `function_return` package
+/// DIRECTLY (no `let`, no `unpack_result_list`, no re-wrap). The error-arm re-raises the seam's
+/// `TrapReason` verbatim (the same three traps, same order, as `call_indirect`, D3a-clean — only the
+/// integer `index` is program-derived). Index 0 emits the un-indexed `call_indirect_lookup` head
+/// (byte-identity, H7); index ≥ 1 the `_at` head. Under `Threading(cur)` the `t_`-prefixed twins
+/// thread the read-only `cur` into BOTH the lookup and the target apply (no rebind). Discards the
+/// enclosing `cont`. Two fresh vars only (`T`, `E`).
 fn emit_return_call_indirect(
   table: String,
   index: Value,
@@ -3468,26 +3476,72 @@ fn emit_return_call_indirect(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let r = list.length(ty.results)
-  let #(names, state2) = fresh_n_vars(state, r)
-  emit_call_indirect(
-    table,
-    index,
-    ty,
-    args,
-    KBind(names, Return(list.map(names, Var)), KReturn),
-    sc,
-    state2,
-    ctx,
-  )
+  let idx = table_idx(ctx, table)
+  let tag = func_type_term(ty)
+  let cargs = core_list(list.map(args, emit_value))
+  let #(tvar, state2) = fresh_var(state)
+  let #(evar, state3) = fresh_var(state2)
+  // Select the head + tail-apply per state channel. Under `Threading` the read-only `cur` flows
+  // into both the lookup and the 2-ary target apply (which returns `{Package, St'}`).
+  let #(lookup, tail_apply) = case sc {
+    NoState -> {
+      let lookup = case idx {
+        0 ->
+          seam_call(ctx.binding.table_module, "call_indirect_lookup", [
+            emit_value(index),
+            tag,
+          ])
+        _ ->
+          seam_call(ctx.binding.table_module, "call_indirect_lookup_at", [
+            CInt(idx),
+            emit_value(index),
+            tag,
+          ])
+      }
+      #(lookup, CApplyExpr(CVar(tvar), [cargs]))
+    }
+    Threading(cur) -> {
+      let lookup = case idx {
+        0 ->
+          seam_call(ctx.binding.table_module, "t_call_indirect_lookup", [
+            CVar(cur),
+            emit_value(index),
+            tag,
+          ])
+        _ ->
+          seam_call(ctx.binding.table_module, "t_call_indirect_lookup_at", [
+            CVar(cur),
+            CInt(idx),
+            emit_value(index),
+            tag,
+          ])
+      }
+      #(lookup, CApplyExpr(CVar(tvar), [CVar(cur), cargs]))
+    }
+  }
+  // The `case`-over-lookup IS the whole expression (no outer `let`), so the ok-arm `apply` is in
+  // genuine tail position; the error-arm re-raises the seam's `TrapReason`.
+  let result_case =
+    CCase(lookup, [
+      CClause([PTuple([PAtom("ok"), PVar(tvar)])], CAtom("true"), tail_apply),
+      CClause(
+        [PTuple([PAtom("error"), PVar(evar)])],
+        CAtom("true"),
+        raise_trap(ctx, CVar(evar)),
+      ),
+    ])
+  Ok(#(result_case, state3))
 }
 
-/// Emit `ir.ReturnCallImport(slot, ty, args)` — the IMPORTED tail-call PLACEHOLDER. Routes the
-/// EXISTING `emit_call_import` (reads the linker-built closure from the instance's func-import
-/// `slot`, then `link.call_import(closure, args)` — a capability, never an ambient `apply`, D3a)
-/// under `KBind(fresh_names, Return(vars), KReturn)`. Value-correct but NON-constant-stack.
-/// `r = list.length(ty.results)` sizes the fresh-name/`Return` vector. Q13-05 completes it as the
-/// existing import path under `KReturn` (value-correct, bounded caller frame — NO `link` change).
+/// Emit `ir.ReturnCallImport(slot, ty, args)` — an IMPORTED tail call. Routes through the EXISTING
+/// import-call logic (`emit_call_import`) under a forced `KReturn` — NO `link` change, NO
+/// `call_import` tail variant (overview §2 ⚠ ABI reconciliation note). `link.call_import` returns a
+/// value LIST, so `emit_call_import` re-packages it into the caller's `function_return` package
+/// under `KReturn` — value-correct, D3a (a 1-ary apply of a handed-in capability, never an ambient
+/// `apply` of a data-named atom). This introduces a BOUNDED caller frame (an import callee is a
+/// separate BEAM process; it cannot tail-recurse back through it): the imported case is
+/// value-correct but NOT a constant-stack claim (Q8 honest-scope sub-case). Discards the enclosing
+/// `cont` (the forced `KReturn` supersedes it), for both `NoState` and `Threading(cur)`.
 fn emit_return_call_import(
   slot: Int,
   ty: FuncType,
@@ -3496,17 +3550,7 @@ fn emit_return_call_import(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let r = list.length(ty.results)
-  let #(names, state2) = fresh_n_vars(state, r)
-  emit_call_import(
-    slot,
-    ty,
-    args,
-    KBind(names, Return(list.map(names, Var)), KReturn),
-    sc,
-    state2,
-    ctx,
-  )
+  emit_call_import(slot, ty, args, KReturn, sc, state, ctx)
 }
 
 // ─────────────────────────── Phase-5 reference layer (§B) ───────────────────────────
@@ -4825,10 +4869,12 @@ fn needs_func_imports(module: Module) -> Bool {
   list.any(module.functions, fn(f) { expr_has_call_import(f.body) })
 }
 
-/// `True` iff `expr` (recursively) contains a `CallImport` node.
+/// `True` iff `expr` (recursively) contains a `CallImport` node — OR a Phase-13 `ReturnCallImport`
+/// (a TAIL call to an imported function reads the same positional func-import capability, so the
+/// module still needs `instantiate/1` + the seeded func-import vector).
 fn expr_has_call_import(expr: Expr) -> Bool {
   case expr {
-    ir.CallImport(..) -> True
+    ir.CallImport(..) | ir.ReturnCallImport(..) -> True
     Let(_, rhs, body) -> expr_has_call_import(rhs) || expr_has_call_import(body)
     If(_, _, t, e) -> expr_has_call_import(t) || expr_has_call_import(e)
     Switch(_, _, arms, default) ->
@@ -5583,26 +5629,29 @@ fn threaded_element_entry(
     Error(_) -> Error(UnknownFunction(fname))
     Ok(sig) -> {
       let arity = result.unwrap(dict.get(ctx.fn_arity, fname), 0)
-      let r = result.unwrap(dict.get(ctx.fn_results, fname), 0)
       let reaching = set.contains(ctx.fn_state_reaching, fname)
       let #(closure, state2) =
-        threaded_element_closure(fname, arity, r, reaching, state)
+        threaded_element_closure(fname, arity, reaching, state)
       Ok(#(CTuple([func_type_term(sig), closure]), state2))
     }
   }
 }
 
-/// A build-controlled THREADED element-segment closure `fun(St, ArgsList) -> {ResultList, St'}`
-/// matching the frozen table-entry ABI `fn(InstanceState, List(Int)) -> #(List(Int),
-/// InstanceState)` (§C). Unpacks `ArgsList` to the target's static `arity`, then:
-/// - PURE target: `{wrap(apply 'f'/n(args…)), St}` — thread `St` through UNTOUCHED.
-/// - STATE-REACHING target: `{Pkg, St'} = apply 'f'/(n+1)(St, args…)` then `{wrap(Pkg), St'}`.
-/// Always a static `apply` of a COMPILE-TIME-LITERAL name — `St` is a parameter, never a
-/// dispatch key (D3a).
+/// A build-controlled THREADED element-segment closure `fun(St, ArgsList) -> {Package, St'}` —
+/// PACKAGE-ABI and TAIL-TRANSPARENT (Phase-13, overview §2 ⚠ ABI reconciliation note). Matches the
+/// funcref threaded ABI `fn(InstanceState, List(Int)) -> #(Dynamic, InstanceState)`. Unpacks
+/// `ArgsList` to the target's static `arity`, then:
+/// - PURE target: `{apply 'f'/n(args…), St}` — the callee's package paired with `St` threaded
+///   through UNTOUCHED (a pure callee cannot tail-recurse back through a state-reaching frame, so
+///   the non-tail tuple position is bounded, §3.2).
+/// - STATE-REACHING target: a BARE `apply 'f'/(n+1)(St, args…)` in TAIL position — `f/(n+1)` returns
+///   `{Package, St'}` DIRECTLY, exactly this closure's return shape, so the tail apply through
+///   `t_call_indirect_lookup` is a real BEAM tail call in constant stack.
+/// Always a static `apply` of a COMPILE-TIME-LITERAL name — `St` is a parameter, never a dispatch
+/// key (D3a). The non-tail `t_call_indirect*` re-wraps the package back into the result list.
 fn threaded_element_closure(
   fname: String,
   arity: Int,
-  r: Int,
   reaching: Bool,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
@@ -5612,10 +5661,9 @@ fn threaded_element_closure(
   case reaching {
     False -> {
       let applied = CApply(FName(fname, arity), list.map(argnames, CVar))
-      let #(wrapped, state4) = wrap_result_list(applied, r, state3)
-      let paired = CTuple([wrapped, CVar(stvar)])
+      let paired = CTuple([applied, CVar(stvar)])
       let body = wrap_args_case(argsvar, arity, argnames, paired)
-      #(CFun([stvar, argsvar], body), state4)
+      #(CFun([stvar, argsvar], body), state3)
     }
     True -> {
       let applied =
@@ -5623,20 +5671,8 @@ fn threaded_element_closure(
           CVar(stvar),
           ..list.map(argnames, CVar)
         ])
-      let #(pkgvar, state4) = fresh_var(state3)
-      let #(stoutvar, state5) = fresh_var(state4)
-      let #(wrapped, state6) = wrap_result_list(CVar(pkgvar), r, state5)
-      let paired = CTuple([wrapped, CVar(stoutvar)])
-      let destructure =
-        CCase(applied, [
-          CClause(
-            [PTuple([PVar(pkgvar), PVar(stoutvar)])],
-            CAtom("true"),
-            paired,
-          ),
-        ])
-      let body = wrap_args_case(argsvar, arity, argnames, destructure)
-      #(CFun([stvar, argsvar], body), state6)
+      let body = wrap_args_case(argsvar, arity, argnames, applied)
+      #(CFun([stvar, argsvar], body), state3)
     }
   }
 }
@@ -5890,63 +5926,36 @@ fn element_entry(
     Error(_) -> Error(UnknownFunction(fname))
     Ok(sig) -> {
       let arity = result.unwrap(dict.get(ctx.fn_arity, fname), 0)
-      let r = result.unwrap(dict.get(ctx.fn_results, fname), 0)
-      let #(closure, state2) = element_closure(fname, arity, r, state)
+      let #(closure, state2) = element_closure(fname, arity, state)
       Ok(#(CTuple([func_type_term(sig), closure]), state2))
     }
   }
 }
 
-/// A build-controlled element-segment closure `fun(Args) -> Results` adapting the
-/// `fn(List(Int)) -> List(Int)` table-entry ABI to a static `apply 'f<idx>'/arity`: unpack
-/// the args list to the function's static `arity`, apply the COMPILE-TIME-LITERAL name, then
-/// re-wrap the `function_return`-packaged result back into a list (0 → `[]`, 1 → `[v]`, N →
-/// `[v1…vn]`). Never a data-driven `apply` (D3a).
+/// A build-controlled element-segment closure `fun(Args) -> Package` — PACKAGE-ABI and
+/// TAIL-TRANSPARENT (Phase-13, overview §2 ⚠ ABI reconciliation note). Its body unpacks the args
+/// list to the function's static `arity`, then a BARE `apply 'f<idx>'/arity(<args>)` in TAIL
+/// position, returning `f`'s `function_return` package DIRECTLY (bare `v` for one result, `'ok'`
+/// for zero, a tuple for `N≥2`) — NOT re-wrapped into a list. This is what lets
+/// `rt_table.call_indirect_lookup`'s returned target tail-apply into the caller's package
+/// (constant stack); the non-tail `call_indirect*` family re-wraps the package back into the result
+/// list inside `rt_table` (`package_to_list`). Never a data-driven `apply` (D3a).
 fn element_closure(
   fname: String,
   arity: Int,
-  r: Int,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
   let #(argsvar, state1) = fresh_var(state)
   let #(argnames, state2) = fresh_n_vars(state1, arity)
   let applied = CApply(FName(fname, arity), list.map(argnames, CVar))
-  let #(wrapped, state3) = wrap_result_list(applied, r, state2)
   let body = case arity {
-    0 -> wrapped
+    0 -> applied
     _ ->
       CCase(CVar(argsvar), [
-        CClause([list_pattern(argnames)], CAtom("true"), wrapped),
+        CClause([list_pattern(argnames)], CAtom("true"), applied),
       ])
   }
-  #(CFun([argsvar], body), state3)
-}
-
-/// Re-wrap a `function_return`-packaged call result into the `List(Int)` the table-entry ABI
-/// returns: 0 results → `[]` (binding+discarding the dummy so the call still RUNS — its trap
-/// still propagates); 1 result → `[V]`; N≥2 → destructure the `{V1,…,Vn}` tuple → `[V1,…,Vn]`.
-fn wrap_result_list(
-  produced: CExpr,
-  r: Int,
-  state: EmitState,
-) -> #(CExpr, EmitState) {
-  case r {
-    0 -> {
-      let #(g, state2) = fresh_var(state)
-      #(CLet([g], produced, CNil), state2)
-    }
-    1 -> #(CCons(produced, CNil), state)
-    _ -> {
-      let #(names, state2) = fresh_n_vars(state, r)
-      let clause =
-        CClause(
-          [PTuple(list.map(names, PVar))],
-          CAtom("true"),
-          core_list(list.map(names, CVar)),
-        )
-      #(CCase(produced, [clause]), state2)
-    }
-  }
+  #(CFun([argsvar], body), state2)
 }
 
 /// Build the ordered data-seeding effects for the ACTIVE data segments (passive segments carry

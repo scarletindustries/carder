@@ -251,13 +251,13 @@ pub fn return_call_free_module_is_conformance_neutral_test() {
 
 // ───────────────────────── 6. placeholder emit is VALUE-CORRECT (Q6) ─────────────────────────
 
-/// Hand-build a module whose functions use each of the three tail-call nodes (as Q13-04 will
-/// eventually produce them), emit it, and assert the emit SUCCEEDS and routes each node through the
-/// EXISTING ordinary-call path (bound-then-returned) — the `.core` carries the ordinary `apply` /
-/// `call_import` / `call_indirect` seams and NEITHER `call_indirect_lookup` (the Q13-05-owned tail
-/// seam) NOR any `return_call` token. This pins that the reach compiles and is value-sound if
-/// reached; the keystone deliberately does NOT assert the constant-stack property or the
-/// lookup-seam package shape (those are Q13-05's guards, in its `emit_core_tailcall_test`).
+/// Hand-build a module whose functions use each of the three tail-call nodes, emit it, and assert
+/// the emit SUCCEEDS and routes each node through its Q13-05-COMPLETED path: the direct callee
+/// `apply`, the import path's `call_import`, and — now that Q13-05 has landed — the indirect tail
+/// seam `call_indirect_lookup` (a genuine constant-stack tail apply). No IR `return_call` token
+/// leaks into the emitted `.core`. (The keystone originally pinned the NON-tail placeholder here;
+/// Q13-05 completed the arms, so this now asserts the completed seam — the constant-stack property
+/// and the lookup-seam package shape are proven in Q13-05's `emit_core_tailcall_test`.)
 pub fn placeholder_emit_is_value_correct_test() {
   let i32_to_i32 = ir.FuncType([ir.TI32], [ir.TI32])
   // A defined callee the direct tail call targets (must exist in `fn_arity`/`fn_results`).
@@ -314,13 +314,12 @@ pub fn placeholder_emit_is_value_correct_test() {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
   let core = core_printer.print_module(cm)
 
-  // Routed through the EXISTING ordinary emitters: the direct callee `apply`, the ordinary import
-  // seam, and the ordinary indirect seam all appear.
+  // The import path's `call_import` seam and the indirect tail's `call_indirect_lookup` seam both
+  // appear (Q13-05 completed the arms — the indirect tail is now a genuine constant-stack tail call
+  // through the lookup seam).
   should.be_true(string.contains(core, "call_import"))
-  should.be_true(string.contains(core, "call_indirect"))
+  should.be_true(string.contains(core, "call_indirect_lookup"))
 
-  // …but NEITHER the Q13-05-owned lookup seam NOR any leaked IR tail-call token — the delegation is
-  // a value-correct NON-tail emission, not yet a tail call.
-  should.be_false(string.contains(core, "call_indirect_lookup"))
+  // No IR tail-call token ever leaks into the emitted Core.
   should.be_false(string.contains(core, "return_call"))
 }

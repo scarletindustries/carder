@@ -23,6 +23,10 @@ import twocore/runtime/rt_state.{type InstanceState, FullDecl, StateDecl}
 import twocore/runtime/rt_table
 import twocore/runtime/rt_table_atomics as atom
 
+/// Box a value as the package `Dynamic` a Phase-13 funcref closure returns (identity at run time).
+@external(erlang, "gleam_stdlib", "identity")
+fn to_pkg(v: a) -> dynamic.Dynamic
+
 fn seed(size: Int, max: option.Option(Int)) -> Nil {
   rt_state.seed(StateDecl(
     mem: dynamic.nil(),
@@ -72,7 +76,7 @@ pub fn set_null_then_call_indirect_traps_test() {
       0,
       rt_table.funcref(ii_i(), fn(args) {
         case args {
-          [a, b] -> [a + b]
+          [a, b] -> to_pkg(a + b)
           _ -> panic as "add"
         }
       }),
@@ -212,8 +216,8 @@ pub fn call_indirect_at_multi_table_cell_test() {
       1,
       rt_table.funcref(ii_i(), fn(a) {
         case a {
-          [x, y] -> [x + y]
-          _ -> []
+          [x, y] -> to_pkg(x + y)
+          _ -> to_pkg(0)
         }
       }),
     )
@@ -244,8 +248,8 @@ pub fn t_call_indirect_at_multi_table_test() {
       1,
       rt_table.funcref_t(ii_i(), fn(s, a) {
         case a {
-          [x, y] -> #([x + y], s)
-          _ -> #([], s)
+          [x, y] -> #(to_pkg(x + y), s)
+          _ -> #(to_pkg(0), s)
         }
       }),
     )
