@@ -989,23 +989,42 @@ fn validate_instr(
       use st3 <- result.try(pop_vals(st2, sig.params))
       Ok(push_vals(st3, sig.results))
     }
-    // ── Phase-13 tail calls (Q3) — CONSERVATIVE-SOUND PLACEHOLDER (Q13-03 completes with the spec
-    // RESULT-TYPE EQUALITY check + the `assert_invalid` rejection tests). Per the WASM tail-call
-    // proposal, `return_call`/`return_call_indirect` pop the callee's params (indirect also pops an
-    // i32 index and requires the target table to hold `funcref`), then are STACK-POLYMORPHIC like
-    // `return` — so the keystone lands the `return`-shape operand typing (pop params + push nothing
-    // + `mark_unreachable`) MINUS the result-equality check. This is sound for every VALID module
-    // (correct operand consumption + `return`-shape polymorphism); Q13-03 adds `sig.results ==
-    // <function frame end_types>` (else the existing `TypeMismatch`) so callee-results ≠
-    // function-results are rejected. The lenient-on-invalid gap is never exercised until then. ──
+    // ── Phase-13 tail calls (Q3) — the WASM tail-call proposal typing rule. ──
+    // `return_call f`: read the callee signature exactly like `ast.Call` (funcidx in
+    // range → `UnknownFunc`), pop the callee's params, then REQUIRE the callee's result
+    // types to equal the CURRENT function's result types — read as `ast.Return` reads
+    // them, from the OUTERMOST (function) control frame's `end_types` via
+    // `list.last(st.ctrls)`, NOT the innermost block (a mismatch → the existing
+    // `TypeMismatch`, reused; no new `ValidateError` variant). Equality is order-sensitive
+    // `List(ValType)` equality, so it rejects both an element-type mismatch (`[i32]` vs
+    // `[i64]`) and an arity mismatch (`[]` vs `[i32]`). The stack then goes polymorphic
+    // (`mark_unreachable`) exactly like `return` — the continuation is unreachable, so
+    // nothing is pushed (WASM tail-call proposal: `return_call` is valid iff callee
+    // results == function results, and is stack-polymorphic like `return`).
     ast.ReturnCall(f) -> {
       use sig <- result.try(case nth(ctx.func_types, f) {
         Ok(s) -> Ok(s)
         Error(_) -> Error(UnknownFunc(f))
       })
+      use func_frame <- result.try(case list.last(st.ctrls) {
+        Ok(fr) -> Ok(fr)
+        Error(_) -> Error(UnexpectedEnd)
+      })
       use st2 <- result.try(pop_vals(st, sig.params))
-      mark_unreachable(st2)
+      case sig.results == func_frame.end_types {
+        False -> Error(TypeMismatch)
+        True -> mark_unreachable(st2)
+      }
     }
+    // `return_call_indirect (type y) x`: the structural prelude is identical to
+    // `call_indirect` — the static `typeidx y` must be in range (`UnknownType`), table `x`
+    // must hold `funcref` (an `externref` table cannot back an indirect tail call →
+    // `RefTypeMismatch`), then pop the i32 index and the callee's params. The added
+    // tail-call constraint is the same result-equality gate as `return_call`: the callee
+    // (type `y`) result types must equal the current function's result types (else
+    // `TypeMismatch`), read from the outermost frame's `end_types`. Then go stack-
+    // polymorphic (`mark_unreachable`). The per-call structural FuncType check stays DYNAMIC
+    // (runtime), unchanged from `call_indirect` (WASM tail-call proposal validation).
     ast.ReturnCallIndirect(type_idx, table) -> {
       use sig <- result.try(case nth(ctx.types, type_idx) {
         Ok(s) -> Ok(s)
@@ -1016,9 +1035,16 @@ fn validate_instr(
         ast.FuncRef -> Ok(Nil)
         _ -> Error(RefTypeMismatch)
       })
+      use func_frame <- result.try(case list.last(st.ctrls) {
+        Ok(fr) -> Ok(fr)
+        Error(_) -> Error(UnexpectedEnd)
+      })
       use st2 <- result.try(pop_expect(st, ast.I32))
       use st3 <- result.try(pop_vals(st2, sig.params))
-      mark_unreachable(st3)
+      case sig.results == func_frame.end_types {
+        False -> Error(TypeMismatch)
+        True -> mark_unreachable(st3)
+      }
     }
 
     // parametric ----------------------------------------------------------------

@@ -2473,6 +2473,242 @@ fn is_ok(r: Result(a, b)) -> Bool {
   }
 }
 
+// ═════════════ Phase-13 (Q13-03) tail-call typing rule ═════════════
+// Spec: the WASM tail-call proposal. `return_call $f` / `return_call_indirect $t
+// (type $ft)` are valid iff the callee's result type EQUALS the current function's
+// result type; they are STACK-POLYMORPHIC like `return`. `return_call_indirect`
+// shares `call_indirect`'s table-`funcref` validation constraint. These tests build
+// the `ast.ReturnCall`/`ast.ReturnCallIndirect` AST directly (no decode/WAT
+// dependency) and assert the rule, not the implementation's incidental output.
+
+/// A `return_call` whose callee results equal the caller's results is ACCEPTED:
+/// `func 0 : () -> i32` tail-calls `func 1 : () -> i32`. Callee results `[i32]` ==
+/// function results `[i32]` (spec: `return_call` valid iff callee results ==
+/// function results).
+pub fn accept_return_call_direct_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [ast.ReturnCall(1), ast.End]),
+      func_(0, [ast.I32Const(0), ast.End]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A `return_call` pops the callee's params before the result-equality check:
+/// `func 0 : () -> i32` pushes two i32s and tail-calls `func 1 : (i32, i32) -> i32`.
+/// The two params are consumed and the callee's `[i32]` result still equals the
+/// caller's `[i32]` (spec: pop the callee's params, then require result equality).
+pub fn accept_return_call_params_consumed_test() {
+  module(
+    types: [ft([], [ast.I32]), ft([ast.I32, ast.I32], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [ast.I32Const(1), ast.I32Const(2), ast.ReturnCall(1), ast.End]),
+      func_(1, [ast.I32Const(0), ast.End]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A `return_call_indirect` through a `funcref` table is ACCEPTED: it pops the i32
+/// index, and the callee `(type 0)` result `[i32]` equals the caller's `[i32]`
+/// (spec: `return_call_indirect` = `call_indirect`'s prelude plus the result-equality
+/// gate).
+pub fn accept_return_call_indirect_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [tbl(1, None)],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.ReturnCallIndirect(0, 0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// After a `return_call` the operand stack is POLYMORPHIC, exactly like `return`:
+/// the trailing `i32.add` would underflow on a concrete empty stack but validates
+/// because `mark_unreachable` made the stack polymorphic, and reaching `End` with
+/// declared result `[i32]` is satisfied by the polymorphic stack (spec: `return_call`
+/// is stack-polymorphic like `return`). This case fails if the arm forgets
+/// `mark_unreachable`.
+pub fn accept_return_call_stack_polymorphic_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [ast.ReturnCall(1), ast.I32Add, ast.End]),
+      func_(0, [ast.I32Const(0), ast.End]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> is_ok()
+  |> should.equal(True)
+}
+
+/// A `return_call` whose callee's result ELEMENT TYPE differs from the caller's is
+/// REJECTED: `func 0 : () -> i32` tail-calls `func 1 : () -> i64`. Callee results
+/// `[i64]` != function results `[i32]` → `TypeMismatch` (spec: the callee result type
+/// must equal the function's result type — the core new constraint).
+pub fn reject_return_call_result_mismatch_test() {
+  module(
+    types: [ft([], [ast.I32]), ft([], [ast.I64])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [ast.ReturnCall(1), ast.End]),
+      func_(1, [ast.I64Const(0), ast.End]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// A `return_call` whose callee result ARITY differs from the caller's is REJECTED:
+/// `func 0 : () -> i32` tail-calls `func 1 : () -> ()`. Callee results `[]` !=
+/// function results `[i32]` → `TypeMismatch`. Proves the full result VECTOR must be
+/// equal, not just the element types (spec: order-sensitive result-vector equality).
+pub fn reject_return_call_result_arity_mismatch_test() {
+  module(
+    types: [ft([], [ast.I32]), ft([], [])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.ReturnCall(1), ast.End]), func_(1, [ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// A `return_call_indirect` whose callee `(type 1)` results differ from the caller's
+/// is REJECTED: caller `func 0 : () -> i32`, indirect type 1 `() -> i64`. Callee
+/// results `[i64]` != function results `[i32]` → `TypeMismatch` (spec: the indirect
+/// tail call carries the same result-equality constraint as the direct one).
+pub fn reject_return_call_indirect_result_mismatch_test() {
+  module(
+    types: [ft([], [ast.I32]), ft([], [ast.I64])],
+    tables: [tbl(1, None)],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.ReturnCallIndirect(1, 0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.TypeMismatch))
+}
+
+/// A `return_call_indirect` through an `externref` table is REJECTED with
+/// `RefTypeMismatch`: an externref table cannot back an indirect tail call, exactly as
+/// it cannot back a `call_indirect` (spec: `return_call_indirect` shares
+/// `call_indirect`'s table-`funcref` validation constraint).
+pub fn reject_return_call_indirect_externref_table_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [rtbl(ast.ExternRef, 1)],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.ReturnCallIndirect(0, 0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.RefTypeMismatch))
+}
+
+/// A `return_call` to an out-of-range funcidx is REJECTED with `UnknownFunc`:
+/// `return_call 7` in a single-function module (spec: the callee funcidx must be in
+/// range — the same guard as `call`).
+pub fn reject_return_call_bad_func_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.ReturnCall(7), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownFunc(7)))
+}
+
+/// A `return_call_indirect` with an out-of-range static typeidx is REJECTED with
+/// `UnknownType`: `return_call_indirect (type 5)` with fewer than 6 types (spec: the
+/// static typeidx must be in range — the same guard as `call_indirect`).
+pub fn reject_return_call_indirect_bad_type_test() {
+  module(
+    types: [ft([], [ast.I32])],
+    tables: [tbl(1, None)],
+    memories: [],
+    globals: [],
+    funcs: [func_(0, [ast.I32Const(0), ast.ReturnCallIndirect(5, 0), ast.End])],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.UnknownType(5)))
+}
+
+/// A `return_call` that does not supply the callee's params underflows: caller
+/// `func 0 : () -> i32` tail-calls `func 1 : (i32) -> i32` with nothing on the stack →
+/// `Underflow` (spec: the callee's params must be popped — the same `pop_vals`
+/// underflow as `call`).
+pub fn reject_return_call_param_mismatch_test() {
+  module(
+    types: [ft([], [ast.I32]), ft([ast.I32], [ast.I32])],
+    tables: [],
+    memories: [],
+    globals: [],
+    funcs: [
+      func_(0, [ast.ReturnCall(1), ast.End]),
+      func_(1, [ast.I32Const(0), ast.End]),
+    ],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.Underflow))
+}
+
 // ───────────────────────────── fixtures ─────────────────────────────
 // Valid (wat2wasm) and invalid (wat2wasm --no-check) `.wasm` byte literals.
 
