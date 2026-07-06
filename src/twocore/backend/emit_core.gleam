@@ -1030,14 +1030,13 @@ fn emit(
     // ── Phase-5 reference layer (H1/H2) — PURE, state-neutral (they touch no memory/table/
     // global, §B). `cur` flows through unchanged under `Threading`. ──
     ir.RefFunc(name) -> emit_ref_func(name, cont, sc, state, ctx)
-    // Phase-14 `RefFuncImport` (R1): FAIL-CLOSED reach — reproduces the exact byte-identical skip an
-    // imported `ref.func` produced before this node existed (`ir.RefFunc("f<slot>")` →
-    // `UnknownFunction("f<slot>")`, since an import name is absent from `ctx.fn_sig`). R14-02
-    // COMPLETES this arm with the real `emit_ref_func_import` (the D3a `link.call_import` adapter
-    // closure). It fails BEFORE any `func_import_at` read, so no `instantiate/0`↔`/1` desync is
-    // exposed at freeze time (the module simply skips, as today).
-    ir.RefFuncImport(slot, _) ->
-      Error(UnknownFunction("f" <> int.to_string(slot)))
+    // Phase-14 `RefFuncImport` (R14-02, R1/R2): a bare `ref.func` of an IMPORTED function in a
+    // function body (pushed then `table.set`/returned) is a PURE, state-neutral funcref
+    // CONSTRUCTION — the `func_import_at(slot)` read is deferred INTO the adapter closure body
+    // (dispatch time), so building the value touches no state and `cur` flows through unchanged
+    // under `Threading`, exactly like `emit_ref_func`.
+    ir.RefFuncImport(slot, ty) ->
+      emit_ref_func_import(slot, ty, cont, sc, state, ctx)
     ir.RefIsNull(arg) -> emit_ref_is_null(arg, cont, sc, state, ctx)
     // ── Phase-5 table layer (H2) — state-reaching (§C). ──
     ir.TableGet(table, index) ->
@@ -3595,6 +3594,143 @@ fn reference_func_entry(
   }
 }
 
+/// Lower `ir.RefFuncImport(slot, ty)` — a `ref.func` of an IMPORTED function (Phase-14, R1/R2).
+/// A PURE, state-neutral funcref CONSTRUCTION (a sibling of `emit_ref_func`): it builds the
+/// `#(FuncType, adapter)` value and disposes it through `cont`, reading NOTHING from state at
+/// build time (the `func_import_at(slot)` read is deferred into the adapter body — see
+/// `imported_reference_func_entry`). Under `Threading(cur)`, `cur` flows through UNCHANGED
+/// (`apply_cont` threads it), exactly like `emit_ref_func`. `slot` is the func-import index
+/// (funcidx `0..imported-1`); `ty` is the import's declared `FuncType`. Never errors — there is
+/// no `ctx.fn_sig` lookup to miss (that miss was the removed `UnknownFunction` residual).
+fn emit_ref_func_import(
+  slot: Int,
+  ty: FuncType,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use #(entry, state2) <- result.try(imported_reference_func_entry(
+    slot,
+    ty,
+    ctx,
+    state,
+  ))
+  apply_cont(cont, [entry], sc, state2, ctx)
+}
+
+/// Build the `#(TypeTag, adapter)` funcref value for an IMPORTED `ref.func` (Phase-14, R2/D3a) —
+/// the sibling of `reference_func_entry` for imports. The stored value is the UNCHANGED funcref
+/// shape `#(FuncType, closure)`, so `rt_table`'s guard-3 structural `entry_type == expected_type`
+/// matches an import-routed slot exactly as it matches a defined-funcref slot (`func_type_term`
+/// is the SAME renderer the `call_indirect` site uses). Like `reference_func_entry`, it branches
+/// on the BUILD strategy `is_threaded(ctx)` (NOT `sc`): a funcref is consumed uniformly by
+/// `call_indirect` / `t_call_indirect` across the whole build, so the adapter ABI must match the
+/// BUILD, not the local state channel.
+///
+/// The adapter is emitted INLINE in Core Erlang (no `link` helper — F3), capturing only the
+/// LITERAL integer `slot` (D3a: the only program-derived operand is a `CInt`; dispatch is
+/// `link:call_import(func_import_at(slot), Args)`, never `erlang:apply` of program data). It
+/// dispatches through the frozen func-import capability seam, then re-packages `call_import`'s
+/// result LIST into the funcref-slot's `function_return` PACKAGE (bare value for one result, the
+/// N-tuple for N≥2, `'ok'` for zero) — the SAME package-ABI a DEFINED `element_closure` returns,
+/// which `rt_table.call_indirect` inverts via `package_to_list`. (This is why the value is
+/// re-shaped and not passed straight through: the Phase-13 funcref-slot ABI is package-ABI, so a
+/// raw list would double-wrap a single result / mis-shape a multi-value one.)
+///
+/// Returns `Result` for signature uniformity with its siblings, but NEVER errors (there is no
+/// `ctx.fn_sig` lookup to miss). Advances `state` past the closure's fresh binder names.
+fn imported_reference_func_entry(
+  slot: Int,
+  ty: FuncType,
+  ctx: Ctx,
+  state: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(closure, state2) = case is_threaded(ctx) {
+    True -> imported_funcref_threaded_closure(slot, ty, ctx, state)
+    False -> imported_funcref_cell_closure(slot, ty, ctx, state)
+  }
+  Ok(#(CTuple([func_type_term(ty), closure]), state2))
+}
+
+/// The CELL import adapter (build `is_threaded == False`; funcref-slot ABI `fun(Args) -> Package`):
+///
+/// ```
+/// fun(Args) -> case link:call_import(rt_state:func_import_at(Slot), Args) of
+///                <[V1,…,Vr]> when 'true' -> <Package(V1,…,Vr)> end
+/// ```
+///
+/// `Args` is the raw-bit argument `List` handed in by `rt_table.call_indirect`; the func-import
+/// slot's closure is read at DISPATCH time (`func_import_at(Slot)`), dispatched via the 1-ary
+/// `link:call_import` (never `apply/3`, D3a), and its result LIST re-packaged into the
+/// `function_return` package the slot ABI expects (`function_return` — bare value / N-tuple /
+/// `'ok'`). The only program-derived operand is the literal `CInt(slot)`.
+fn imported_funcref_cell_closure(
+  slot: Int,
+  ty: FuncType,
+  ctx: Ctx,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  let #(argsvar, state1) = fresh_var(state)
+  let #(resnames, state2) = fresh_n_vars(state1, list.length(ty.results))
+  let call =
+    seam_call(link_module, "call_import", [
+      seam_call(ctx.binding.state_module, "func_import_at", [CInt(slot)]),
+      CVar(argsvar),
+    ])
+  let body =
+    CCase(call, [
+      CClause(
+        [list_pattern(resnames)],
+        CAtom("true"),
+        function_return(list.map(resnames, CVar)),
+      ),
+    ])
+  #(CFun([argsvar], body), state2)
+}
+
+/// The THREADED import adapter (build `is_threaded == True`; funcref-slot ABI
+/// `fun(St, Args) -> {Package, St'}`):
+///
+/// ```
+/// fun(St, Args) -> case link:call_import(rt_state:t_func_import_at(St, Slot), Args) of
+///                    <[V1,…,Vr]> when 'true' -> {<Package(V1,…,Vr)>, St} end
+/// ```
+///
+/// `St` (the dispatch-time instance state handed in by `t_call_indirect`) is threaded through
+/// UNCHANGED — the imported callee threads its OWN state INSIDE the linker-built routing closure,
+/// exactly as `emit_call_import` does under `Threading` (`cur` unchanged). The `St` used to read
+/// the slot is the closure's PARAMETER (dispatch-time), never the build-time `cur`, so building
+/// the funcref stays pure. The result LIST is re-packaged into the `function_return` package the
+/// threaded slot ABI expects (paired with the threaded-through `St`).
+fn imported_funcref_threaded_closure(
+  slot: Int,
+  ty: FuncType,
+  ctx: Ctx,
+  state: EmitState,
+) -> #(CExpr, EmitState) {
+  let #(stvar, state1) = fresh_var(state)
+  let #(argsvar, state2) = fresh_var(state1)
+  let #(resnames, state3) = fresh_n_vars(state2, list.length(ty.results))
+  let call =
+    seam_call(link_module, "call_import", [
+      seam_call(ctx.binding.state_module, "t_func_import_at", [
+        CVar(stvar),
+        CInt(slot),
+      ]),
+      CVar(argsvar),
+    ])
+  let body =
+    CCase(call, [
+      CClause(
+        [list_pattern(resnames)],
+        CAtom("true"),
+        CTuple([function_return(list.map(resnames, CVar)), CVar(stvar)]),
+      ),
+    ])
+  #(CFun([stvar, argsvar], body), state3)
+}
+
 /// Lower `RefIsNull(arg)` (§B): delegate the sentinel test to the runtime
 /// (`call '<rt_ref>':'is_null'(Arg)` → a Core `'true'`/`'false'`) and map it to the i32
 /// `1`/`0` the spec requires (`ref.is_null` yields an i32). Keeping the comparison inside
@@ -4197,13 +4333,14 @@ fn render_ref_item(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case item {
     ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
-    // Phase-14 `RefFuncImport` (R1): DELIBERATE fail-closed arm (the wildcard below would skip it as
-    // `UnsupportedNode`). A `RefFuncImport` makes its segment non-`all_reffunc` → non-`byte_ident_funcref`,
-    // so an imported-`ref.func` segment routes here (the general `init_elem_ref` path). We reproduce the
-    // EXACT byte-identical skip today's fast path gave (`element_entry("f<slot>")` →
-    // `UnknownFunction("f<slot>")`). R14-02 COMPLETES this arm with the real adapter-closure entry.
-    ir.RefFuncImport(slot, _) ->
-      Error(UnknownFunction("f" <> int.to_string(slot)))
+    // Phase-14 `RefFuncImport` (R14-02, R1/R2): an IMPORTED `ref.func` element-init item. A
+    // `RefFuncImport` makes its segment non-`all_reffunc` → non-`byte_ident_funcref`, so the whole
+    // segment routes to the general `init_elem_ref` path and lands here. Build the real D3a
+    // adapter-closure funcref entry (the SAME `#(TypeTag, adapter)` value `emit_ref_func_import`
+    // builds for a body-level ref.func — imported items and defined/null items coexist in a mixed
+    // segment, so this must NOT poison the others).
+    ir.RefFuncImport(slot, ty) ->
+      imported_reference_func_entry(slot, ty, ctx, state)
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
     GlobalGet(name) -> Ok(#(ref_global_read(name, state_ref, ctx), state))
     _ -> Error(UnsupportedNode("elem_item"))
@@ -4876,12 +5013,58 @@ fn needs_full_decl(module: Module) -> Bool {
   || needs_func_imports(module)
 }
 
-/// `True` iff `module` calls an IMPORTED function anywhere (contains a `CallImport` node) — the
-/// condition that forces the func-import dispatch vector to be seeded at `instantiate` (S5). A
-/// module that merely IMPORTS a function without calling it produces no `CallImport`, so this is
-/// `False` and the module stays byte-neutral through the func-import surface (I7).
-fn needs_func_imports(module: Module) -> Bool {
-  list.any(module.functions, fn(f) { expr_has_call_import(f.body) })
+/// `True` iff `module` is IMPORT-BEARING for the func-import dispatch vector — the SINGLE PUBLIC
+/// predicate (R3, Phase-14) that forces the vector to be seeded at `instantiate` (S5) AND that the
+/// conformance driver (`driver.module_calls_import`) calls to decide whether to weave the positional
+/// `link.Provided` function-import closures. Because emit's seed and the driver's woven closures are
+/// now the SAME function of the SAME lowered `irmod`, the `instantiate/0`↔`instantiate/1` arity
+/// cannot desync (the sharpest edge in Phase 13's capstone).
+///
+/// `True` when EITHER (a) some function body contains a `CallImport` / `ReturnCallImport` (it CALLS
+/// an imported function) OR a body-level `RefFuncImport` (it `ref.func`s an imported function — e.g.
+/// returned or `table.set` into a slot), OR (b) some ELEMENT SEGMENT init item is a `RefFuncImport`
+/// — a `ref.func` of an imported function placed into a table (Phase-14). Case (b) scans ALL element
+/// modes (active / passive / declarative): a conservative over-approximation that subsumes "passive
+/// segments reachable via `table.init`" without fragile reachability tracing. Over-seeding is safe
+/// and byte-neutral — R4 seeds ALL function imports regardless, so a never-`table.init`'d passive
+/// segment merely seeds an already-all-seeded vector. Both surfaces are scanned because the adapter's
+/// deferred `func_import_at(slot)` read (built by EITHER) faults at dispatch unless the vector was
+/// seeded at instantiate.
+///
+/// BYTE-IDENTITY (H7/R5): `RefFuncImport` is a new node present in NO pre-Phase-14 module, so
+/// neither the body scan nor the element scan changes any existing module's result — a module that
+/// merely IMPORTS a function without calling or `ref.func`-ing it stays `False` (I7).
+pub fn needs_func_imports(module: Module) -> Bool {
+  list.any(module.functions, fn(f) {
+    expr_has_call_import(f.body) || expr_has_ref_func_import(f.body)
+  })
+  || list.any(module.elements, fn(seg) {
+    list.any(seg.init, expr_has_ref_func_import)
+  })
+}
+
+/// `True` iff `expr` (recursively) contains a `RefFuncImport` node — an imported `ref.func`
+/// construction anywhere in `expr`. Used by `needs_func_imports` to seed the func-import vector for
+/// a module whose ONLY use of a func import is a `ref.func` (in an element-segment init item OR a
+/// function body), with no `CallImport` anywhere. Recurses the SAME control-flow containers as
+/// `expr_has_call_import` so a body-level imported `ref.func` (returned or stored) is also caught.
+fn expr_has_ref_func_import(expr: Expr) -> Bool {
+  case expr {
+    ir.RefFuncImport(..) -> True
+    Let(_, rhs, body) ->
+      expr_has_ref_func_import(rhs) || expr_has_ref_func_import(body)
+    If(_, _, t, e) -> expr_has_ref_func_import(t) || expr_has_ref_func_import(e)
+    Switch(_, _, arms, default) ->
+      list.any(arms, fn(a) {
+        let SwitchArm(_, b) = a
+        expr_has_ref_func_import(b)
+      })
+      || expr_has_ref_func_import(default)
+    Block(_, _, body) -> expr_has_ref_func_import(body)
+    Loop(_, _, _, body) -> expr_has_ref_func_import(body)
+    Charge(_, body) -> expr_has_ref_func_import(body)
+    _ -> False
+  }
 }
 
 /// `True` iff `expr` (recursively) contains a `CallImport` node — OR a Phase-13 `ReturnCallImport`
@@ -4926,8 +5109,10 @@ fn count_state_imports(module: Module) -> Int {
 }
 
 /// The number of FUNCTION imports (`ir.ImportFn`) — one dispatch-closure slot each, in
-/// function-import declaration order, indexed by `CallImport.slot`.
-fn count_function_imports(module: Module) -> Int {
+/// function-import declaration order, indexed by `CallImport.slot`. Public (Phase-14) so the
+/// arity-lockstep test can assert `count_import_slots == count_function_imports` for an
+/// import-bearing module.
+pub fn count_function_imports(module: Module) -> Int {
   list.fold(module.imports, 0, fn(n, imp) {
     case imp {
       ir.ImportFn(..) -> n + 1
@@ -4941,8 +5126,9 @@ fn count_function_imports(module: Module) -> Int {
 /// function (`needs_func_imports`) — every function import's dispatch-closure slot (last). A module
 /// that imports functions but never calls one contributes NO function slot, so its arity is
 /// byte-identical to Phase-5 (I7). The harness passes `link_imports(m) ++ link_func_imports(m)` in
-/// exactly this order.
-fn count_import_slots(module: Module) -> Int {
+/// exactly this order. Public (Phase-14) so the arity-lockstep test can assert the generated entry
+/// is `instantiate/1` (`count_import_slots > 0`) for an import-bearing module.
+pub fn count_import_slots(module: Module) -> Int {
   count_state_imports(module) + count_func_import_positions(module)
 }
 
@@ -5348,13 +5534,13 @@ fn render_ref_global_init(
   case init {
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
     ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
-    // Phase-14 `RefFuncImport` (R1): DELIBERATE fail-closed arm (the wildcard below would skip it as
-    // `NonConstInit`). A reference GLOBAL initialised by an imported `ref.func` (not exercised by
-    // `table_copy`, but armed so no path silently re-categorises the skip). Reproduces the exact
-    // byte-identical `UnknownFunction("f<slot>")` skip. R14-02 COMPLETES this arm (a funcref global
-    // holding an imported funcref is well-defined and cheap).
-    ir.RefFuncImport(slot, _) ->
-      Error(UnknownFunction("f" <> int.to_string(slot)))
+    // Phase-14 `RefFuncImport` (R14-02, F2): a reference GLOBAL initialised by an imported
+    // `ref.func`. Well-defined and cheap — the SAME `#(TypeTag, adapter)` funcref value (§3.1c),
+    // just stored in a global rather than a table slot. Completing it (decision F2, option (a))
+    // means that after Phase 14 NO path skips as `UnknownFunction` from this gap — not just the
+    // element path. Not exercised by `table_copy`, but closing it keeps the residual honest.
+    ir.RefFuncImport(slot, ty) ->
+      imported_reference_func_entry(slot, ty, ctx, state)
     Values([ir.ConstV128(bytes)]) -> Ok(#(core_binary_bytes(bytes), state))
     _ -> Error(NonConstInit("non-constant reference global init"))
   }
@@ -5900,11 +6086,19 @@ fn byte_ident_funcref(seg: ir.ElementSegment, tidx: Int) -> Bool {
   seg.ref_ty == ir.FuncRef && tidx == 0 && all_reffunc(seg.init)
 }
 
-/// `True` iff every element-init item is a `RefFunc` (the Phase-2 funcidx-only shape).
+/// `True` iff every element-init item is a `RefFunc` (the Phase-2 funcidx-only shape) — the gate
+/// that keeps a pure-defined table-0 segment on the frozen `init_elem` fast path (byte-identical,
+/// R5). An IMPORTED `ref.func` (`RefFuncImport`, Phase-14 R1) is DELIBERATELY not-plain: it returns
+/// `False` (explicit arm, regression-proof against a future maintainer widening the `True` arm) so
+/// any segment carrying one routes through the general `init_elem_ref` path → `render_ref_item`'s
+/// `RefFuncImport` arm, where the D3a adapter closure is built.
 fn all_reffunc(items: List(Expr)) -> Bool {
   list.all(items, fn(it) {
     case it {
       ir.RefFunc(_) -> True
+      // Imported ref.func is NOT the plain Phase-2 shape: route the segment through
+      // `init_elem_ref` (R1/R5), never the frozen defined-only `init_elem` fast path.
+      ir.RefFuncImport(_, _) -> False
       _ -> False
     }
   })

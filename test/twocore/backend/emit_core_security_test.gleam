@@ -876,6 +876,86 @@ pub fn js_runtime_boundary_has_no_ambient_authority_test() {
   })
 }
 
+/// A Phase-14 module exercising the IMPORTED-`ref.func` adapter surface (R14-02 §5.5): an
+/// `ImportFn` (funcidx 0) placed into a `FuncRef` table via an active `elem` `RefFuncImport`
+/// segment, dispatched by `call_indirect`. The generated instantiate builds the D3a adapter closure
+/// for the imported slot — the exact new authority this test must certify is ambient-free.
+fn imported_funcref_module() -> ir.Module {
+  let ty = ir.FuncType([ir.TI32], [ir.TI32])
+  let dispatch =
+    ir.Function(
+      name: "dispatch",
+      params: [ir.Local("k", ir.TI32)],
+      result: [ir.TI32],
+      locals: [],
+      body: ir.CallIndirect("t0", ir.ConstI32(0), ty, [ir.Var("k")]),
+    )
+  ir.Module(
+    name: "twocore@test@rfi",
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [ir.ImportFn("a", "ef", ty)],
+    functions: [dispatch],
+    exports: [ir.ExportFn("dispatch", "dispatch")],
+    data_segments: [],
+    tables: [ir.TableDecl("t0", ir.FuncRef, 2, option.None)],
+    elements: [
+      ir.ElementSegment(
+        ir.ElemActive("t0", ir.Values([ir.ConstI32(0)])),
+        ir.FuncRef,
+        [ir.RefFuncImport(0, ty)],
+      ),
+    ],
+    start: option.None,
+    tags: [],
+  )
+}
+
+/// EXTENDED D3a security invariant for the Phase-14 imported-`ref.func` adapter (R14-02 §5.5), under
+/// Cell, Threaded, AND Unsafe — all ambient-free with NO new module atom or allow-set entry. (a)
+/// every `call` targets a fixed `Binding`/allow-set runtime atom with a literal function; (b) every
+/// `apply` is a static local `FName`; (c) THE surgical assertion: the adapter captures only the
+/// LITERAL slot — its ONLY calls are `link:call_import` over a closure read from
+/// `rt_state:func_import_at` / `t_func_import_at`, and NO `erlang:*` (never `erlang:apply` of a
+/// data-named target). The adapter routes through the already-admitted `link.call_import` seam — no
+/// new allow-set entry is required.
+pub fn imported_funcref_adapter_has_no_ambient_authority_test() {
+  let cell = instance.safe_default()
+  let threaded =
+    instance.Binding(
+      ..instance.safe_default(),
+      state_strategy: instance.Threaded,
+    )
+  let unsafe = profiles.unsafe()
+  list.each([cell, threaded, unsafe], fn(binding) {
+    let assert Ok(m) = emit_core.emit_module(imported_funcref_module(), binding)
+    // (a) every call → a fixed runtime/allow-set module + literal function atom.
+    assert_calls_are_runtime(m, binding)
+    // (b) every apply → a static local FName, never a runtime-module atom.
+    let allowed = runtime_modules(binding)
+    let applies =
+      list.flat_map(m.defs, fn(d) {
+        let core_erlang.FunDef(_, v) = d
+        applies_in(v)
+      })
+    list.each(applies, fn(name) {
+      let core_erlang.FName(n, _arity) = name
+      assert set.contains(allowed, n) == False
+    })
+    // (c) NO `erlang:*` is emitted — the adapter dispatch is a `call` to the fixed `link`/`rt_state`
+    // atoms over a HANDED-IN closure read from the func-import slot, never `apply` of program data.
+    assert has_call(m, "erlang", "apply") == False
+    assert erlang_calls(m) == []
+    // The adapter's dispatch: `link:call_import` over the slot closure read via
+    // `rt_state:func_import_at` (cell) / `t_func_import_at` (threaded). The ONLY program-derived
+    // operand is the literal integer slot.
+    assert has_call(m, "twocore@runtime@link", "call_import")
+    assert has_call(m, binding.state_module, "func_import_at")
+      || has_call(m, binding.state_module, "t_func_import_at")
+  })
+}
+
 /// Every `#(module, fun)` `CCall` whose module position is the literal atom `'erlang'` — the D3a
 /// forbidden ambient-authority surface. Must be EMPTY: the Phase-6 dispatch names no `erlang:*`.
 fn erlang_calls(m: CModule) -> List(#(CExpr, CExpr)) {

@@ -20,10 +20,11 @@
 //// - **defaults are byte-identical (R5)** — a module with no imported `ref.func` round-trips, its
 ////   `.ir`/`.core` carry NONE of the new token, and its all-`RefFunc` table-0 segment keeps the
 ////   frozen `init_elem` fast path (never routed to `init_elem_ref`);
-//// - **the imported-`ref.func` case STILL SKIPS, byte-identically** — `emit_module` returns the
-////   EXACT `Error(UnknownFunction("f<slot>"))` the pre-keystone `ir.RefFunc("f<slot>")` produced,
-////   in the element-segment path, a function body, and a reference-global init — no regression;
-////   R14-02 is what flips it to `Ok`.
+//// - **the imported-`ref.func` case now EMITS (R14-02 completed the arm)** — `emit_module` returns
+////   `Ok` (the real D3a `link.call_import` adapter closure) in the element-segment path, a function
+////   body, and a reference-global init; the former `Error(UnknownFunction("f<slot>"))` residual is
+////   gone. The end-to-end `call_indirect == direct call` obligation is proven in
+////   `reffunc_import_emit_test` (R14-02 §5.2).
 
 import gleam/list
 import gleam/option.{None}
@@ -446,24 +447,26 @@ pub fn defined_only_segment_is_byte_identical_test() {
   should.be_true(string.contains(core, "init_elem"))
 }
 
-// ───────────────────────────── §4.7 imported `ref.func` STILL SKIPS, byte-identically ─────────────────────────────
+// ───────────────────────────── §4.7 imported `ref.func` now EMITS (R14-02 completed the arm) ─────────────────────────────
 
-/// §4.7 — the conservative arm is NO-REGRESSION. An imported `ref.func` (now `RefFuncImport(slot,
-/// ty)`, as `lower` produces) STILL fails emission with the EXACT `Error(UnknownFunction("f<slot>"))`
-/// the pre-keystone `ir.RefFunc("f<slot>")` produced — so the conformance skip is byte-identical
-/// (`residual_audit` green, no assert flips). Proven in all three fail-closed reaches:
-/// the element-segment init (`render_ref_item`), a function body (the `emit` dispatch), and a
-/// reference-global init (`render_ref_global_init`). R14-02 is what flips these to `Ok`.
-/// Spec (deferred obligation, R14-04 proves it): an imported function reached via `call_indirect`
-/// must equal a direct `call` of that import — the keystone claims only the byte-identical skip.
-pub fn imported_reffunc_still_skips_byte_identically_test() {
+/// §4.7 — the keystone's conservative fail-closed arm is now COMPLETED by R14-02. An imported
+/// `ref.func` (`RefFuncImport(slot, ty)`, as `lower` produces) that used to fail emission with
+/// `Error(UnknownFunction("f<slot>"))` now EMITS the real D3a `link.call_import` adapter closure —
+/// `emit_module` returns `Ok` (no `UnknownFunction`) in all three former fail-closed reaches: the
+/// element-segment init (`render_ref_item`), a function body (the `emit` dispatch), and a
+/// reference-global init (`render_ref_global_init`). This is the freeze pin flipped exactly as
+/// R14-01 anticipated ("R14-02 is what flips these to `Ok`"). The full spec obligation — an imported
+/// function reached via `call_indirect` equals a direct `call` of that import — is proven end-to-end
+/// under Cell AND Threaded in `reffunc_import_emit_test` (R14-02 §5.2); this only pins that the
+/// former residual is gone.
+pub fn imported_reffunc_now_emits_test() {
   let ty = ir.FuncType([ir.TI32], [ir.TI32])
   let import_fn = ir.ImportFn("a", "ef0", ty)
 
   // (render_ref_item) — an element segment holding an imported funcref (`slot >= 1`).
   let seg_module =
     ir_module(
-      "twocore@reffunc_import@skip_elem",
+      "twocore@reffunc_import@emit_elem",
       [import_fn],
       [],
       [],
@@ -478,12 +481,12 @@ pub fn imported_reffunc_still_skips_byte_identically_test() {
       [],
     )
   emit_core.emit_module(seg_module, instance.safe_default())
-  |> should.equal(Error(emit_core.UnknownFunction("f3")))
+  |> should.be_ok
 
   // (emit dispatch) — an imported funcref in a FUNCTION BODY (`slot == 0`).
   let body_module =
     ir_module(
-      "twocore@reffunc_import@skip_body",
+      "twocore@reffunc_import@emit_body",
       [import_fn],
       [
         ir.Function(
@@ -500,12 +503,12 @@ pub fn imported_reffunc_still_skips_byte_identically_test() {
       [ir.ExportFn("run", "f1")],
     )
   emit_core.emit_module(body_module, instance.safe_default())
-  |> should.equal(Error(emit_core.UnknownFunction("f0")))
+  |> should.be_ok
 
   // (render_ref_global_init) — a funcref GLOBAL initialised by an imported `ref.func` (`slot >= 1`).
   let global_module =
     ir_module(
-      "twocore@reffunc_import@skip_global",
+      "twocore@reffunc_import@emit_global",
       [import_fn],
       [],
       [ir.GlobalDecl("g0", ir.TFuncRef, False, ir.RefFuncImport(1, ty))],
@@ -514,5 +517,5 @@ pub fn imported_reffunc_still_skips_byte_identically_test() {
       [],
     )
   emit_core.emit_module(global_module, instance.safe_default())
-  |> should.equal(Error(emit_core.UnknownFunction("f1")))
+  |> should.be_ok
 }

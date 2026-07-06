@@ -38,6 +38,7 @@ import gleam/option.{None}
 import gleam/result
 import gleam/string
 import twocore/backend/build_beam
+import twocore/backend/emit_core
 import twocore/conformance/ffi
 import twocore/conformance/fixture.{
   type SpecValue, ExternRefTag, ExternRefVal, F32Bits, F32Nan, F64Bits, F64Nan,
@@ -316,38 +317,18 @@ fn is_registered(capability: String, providers: List(link.Provider)) -> Bool {
   })
 }
 
-/// True iff `module` CALLS an imported function anywhere (its IR contains a `CallImport` node) —
-/// the exact condition emit_core (`needs_func_imports`) uses to decide whether the generated
-/// `instantiate` seeds the function-import dispatch vector. The driver mirrors it so it appends the
-/// function-import closures to the positional `Imports` list on exactly the modules that expect
-/// them (a module that merely imports a function without calling it stays byte-neutral — no
-/// `CallImport` ⇒ no closures woven ⇒ `instantiate/0`, I7).
-fn module_calls_import(module: ir.Module) -> Bool {
-  list.any(module.functions, fn(f) { expr_calls_import(f.body) })
-}
-
-/// True iff `expr` (recursively, through the control-flow containers that hold sub-`Expr`s) contains
-/// a `CallImport` node — OR a Phase-13 `ReturnCallImport` (an imported TAIL call). Mirrors
-/// emit_core's private `expr_has_call_import`, which weaves the function-import dispatch vector (and
-/// so emits `instantiate/1`) for BOTH import-call shapes; the driver must match it so an
-/// import-tail-calling module is started through `instantiate/1` rather than the absent
-/// `instantiate/0` (which would surface as `instantiate: undef`).
-fn expr_calls_import(expr: ir.Expr) -> Bool {
-  case expr {
-    ir.CallImport(..) | ir.ReturnCallImport(..) -> True
-    ir.Let(_, rhs, body) -> expr_calls_import(rhs) || expr_calls_import(body)
-    ir.If(_, _, t, e) -> expr_calls_import(t) || expr_calls_import(e)
-    ir.Switch(_, _, arms, default) ->
-      list.any(arms, fn(a) {
-        let ir.SwitchArm(_, b) = a
-        expr_calls_import(b)
-      })
-      || expr_calls_import(default)
-    ir.Block(_, _, body) -> expr_calls_import(body)
-    ir.Loop(_, _, _, body) -> expr_calls_import(body)
-    ir.Charge(_, body) -> expr_calls_import(body)
-    _ -> False
-  }
+/// True iff `module` is IMPORT-BEARING for the func-import dispatch vector — the driver's decision
+/// to append the positional `link.Provided` function-import closures to the `Imports` list handed to
+/// `instantiate/1`. It DELEGATES to `emit_core.needs_func_imports`, the SINGLE SOURCE OF TRUTH (R3,
+/// Phase-14): emit uses that exact predicate over the identical lowered `irmod` to decide whether the
+/// generated `instantiate/1` destructures the func-import closures, so the driver's supplied
+/// `Imports` length and emit's arity are the SAME function of the SAME module and CANNOT desync (the
+/// arity bug Phase 13's capstone had to hand-fix). This covers both a body-level `CallImport` /
+/// `ReturnCallImport` AND a `ref.func` of an imported function in an element segment or body (a
+/// module that merely imports a function without using it stays byte-neutral → `instantiate/0`, I7).
+/// Public so the arity-lockstep test can assert the driver and emit agree by construction (R3).
+pub fn module_calls_import(module: ir.Module) -> Bool {
+  emit_core.needs_func_imports(module)
 }
 
 /// Build the `export name → result value-types` table from the lowered IR module. Function
