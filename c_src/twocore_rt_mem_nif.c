@@ -78,8 +78,13 @@ static ERL_NIF_TERM oob(ErlNifEnv *env) {
     return enif_make_tuple2(env, am_error, am_oob);
 }
 
-/* Recover this NIF's resource from `t`. Sound because under `mem_tier == Nif` the memory slot is
- * produced SOLELY by this module's `nif_fresh`, so `t` is always one of our resources. */
+/* Recover this NIF's resource from `t`. `t` is always one of THIS module's resources: an OWN memory is
+ * produced solely by `nif_fresh`, and the Gleam heads (rt_mem_nif.gleam) never hand a FOREIGN handle
+ * here — an IMPORTED paged memory (built by `link.spectest_export` with the paged tier, so a tuple, not
+ * a resource) is discriminated away Gleam-side (`is_native_mem`) and DELEGATED to the paged core BEFORE
+ * any `@external`. So a failed `enif_get_resource` is a genuine internal invariant violation (→
+ * `badarg`), NOT the imported-memory path — that path never reaches the C (the S15-03 `init_data` bug
+ * was exactly a foreign handle reaching here; the fix keeps it Gleam-side). */
 static int get_mem(ErlNifEnv *env, ERL_NIF_TERM t, twocore_mem_t **out) {
     return enif_get_resource(env, t, MEM_RES_TYPE, (void **)out);
 }

@@ -34,6 +34,7 @@ import twocore/runtime/instance.{
   Atomics, Binding, Cell, Nif, Paged, Safe, TableAtomics, TableEts, TablePaged,
   Threaded, Unsafe,
 }
+import twocore/runtime/nif_loader
 import twocore/runtime/profiles
 
 /// The absolute path of the shared acceptance corpus (the spec-`.expected`-bearing
@@ -121,10 +122,16 @@ pub const threaded_atomics = Combo(
   Safe,
 )
 
-/// The tier-N `nif` ceiling — WHERE IT SHIPS (G8): a node-safe skeleton delegating to the paged
-/// core (the production C NIF is documented-deferred), so it LINKS and must be byte-identical
-/// like the rest. `Nif` is Unsafe-only (G6), so this point is `Unsafe`; its `TablePaged` table
-/// keeps the point node-safe. Included because the skeleton loads on a bare BEAM.
+/// The tier-N `nif` ceiling — the raw-`O(1)` NATIVE memory ceiling (Phase 15). `Nif` is Unsafe-only
+/// (G6), so this point is `Unsafe`; its `TablePaged` table keeps the axis node-safe. Under a C toolchain
+/// (`cc`), once a dedicated native test (`rt_mem_nif_safety_test`/`rt_mem_nif_test`) has `load_nif`'d the
+/// real `c_src/twocore_rt_mem_nif.c`, `rt_mem_nif` routes native PER OP (`nif_available()`), so any
+/// `cell_nif` driver — the whole-corpus tier differential — drives the REAL native buffer (the production
+/// ceiling, byte-identical to the paged reference). `binding_for` reuses that attachment but never forces
+/// a load (protecting the keystone probe — see `nif_loader`). Absent `cc` (or before the `.so` is
+/// attached — e.g. the pre-probe conformance matrix) `rt_mem_nif` delegates to the paged core (MF3 —
+/// byte-identical), so this point still LINKS + runs on a bare BEAM. Either way it must equal the spec
+/// `.expected` (and so every other combo).
 pub const cell_nif = Combo("cell×nif", Cell, Nif, TablePaged, Unsafe)
 
 /// The tier-O `ets`-backed table (`TableEts`) under the `Cell` calling convention, Safe. Not a
@@ -200,7 +207,27 @@ pub const cross_module_combos: List(Combo) = [
 ///   iff the combination is policy-incoherent (e.g. a hand-built `Safe + Nif`) — which `shipped`
 ///   never lists, so the assert is unreachable and documents the G6 invariant. Total for every
 ///   shipped combo.
+///
+/// **Phase-15 `Nif` side-effect (S15-04).** For a `Nif` combo this calls `nif_loader.reuse_if_available()`:
+/// when the real `c_src/twocore_rt_mem_nif.c` `.so` is ALREADY attached (a dedicated native test —
+/// `rt_mem_nif_safety_test` / `rt_mem_nif_test`, which sort AFTER the keystone probe — attached it),
+/// `cell_nif` drives the NATIVE buffer (so the whole-corpus tier differential runs native); otherwise it
+/// uses the paged core (byte-identical, still green). It deliberately does NOT force a fresh compile+load
+/// here — `binding_for` also runs during the PRE-keystone-probe conformance matrix, and attaching the
+/// `.so` there would leave leaked instance-process resources that block the keystone probe's `CREATE`-only
+/// reload (see `nif_loader`'s "keystone-probe constraint"). The returned `Binding` is IDENTICAL either way
+/// (the `mem_module` atom is the same), so no proof suite needs an edit — `rt_mem_nif` routes native
+/// per-op via `nif_available()`. Non-`Nif` combos skip the side-effect entirely.
 pub fn binding_for(c: Combo) -> Binding {
+  // Drive native memory when the real `.so` is already attached; NEVER force a load here (that would
+  // attach it during the pre-keystone-probe conformance run and break the probe — see `nif_loader`).
+  case c.mem {
+    Nif -> {
+      let _ = nif_loader.reuse_if_available()
+      Nil
+    }
+    _ -> Nil
+  }
   let base = case c.policy {
     Safe -> profiles.safe()
     Unsafe -> profiles.unsafe()

@@ -33,11 +33,24 @@
 //// All identical to the paged reference (native by construction; paged by delegation) — so tier-N is
 //// byte-identical to the spec via the shared oracle.
 ////
-//// **Coercion soundness.** Under `mem_tier == Nif` the cell / threaded `mem` slot is produced SOLELY
-//// by this module's `fresh`/`fresh64`, so the opaque `Dynamic` there is always THIS tier's handle: a
-//// native resource when the `.so` is loaded (→ `enif_get_resource` is sound), else a paged `Mem` (→
-//// delegating to `rt_mem`'s coercing entry points is sound). The two arms never mix within a single
-//// memory's lifetime because `nif_available()` is stable for the run.
+//// **Coercion soundness.** Under `mem_tier == Nif` an OWN memory is produced SOLELY by this module's
+//// `fresh`/`fresh64`, so its opaque `Dynamic` is always THIS tier's handle: a native resource when the
+//// `.so` is loaded (→ `enif_get_resource` is sound), else a paged `Mem` (→ delegating to `rt_mem`'s
+//// coercing entry points is sound).
+////
+//// **The one exception is an IMPORTED memory.** A module may `(import "spectest" "memory" …)`, and
+//// `link.spectest_export` builds the provided memory with the PAGED tier UNCONDITIONALLY
+//// (`rt_mem.fresh`), tier-agnostically — so under a loaded `.so` the `mem` slot can hold a paged `Mem`
+//// even though `nif_available()` is `true`. Handing that foreign handle to a native `@external`
+//// (`enif_get_resource`) FAILS with `badarg` — NOT the WebAssembly `Error(MemoryOutOfBounds)` an
+//// out-of-bounds active-data segment must raise (the S15-03 native `init_data` bug: `data.wast`'s
+//// imported-memory OOB cases raised `badarg`, not the trap). The instantiation-time SEGMENT + BULK
+//// writers (`init_data*`/`fill`/`copy`/`init` + `t_*` twins) — the ops that receive an imported handle
+//// — therefore DISCRIMINATE on the handle shape (`is_native_mem`): a native resource is served by the
+//// C, an imported paged `Mem` is DELEGATED to `rt_mem` (byte-identical by construction, so a genuine
+//// OOB returns `Error(MemoryOutOfBounds)` from the paged core). A paged `Mem` is a Gleam record → an
+//// Erlang TUPLE; a native resource is an opaque ERTS resource term (a reference — never a tuple), so
+//// the discriminator is stable and under this module's control.
 
 import gleam/dynamic.{type Dynamic}
 import gleam/option.{type Option}
@@ -60,6 +73,22 @@ import twocore/runtime/rt_state.{type InstanceState}
 /// dispatch switch: `true` ⇒ native arm, `false` ⇒ paged-delegate arm. Never raises.
 @external(erlang, "twocore_rt_mem_nif_ffi", "nif_available")
 fn nif_available() -> Bool
+
+/// `erlang:is_tuple/1` — a cheap guard BIF. A paged `Mem` is a Gleam record → an Erlang TUPLE; a
+/// native tier-N resource is an opaque ERTS resource term (a reference — never a tuple).
+@external(erlang, "erlang", "is_tuple")
+fn is_tuple(term: Dynamic) -> Bool
+
+/// `True` iff `h` is a NATIVE tier-N resource (serve it from the C), `False` iff it is an IMPORTED
+/// paged `Mem` that must be delegated to the paged core `rt_mem` (see the module doc's "Coercion
+/// soundness"). Discriminates on the stable paged shape: a paged `Mem` is a Gleam record → an Erlang
+/// tuple, so `!is_tuple(h)` ⇒ a native resource. This is the guard the SEGMENT + BULK writers use so an
+/// imported-memory OOB returns `Error(MemoryOutOfBounds)` from `rt_mem` rather than a `badarg` from
+/// `enif_get_resource` failing on a foreign handle. Only meaningful under `nif_available()`; when the
+/// `.so` is unloaded EVERY handle is a paged `Mem` (a tuple), so this is `False` and all ops delegate.
+fn is_native_mem(h: Dynamic) -> Bool {
+  !is_tuple(h)
+}
 
 /// Allocate a reserved buffer of `reserve_bytes`, zero-filled, with the live watermark at
 /// `min_bytes`. Returns the opaque resource handle.
@@ -319,10 +348,18 @@ fn grow_charged(prev: Int, delta: Int) -> Int {
 
 /// Write an active DATA segment's `bytes` into this process's memory at `offset`, at instantiation.
 /// Whole-range bounds-checked (no-wrap). `Ok(Nil)`, or `Error(MemoryOutOfBounds)` (nothing written).
-/// Native: `nif_init_data` (`ea = offset`). Fallback: `rt_mem.init_data`.
+/// Native (own memory): `nif_init_data` (`ea = offset`). An IMPORTED paged memory OR an unloaded `.so`:
+/// `rt_mem.init_data` — so an OOB active segment into an imported memory returns
+/// `Error(MemoryOutOfBounds)`, not a `badarg` (S15-03 fix; see the module doc's "Coercion soundness").
 pub fn init_data(offset: Int, bytes: BitArray) -> Result(Nil, TrapReason) {
   case nif_available() {
-    True -> nif_init_data(rt_state.mem_at(0), offset, bytes)
+    True -> {
+      let h = rt_state.mem_at(0)
+      case is_native_mem(h) {
+        True -> nif_init_data(h, offset, bytes)
+        False -> rt_mem.init_data(offset, bytes)
+      }
+    }
     False -> rt_mem.init_data(offset, bytes)
   }
 }
@@ -410,9 +447,13 @@ pub fn t_init_data(
   case nif_available() {
     True -> {
       let h = rt_state.mem(st)
-      case nif_init_data(h, offset, bytes) {
-        Ok(Nil) -> Ok(rt_state.with_mem(st, h))
-        Error(reason) -> Error(reason)
+      case is_native_mem(h) {
+        True ->
+          case nif_init_data(h, offset, bytes) {
+            Ok(Nil) -> Ok(rt_state.with_mem(st, h))
+            Error(reason) -> Error(reason)
+          }
+        False -> rt_mem.t_init_data(st, offset, bytes)
       }
     }
     False -> rt_mem.t_init_data(st, offset, bytes)
@@ -423,9 +464,10 @@ pub fn t_init_data(
 
 /// The tier's whole in-bounds byte image — the differential reference the oracle compares
 /// byte-for-byte after each op. `mem` is passed directly by the test (the handle from the cell /
-/// record). Native: `nif_to_flat`. Fallback: `rt_mem.to_flat`. O(byte_len); tests only.
+/// record). Dispatches on the GIVEN handle (not a global flag): a native resource → `nif_to_flat`, an
+/// imported/paged `Mem` → `rt_mem.to_flat`. O(byte_len); tests only.
 pub fn to_flat(mem: Dynamic) -> BitArray {
-  case nif_available() {
+  case is_native_mem(mem) {
     True -> nif_to_flat(mem)
     False -> rt_mem.to_flat(mem)
   }
@@ -493,15 +535,21 @@ pub fn grow_at(mem_idx: Int, delta: Int) -> Int {
   }
 }
 
-/// Active DATA-segment write into memory `mem_idx` at instantiation. Native: `nif_init_data`.
-/// Fallback: `rt_mem.init_data_at`.
+/// Active DATA-segment write into memory `mem_idx` at instantiation. Native (own memory):
+/// `nif_init_data`. IMPORTED paged memory / unloaded `.so`: `rt_mem.init_data_at` (S15-03 fix).
 pub fn init_data_at(
   mem_idx: Int,
   offset: Int,
   bytes: BitArray,
 ) -> Result(Nil, TrapReason) {
   case nif_available() {
-    True -> nif_init_data(rt_state.mem_at(mem_idx), offset, bytes)
+    True -> {
+      let h = rt_state.mem_at(mem_idx)
+      case is_native_mem(h) {
+        True -> nif_init_data(h, offset, bytes)
+        False -> rt_mem.init_data_at(mem_idx, offset, bytes)
+      }
+    }
     False -> rt_mem.init_data_at(mem_idx, offset, bytes)
   }
 }
@@ -515,17 +563,21 @@ pub fn fill(
   count: Int,
 ) -> Result(Nil, TrapReason) {
   case nif_available() {
-    True ->
-      charge_count(
-        nif_fill(rt_state.mem_at(mem_idx), dest, value, count),
-        count,
-      )
+    True -> {
+      let h = rt_state.mem_at(mem_idx)
+      case is_native_mem(h) {
+        True -> charge_count(nif_fill(h, dest, value, count), count)
+        False -> rt_mem.fill(mem_idx, dest, value, count)
+      }
+    }
     False -> rt_mem.fill(mem_idx, dest, value, count)
   }
 }
 
 /// `memory.copy` from memory `src_mem` to `dst_mem` (memmove, cross-memory-capable, `count` fuel on
-/// success). Native: `nif_copy` on the two sourced handles. Fallback: `rt_mem.copy`.
+/// success). Native (both own memories): `nif_copy` on the two sourced handles. If EITHER handle is an
+/// IMPORTED paged memory (or the `.so` is unloaded): `rt_mem.copy` — a single module's memories are one
+/// kind, so a mixed native/paged pair never arises in practice (S15-03 fix).
 pub fn copy(
   dst_mem: Int,
   src_mem: Int,
@@ -534,17 +586,14 @@ pub fn copy(
   count: Int,
 ) -> Result(Nil, TrapReason) {
   case nif_available() {
-    True ->
-      charge_count(
-        nif_copy(
-          rt_state.mem_at(dst_mem),
-          rt_state.mem_at(src_mem),
-          dst,
-          src,
-          count,
-        ),
-        count,
-      )
+    True -> {
+      let dh = rt_state.mem_at(dst_mem)
+      let sh = rt_state.mem_at(src_mem)
+      case is_native_mem(dh) && is_native_mem(sh) {
+        True -> charge_count(nif_copy(dh, sh, dst, src, count), count)
+        False -> rt_mem.copy(dst_mem, src_mem, dst, src, count)
+      }
+    }
     False -> rt_mem.copy(dst_mem, src_mem, dst, src, count)
   }
 }
@@ -559,11 +608,13 @@ pub fn init(
   count: Int,
 ) -> Result(Nil, TrapReason) {
   case nif_available() {
-    True ->
-      charge_count(
-        nif_init(rt_state.mem_at(mem_idx), seg, dst, src, count),
-        count,
-      )
+    True -> {
+      let h = rt_state.mem_at(mem_idx)
+      case is_native_mem(h) {
+        True -> charge_count(nif_init(h, seg, dst, src, count), count)
+        False -> rt_mem.init(mem_idx, seg, dst, src, count)
+      }
+    }
     False -> rt_mem.init(mem_idx, seg, dst, src, count)
   }
 }
@@ -796,9 +847,13 @@ pub fn t_init_data_at(
   case nif_available() {
     True -> {
       let h = rt_state.t_mem_at(st, mem_idx)
-      case nif_init_data(h, offset, bytes) {
-        Ok(Nil) -> Ok(rt_state.t_with_mem_at(st, mem_idx, h))
-        Error(reason) -> Error(reason)
+      case is_native_mem(h) {
+        True ->
+          case nif_init_data(h, offset, bytes) {
+            Ok(Nil) -> Ok(rt_state.t_with_mem_at(st, mem_idx, h))
+            Error(reason) -> Error(reason)
+          }
+        False -> rt_mem.t_init_data_at(st, mem_idx, offset, bytes)
       }
     }
     False -> rt_mem.t_init_data_at(st, mem_idx, offset, bytes)
@@ -817,7 +872,11 @@ pub fn t_fill(
   case nif_available() {
     True -> {
       let h = rt_state.t_mem_at(st, mem_idx)
-      t_charge_count(nif_fill(h, dest, value, count), st, mem_idx, h, count)
+      case is_native_mem(h) {
+        True ->
+          t_charge_count(nif_fill(h, dest, value, count), st, mem_idx, h, count)
+        False -> rt_mem.t_fill(st, mem_idx, dest, value, count)
+      }
     }
     False -> rt_mem.t_fill(st, mem_idx, dest, value, count)
   }
@@ -838,7 +897,17 @@ pub fn t_copy(
     True -> {
       let dh = rt_state.t_mem_at(st, dst_mem)
       let sh = rt_state.t_mem_at(st, src_mem)
-      t_charge_count(nif_copy(dh, sh, dst, src, count), st, dst_mem, dh, count)
+      case is_native_mem(dh) && is_native_mem(sh) {
+        True ->
+          t_charge_count(
+            nif_copy(dh, sh, dst, src, count),
+            st,
+            dst_mem,
+            dh,
+            count,
+          )
+        False -> rt_mem.t_copy(st, dst_mem, src_mem, dst, src, count)
+      }
     }
     False -> rt_mem.t_copy(st, dst_mem, src_mem, dst, src, count)
   }
@@ -857,7 +926,17 @@ pub fn t_init(
   case nif_available() {
     True -> {
       let h = rt_state.t_mem_at(st, mem_idx)
-      t_charge_count(nif_init(h, seg, dst, src, count), st, mem_idx, h, count)
+      case is_native_mem(h) {
+        True ->
+          t_charge_count(
+            nif_init(h, seg, dst, src, count),
+            st,
+            mem_idx,
+            h,
+            count,
+          )
+        False -> rt_mem.t_init(st, mem_idx, seg, dst, src, count)
+      }
     }
     False -> rt_mem.t_init(st, mem_idx, seg, dst, src, count)
   }
