@@ -89,19 +89,21 @@ is a build-emitted adapter capturing only the literal slot integer:
   `emit_call_import` does under `Threading`.
 
 No new `rt_table`/`rt_ref`/`rt_state`/`link` runtime data or dispatch function is required — `func_import_at`
-/ `t_func_import_at` / `call_import` already exist; the adapter is emitted inline in Core Erlang (a tidy
-optional `link.imported_funcref(slot)` helper may be introduced for readability/testability, owned by the
-runtime-differential unit). This is D3a-clean: the closure is build-controlled, only the integer index/slot
-is program-derived, and there is no `erlang:apply` on program data.
+/ `t_func_import_at` / `call_import` already exist; the adapter is emitted **inline** in Core Erlang. The
+inline-vs-helper seam is **frozen to inline** (§3): no `link.imported_funcref` helper is introduced and
+`link.gleam` is not touched by R14-02 or R14-03. This is D3a-clean: the closure is build-controlled, only the
+integer index/slot is program-derived, and there is no `erlang:apply` on program data.
 
-**R3 — The import-bearing detection must be extended, in lockstep, in two mirrored places.** Today
-`emit_core.needs_func_imports` scans only *function bodies* for `CallImport` to decide whether to seed the
-func-import vector; `driver.module_calls_import` mirrors it to decide whether to weave provider closures
-into `Imports`. A module that only `ref.func`s an import in an `elem` segment (no `CallImport` in any body)
-is missed by both — so the func-import vector is never seeded and `func_import_at(slot)` would fault, or
-the `instantiate/0` vs `instantiate/1` arity desyncs. **Both** detectors must additionally scan element
-segments (and passive segments reachable via `table.init`) for `RefFuncImport`. To make the lockstep
-unbreakable, a single unit owns both edits (R14-02).
+**R3 — The import-bearing detection is ONE public predicate the driver calls (single source of truth).**
+Today `emit_core.needs_func_imports` scans only *function bodies* for `CallImport` to decide whether to seed
+the func-import vector; `driver.module_calls_import` maintains a *separate* mirror of it to decide whether to
+weave provider closures into `Imports`. A module that only `ref.func`s an import in an `elem` segment (no
+`CallImport` in any body) is missed by both — so the func-import vector is never seeded and
+`func_import_at(slot)` would fault, or the `instantiate/0` vs `instantiate/1` arity desyncs.
+`needs_func_imports` is extended to additionally scan element segments (and passive segments reachable via
+`table.init`) for `RefFuncImport`, made **public**, and `driver.module_calls_import` is changed to **call
+it** — both operate on the identical lowered `irmod`, so there is structurally **one** detector and no mirror
+to desync (strictly stronger than diffing two copies by eye). A single unit owns both edits (R14-02).
 
 **R4 — Seeding order is already correct; do not reorder.** The func-import vector is seeded *before*
 element segments run in both `full_cell_body` and `full_threaded_body`, so an imported-funcref element
@@ -153,9 +155,10 @@ driver mirror in one unit for lockstep), R14-03 (runtime differential coverage, 
 R14-04 capstone.
 
 **Open seams for the scoping fan-out / critique to resolve:**
-1. Whether the Cell/Threaded adapter closures are emitted **inline** in Core Erlang or via a small
-   `link.imported_funcref(slot)` runtime helper (readability/testability vs one more runtime function);
-   confirm either is D3a-clean and byte-neutral for non-imported modules.
+1. **FROZEN to inline (resolved).** The Cell/Threaded adapter closures are emitted **inline** in Core
+   Erlang — no `link.imported_funcref(slot)` runtime helper is introduced, and `link.gleam` is not touched
+   by R14-02 or R14-03. R14-03 is pure test-only and builds its differential substrate by hand
+   (`rt_table.funcref(ty, fn(...))`). Inline is D3a-clean and byte-neutral for non-imported modules.
 2. The exact keystone conservative-emit-arm (does it keep returning today's `UnknownFunction`, or a
    clearer `RefFuncImportUnsupported` placeholder?) — it must be byte-identical to today for the skipped
    set and provably no-regression for the passing set.
@@ -170,9 +173,9 @@ R14-04 capstone.
 
 | Unit | Owns / creates | Deliberate cross-file reaches |
 |---|---|---|
-| **R14-01** keystone | `src/twocore/ir.gleam` (`RefFuncImport`) · `src/twocore/frontend/wasm/lower.gleam` (the import-split) · `src/twocore/ir/effect.gleam` · `src/twocore/ir/printer.gleam` · `src/twocore/ir/parser.gleam` · `src/twocore/middle/ir_lower.gleam` · `src/twocore/middle/ir_opt/{baseline,aggressive,bce,mem_clobber}.gleam` (barrier arms) · new `test/twocore/reffunc_import_freeze_test.gleam` | a conservative fail-closed arm into `src/twocore/backend/emit_core.gleam` (completed by R14-02), recorded in `state.md` |
-| **R14-02** backend + driver (the heart, lockstep) | the real imported-funcref emission in `src/twocore/backend/emit_core.gleam` (`emit_ref_func_import`, `imported_reference_func_entry` Cell+Threaded, the `render_ref_item` arm, `all_reffunc`/`byte_ident_funcref` treating `RefFuncImport` as not-plain, and the extended `needs_func_imports` element-segment scan) **and** the mirrored extension in `test/twocore/conformance/driver.gleam` (`module_calls_import`/`expr_calls_import`) — one unit so the arity detection cannot desync + `emit_core` e2e/dispatch tests | — |
-| **R14-03** runtime differential | `test/twocore/runtime/rt_table_reftype_differential_test.gleam` (+ siblings): an import-routed funcref slot stores/dispatches identically across `TablePaged`/`TableEts`/`TableAtomics` × Cell/Threaded; optional `src/twocore/runtime/link.gleam` `imported_funcref/1` helper if introduced | — |
+| **R14-01** keystone | `src/twocore/ir.gleam` (`RefFuncImport`) · `src/twocore/frontend/wasm/lower.gleam` (the import-split) · `src/twocore/ir/effect.gleam` · `src/twocore/ir/printer.gleam` · `src/twocore/ir/parser.gleam` · `src/twocore/middle/ir_lower.gleam` · `src/twocore/middle/ir_opt/{baseline,aggressive,bce,mem_clobber}.gleam` (barrier arms) · new `test/twocore/reffunc_import_freeze_test.gleam` | the forced pass-through + conservative fail-closed arms into `src/twocore/backend/emit_core.gleam` (four arms; completed by R14-02), recorded in `state.md` |
+| **R14-02** backend + driver (the heart, lockstep) | the real imported-funcref emission in `src/twocore/backend/emit_core.gleam` (`emit_ref_func_import`, `imported_reference_func_entry` Cell+Threaded, the `render_ref_item` arm, the `render_ref_global_init` completion, `all_reffunc`/`byte_ident_funcref` treating `RefFuncImport` as not-plain, and the extended **public** `needs_func_imports` element-segment scan) **and** the delegating change in `test/twocore/conformance/driver.gleam` (`module_calls_import` now **calls** `emit_core.needs_func_imports` — one shared predicate so the arity detection cannot desync) + `emit_core` e2e/dispatch tests | — |
+| **R14-03** runtime differential | `test/twocore/runtime/rt_table_reftype_differential_test.gleam` (+ siblings): an import-routed funcref slot stores/dispatches identically across `TablePaged`/`TableEts`/`TableAtomics` × Cell/Threaded — **test-only; owns no `src/` file** (the adapter seam is frozen to inline, §3) | — |
 | **R14-04** capstone | `test/twocore/conformance/skipcount_test.gleam` + `residual_audit_test.gleam` (re-measure + tighten) · a new `test/twocore/conformance/corpus/xlink.{wat,wasm,expected}` backstop + `test/twocore/tier/combos.gleam` wiring · `docs/phase-14-surface.md` + `docs/phase-6-surface.md` accounting update · `docs/wasm-conformance.svg` (regen) · `../01-status.md` | the single conformance-wiring + status point only |
 
 ---
