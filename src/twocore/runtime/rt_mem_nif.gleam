@@ -1,105 +1,247 @@
 //// `rt_mem_nif` — the tier-N (`nif`) linear-memory backend: the raw-`O(1)` NATIVE ceiling
 //// (G2). **Unsafe-only; forbidden in Safe** (G6) — the linker rejects a `Safe + Nif` binding
-//// fail-closed (unit 07 §B.4). Selected when `binding.mem_tier == Nif`, which unit 07 maps to
-//// the module name `"twocore@runtime@rt_mem_nif"`; `emit_core` stays tier-agnostic (it reads
-//// only `mem_module`, never the tier).
+//// fail-closed. Selected when `binding.mem_tier == Nif`, which maps to the module name
+//// `"twocore@runtime@rt_mem_nif"`; `emit_core` stays tier-agnostic (it reads only `mem_module`,
+//// never the tier), so the tier routes here unchanged.
 ////
-//// **Honest status (G8) — the C NIF is DEFERRED; this is a NODE-SAFE REFERENCE SKELETON.**
-//// A production tier-N memory is a C NIF (a raw pointer into `enif_alloc`'d bytes, the
-//// bounds-check enforced *in C*, a bug there a genuine host escape / node crash) and needs a
-//// native build toolchain this project does not ship (verified: no `c_src/`, no native config
-//// in `gleam.toml`, no per-platform `.so`). Rather than half-ship an untested `.so`, Phase 4
-//// **documents the C NIF as deferred** (the drop-in seam is fixed in the unit doc §B.3) and the
-//// BODIES here **delegate to the already-proven paged core** (`twocore/runtime/rt_mem`). So this
-//// module is spec-correct **by construction** — it *is* the paged algebra, which unit P2-04
-//// differentially proved against the flat-binary oracle — but it carries the paged **rebuild**
-//// cost, **NOT the raw-`O(1)` native ceiling**. Being pure BEAM it also **cannot crash the node**
-//// (unlike the real NIF) and needs zero FFI.
+//// **Native-when-loaded, paged-delegate-otherwise (Phase-15 MF3).** Every frozen head dispatches
+//// on `nif_available()` — a cheap cached-atom read that is `true` ONLY when the compiled `.so`
+//// (`c_src/twocore_rt_mem_nif.c`) is attached to the shim `twocore_rt_mem_nif_ffi`:
 ////
-//// **The tier's CLASSIFICATION is a property of its intended PRODUCTION impl, not of this body.**
-//// tier-N is Unsafe-only / Safe-forbidden because the *native* code that will replace this
-//// skeleton can escape the host on a bounds bug (§C, keystone §B.4). The Safe-forbidden gate
-//// exists to contain that native impl the day the `.so` drops in — behind these **byte-identical**
-//// heads, with zero call-site change (units 07/08/09 and the `emit_core` seam are untouched).
-//// This module does NOT itself construct a `Safe + Nif` binding; the enforcing gate is unit 07's
-//// `validate_binding` (Safe + Nif → `Error(SafeForbidsNif)`, fail-closed).
+//// - **loaded** (CI ubuntu gcc, dev macOS clang, packaged deployments) → the native arm sources the
+////   ERTS resource handle (from the pdict cell / the threaded record / the mem-index slot) and calls
+////   the `nif_`-prefixed `@external`s on it, passing the COMBINED no-wrap effective address
+////   `ea = addr + offset` (computed Gleam-side as a BEAM bignum — the C never re-adds). The C is the
+////   security boundary (the overflow-safe bounds check lives there, S3); the memory algebra is
+////   BIT-IDENTICAL to the paged reference (the per-op `nif ≡ paged ≡ oracle` differential proves it).
+//// - **not loaded** (a bare BEAM / `cc`-absent host) → the same head delegates to the paged core
+////   `twocore/runtime/rt_mem`, byte-identical by construction. This preserves the Phase-11
+////   `runs_anywhere` property: the tier runs on a bare BEAM with NO NIF and no per-file skip-gating,
+////   so `conformance_test` / `mem_oracle_differential_test` / `pipeline_tier_test` keep working.
 ////
-//// **Behaviour is frozen, not just shape** (the §11 security invariant, G6): little-endian,
-//// no-wrap effective address (`ea = addr + offset` as a bignum, never masked), trap-before-write
-//// (all-or-nothing multi-byte stores), a bounds-check on every access, the Safe max-pages cap,
-//// and f32/f64 as raw-byte moves over the IEEE bit pattern (D5). All inherited unchanged from the
-//// delegated paged core, so tier-N is byte-identical to the spec via the shared oracle (§D).
+//// **The Gleam keeps the plumbing + the fuel; the C is the pure algebra.** The pdict/record/mem-index
+//// sourcing and the `rt_meter.charge` fuel debits live in these heads (metering byte-identical to
+//// paged/atomics — an untrusted module cannot allocate to the cap with zero CPU accounting), never
+//// in the C. The resource is MUTATED IN PLACE and its identity is stable across every op including
+//// `grow` (a watermark bump inside the reserved buffer — no realloc), so the cell mutators need no
+//// write-back and the threaded mutators return the rebound record carrying the SAME handle. This
+//// module NEVER calls `rt_trap`; the `emit_core` seam does the `{ok,_}`/`{error,R}` → raise.
 ////
-//// **Coercion soundness.** Under `mem_tier == Nif` the cell / threaded `mem` slot is produced
-//// SOLELY by this module's `fresh` (which calls `rt_mem.fresh`), so the opaque `Dynamic` there is
-//// always a paged `Mem`; delegating to `rt_mem`'s own cell / threaded / `to_flat` entry points
-//// (each of which coerces via `gleam_stdlib:identity/1`, a no-op) is therefore sound.
+//// **Behaviour is frozen** (the §11 security invariant, G6): little-endian; no-wrap effective address
+//// (never masked); trap-before-write (all-or-nothing multi-byte stores); a bounds-check on every
+//// checked access; the reserved max-pages cap; f32/f64 as raw-byte moves over the IEEE bit pattern.
+//// All identical to the paged reference (native by construction; paged by delegation) — so tier-N is
+//// byte-identical to the spec via the shared oracle.
+////
+//// **Coercion soundness.** Under `mem_tier == Nif` the cell / threaded `mem` slot is produced SOLELY
+//// by this module's `fresh`/`fresh64`, so the opaque `Dynamic` there is always THIS tier's handle: a
+//// native resource when the `.so` is loaded (→ `enif_get_resource` is sound), else a paged `Mem` (→
+//// delegating to `rt_mem`'s coercing entry points is sound). The two arms never mix within a single
+//// memory's lifetime because `nif_available()` is stable for the run.
 
 import gleam/dynamic.{type Dynamic}
 import gleam/option.{type Option}
 import twocore/ir.{type TrapReason}
 import twocore/runtime/rt_mem
+import twocore/runtime/rt_mem_atomics
+import twocore/runtime/rt_meter
 import twocore/runtime/rt_state.{type InstanceState}
 
-// ───────────────────────────── the cell-backed family (state_strategy: Cell) ─────────────────────────────
+// ───────────────────────────── the frozen NIF ABI (@external into the shim) ─────────────────────────────
 //
-// Same frozen heads as paged/atomics, operating on the `mem` slot of THIS process's cell. Each
-// body re-exports the corresponding `rt_mem` cell entry point — the node-safe skeleton (§B.2):
-// spec-correct, NOT the native ceiling. `rt_mem_nif` never calls `rt_trap`; the `emit_core` seam
-// does the `{ok,_}`/`{error,R}` case + raise (keystone §A.3).
+// One `@external` per §3.2 export, each targeting its `nif_`-prefixed name in the frozen shim
+// `twocore_rt_mem_nif_ffi`. Every load/store passes the COMBINED `ea` (never `addr`/`offset`
+// separately). The term shapes are the frozen ABI: `Ok(x)` = `{ok, x}`, `Error(MemoryOutOfBounds)`
+// = `{error, memory_out_of_bounds}`, `Nil` = the atom `nil`, `Bool` = `true`/`false`, `BitArray` =
+// an Erlang binary. When the `.so` is NOT attached the shim stubs raise `nif_error(nif_not_loaded)`
+// — so these are called ONLY under `nif_available()` (which the `.erl` stub answers `false`).
 
-/// Build a FRESH tier-N memory of `min_pages` zero-filled 64 KiB pages, returning the opaque
-/// handle as `Dynamic` (ready for `rt_state.seed`).
+/// `true` iff the native `.so` is attached (the C body returns `true`; the `.erl` stub `false`). THE
+/// dispatch switch: `true` ⇒ native arm, `false` ⇒ paged-delegate arm. Never raises.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_available")
+fn nif_available() -> Bool
+
+/// Allocate a reserved buffer of `reserve_bytes`, zero-filled, with the live watermark at
+/// `min_bytes`. Returns the opaque resource handle.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_fresh")
+fn nif_fresh(min_bytes: Int, reserve_bytes: Int) -> Dynamic
+
+/// Load `bytes` LE bytes at `ea`, sign/zero-extended to `result_width`. `{ok, v}` | OOB.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_load")
+fn nif_load(
+  res: Dynamic,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  ea: Int,
+) -> Result(Int, TrapReason)
+
+/// Store the low `bytes` bytes of `value` LE at `ea` (trap-before-write). `{ok, nil}` | OOB.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_store")
+fn nif_store(
+  res: Dynamic,
+  bytes: Int,
+  ea: Int,
+  value: Int,
+) -> Result(Nil, TrapReason)
+
+/// Current size in pages (`byte_len / 65536`).
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_size")
+fn nif_size(res: Dynamic) -> Int
+
+/// Bump the watermark by `delta` pages within the reservation; previous pages, or `-1` on failure.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_grow")
+fn nif_grow(res: Dynamic, delta: Int) -> Int
+
+/// Write `bytes` at `ea` (whole-range check up front). `{ok, nil}` | OOB.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_init_data")
+fn nif_init_data(
+  res: Dynamic,
+  ea: Int,
+  bytes: BitArray,
+) -> Result(Nil, TrapReason)
+
+/// Read `n` bytes at `ea` in ascending-address order. `{ok, bytes}` | OOB. The v128 byte seam.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_load_bytes")
+fn nif_load_bytes(res: Dynamic, ea: Int, n: Int) -> Result(BitArray, TrapReason)
+
+/// Write the run `bytes` at `ea` (trap-before-write). `{ok, nil}` | OOB. The v128 byte seam.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_store_bytes")
+fn nif_store_bytes(
+  res: Dynamic,
+  ea: Int,
+  bytes: BitArray,
+) -> Result(Nil, TrapReason)
+
+/// Fill `count` bytes at `dest` with `value & 0xFF` (eager bounds). `{ok, nil}` | OOB.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_fill")
+fn nif_fill(
+  res: Dynamic,
+  dest: Int,
+  value: Int,
+  count: Int,
+) -> Result(Nil, TrapReason)
+
+/// memmove `count` bytes `src → dst` (cross-resource when the handles differ; eager bounds on both).
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_copy")
+fn nif_copy(
+  dst_res: Dynamic,
+  src_res: Dynamic,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason)
+
+/// Copy `count` bytes from `seg[src..]` to `dst` (eager bounds on segment + memory). `{ok, nil}` | OOB.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_init")
+fn nif_init(
+  res: Dynamic,
+  seg: BitArray,
+  dst: Int,
+  src: Int,
+  count: Int,
+) -> Result(Nil, TrapReason)
+
+/// The whole in-bounds byte image `[0, byte_len)` — the differential hook (tests only).
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_to_flat")
+fn nif_to_flat(res: Dynamic) -> BitArray
+
+/// UNCHECKED load — `nif_load` MINUS the bounds compare (a raw LE deref). Bare `int`.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_load_unchecked")
+fn nif_load_unchecked(
+  res: Dynamic,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  ea: Int,
+) -> Int
+
+/// UNCHECKED store — `nif_store` MINUS the bounds compare (a raw LE write). Bare `nil`.
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_store_unchecked")
+fn nif_store_unchecked(res: Dynamic, bytes: Int, ea: Int, value: Int) -> Nil
+
+// ───────────────────────────── the cell-backed family (state_strategy: Cell) ─────────────────────────────
+
+/// Build a FRESH tier-N memory of `min_pages` zero-filled 64 KiB pages, returning the opaque handle
+/// as `Dynamic` (ready for `rt_state.seed`).
 ///
 /// - `min_pages`: the initial page count (the module's declared memory minimum).
 /// - `max_pages`: the declared maximum in pages, or `None` for "unbounded" (still subject to
-///   `safe_cap`). tier-N is Unsafe-only, so `None` can leave the effective max at the full
-///   2¹⁶-page address space; the paged skeleton is sparse, so no eager allocation results.
-/// - `safe_cap`: the finite Safe max-pages cap, baked into the returned value so `grow` enforces
-///   it without a profile parameter. The baked effective max is
-///   `min(declared_max ?? safe_cap, safe_cap, 65536)`.
-/// - Returns the fresh memory value as `Dynamic` (opaque). Total — never fails.
+///   `safe_cap`). The baked effective max is `min(declared_max ?? safe_cap, safe_cap, 65536)`.
+/// - `safe_cap`: the finite Safe max-pages cap.
+/// - Returns the fresh memory as `Dynamic` (opaque). Total on the admissible path.
 ///
-/// **NOT the native ceiling:** delegates to `rt_mem.fresh`, so the handle is a paged `Mem`, not a
-/// native resource. The real C NIF (deferred, §B.3) drops in behind this identical head.
+/// **Native arm** (`.so` loaded): the tier RESERVES its buffer up front (never realloc'd) — the
+/// reservation `reserve = max(min_pages, effective_max)` pages reuses the atomics reservation caps
+/// (`rt_mem_atomics.reservation`), so `nif_fresh` gets `MinBytes = min_pages * 65536` and
+/// `ReserveBytes = reserve * 65536`; `max_bytes` encodes the paged `max` so `grow` is bit-identical.
+/// An over-cap reservation is INADMISSIBLE under tier-N (it must use paged — enforced at link time by
+/// `validate_binding`); reaching it here is unreachable-post-validation and fails closed with a
+/// node-safe `panic` (mirroring `rt_mem_atomics.a_fresh`). **Fallback arm**: `rt_mem.fresh` (paged).
 pub fn fresh(min_pages: Int, max_pages: Option(Int), safe_cap: Int) -> Dynamic {
-  rt_mem.fresh(min_pages, max_pages, safe_cap)
+  case nif_available() {
+    True ->
+      case
+        rt_mem_atomics.reservation(
+          min_pages,
+          max_pages,
+          safe_cap,
+          rt_mem_atomics.atomics_reserve_cap_pages,
+        )
+      {
+        Ok(reserve) ->
+          nif_fresh(min_pages * rt_mem.page_bytes, reserve * rt_mem.page_bytes)
+        Error(Nil) ->
+          panic as "rt_mem_nif.fresh: over-cap reservation (inadmissible under tier-N; must use paged — unreachable post-validation)"
+      }
+    False -> rt_mem.fresh(min_pages, max_pages, safe_cap)
+  }
 }
 
-/// Build a FRESH tier-N 64-bit (`Idx64`, memory64) memory, delegating to `rt_mem.fresh64` (P6-08,
-/// §D). Only ever emitted for a TINY BOUNDED 64-bit memory: unit 09's `validate_binding` calls
-/// `rt_mem_atomics.reservation64` on the same rule as `atomics` and FAIL-CLOSED REJECTS an over-cap
-/// / unbounded 64-bit `nif` binding at LINK time — because the deferred native tier's C impl
-/// RESERVES (it cannot back a 256 TiB sparse memory), so the tier's classification (not this
-/// skeleton's sparse delegate) governs. A tiny bounded one delegates to the sparse paged core.
+/// Build a FRESH tier-N 64-bit (`Idx64`, memory64) memory. Only ever emitted for a TINY BOUNDED
+/// 64-bit memory: an over-cap / unbounded 64-bit `nif` binding is fail-closed rejected at link time
+/// (`validate_binding` via `reservation64`), because the native tier RESERVES (it cannot back a
+/// 256 TiB sparse memory).
 ///
 /// - `min_pages`/`max_pages`/`mem64_cap`: see `rt_mem.fresh64`.
-/// - Returns the fresh memory as `Dynamic` (a paged `Mem`; NOT the native ceiling). Total.
+/// - Returns the fresh memory as `Dynamic` (opaque). Total on the admissible path.
 ///
-/// Coercion soundness holds unchanged: under `mem_tier == Nif` the `mem` slot is produced solely by
-/// this module's `fresh`/`fresh64` (→ `rt_mem.fresh`/`fresh64`), so it is always a paged `Mem`.
+/// **Native arm**: reserve via `rt_mem_atomics.reservation64` (folding the 64-bit cap) → `nif_fresh`;
+/// over-cap is unreachable-post-validation and fails closed. **Fallback arm**: `rt_mem.fresh64`.
 pub fn fresh64(
   min_pages: Int,
   max_pages: Option(Int),
   mem64_cap: Int,
 ) -> Dynamic {
-  rt_mem.fresh64(min_pages, max_pages, mem64_cap)
+  case nif_available() {
+    True ->
+      case
+        rt_mem_atomics.reservation64(
+          min_pages,
+          max_pages,
+          mem64_cap,
+          rt_mem_atomics.atomics_reserve_cap_pages,
+        )
+      {
+        Ok(reserve) ->
+          nif_fresh(min_pages * rt_mem.page_bytes, reserve * rt_mem.page_bytes)
+        Error(Nil) ->
+          panic as "rt_mem_nif.fresh64: over-cap 64-bit reservation (inadmissible under tier-N; must use paged — unreachable post-validation)"
+      }
+    False -> rt_mem.fresh64(min_pages, max_pages, mem64_cap)
+  }
 }
 
-/// Load `bytes` bytes (1/2/4/8) little-endian at `ea = addr(unsigned i32) + offset`, normalised
-/// to `result_width` bits (`signed` ⇒ sign-extend, else zero-extend). Reads the handle from the
-/// cell.
+/// Load `bytes` bytes (1/2/4/8) little-endian at `ea = addr + offset`, normalised to `result_width`
+/// bits (`signed` ⇒ sign-extend, else zero-extend). Reads the handle from the cell (index 0).
 ///
 /// - `bytes`: the access width in bytes (1/2/4/8).
-/// - `signed`: whether a sub-word load is sign-extended to `result_width` (else zero-extended);
-///   irrelevant when `bytes * 8 == result_width`.
-/// - `result_width`: the result's width in bits (32 or 64) — disambiguates `i32.load8_s` from
-///   `i64.load8_s`.
-/// - `addr`/`offset`: the unsigned i32 base and static offset (added as a bignum — no wrap).
-/// - Returns `Ok(bits)` (the loaded value as a raw bit pattern), or `Error(MemoryOutOfBounds)`
-///   iff `ea + bytes > byte_len`. Read-only.
+/// - `signed`: whether a sub-word load is sign-extended to `result_width` (else zero-extended).
+/// - `result_width`: 32 or 64 — disambiguates `i32.load8_s` from `i64.load8_s`.
+/// - `addr`/`offset`: the unsigned i32 base and static offset (combined as a bignum — no wrap).
+/// - Returns `Ok(bits)`, or `Error(MemoryOutOfBounds)` iff `ea + bytes > byte_len`. Read-only.
 ///
-/// **NOT the native ceiling:** delegates to `rt_mem.load` (paged rebuild cost).
+/// Native: `nif_load` on the cell resource with the combined `ea`. Fallback: `rt_mem.load`.
 pub fn load(
   bytes: Int,
   signed: Bool,
@@ -107,79 +249,92 @@ pub fn load(
   addr: Int,
   offset: Int,
 ) -> Result(Int, TrapReason) {
-  rt_mem.load(bytes, signed, result_width, addr, offset)
+  case nif_available() {
+    True ->
+      nif_load(rt_state.mem_at(0), bytes, signed, result_width, addr + offset)
+    False -> rt_mem.load(bytes, signed, result_width, addr, offset)
+  }
 }
 
 /// Store `value`'s low `bytes` bytes (1/2/4/8) little-endian at `ea`. Traps BEFORE any byte is
-/// written if out of bounds (§11, all-or-nothing — zero corruption).
+/// written if out of bounds (all-or-nothing — zero corruption).
 ///
 /// - `bytes`: the store width in bytes (1/2/4/8); the value's sign is irrelevant.
-/// - `addr`/`offset`: the unsigned i32 base and static offset (bignum — no wrap).
+/// - `addr`/`offset`: the base and static offset (bignum — no wrap).
 /// - `value`: the raw bit pattern whose low `bytes` bytes are written.
-/// - Returns `Ok(Nil)` on success (writing the new handle back to the cell), or
-///   `Error(MemoryOutOfBounds)` with ZERO mutation.
+/// - Returns `Ok(Nil)` on success, or `Error(MemoryOutOfBounds)` with ZERO mutation.
 ///
-/// **NOT the native ceiling:** delegates to `rt_mem.store`; the paged store copies one chunk into
-/// a new `Mem` (rebuild cost). The real NIF would mutate in place (raw `O(1)`).
+/// Native: `nif_store` mutates the cell resource IN PLACE — NO write-back (stable handle). Fallback:
+/// `rt_mem.store` (rebuild + `mem_put`).
 pub fn store(
   bytes: Int,
   addr: Int,
   value: Int,
   offset: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.store(bytes, addr, value, offset)
+  case nif_available() {
+    True -> nif_store(rt_state.mem_at(0), bytes, addr + offset, value)
+    False -> rt_mem.store(bytes, addr, value, offset)
+  }
 }
 
-/// The current size of this process's memory, in 64 KiB pages (`memory.size`).
-///
-/// - Returns the page count. Total. Reads the handle from the cell.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.size`.
+/// The current size of this process's memory, in 64 KiB pages (`memory.size`). Total; read-only.
+/// Native: `nif_size`. Fallback: `rt_mem.size`.
 pub fn size() -> Int {
-  rt_mem.size()
+  case nif_available() {
+    True -> nif_size(rt_state.mem_at(0))
+    False -> rt_mem.size()
+  }
 }
 
 /// Grow this process's memory by `delta` pages (`memory.grow`).
 ///
 /// - `delta`: the number of pages to add (≥ 0).
-/// - Returns the PREVIOUS size in pages on success, or `-1` if the growth would exceed the
-///   declared max, the Safe cap, OR the 65536-page hard cap (in which case NOTHING is allocated
-///   and no fuel is charged). Newly-added pages are zero-filled. On success it charges
-///   `delta * page_bytes` fuel (proportional to the bytes made addressable, P2) and writes the
-///   new handle back.
+/// - Returns the PREVIOUS size in pages on success, or `-1` if the growth would exceed the reserved
+///   max (in which case NOTHING is allocated and NO fuel is charged). Newly-added pages are
+///   zero-filled. On success it charges `delta * page_bytes` fuel (proportional to the bytes made
+///   addressable, P2), IDENTICALLY on both arms — a failed grow (`-1`) charges nothing, so nif and
+///   paged meter identically.
 ///
-/// **NOT the native ceiling:** delegates to `rt_mem.grow` (paged watermark move + fuel charge).
+/// Native: `nif_grow` bumps the watermark in place (stable handle — no write-back), then the fuel is
+/// charged here on `prev != -1`. Fallback: `rt_mem.grow`.
 pub fn grow(delta: Int) -> Int {
-  rt_mem.grow(delta)
+  case nif_available() {
+    True -> grow_charged(nif_grow(rt_state.mem_at(0), delta), delta)
+    False -> rt_mem.grow(delta)
+  }
 }
 
-/// Write an active DATA segment's `bytes` into this process's memory at `offset`, at
-/// instantiation. Bounds-checked (no-wrap), whole range up front.
-///
-/// - `offset`: the destination byte offset.
-/// - `bytes`: the raw bytes to write.
-/// - Returns `Ok(Nil)` (writing the new handle back), or `Error(MemoryOutOfBounds)` if the
-///   segment does not fit (an instantiation-time trap; nothing is written).
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.init_data`.
+/// Shared grow-fuel accounting for the native arm: charge `delta * page_bytes` ONLY when the grow
+/// succeeded (`prev != -1`), returning `prev`. A failed grow charges nothing (metering parity).
+fn grow_charged(prev: Int, delta: Int) -> Int {
+  case prev {
+    -1 -> -1
+    _ -> {
+      rt_meter.charge(delta * rt_mem.page_bytes)
+      prev
+    }
+  }
+}
+
+/// Write an active DATA segment's `bytes` into this process's memory at `offset`, at instantiation.
+/// Whole-range bounds-checked (no-wrap). `Ok(Nil)`, or `Error(MemoryOutOfBounds)` (nothing written).
+/// Native: `nif_init_data` (`ea = offset`). Fallback: `rt_mem.init_data`.
 pub fn init_data(offset: Int, bytes: BitArray) -> Result(Nil, TrapReason) {
-  rt_mem.init_data(offset, bytes)
+  case nif_available() {
+    True -> nif_init_data(rt_state.mem_at(0), offset, bytes)
+    False -> rt_mem.init_data(offset, bytes)
+  }
 }
 
 // ───────────────────────────── the threaded family (state_strategy: Threaded) ─────────────────────────────
 //
-// The purely-functional twin of the cell-backed family: generated code under `state_strategy:
-// Threaded` threads the `rt_state.InstanceState` record as a value. These heads are identical to
-// paged/atomics; each body re-exports `rt_mem`'s threaded wrapper. Reads leave `st` untouched;
-// mutators return the rebound record (§10). Under the shipped skeleton the handle is the immutable
-// paged `Mem`, so `t_store` returns a NEW handle; under the deferred native NIF the handle is a
-// mutable resource, so `t_store` mutates in place and returns the SAME handle — the SIGNATURE is
-// identical either way, which is exactly why the native impl needs no seam change.
+// The purely-functional twin: generated code under `Threaded` threads the `InstanceState` record.
+// Reads leave `st` untouched; mutators return the rebound record. On the native arm the resource is
+// mutable, so `t_store` mutates it in place and rebinds the SAME handle — the SIGNATURE is identical
+// to the paged skeleton (which rebinds a NEW immutable `Mem`), which is why the seam needs no change.
 
-/// Threaded load (read-only): projects `st.mem`, drives the load, leaves `st` UNCHANGED. Returns
-/// `Ok(bits)` or `Error(MemoryOutOfBounds)`. See `load` for the codec / bounds contract.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.t_load`.
+/// Threaded load (read-only): projects `st.mem`, drives the load, leaves `st` UNCHANGED. See `load`.
 pub fn t_load(
   st: InstanceState,
   bytes: Int,
@@ -188,16 +343,16 @@ pub fn t_load(
   addr: Int,
   offset: Int,
 ) -> Result(Int, TrapReason) {
-  rt_mem.t_load(st, bytes, signed, result_width, addr, offset)
+  case nif_available() {
+    True ->
+      nif_load(rt_state.mem(st), bytes, signed, result_width, addr + offset)
+    False -> rt_mem.t_load(st, bytes, signed, result_width, addr, offset)
+  }
 }
 
-/// Threaded store. Bounds-checks first (trap-before-write), then returns `Ok(st')` — the §10
-/// rebound record whose `mem` is the new handle — or `Error(MemoryOutOfBounds)` with `st`
-/// untouched (zero mutation). See `store`.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.t_store`; the skeleton's paged `Mem` is
-/// immutable, so the returned `mem` differs (a NEW handle). The real NIF mutates in place and
-/// returns the SAME handle — same signature.
+/// Threaded store. Bounds-checks first (trap-before-write), then returns `Ok(st')` — the rebound
+/// record whose `mem` is the (in-place-mutated, same) handle — or `Error(MemoryOutOfBounds)` with
+/// `st` untouched (zero mutation). See `store`.
 pub fn t_store(
   st: InstanceState,
   bytes: Int,
@@ -205,66 +360,85 @@ pub fn t_store(
   value: Int,
   offset: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_store(st, bytes, addr, value, offset)
+  case nif_available() {
+    True -> {
+      let h = rt_state.mem(st)
+      case nif_store(h, bytes, addr + offset, value) {
+        Ok(Nil) -> Ok(rt_state.with_mem(st, h))
+        Error(reason) -> Error(reason)
+      }
+    }
+    False -> rt_mem.t_store(st, bytes, addr, value, offset)
+  }
 }
 
 /// Threaded `memory.size` (read-only): the page count of `st.mem`; `st` unchanged.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.t_size`.
 pub fn t_size(st: InstanceState) -> Int {
-  rt_mem.t_size(st)
+  case nif_available() {
+    True -> nif_size(rt_state.mem(st))
+    False -> rt_mem.t_size(st)
+  }
 }
 
-/// Threaded `memory.grow`. Returns `#(prev_pages, st')` where `st'` rebinds `st.mem` to the grown
-/// handle, or `#(-1, st)` past the max / cap (unchanged, nothing allocated). Charges
-/// `delta * page_bytes` grow fuel on the SUCCESS path (P2 — parity with paged/atomics, so
-/// metered+threaded is byte-identical to metered+cell and an untrusted module cannot allocate to
-/// the page cap with zero CPU accounting). See `grow`.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.t_grow` (the fuel charge is inherited from the
-/// delegated paged wrapper).
+/// Threaded `memory.grow`. Returns `#(prev_pages, st')` (rebinding `st.mem` to the grown, same
+/// handle), or `#(-1, st)` past the max/cap (unchanged, nothing allocated). Charges
+/// `delta * page_bytes` grow fuel on the SUCCESS path (P2 parity with the cell `grow`). See `grow`.
 pub fn t_grow(st: InstanceState, delta: Int) -> #(Int, InstanceState) {
-  rt_mem.t_grow(st, delta)
+  case nif_available() {
+    True -> {
+      let h = rt_state.mem(st)
+      case nif_grow(h, delta) {
+        -1 -> #(-1, st)
+        prev -> {
+          rt_meter.charge(delta * rt_mem.page_bytes)
+          #(prev, rt_state.with_mem(st, h))
+        }
+      }
+    }
+    False -> rt_mem.t_grow(st, delta)
+  }
 }
 
-/// Threaded active-data-segment write at instantiation. Bounds-checks the whole range up front,
-/// then returns `Ok(st')` (rebinding `st.mem`), or `Error(MemoryOutOfBounds)` (nothing written,
-/// `st` untouched). See `init_data`.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.t_init_data`.
+/// Threaded active-data-segment write at instantiation. Bounds-checks the whole range up front, then
+/// returns `Ok(st')` (rebinding `st.mem`), or `Error(MemoryOutOfBounds)` (nothing written). See
+/// `init_data`.
 pub fn t_init_data(
   st: InstanceState,
   offset: Int,
   bytes: BitArray,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_init_data(st, offset, bytes)
+  case nif_available() {
+    True -> {
+      let h = rt_state.mem(st)
+      case nif_init_data(h, offset, bytes) {
+        Ok(Nil) -> Ok(rt_state.with_mem(st, h))
+        Error(reason) -> Error(reason)
+      }
+    }
+    False -> rt_mem.t_init_data(st, offset, bytes)
+  }
 }
 
 // ───────────────────────────── the differential hook (§D/§11) ─────────────────────────────
 
-/// The tier's whole in-bounds byte image (absent regions rendered as zero) — the differential
-/// reference the oracle compares byte-for-byte after each op, mirrored on `rt_mem.to_flat` /
-/// `o_flat`.
-///
-/// - `mem`: the opaque cell / threaded-record memory handle (a `Dynamic`).
-/// - Returns the flat `byte_len`-length byte image. O(byte_len); tests only.
-///
-/// **NOT the native ceiling:** delegates to `rt_mem.to_flat`, which coerces the `Dynamic` to a
-/// paged `Mem`. The identical byte-image comparison is the exact check that would catch a C
-/// bounds / endianness bug in the deferred native impl before it could escape (§D).
+/// The tier's whole in-bounds byte image — the differential reference the oracle compares
+/// byte-for-byte after each op. `mem` is passed directly by the test (the handle from the cell /
+/// record). Native: `nif_to_flat`. Fallback: `rt_mem.to_flat`. O(byte_len); tests only.
 pub fn to_flat(mem: Dynamic) -> BitArray {
-  rt_mem.to_flat(mem)
+  case nif_available() {
+    True -> nif_to_flat(mem)
+    False -> rt_mem.to_flat(mem)
+  }
 }
 
-// ───────────────────────────── multi-memory + bulk memory skeleton (P5-08, delegating) ─────────────────────────────
+// ───────────────────────────── multi-memory + bulk (the `_at` twins + fill/copy/init) ─────────────────────────────
 //
-// The Phase-5 additive surface — the index-routed `_at` load/store/size/grow/init_data variants and
-// the bulk ops (`fill`/`copy`/`init`) — each delegating to `rt_mem` (spec-correct by construction,
-// NOT the native ceiling; the deferred C NIF drops in behind these byte-identical heads). Coercion
-// soundness holds unchanged: under `mem_tier == Nif` the `mem` slot is produced solely by this
-// module's `fresh` (→ `rt_mem.fresh`), so delegating to `rt_mem`'s coercing entry points is sound.
+// The index-routed cell family: each op sources the handle from the mem-index slot
+// (`rt_state.mem_at(mem_idx)` / `with_mem_at`), so `load_at(0, …) ≡ load(…)`. Mutators mutate the
+// resource in place (native) so no write-back; bulk ops charge `count` fuel on the SUCCESS path.
 
-/// `load` from memory `mem_idx` (read-only). Delegates to `rt_mem.load_at`.
+/// `load` from memory `mem_idx` (read-only). Native: `nif_load` on slot `mem_idx`. Fallback:
+/// `rt_mem.load_at`.
 pub fn load_at(
   mem_idx: Int,
   bytes: Int,
@@ -273,10 +447,21 @@ pub fn load_at(
   addr: Int,
   offset: Int,
 ) -> Result(Int, TrapReason) {
-  rt_mem.load_at(mem_idx, bytes, signed, result_width, addr, offset)
+  case nif_available() {
+    True ->
+      nif_load(
+        rt_state.mem_at(mem_idx),
+        bytes,
+        signed,
+        result_width,
+        addr + offset,
+      )
+    False -> rt_mem.load_at(mem_idx, bytes, signed, result_width, addr, offset)
+  }
 }
 
-/// `store` into memory `mem_idx`. Delegates to `rt_mem.store_at`.
+/// `store` into memory `mem_idx`. Native: `nif_store` in place (no write-back). Fallback:
+/// `rt_mem.store_at`.
 pub fn store_at(
   mem_idx: Int,
   bytes: Int,
@@ -284,43 +469,63 @@ pub fn store_at(
   value: Int,
   offset: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.store_at(mem_idx, bytes, addr, value, offset)
+  case nif_available() {
+    True -> nif_store(rt_state.mem_at(mem_idx), bytes, addr + offset, value)
+    False -> rt_mem.store_at(mem_idx, bytes, addr, value, offset)
+  }
 }
 
-/// `memory.size` of memory `mem_idx`. Delegates to `rt_mem.size_at`.
+/// `memory.size` of memory `mem_idx`. Native: `nif_size` on slot `mem_idx`. Fallback:
+/// `rt_mem.size_at`.
 pub fn size_at(mem_idx: Int) -> Int {
-  rt_mem.size_at(mem_idx)
+  case nif_available() {
+    True -> nif_size(rt_state.mem_at(mem_idx))
+    False -> rt_mem.size_at(mem_idx)
+  }
 }
 
 /// `memory.grow` memory `mem_idx` by `delta` pages (charges `delta * page_bytes` fuel on success).
-/// Delegates to `rt_mem.grow_at`.
+/// Native: `nif_grow` in place. Fallback: `rt_mem.grow_at`.
 pub fn grow_at(mem_idx: Int, delta: Int) -> Int {
-  rt_mem.grow_at(mem_idx, delta)
+  case nif_available() {
+    True -> grow_charged(nif_grow(rt_state.mem_at(mem_idx), delta), delta)
+    False -> rt_mem.grow_at(mem_idx, delta)
+  }
 }
 
-/// Active DATA-segment write into memory `mem_idx` at instantiation. Delegates to
-/// `rt_mem.init_data_at`.
+/// Active DATA-segment write into memory `mem_idx` at instantiation. Native: `nif_init_data`.
+/// Fallback: `rt_mem.init_data_at`.
 pub fn init_data_at(
   mem_idx: Int,
   offset: Int,
   bytes: BitArray,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.init_data_at(mem_idx, offset, bytes)
+  case nif_available() {
+    True -> nif_init_data(rt_state.mem_at(mem_idx), offset, bytes)
+    False -> rt_mem.init_data_at(mem_idx, offset, bytes)
+  }
 }
 
-/// `memory.fill` on memory `mem_idx` (eager bounds, `count` fuel on success). Delegates to
-/// `rt_mem.fill`.
+/// `memory.fill` on memory `mem_idx` (eager bounds, `count` fuel on success). Native: `nif_fill`,
+/// charging Gleam-side on `Ok`. Fallback: `rt_mem.fill`.
 pub fn fill(
   mem_idx: Int,
   dest: Int,
   value: Int,
   count: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.fill(mem_idx, dest, value, count)
+  case nif_available() {
+    True ->
+      charge_count(
+        nif_fill(rt_state.mem_at(mem_idx), dest, value, count),
+        count,
+      )
+    False -> rt_mem.fill(mem_idx, dest, value, count)
+  }
 }
 
 /// `memory.copy` from memory `src_mem` to `dst_mem` (memmove, cross-memory-capable, `count` fuel on
-/// success). Delegates to `rt_mem.copy`.
+/// success). Native: `nif_copy` on the two sourced handles. Fallback: `rt_mem.copy`.
 pub fn copy(
   dst_mem: Int,
   src_mem: Int,
@@ -328,11 +533,24 @@ pub fn copy(
   src: Int,
   count: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.copy(dst_mem, src_mem, dst, src, count)
+  case nif_available() {
+    True ->
+      charge_count(
+        nif_copy(
+          rt_state.mem_at(dst_mem),
+          rt_state.mem_at(src_mem),
+          dst,
+          src,
+          count,
+        ),
+        count,
+      )
+    False -> rt_mem.copy(dst_mem, src_mem, dst, src, count)
+  }
 }
 
-/// `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped; eager bounds,
-/// `count` fuel on success). Delegates to `rt_mem.init`.
+/// `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped; eager bounds, `count`
+/// fuel on success). Native: `nif_init`. Fallback: `rt_mem.init`.
 pub fn init(
   mem_idx: Int,
   seg: BitArray,
@@ -340,10 +558,33 @@ pub fn init(
   src: Int,
   count: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.init(mem_idx, seg, dst, src, count)
+  case nif_available() {
+    True ->
+      charge_count(
+        nif_init(rt_state.mem_at(mem_idx), seg, dst, src, count),
+        count,
+      )
+    False -> rt_mem.init(mem_idx, seg, dst, src, count)
+  }
 }
 
-/// Threaded `load` from memory `mem_idx` (read-only). Delegates to `rt_mem.t_load_at`.
+/// Shared bulk-op fuel accounting for the native (cell) arm: charge `count` fuel ONLY when the op
+/// succeeded (`Ok`), passing the result through unchanged. A trapping op charges nothing.
+fn charge_count(
+  result: Result(Nil, TrapReason),
+  count: Int,
+) -> Result(Nil, TrapReason) {
+  case result {
+    Ok(Nil) -> {
+      rt_meter.charge(count)
+      Ok(Nil)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Threaded `load` from memory `mem_idx` (read-only). Native: `nif_load` on slot `mem_idx`.
+/// Fallback: `rt_mem.t_load_at`.
 pub fn t_load_at(
   st: InstanceState,
   mem_idx: Int,
@@ -353,10 +594,22 @@ pub fn t_load_at(
   addr: Int,
   offset: Int,
 ) -> Result(Int, TrapReason) {
-  rt_mem.t_load_at(st, mem_idx, bytes, signed, result_width, addr, offset)
+  case nif_available() {
+    True ->
+      nif_load(
+        rt_state.t_mem_at(st, mem_idx),
+        bytes,
+        signed,
+        result_width,
+        addr + offset,
+      )
+    False ->
+      rt_mem.t_load_at(st, mem_idx, bytes, signed, result_width, addr, offset)
+  }
 }
 
-/// Threaded `store` into memory `mem_idx`. Delegates to `rt_mem.t_store_at`.
+/// Threaded `store` into memory `mem_idx`. Native: `nif_store` in place, rebinding the same handle.
+/// Fallback: `rt_mem.t_store_at`.
 pub fn t_store_at(
   st: InstanceState,
   mem_idx: Int,
@@ -365,71 +618,108 @@ pub fn t_store_at(
   value: Int,
   offset: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_store_at(st, mem_idx, bytes, addr, value, offset)
+  case nif_available() {
+    True -> {
+      let h = rt_state.t_mem_at(st, mem_idx)
+      case nif_store(h, bytes, addr + offset, value) {
+        Ok(Nil) -> Ok(rt_state.t_with_mem_at(st, mem_idx, h))
+        Error(reason) -> Error(reason)
+      }
+    }
+    False -> rt_mem.t_store_at(st, mem_idx, bytes, addr, value, offset)
+  }
 }
 
-// ── the v128-memory BitArray seam (S4) — delegated to the paged `rt_mem` core (the nif skeleton
-// delegates memory to `rt_mem`, so the SIMD-memory `.wast` files run under `cell × nif` too, §G.1).
+// ── the v128-memory BitArray seam (S4): checked whole-run byte moves emit_core composes with rt_simd.
 
-/// `load_bytes` on the cell memory (index 0). Delegates to `rt_mem.load_bytes`.
+/// `load_bytes` on the cell memory (index 0). Native: `nif_load_bytes`. Fallback: `rt_mem.load_bytes`.
 pub fn load_bytes(
   addr: Int,
   offset: Int,
   n: Int,
 ) -> Result(BitArray, TrapReason) {
-  rt_mem.load_bytes(addr, offset, n)
+  case nif_available() {
+    True -> nif_load_bytes(rt_state.mem_at(0), addr + offset, n)
+    False -> rt_mem.load_bytes(addr, offset, n)
+  }
 }
 
-/// `store_bytes` into the cell memory (index 0). Delegates to `rt_mem.store_bytes`.
+/// `store_bytes` into the cell memory (index 0). Native: `nif_store_bytes` in place. Fallback:
+/// `rt_mem.store_bytes`.
 pub fn store_bytes(
   addr: Int,
   bytes: BitArray,
   offset: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.store_bytes(addr, bytes, offset)
+  case nif_available() {
+    True -> nif_store_bytes(rt_state.mem_at(0), addr + offset, bytes)
+    False -> rt_mem.store_bytes(addr, bytes, offset)
+  }
 }
 
-/// `load_bytes` on memory `mem_idx`. Delegates to `rt_mem.load_bytes_at`.
+/// `load_bytes` on memory `mem_idx`. Native: `nif_load_bytes` on slot `mem_idx`. Fallback:
+/// `rt_mem.load_bytes_at`.
 pub fn load_bytes_at(
   mem_idx: Int,
   addr: Int,
   offset: Int,
   n: Int,
 ) -> Result(BitArray, TrapReason) {
-  rt_mem.load_bytes_at(mem_idx, addr, offset, n)
+  case nif_available() {
+    True -> nif_load_bytes(rt_state.mem_at(mem_idx), addr + offset, n)
+    False -> rt_mem.load_bytes_at(mem_idx, addr, offset, n)
+  }
 }
 
-/// `store_bytes` on memory `mem_idx`. Delegates to `rt_mem.store_bytes_at`.
+/// `store_bytes` on memory `mem_idx`. Native: `nif_store_bytes` in place. Fallback:
+/// `rt_mem.store_bytes_at`.
 pub fn store_bytes_at(
   mem_idx: Int,
   addr: Int,
   bytes: BitArray,
   offset: Int,
 ) -> Result(Nil, TrapReason) {
-  rt_mem.store_bytes_at(mem_idx, addr, bytes, offset)
+  case nif_available() {
+    True -> nif_store_bytes(rt_state.mem_at(mem_idx), addr + offset, bytes)
+    False -> rt_mem.store_bytes_at(mem_idx, addr, bytes, offset)
+  }
 }
 
-/// Threaded `load_bytes` (read-only). Delegates to `rt_mem.t_load_bytes`.
+/// Threaded `load_bytes` (read-only). Native: `nif_load_bytes`. Fallback: `rt_mem.t_load_bytes`.
 pub fn t_load_bytes(
   st: InstanceState,
   addr: Int,
   offset: Int,
   n: Int,
 ) -> Result(BitArray, TrapReason) {
-  rt_mem.t_load_bytes(st, addr, offset, n)
+  case nif_available() {
+    True -> nif_load_bytes(rt_state.mem(st), addr + offset, n)
+    False -> rt_mem.t_load_bytes(st, addr, offset, n)
+  }
 }
 
-/// Threaded `store_bytes`. Delegates to `rt_mem.t_store_bytes`.
+/// Threaded `store_bytes`. Native: `nif_store_bytes` in place, rebinding the same handle. Fallback:
+/// `rt_mem.t_store_bytes`.
 pub fn t_store_bytes(
   st: InstanceState,
   addr: Int,
   bytes: BitArray,
   offset: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_store_bytes(st, addr, bytes, offset)
+  case nif_available() {
+    True -> {
+      let h = rt_state.mem(st)
+      case nif_store_bytes(h, addr + offset, bytes) {
+        Ok(Nil) -> Ok(rt_state.with_mem(st, h))
+        Error(reason) -> Error(reason)
+      }
+    }
+    False -> rt_mem.t_store_bytes(st, addr, bytes, offset)
+  }
 }
 
-/// Threaded `load_bytes` on memory `mem_idx`. Delegates to `rt_mem.t_load_bytes_at`.
+/// Threaded `load_bytes` on memory `mem_idx`. Native: `nif_load_bytes` on slot `mem_idx`. Fallback:
+/// `rt_mem.t_load_bytes_at`.
 pub fn t_load_bytes_at(
   st: InstanceState,
   mem_idx: Int,
@@ -437,10 +727,14 @@ pub fn t_load_bytes_at(
   offset: Int,
   n: Int,
 ) -> Result(BitArray, TrapReason) {
-  rt_mem.t_load_bytes_at(st, mem_idx, addr, offset, n)
+  case nif_available() {
+    True -> nif_load_bytes(rt_state.t_mem_at(st, mem_idx), addr + offset, n)
+    False -> rt_mem.t_load_bytes_at(st, mem_idx, addr, offset, n)
+  }
 }
 
-/// Threaded `store_bytes` on memory `mem_idx`. Delegates to `rt_mem.t_store_bytes_at`.
+/// Threaded `store_bytes` on memory `mem_idx`. Native: `nif_store_bytes` in place. Fallback:
+/// `rt_mem.t_store_bytes_at`.
 pub fn t_store_bytes_at(
   st: InstanceState,
   mem_idx: Int,
@@ -448,34 +742,71 @@ pub fn t_store_bytes_at(
   bytes: BitArray,
   offset: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_store_bytes_at(st, mem_idx, addr, bytes, offset)
+  case nif_available() {
+    True -> {
+      let h = rt_state.t_mem_at(st, mem_idx)
+      case nif_store_bytes(h, addr + offset, bytes) {
+        Ok(Nil) -> Ok(rt_state.t_with_mem_at(st, mem_idx, h))
+        Error(reason) -> Error(reason)
+      }
+    }
+    False -> rt_mem.t_store_bytes_at(st, mem_idx, addr, bytes, offset)
+  }
 }
 
-/// Threaded `memory.size` of memory `mem_idx`. Delegates to `rt_mem.t_size_at`.
+/// Threaded `memory.size` of memory `mem_idx`. Native: `nif_size` on slot `mem_idx`. Fallback:
+/// `rt_mem.t_size_at`.
 pub fn t_size_at(st: InstanceState, mem_idx: Int) -> Int {
-  rt_mem.t_size_at(st, mem_idx)
+  case nif_available() {
+    True -> nif_size(rt_state.t_mem_at(st, mem_idx))
+    False -> rt_mem.t_size_at(st, mem_idx)
+  }
 }
 
-/// Threaded `memory.grow` of memory `mem_idx`. Delegates to `rt_mem.t_grow_at`.
+/// Threaded `memory.grow` of memory `mem_idx`. Native: `nif_grow` in place, charging fuel on success
+/// and rebinding the same handle. Fallback: `rt_mem.t_grow_at`.
 pub fn t_grow_at(
   st: InstanceState,
   mem_idx: Int,
   delta: Int,
 ) -> #(Int, InstanceState) {
-  rt_mem.t_grow_at(st, mem_idx, delta)
+  case nif_available() {
+    True -> {
+      let h = rt_state.t_mem_at(st, mem_idx)
+      case nif_grow(h, delta) {
+        -1 -> #(-1, st)
+        prev -> {
+          rt_meter.charge(delta * rt_mem.page_bytes)
+          #(prev, rt_state.t_with_mem_at(st, mem_idx, h))
+        }
+      }
+    }
+    False -> rt_mem.t_grow_at(st, mem_idx, delta)
+  }
 }
 
-/// Threaded active DATA-segment write into memory `mem_idx`. Delegates to `rt_mem.t_init_data_at`.
+/// Threaded active DATA-segment write into memory `mem_idx`. Native: `nif_init_data`. Fallback:
+/// `rt_mem.t_init_data_at`.
 pub fn t_init_data_at(
   st: InstanceState,
   mem_idx: Int,
   offset: Int,
   bytes: BitArray,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_init_data_at(st, mem_idx, offset, bytes)
+  case nif_available() {
+    True -> {
+      let h = rt_state.t_mem_at(st, mem_idx)
+      case nif_init_data(h, offset, bytes) {
+        Ok(Nil) -> Ok(rt_state.t_with_mem_at(st, mem_idx, h))
+        Error(reason) -> Error(reason)
+      }
+    }
+    False -> rt_mem.t_init_data_at(st, mem_idx, offset, bytes)
+  }
 }
 
-/// Threaded `memory.fill` on memory `mem_idx`. Delegates to `rt_mem.t_fill`.
+/// Threaded `memory.fill` on memory `mem_idx`. Native: `nif_fill`, charging `count` fuel on success
+/// and rebinding the same handle. Fallback: `rt_mem.t_fill`.
 pub fn t_fill(
   st: InstanceState,
   mem_idx: Int,
@@ -483,11 +814,18 @@ pub fn t_fill(
   value: Int,
   count: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_fill(st, mem_idx, dest, value, count)
+  case nif_available() {
+    True -> {
+      let h = rt_state.t_mem_at(st, mem_idx)
+      t_charge_count(nif_fill(h, dest, value, count), st, mem_idx, h, count)
+    }
+    False -> rt_mem.t_fill(st, mem_idx, dest, value, count)
+  }
 }
 
-/// Threaded `memory.copy` from memory `src_mem` to `dst_mem` (memmove, cross-memory-capable).
-/// Delegates to `rt_mem.t_copy`.
+/// Threaded `memory.copy` from memory `src_mem` to `dst_mem` (memmove, cross-memory-capable). Native:
+/// `nif_copy` on the two sourced handles, charging `count` fuel on success and rebinding `dst_mem`.
+/// Fallback: `rt_mem.t_copy`.
 pub fn t_copy(
   st: InstanceState,
   dst_mem: Int,
@@ -496,11 +834,18 @@ pub fn t_copy(
   src: Int,
   count: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_copy(st, dst_mem, src_mem, dst, src, count)
+  case nif_available() {
+    True -> {
+      let dh = rt_state.t_mem_at(st, dst_mem)
+      let sh = rt_state.t_mem_at(st, src_mem)
+      t_charge_count(nif_copy(dh, sh, dst, src, count), st, dst_mem, dh, count)
+    }
+    False -> rt_mem.t_copy(st, dst_mem, src_mem, dst, src, count)
+  }
 }
 
-/// Threaded `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped). Delegates
-/// to `rt_mem.t_init`.
+/// Threaded `memory.init` into memory `mem_idx` from segment bytes `seg` (ε if dropped). Native:
+/// `nif_init`, charging `count` fuel on success and rebinding `mem_idx`. Fallback: `rt_mem.t_init`.
 pub fn t_init(
   st: InstanceState,
   mem_idx: Int,
@@ -509,5 +854,113 @@ pub fn t_init(
   src: Int,
   count: Int,
 ) -> Result(InstanceState, TrapReason) {
-  rt_mem.t_init(st, mem_idx, seg, dst, src, count)
+  case nif_available() {
+    True -> {
+      let h = rt_state.t_mem_at(st, mem_idx)
+      t_charge_count(nif_init(h, seg, dst, src, count), st, mem_idx, h, count)
+    }
+    False -> rt_mem.t_init(st, mem_idx, seg, dst, src, count)
+  }
+}
+
+/// Shared bulk-op fuel + rebind accounting for the native (threaded) arm: on `Ok`, charge `count`
+/// fuel and return `Ok(st')` with slot `mem_idx` rebound to the (in-place-mutated) handle `h`; on a
+/// trap, return `Error` with `st` untouched and no charge.
+fn t_charge_count(
+  result: Result(Nil, TrapReason),
+  st: InstanceState,
+  mem_idx: Int,
+  h: Dynamic,
+  count: Int,
+) -> Result(InstanceState, TrapReason) {
+  case result {
+    Ok(Nil) -> {
+      rt_meter.charge(count)
+      Ok(rt_state.t_with_mem_at(st, mem_idx, h))
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+// ───────────────────────────── the unchecked fast path (S4 — dead until S15-03 routes it) ─────────────────────────────
+//
+// The Phase-10 lever: `load_unchecked`/`store_unchecked` (+ `t_` twins) skip the bounds compare (a
+// raw deref). SOUND only because the loop-versioning guard has already proved the whole range in
+// bounds before this arm runs (trap-preservation is absolute). On tier-N a bug here is a raw OOB
+// access, which is why the tier is Unsafe-only and the guard is load-bearing. `emit_core` gates
+// `mem == 0` for unchecked, so there are NO `_at` unchecked heads. S15-02 lands these heads green and
+// dead-until-called; S15-03 flips the `emit_core` whitelist so they route.
+
+/// UNCHECKED cell load — `load` MINUS the bounds check/`Result`. Returns the raw bit pattern. Native:
+/// `nif_load_unchecked` (a raw C deref). Fallback: `rt_mem.load_unchecked`.
+pub fn load_unchecked(
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  case nif_available() {
+    True ->
+      nif_load_unchecked(
+        rt_state.mem_at(0),
+        bytes,
+        signed,
+        result_width,
+        addr + offset,
+      )
+    False -> rt_mem.load_unchecked(bytes, signed, result_width, addr, offset)
+  }
+}
+
+/// UNCHECKED cell store — `store` MINUS the bounds check/`Result`. Native: `nif_store_unchecked` (a
+/// raw C write) in place; returns `Nil`. Fallback: `rt_mem.store_unchecked`.
+pub fn store_unchecked(bytes: Int, addr: Int, value: Int, offset: Int) -> Nil {
+  case nif_available() {
+    True -> nif_store_unchecked(rt_state.mem_at(0), bytes, addr + offset, value)
+    False -> rt_mem.store_unchecked(bytes, addr, value, offset)
+  }
+}
+
+/// UNCHECKED threaded load — `t_load` MINUS the bounds check/`Result`. `st` unchanged. Native:
+/// `nif_load_unchecked`. Fallback: `rt_mem.t_load_unchecked`.
+pub fn t_load_unchecked(
+  st: InstanceState,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  case nif_available() {
+    True ->
+      nif_load_unchecked(
+        rt_state.mem(st),
+        bytes,
+        signed,
+        result_width,
+        addr + offset,
+      )
+    False ->
+      rt_mem.t_load_unchecked(st, bytes, signed, result_width, addr, offset)
+  }
+}
+
+/// UNCHECKED threaded store — `t_store` MINUS the bounds check/`Result`. Rebinds the same (in-place-
+/// mutated) handle. Native: `nif_store_unchecked`. Fallback: `rt_mem.t_store_unchecked`.
+pub fn t_store_unchecked(
+  st: InstanceState,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> InstanceState {
+  case nif_available() {
+    True -> {
+      let h = rt_state.mem(st)
+      let _ = nif_store_unchecked(h, bytes, addr + offset, value)
+      rt_state.with_mem(st, h)
+    }
+    False -> rt_mem.t_store_unchecked(st, bytes, addr, value, offset)
+  }
 }

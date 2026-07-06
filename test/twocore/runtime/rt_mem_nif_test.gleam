@@ -25,7 +25,7 @@
 
 import gleam/dynamic
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{Some}
 import gleeunit/should
 import twocore/ir.{MemoryOutOfBounds}
 import twocore/runtime/instance.{type Binding, Nif}
@@ -33,7 +33,7 @@ import twocore/runtime/profiles
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_mem_nif as nif
 import twocore/runtime/rt_meter
-import twocore/runtime/rt_state.{type InstanceState, StateDecl}
+import twocore/runtime/rt_state.{type InstanceState, FullDecl, StateDecl}
 
 /// Page byte length; one fresh page = 65536 bytes.
 const page: Int = 65_536
@@ -53,6 +53,116 @@ fn threaded(min_pages: Int, max_pages: option.Option(Int)) -> InstanceState {
     globals: [],
     table: dynamic.nil(),
   ))
+}
+
+/// A threaded `InstanceState` with TWO independent tier-N memories (indices 0 and 1) for the
+/// cross-memory `copy` differential (mirrors `rt_mem_test.two_mem_state`).
+fn two_mem_threaded(
+  min0: Int,
+  max0: option.Option(Int),
+  min1: Int,
+  max1: option.Option(Int),
+) -> InstanceState {
+  rt_state.fresh_full(
+    FullDecl(
+      mems: [nif.fresh(min0, max0, big_cap), nif.fresh(min1, max1, big_cap)],
+      globals: [],
+      tables: [],
+      ref_globals: [],
+    ),
+  )
+}
+
+// ───────────────────────────── the `cc`-gated real-NIF harness (S6) ─────────────────────────────
+//
+// The native assertions build + `load_nif` the COMMITTED `c_src/twocore_rt_mem_nif.c` at test time
+// through the frozen S15-01 build FFI, then run against the REAL NIF. Absent a C toolchain the whole
+// arm is a CATEGORIZED SKIP (the differential does not run and is not counted as passed) — never a
+// false green (S6). A broken pipe (`{build_error, _}`) is a LOUD panic, never a skip.
+
+/// The `compile_load_cnif/0` result, marshalled from the frozen build FFI (`loaded → Loaded`,
+/// `skip_no_toolchain → SkipNoToolchain`, `{build_error, Bin} → BuildError(String)`).
+type BuildResult {
+  Loaded
+  SkipNoToolchain
+  BuildError(String)
+}
+
+@external(erlang, "twocore_rt_mem_nif_build_ffi", "compile_load_cnif")
+fn compile_load_cnif() -> BuildResult
+
+/// The shim's `nif_available/0`: `true` ONLY when the real `.so` is attached (the stub answers
+/// `false`). Probed directly so a gated test CONFIRMS the native path is live — a silent paged
+/// fallback would make the `nif ≡ paged` differential trivially pass (a false green).
+@external(erlang, "twocore_rt_mem_nif_ffi", "nif_available")
+fn shim_available() -> Bool
+
+/// `erlang:processes/0` — every live process (so each can be GC'd to release unreferenced resources).
+@external(erlang, "erlang", "processes")
+fn all_pids() -> List(dynamic.Dynamic)
+
+/// `erlang:garbage_collect/1` — GC the given process.
+@external(erlang, "erlang", "garbage_collect")
+fn gc_pid(pid: dynamic.Dynamic) -> Bool
+
+/// `timer:sleep/1` — yield so pending resource frees (from just-exited test processes) complete
+/// before a reload retry.
+@external(erlang, "timer", "sleep")
+fn sleep(ms: Int) -> dynamic.Dynamic
+
+/// GC EVERY live process, freeing any nif resource that has become unreferenced. `erlang:load_nif`
+/// refuses to attach (on the build FFI's purge+delete+reload path) while ANY resource from a prior
+/// load is still live — and a gleeunit run spreads them across per-test processes — so a global sweep
+/// is what makes the reload attach.
+fn gc_all() -> Nil {
+  list.each(all_pids(), fn(p) {
+    let _ = gc_pid(p)
+    Nil
+  })
+}
+
+/// Ensure the real NIF is attached: if a prior gated test already attached it (`shim_available()`),
+/// reuse it (no redundant recompile). Otherwise BUILD + LOAD the committed `.c` — first sweeping every
+/// process's unreferenced resources so the reload can attach (see `gc_all`), retrying across a short
+/// yield so any not-yet-freed resource from a just-finished test drains.
+fn ensure_native() -> BuildResult {
+  case shim_available() {
+    True -> Loaded
+    False -> load_clean(4)
+  }
+}
+
+fn load_clean(attempts: Int) -> BuildResult {
+  rt_state.clear()
+  gc_all()
+  case compile_load_cnif() {
+    BuildError(text) ->
+      case attempts > 1 {
+        True -> {
+          let _ = sleep(25)
+          load_clean(attempts - 1)
+        }
+        False -> BuildError(text)
+      }
+    result -> result
+  }
+}
+
+/// Run `body` against the REAL NIF, or categorize a skip when no toolchain is present. On `Loaded` it
+/// asserts `shim_available()` (so the body genuinely exercises native memory, never a false green),
+/// then RELEASES the body's resources (clear the cell + sweep) so a later reload — a subsequent gated
+/// test or the keystone probe test — is not blocked by a resource this test left live.
+fn with_native_nif(body: fn() -> Nil) -> Nil {
+  case ensure_native() {
+    Loaded -> {
+      shim_available() |> should.be_true
+      body()
+      rt_state.clear()
+      gc_all()
+    }
+    SkipNoToolchain -> Nil
+    BuildError(text) -> panic as text
+  }
 }
 
 // ───────────────────────────── 1. Little-endian multi-byte layout (endianness.wast) ─────────────────────────────
@@ -578,16 +688,18 @@ pub fn cell_to_flat_matches_oracle_test() {
 
 // ───────────────────────────── 12. Threaded family (thread the InstanceState record) ─────────────────────────────
 
-// t_store returns a REBOUND record (the skeleton's paged Mem is immutable). Reading through the
-// PRE-store `st` must NOT see the mutation (the value lives only in the rebound record).
-pub fn threaded_store_rebinds_test() {
+// The threaded convention returns a rebound record carrying the state; reading through the RETURNED
+// `st'` sees the store. (Whether the pre-store `st` also observes the write is an IMPLEMENTATION
+// detail — the paged skeleton rebinds a NEW immutable `Mem` so it does not, the native NIF mutates
+// the resource in place so it does — NOT a WASM-spec property, so it is deliberately not asserted;
+// generated threaded code always uses the returned record. D8.)
+pub fn threaded_store_uses_returned_record_test() {
   let st = threaded(1, Some(1))
   let assert Ok(st2) = nif.t_store(st, 8, 5, 0xDEADBEEFCAFEF00D, 0)
-  // The rebound record carries the store.
   nif.t_load(st2, 8, False, 64, 5, 0)
   |> should.equal(Ok(0xDEADBEEFCAFEF00D))
-  // The pre-store record is UNCHANGED (immutable paged handle — a new one was rebound).
-  nif.t_load(st, 8, False, 64, 5, 0) |> should.equal(Ok(0))
+  // A read at an untouched address is still zero (the store touched only [5, 13)).
+  nif.t_load(st2, 4, False, 32, 20, 0) |> should.equal(Ok(0))
 }
 
 // t_load / t_size are read-only (st unchanged).
@@ -712,24 +824,325 @@ pub fn head_compatibility_with_paged_test() {
   |> should.equal(rt_mem.t_load(sp, 4, False, 32, page, 0))
 }
 
-// ───────────────────────────── memory64 (P6-08, §D): fresh64 delegates to the sparse paged core ─────────────────────────────
+// ───────────────────────────── memory64 (P6-08, §D): fresh64 for a TINY BOUNDED 64-bit memory ─────────────────────────────
 //
-// The nif skeleton's `fresh64` delegates to `rt_mem.fresh64` (a paged `Mem`; NOT the native
-// ceiling). The over-cap fail-closed gate lives in unit 09's `validate_binding` (mirroring atomics
-// via `reservation64`); a TINY BOUNDED 64-bit memory delegates to the sparse paged core, which is
-// already 64-bit-correct — so an address past 2^32 round-trips through the delegated `Mem`.
-pub fn fresh64_delegates_to_paged_large_address_test() {
+// A TINY BOUNDED 64-bit memory is the ONLY memory64 shape admissible under tier-N (the native tier
+// RESERVES — it cannot back a 256 TiB sparse memory; an over-cap / unbounded 64-bit `nif` binding is
+// fail-closed rejected at link time via `reservation64`). Here `fresh64` builds such a bounded memory
+// and drives it through the tier-N threaded API — arm-agnostic: native when the `.so` is loaded, the
+// paged delegate otherwise (both byte-identical). Addresses stay within the bounded reservation, so
+// this exercises the 64-bit constructor path (not the > 2^32 sparse address space, which is
+// inadmissible under tier-N by design).
+pub fn fresh64_bounded_roundtrips_test() {
   let cap = rt_mem.mem64_hard_max_pages
-  // fresh64 builds a paged Mem; coerce it back via rt_mem.from_dynamic to drive the pure core.
-  let m = rt_mem.from_dynamic(nif.fresh64(1, None, cap))
-  // Grow past the i32 range (1 → 2^16 + 2 pages), sparse — then round-trip an i64 past 2^32.
-  let #(old, m) = rt_mem.mem_grow(m, 65_537)
-  old |> should.equal(1)
-  let base = 4_294_967_296 + 40
-  let assert Ok(m) = rt_mem.mem_store(m, 8, base, 0x0123456789ABCDEF, 0)
-  rt_mem.mem_load(m, 8, False, 64, base, 0)
+  let st =
+    rt_state.fresh(StateDecl(
+      mem: nif.fresh64(1, Some(3), cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+  nif.t_size(st) |> should.equal(1)
+  let assert Ok(st) = nif.t_store(st, 8, 40, 0x0123456789ABCDEF, 0)
+  nif.t_load(st, 8, False, 64, 40, 0)
   |> should.equal(Ok(0x0123456789ABCDEF))
-  // The delegating fresh64 and rt_mem.fresh64 build a byte-identical handle.
-  rt_mem.to_flat(nif.fresh64(2, Some(3), cap))
-  |> should.equal(rt_mem.to_flat(rt_mem.fresh64(2, Some(3), cap)))
+  // Grow within the bounded max (1 → 3), and a freshly-grown page reads zero and is writable.
+  let #(old, st) = nif.t_grow(st, 2)
+  old |> should.equal(1)
+  nif.t_size(st) |> should.equal(3)
+  nif.t_load(st, 8, False, 64, 2 * page, 0) |> should.equal(Ok(0))
+  // Past the declared max (3): -1, unchanged.
+  let #(r, st) = nif.t_grow(st, 1)
+  r |> should.equal(-1)
+  nif.t_size(st) |> should.equal(3)
+}
+
+// ───────────────────────────── 15. The `cc`-gated REAL-NIF differential (S6/S7 — the load-bearing proof) ─────────────────────────────
+//
+// These run against the COMPILED `c_src/twocore_rt_mem_nif.c` (built + `load_nif`'d via the frozen
+// S15-01 harness); `shim_available()` is asserted true inside `with_native_nif`, so a silent paged
+// fallback cannot false-green the `nif ≡ paged ≡ oracle` equalities. Absent a C toolchain each is a
+// CATEGORIZED SKIP. The assertions are spec-grounded (little-endian, sign-extension, the exact
+// `ea + n <= byte_len` bound, no-wrap, trap-before-write, grow zero-fill) — never change-detectors.
+
+/// The build gate is categorized, never a false green: `Loaded` (cc present) OR `SkipNoToolchain` (cc
+/// absent) — NEVER a `BuildError`. On a cc-absent host this is the test that proves the native arm
+/// SKIPS rather than silently passing (S6). On a cc-present host it confirms `nif_available()` flips
+/// to `true` once the real `.so` is attached.
+pub fn nif_build_gate_is_categorized_test() {
+  // Via `ensure_native` (which REUSES an already-attached NIF rather than forcing a fresh reload):
+  // `erlang:load_nif` fails to attach on a reload while resources from a prior load are still live
+  // (an ERTS constraint on the build FFI's purge+delete+reload path, not a bug in the `.c`), so the
+  // gate is probed through the same reuse the differential uses. On a cc-absent host this drives the
+  // `SkipNoToolchain` (the categorized skip — the point of this test); with `cc` it is `Loaded`.
+  case ensure_native() {
+    Loaded -> shim_available() |> should.be_true
+    SkipNoToolchain -> Nil
+    BuildError(text) -> panic as text
+  }
+}
+
+/// The THREADED per-op differential against the REAL NIF: the exact existing 3-way
+/// `nif ≡ paged ≡ oracle` harness, now forced native. Every random load/store/grow/init step agrees
+/// in value AND trap AND whole byte image with the paged reference and the flat-binary oracle.
+pub fn native_threaded_differential_test() {
+  with_native_nif(fn() {
+    run_differential(150, 0x1234)
+    run_differential(150, 0xBEEF)
+    run_differential(200, 0xC0FFEE)
+  })
+}
+
+/// The CELL per-op differential against the REAL NIF: drives the cell-backed heads
+/// (`store`/`load`/`grow`/`init_data`) through the same randomized trace and holds them
+/// byte-identical to the oracle (exercising the pdict plumbing + in-place mutation).
+pub fn native_cell_differential_test() {
+  with_native_nif(fn() {
+    cell_differential(150, 0x51DE)
+    cell_differential(150, 0xF00D)
+  })
+}
+
+/// Seed the cell with a tier-N memory and drive the cell heads through `count` random ops, holding
+/// the result AND the flat byte image byte-identical to the oracle at every step.
+fn cell_differential(count: Int, seed: Int) -> Nil {
+  rt_meter.reset_fuel()
+  rt_state.seed(StateDecl(
+    mem: nif.fresh(1, Some(2), big_cap),
+    globals: [],
+    table: dynamic.nil(),
+  ))
+  let o = rt_mem.o_fresh(1, Some(2), big_cap)
+  cell_diff_loop(o, seed, count)
+}
+
+fn cell_diff_loop(o: rt_mem.OMem, seed: Int, remaining: Int) -> Nil {
+  case remaining <= 0 {
+    True -> Nil
+    False -> {
+      let #(op, seed) = gen_op(nif.size() * page, seed)
+      let rn = apply_nif_cell(op)
+      let #(o, ro) = apply_oracle(o, op)
+      rn |> should.equal(ro)
+      nif.to_flat(rt_state.mem_get()) |> should.equal(rt_mem.o_flat(o))
+      cell_diff_loop(o, seed, remaining - 1)
+    }
+  }
+}
+
+fn apply_nif_cell(op: Op) -> OpResult {
+  case op {
+    OpLoad(b, s, w, ad, off) -> RLoad(nif.load(b, s, w, ad, off))
+    OpStore(b, ad, v, off) -> RStore(nif.store(b, ad, v, off))
+    OpGrow(d) -> RGrow(nif.grow(d))
+    OpInit(off, bytes) -> RInit(nif.init_data(off, bytes))
+  }
+}
+
+/// The `_at` index-0 twins are byte-identical to the frozen non-indexed heads (H7): the same cell
+/// resource is sourced either way. Cross-checked against the REAL NIF.
+pub fn native_at_index0_equals_head_test() {
+  with_native_nif(fn() {
+    rt_state.seed(StateDecl(
+      mem: nif.fresh(1, Some(3), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+    // store via the `_at` head, read via BOTH the head and the `_at` head — identical.
+    nif.store_at(0, 8, 64, 0x0102030405060708, 0) |> should.equal(Ok(Nil))
+    nif.load(8, False, 64, 64, 0) |> should.equal(Ok(0x0102030405060708))
+    nif.load_at(0, 8, False, 64, 64, 0) |> should.equal(Ok(0x0102030405060708))
+    nif.size_at(0) |> should.equal(nif.size())
+    nif.grow_at(0, 1) |> should.equal(1)
+    nif.size_at(0) |> should.equal(2)
+    nif.size() |> should.equal(2)
+    // init_data_at index 0 ≡ init_data.
+    nif.init_data_at(0, 100, <<0xDE, 0xAD>>) |> should.equal(Ok(Nil))
+    nif.load(1, False, 32, 100, 0) |> should.equal(Ok(0xDE))
+  })
+}
+
+/// The two-memory `copy` (a CROSS-RESOURCE `memmove` in C): copy a run from memory 1 to memory 0,
+/// held byte-identical to the paged two-memory reference on BOTH memories; an OOB copy traps
+/// (trap-before-write). Exercises `enif_get_resource` validating BOTH handles.
+pub fn native_cross_memory_copy_test() {
+  with_native_nif(fn() {
+    let sn = two_mem_threaded(1, Some(1), 1, Some(1))
+    let sp =
+      rt_state.fresh_full(
+        FullDecl(
+          mems: [
+            rt_mem.fresh(1, Some(1), big_cap),
+            rt_mem.fresh(1, Some(1), big_cap),
+          ],
+          globals: [],
+          tables: [],
+          ref_globals: [],
+        ),
+      )
+    // Seed memory 1 identically in both.
+    let assert Ok(sn) = nif.t_init_data_at(sn, 1, 0, <<0xDE, 0xAD, 0xBE, 0xEF>>)
+    let assert Ok(sp) =
+      rt_mem.t_init_data_at(sp, 1, 0, <<0xDE, 0xAD, 0xBE, 0xEF>>)
+    // Copy 4 bytes from memory 1 (src) to memory 0 (dst) at address 10.
+    let assert Ok(sn) = nif.t_copy(sn, 0, 1, 10, 0, 4)
+    let assert Ok(sp) = rt_mem.t_copy(sp, 0, 1, 10, 0, 4)
+    nif.to_flat(rt_state.t_mem_at(sn, 0))
+    |> should.equal(rt_mem.to_flat(rt_state.t_mem_at(sp, 0)))
+    nif.to_flat(rt_state.t_mem_at(sn, 1))
+    |> should.equal(rt_mem.to_flat(rt_state.t_mem_at(sp, 1)))
+    nif.t_load_at(sn, 0, 4, False, 32, 10, 0) |> should.equal(Ok(0xEFBEADDE))
+    // Memory 1 (the source) is untouched.
+    nif.t_load_at(sn, 1, 4, False, 32, 0, 0) |> should.equal(Ok(0xEFBEADDE))
+    // An OOB copy traps and mutates nothing.
+    let before = nif.to_flat(rt_state.t_mem_at(sn, 0))
+    nif.t_copy(sn, 0, 1, page - 2, 0, 4)
+    |> should.equal(Error(MemoryOutOfBounds))
+    nif.to_flat(rt_state.t_mem_at(sn, 0)) |> should.equal(before)
+  })
+}
+
+/// The bulk ops (`fill`/`copy` same-memory/`init`) and their traps, held byte-identical to the
+/// oracle against the REAL NIF; an OOB op mutates nothing.
+pub fn native_bulk_fill_copy_init_test() {
+  with_native_nif(fn() {
+    rt_meter.reset_fuel()
+    rt_state.seed(StateDecl(
+      mem: nif.fresh(1, Some(1), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+    let o = rt_mem.o_fresh(1, Some(1), big_cap)
+    nif.fill(0, 8, 0x77, 4) |> should.equal(Ok(Nil))
+    let assert Ok(o) = rt_mem.o_fill(o, 8, 0x77, 4)
+    nif.init(0, <<1, 2, 3, 4>>, 20, 0, 4) |> should.equal(Ok(Nil))
+    let assert Ok(o) = rt_mem.o_init(o, <<1, 2, 3, 4>>, 20, 0, 4)
+    // Same-memory copy (overlapping-safe memmove).
+    nif.copy(0, 0, 22, 20, 4) |> should.equal(Ok(Nil))
+    let assert Ok(o) = rt_mem.o_copy(o, o, 22, 20, 4)
+    nif.to_flat(rt_state.mem_get()) |> should.equal(rt_mem.o_flat(o))
+    // A dropped/ε segment `init` with count > 0 traps.
+    nif.init(0, <<>>, 0, 0, 1) |> should.equal(Error(MemoryOutOfBounds))
+    // OOB fill traps with zero mutation.
+    nif.fill(0, page - 2, 0xFF, 4) |> should.equal(Error(MemoryOutOfBounds))
+    nif.to_flat(rt_state.mem_get()) |> should.equal(rt_mem.o_flat(o))
+  })
+}
+
+/// The SIMD byte seam (`load_bytes`/`store_bytes`) against the REAL NIF: a 16-byte run round-trips
+/// and matches the oracle; OOB traps (trap-before-write on the store).
+pub fn native_simd_bytes_test() {
+  with_native_nif(fn() {
+    rt_state.seed(StateDecl(
+      mem: nif.fresh(1, Some(1), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+    let o = rt_mem.o_fresh(1, Some(1), big_cap)
+    let v = <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>
+    nif.store_bytes(32, v, 0) |> should.equal(Ok(Nil))
+    let assert Ok(o) = rt_mem.o_store_bytes(o, 32, v, 0)
+    nif.load_bytes(32, 0, 16) |> should.equal(Ok(v))
+    nif.load_bytes(32, 0, 16) |> should.equal(rt_mem.o_load_bytes(o, 32, 0, 16))
+    nif.to_flat(rt_state.mem_get()) |> should.equal(rt_mem.o_flat(o))
+    // OOB store_bytes traps and mutates nothing.
+    let before = nif.to_flat(rt_state.mem_get())
+    nif.store_bytes(page - 8, v, 0) |> should.equal(Error(MemoryOutOfBounds))
+    nif.to_flat(rt_state.mem_get()) |> should.equal(before)
+    // OOB load_bytes traps.
+    nif.load_bytes(page - 8, 0, 16) |> should.equal(Error(MemoryOutOfBounds))
+  })
+}
+
+/// The UNCHECKED fast path against the REAL NIF: for IN-BOUNDS accesses (the only sound domain — the
+/// Phase-10 guard proves the range in bounds before the unchecked arm runs) the unchecked value
+/// equals the unwrapped checked value, including sub-word sign-extension.
+pub fn native_unchecked_matches_checked_in_bounds_test() {
+  with_native_nif(fn() {
+    rt_state.seed(StateDecl(
+      mem: nif.fresh(1, Some(1), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+    // Cell unchecked store/load round-trips and equals the checked path.
+    nif.store_unchecked(4, 100, 0x04030201, 0)
+    nif.load_unchecked(4, False, 32, 100, 0) |> should.equal(0x04030201)
+    let assert Ok(checked) = nif.load(4, False, 32, 100, 0)
+    nif.load_unchecked(4, False, 32, 100, 0) |> should.equal(checked)
+    // Signed sub-word sign-extension holds on the unchecked path too (result_width disambiguates).
+    nif.store_unchecked(1, 200, 0x80, 0)
+    nif.load_unchecked(1, True, 32, 200, 0) |> should.equal(0xFFFFFF80)
+    nif.load_unchecked(1, True, 64, 200, 0)
+    |> should.equal(0xFFFFFFFFFFFFFF80)
+    // Threaded unchecked twins.
+    let st = threaded(1, Some(1))
+    let st = nif.t_store_unchecked(st, 8, 300, 0x1122334455667788, 0)
+    nif.t_load_unchecked(st, 8, False, 64, 300, 0)
+    |> should.equal(0x1122334455667788)
+  })
+}
+
+/// Spec-cited edge vectors against the REAL NIF (differential, not goldens): sign-extension, the
+/// exact bound, no-wrap, trap-before-write, and grow zero-fill.
+pub fn native_edge_vectors_test() {
+  with_native_nif(fn() {
+    let st = threaded(1, Some(2))
+    // i32.load8_s of 0x80 → 0xFFFFFF80; i64.load8_s → 0xFF..80.
+    let assert Ok(st) = nif.t_store(st, 1, 0, 0x80, 0)
+    nif.t_load(st, 1, True, 32, 0, 0) |> should.equal(Ok(0xFFFFFF80))
+    nif.t_load(st, 1, True, 64, 0, 0) |> should.equal(Ok(0xFFFFFFFFFFFFFF80))
+    // The exact bound: a load ending AT byte_len succeeds; one byte past traps.
+    nif.t_load(st, 4, False, 32, page - 4, 0) |> should.equal(Ok(0))
+    nif.t_load(st, 4, False, 32, page - 3, 0)
+    |> should.equal(Error(MemoryOutOfBounds))
+    // No-wrap: addr = 0xFFFFFFFF + a large offset traps (never wraps to a small ea).
+    nif.t_load(st, 4, False, 32, 0xFFFFFFFF, 100)
+    |> should.equal(Error(MemoryOutOfBounds))
+    // Trap-before-write: a straddling store leaves the buffer unchanged.
+    let assert Ok(st) = nif.t_store(st, 4, page - 4, 0xAABBCCDD, 0)
+    let before = nif.to_flat(rt_state.mem(st))
+    nif.t_store(st, 4, page - 2, 0x11223344, 0)
+    |> should.equal(Error(MemoryOutOfBounds))
+    nif.to_flat(rt_state.mem(st)) |> should.equal(before)
+    // grow returns prev pages and exposes zero-filled pages; -1 past the max.
+    let #(old, st) = nif.t_grow(st, 1)
+    old |> should.equal(1)
+    nif.t_load(st, 8, False, 64, page, 0) |> should.equal(Ok(0))
+    let #(r, _st) = nif.t_grow(st, 1)
+    r |> should.equal(-1)
+  })
+}
+
+/// grow charges `delta * page_bytes` fuel Gleam-side ONLY on success (`prev != -1`) against the REAL
+/// NIF — a failed grow charges nothing (metering parity with the paged reference).
+pub fn native_grow_charges_fuel_only_on_success_test() {
+  with_native_nif(fn() {
+    rt_meter.reset_fuel()
+    rt_state.seed(StateDecl(
+      mem: nif.fresh(1, Some(4), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+    nif.grow(2) |> should.equal(1)
+    rt_meter.fuel_consumed() |> should.equal(2 * page)
+    // A failed grow (past max) charges nothing.
+    nif.grow(100) |> should.equal(-1)
+    rt_meter.fuel_consumed() |> should.equal(2 * page)
+  })
+}
+
+/// ABI atom round-trip (guards the frozen term shapes): `{ok, nil}` decodes to `Ok(Nil)`,
+/// `{error, memory_out_of_bounds}` to `Error(MemoryOutOfBounds)`, `{ok, V}` to `Ok(V)` — so an atom
+/// drift between the C and the Gleam-compiled constructor is caught here, not mis-decoded silently.
+pub fn native_abi_atom_roundtrip_test() {
+  with_native_nif(fn() {
+    rt_state.seed(StateDecl(
+      mem: nif.fresh(1, Some(1), big_cap),
+      globals: [],
+      table: dynamic.nil(),
+    ))
+    nif.store(4, 0, 0x04030201, 0) |> should.equal(Ok(Nil))
+    nif.store(4, page, 0, 0) |> should.equal(Error(MemoryOutOfBounds))
+    nif.load(4, False, 32, 0, 0) |> should.equal(Ok(0x04030201))
+    nif.load(4, False, 32, page, 0) |> should.equal(Error(MemoryOutOfBounds))
+  })
 }
