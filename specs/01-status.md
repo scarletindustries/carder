@@ -283,7 +283,7 @@ src/twocore/runtime/porffor_abi.gleam     pure Porffor (f64,i32) typed-value ABI
 
 Docs (measured writeups, kept): `docs/phase-{3,4,9,10}-benchmark.md` (phase-4 now carries the measured
 `nif` tier-N column), `docs/phase-{5,6,13,14}-surface.md`, `docs/phase-15-tier-n.md`,
-`docs/js-on-the-beam.md`, `docs/wasm-conformance.svg`.
+`docs/wasm-conformance.svg`.
 
 ---
 
