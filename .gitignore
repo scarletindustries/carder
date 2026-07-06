@@ -33,3 +33,10 @@ erl_crash.dump
 !/test/twocore/conformance/fixtures/eh/*.wasm
 # macOS Finder metadata
 .DS_Store
+
+# Phase-15 tier-N C NIF build artifacts — anchored to the in-tree build location ONLY, so a future
+# committed priv/*.so from the packaging follow-on is NOT silently ignored (the follow-on git add -f's
+# if these ever widen). The test-time build compiles under $TMPDIR (outside the repo) and is never staged.
+/c_src/*.so
+/c_src/*.dylib
+/c_src/*.o

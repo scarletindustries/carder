@@ -48,13 +48,21 @@ paged-delegate fallback** is kept when the `.so` isn't loaded (preserves bare-BE
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«NIF-BUILD-FROZEN»` — `c_src/twocore_rt_mem_nif.h` resource-struct + op ABI (nif_-prefixed, combined `Ea`, 16 exports incl. `nif_ping`+`nif_available`), the `src/twocore_rt_mem_nif_ffi.erl` shim export table + `on_load`/`.so`-name convention, and the `test/twocore_rt_mem_nif_build_ffi.erl` `cc`-gated compile+`load_nif` harness — proven live by a `nif_ping` NIF compiling+loading on CI gcc + macOS clang. `rt_mem_nif.gleam` stays the byte-identical paged-delegate at this unit | S15-01 | `unclaimed` | S15-02, S15-03, S15-04, S15-05 |
+| `«NIF-BUILD-FROZEN»` — `c_src/twocore_rt_mem_nif.h` resource-struct + op ABI (nif_-prefixed, combined `Ea`, 16 exports incl. `nif_ping`+`nif_available`), the `src/twocore_rt_mem_nif_ffi.erl` shim export table + `on_load`/`.so`-name convention, and the `test/twocore_rt_mem_nif_build_ffi.erl` `cc`-gated compile+`load_nif` harness — proven live by a `nif_ping` NIF compiling+loading on CI gcc + macOS clang. `rt_mem_nif.gleam` stays the byte-identical paged-delegate at this unit | S15-01 | **FROZEN ✓ (S15-01)** | S15-02, S15-03, S15-04, S15-05 |
+
+**`«NIF-BUILD-FROZEN»` — the four frozen surfaces S15-02..05 bind to (proven live, macOS clang OTP 29 / erts 17.0.2):**
+1. **Resource ABI** — `c_src/twocore_rt_mem_nif.h`: `twocore_mem_t { size_t byte_len; size_t max_bytes; unsigned char data[]; }` (reserved buffer, moving watermark, never realloc'd) + resource-type name `"twocore_rt_mem_nif_resource"`.
+2. **Shim export table** — `src/twocore_rt_mem_nif_ffi.erl`: 16 `nif_`-prefixed exports (`nif_ping/0`, `nif_available/0` [stub returns `false`], + the 14 op stubs incl. the stubbed `nif_load_unchecked/5`+`nif_store_unchecked/4`), each op-stub `erlang:nif_error(nif_not_loaded)`; combined-`Ea` argument shape (Gleam computes `ea=addr+offset` no-wrap bignum, C never re-adds).
+3. **`.so`/`load_nif`/`ERL_NIF_INIT` convention** — `.so` basename `twocore_rt_mem_nif`; `ERL_NIF_INIT` module atom = the shim = **`twocore_rt_mem_nif_ffi`** (NOT `twocore_rt_mem_nif`); `-on_load` resolves via `TWOCORE_RT_MEM_NIF_SO` env override → `priv/twocore_rt_mem_nif`, soft-`ok`.
+4. **Build-gate signature** — `test/twocore_rt_mem_nif_build_ffi.erl`: `which/1`, `cc/0` (cc→gcc), `compile_load_probe/0` (embedded `nif_ping`), `compile_load_cnif/0` (the committed `.c`, for S15-02) → `loaded | skip_no_toolchain | {build_error, Bin}`. **Frozen `erts_include/0` resolver** (candidate list: `erts-<vsn>/include` → `usr/include` → `filename:join(code:lib_dir(erts),"include")`; the bare `code:lib_dir(erts,include)` is header-less on homebrew OTP 29) + **`os:type()` cflags**: common `-shared -fPIC -O2 -I<inc>`, `{unix,darwin}` **MANDATORY `-undefined dynamic_lookup`**, `{unix,linux}` nothing extra.
+
+Live proof this host: `cc -shared -fPIC -O2 -undefined dynamic_lookup -I/opt/homebrew/Cellar/erlang/29.0.2/lib/erlang/erts-17.0.2/include -o <tmp>/twocore_rt_mem_nif.so <tmp>/twocore_rt_mem_nif.c` → `load_nif` attaches → `compile_load_probe()=loaded`, `nif_ping()=pong`, `nif_available()=false` (stub). Without `-undefined dynamic_lookup`: `ld: Undefined symbols … _enif_make_atom` (the frozen macOS gotcha, confirmed).
 
 ### Units
 
 | Unit | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|
-| **S15-01** Keystone: freeze the native toolchain path (`nif_ping`) | `unclaimed` | — | `«NIF-BUILD-FROZEN»`; the shim + build-gate proven to compile+load on gcc + clang; `rt_mem_nif.gleam` untouched (byte-identical). |
+| **S15-01** Keystone: freeze the native toolchain path (`nif_ping`) | **done (keystone)** | — | `«NIF-BUILD-FROZEN»`; the shim + build-gate proven to compile+load on gcc + clang; `rt_mem_nif.gleam` untouched (byte-identical). |
 | **S15-02** Native backend (C core + Gleam `@external`, the heart) | `unclaimed` | `«NIF-BUILD-FROZEN»` | `c_src/twocore_rt_mem_nif.c` (checked ops, LE, overflow-safe memory64 bounds = the security boundary) + `rt_mem_nif.gleam` swapped to `@external` **with the paged-delegate fallback when unloaded**; per-op nif≡paged≡oracle differential (gated on `cc`). Includes the `*_unchecked` heads. |
 | **S15-03** Unchecked fast path wiring | `unclaimed` | S15-02 | One-line `emit_core.mem_supports_unchecked` `Nif` whitelist add + flip `emit_unchecked_test` (nif emits unchecked, not falls-back). |
 | **S15-04** Node-safety fuzz + full `cell_nif` matrix | `unclaimed` | S15-02 | C bounds-check fuzz (incl. 64-bit-address vectors + cross-resource copy) proving no host escape; `combos.cell_nif` exercises native; the 4 Safe-forbidden gates + `--link` exclusion re-confirmed. |
@@ -63,6 +71,8 @@ paged-delegate fallback** is kept when the `.so` isn't loaded (preserves bare-BE
 ### Landing log
 
 _(one line per landing: `unit — N tests (was M, +K), conformance p/s/f, 0 warnings, format clean, byte-identical`)_
+
+- S15-01 keystone — 2082 tests (was 2080, +2: the `nif_ping` compile+load proof + the gate-categorization test), conformance 47734/683/0, 0 warnings, format clean, `rt_mem_nif.gleam` byte-identical. `«NIF-BUILD-FROZEN»` proven live on macOS clang: `nif_ping` compiled + `load_nif` attached + returned `pong`. The `c_src/*.c` (S15-02) is NOT built; only the embedded probe `.c` compiles this unit.
 
 ---
 
