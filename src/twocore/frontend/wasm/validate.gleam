@@ -989,6 +989,37 @@ fn validate_instr(
       use st3 <- result.try(pop_vals(st2, sig.params))
       Ok(push_vals(st3, sig.results))
     }
+    // ── Phase-13 tail calls (Q3) — CONSERVATIVE-SOUND PLACEHOLDER (Q13-03 completes with the spec
+    // RESULT-TYPE EQUALITY check + the `assert_invalid` rejection tests). Per the WASM tail-call
+    // proposal, `return_call`/`return_call_indirect` pop the callee's params (indirect also pops an
+    // i32 index and requires the target table to hold `funcref`), then are STACK-POLYMORPHIC like
+    // `return` — so the keystone lands the `return`-shape operand typing (pop params + push nothing
+    // + `mark_unreachable`) MINUS the result-equality check. This is sound for every VALID module
+    // (correct operand consumption + `return`-shape polymorphism); Q13-03 adds `sig.results ==
+    // <function frame end_types>` (else the existing `TypeMismatch`) so callee-results ≠
+    // function-results are rejected. The lenient-on-invalid gap is never exercised until then. ──
+    ast.ReturnCall(f) -> {
+      use sig <- result.try(case nth(ctx.func_types, f) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error(UnknownFunc(f))
+      })
+      use st2 <- result.try(pop_vals(st, sig.params))
+      mark_unreachable(st2)
+    }
+    ast.ReturnCallIndirect(type_idx, table) -> {
+      use sig <- result.try(case nth(ctx.types, type_idx) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error(UnknownType(type_idx))
+      })
+      use #(ref_ty, _) <- result.try(table_entry(ctx, table))
+      use _ <- result.try(case ref_ty {
+        ast.FuncRef -> Ok(Nil)
+        _ -> Error(RefTypeMismatch)
+      })
+      use st2 <- result.try(pop_expect(st, ast.I32))
+      use st3 <- result.try(pop_vals(st2, sig.params))
+      mark_unreachable(st3)
+    }
 
     // parametric ----------------------------------------------------------------
     ast.Drop -> {

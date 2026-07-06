@@ -149,6 +149,13 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
     | ir.SimdLoadLane(..)
     | ir.SimdStoreLane(..)
     | ir.CallImport(..)
+    | // Phase-13 tail-call nodes carry only `Value` operands (no sub-`Expr`), so like the leaves
+      // they return unchanged from this `Expr`-traversal combinator. They are barriers
+      // (`ir/effect`), so no pass hoists across them; a pass that rewrites their `Value` operands
+      // does so in its own per-node arm, not here.
+      ir.ReturnCall(..)
+    | ir.ReturnCallIndirect(..)
+    | ir.ReturnCallImport(..)
     | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`), so like the leaves
       // they return unchanged. They are barriers (`ir/effect`), so no pass hoists across them.
       ir.Throw(..)

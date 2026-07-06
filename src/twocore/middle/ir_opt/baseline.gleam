@@ -985,6 +985,20 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
       )
     ir.CallImport(slot, ty, cargs) ->
       ir.CallImport(slot, ty, subst_values(cargs, subs))
+    // ── Phase-13 tail calls: substitute into their `Value` operands (the indirect `index` + the
+    // args); the `fn_name`/`table`/`slot`/`ty` are static. Value-only bottom transfers, like
+    // `CallImport`/`CallIndirect`. ──
+    ir.ReturnCall(fn_name, cargs) ->
+      ir.ReturnCall(fn_name, subst_values(cargs, subs))
+    ir.ReturnCallIndirect(table, index, ty, cargs) ->
+      ir.ReturnCallIndirect(
+        table,
+        subst_value(index, subs),
+        ty,
+        subst_values(cargs, subs),
+      )
+    ir.ReturnCallImport(slot, ty, cargs) ->
+      ir.ReturnCallImport(slot, ty, subst_values(cargs, subs))
     // ── Phase-7 EH nodes: substitute their `Value` operands (the tag NAME is static); `Try`
     // recurses into its body + each handler's inline handler expression. Byte-neutral (no
     // Phase-1..6 module has these nodes). ──
@@ -1132,6 +1146,12 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.SimdStoreLane(_, _, addr, _, _, vec) ->
       list.append(value_name(addr), value_name(vec))
     ir.CallImport(_, _, args) -> values_names(args)
+    // ── Phase-13 tail calls: collect the `Var` names in their `Value` operands (the indirect
+    // `index` + the args), like `CallImport`/`CallIndirect`. ──
+    ir.ReturnCall(_, args) -> values_names(args)
+    ir.ReturnCallIndirect(_, index, _, args) ->
+      list.append(value_name(index), values_names(args))
+    ir.ReturnCallImport(_, _, args) -> values_names(args)
     // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions (the tag
     // NAME is static). Over-approximating (including handler binders) is safe for liveness —
     // names are function-unique. Byte-neutral (no Phase-1..6 module has these nodes). ──

@@ -60,10 +60,10 @@ import twocore/ir.{
   DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
   Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad,
   MemLoadUnchecked, MemSize, MemStore, MemStoreUnchecked, Num, NumTerm, RefFunc,
-  RefIsNull, Return, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
-  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
-  TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS,
-  TruncU, Try, Values,
+  RefIsNull, Return, ReturnCall, ReturnCallImport, ReturnCallIndirect, Simd,
+  SimdLoad, SimdLoadLane, SimdShuffle, SimdStore, SimdStoreLane, Switch,
+  TableCopy, TableFill, TableGet, TableGrow, TableInit, TableSet, TableSize,
+  TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS, TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -144,6 +144,16 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     | // Phase-6 imported-function CALL (S5/S7): a call is a barrier (it may read/write any
       // state and trap) — classified like `CallDirect`/`CallHost`.
       CallImport(_, _, _)
+    | // ── Phase-13 tail calls (Q1/Q2): ALL THREE tail-call nodes are barriers. Like
+      // `Return`/`Trap`/`CallImport`, a tail call is a non-local control transfer to arbitrary
+      // callee code that also may read/write any state and trap — so it is NEVER reordered,
+      // hoisted, CSE'd, duplicated, or eliminated (doing so would add/remove/relocate an effect or
+      // a trap, an F2 observable). Since the `case` is exhaustive, OMITTING any tail-call node
+      // fails to compile (fail-closed, D4). The deep `classify`/`can_cse`/`can_eliminate_if_unused`
+      // derive `Effectful`/`False`/`False` from this arm. They carry only `Value` operands.
+      ReturnCall(_, _)
+    | ReturnCallIndirect(_, _, _, _)
+    | ReturnCallImport(_, _, _)
     | // ── Phase-7 exception handling (J5/T1): ALL THREE EH nodes are barriers. `Throw`/`ThrowRef`
       // are non-local control transfers that RAISE (like `Trap`/`Return`) — never reorder, hoist,
       // duplicate, or eliminate (they add/remove an exception, an F2 observable). `Try` establishes

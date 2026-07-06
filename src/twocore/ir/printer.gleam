@@ -868,6 +868,29 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_functype(ty)
       <> " "
       <> value_list(args)
+    // ── Phase-13 tail calls (Q1/Q2, D5). No Phase-1..12 module contains these, so any spelling is
+    // conformance-neutral by construction; the keystone makes it the LOSSLESS round-trip spelling
+    // (`parser.parse_expr` reads it back — proven by the freeze test's D5 round-trip). Each reuses
+    // the frozen `value_list`/`print_value`/`print_functype` helpers so the spelling cannot drift
+    // from `call`/`call_indirect`/`call_import`. ──
+    ir.ReturnCall(fn_name, args) ->
+      "return_call @" <> fn_name <> " " <> value_list(args)
+    ir.ReturnCallIndirect(table, index, ty, args) ->
+      "return_call_indirect @"
+      <> table
+      <> " ["
+      <> print_value(index)
+      <> "] : "
+      <> print_functype(ty)
+      <> " "
+      <> value_list(args)
+    ir.ReturnCallImport(slot, ty, args) ->
+      "return_call_import "
+      <> int.to_string(slot)
+      <> " : "
+      <> print_functype(ty)
+      <> " "
+      <> value_list(args)
     // ── Phase-7 EH nodes (J2/T1). No Phase-1..6 module contains these, so any spelling is
     // conformance-neutral by construction; P7-02 makes it the round-trip spelling. ──
     ir.Throw(tag, args) -> "throw @" <> tag <> " " <> value_list(args)

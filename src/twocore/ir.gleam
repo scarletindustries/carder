@@ -758,6 +758,48 @@ pub type Expr {
   /// CAPABILITY, never an ambient `apply` of a data-named `module:atom` (D3a). Effectful (it is a
   /// call — §effect). No Phase-1..5 module produces this node; P6-05 lowers imported calls to it.
   CallImport(slot: Int, ty: FuncType, args: List(Value))
+  // ── Phase-13 tail calls (Q1/Q2) — three effectful BOTTOM-TRANSFER barriers, each a sibling of
+  // `Return` (control leaves; the rest of the block is unreachable) AND of `CallImport`
+  // (Value-only, capability dispatch). Each carries ONLY `Value` operands (no sub-`Expr`), so it
+  // is a LEAF in every traversal and a barrier in `ir/effect` — never reordered, hoisted, CSE'd,
+  // duplicated, or eliminated (like `Return`/`Trap`/`CallImport`). No new `TrapReason`: the
+  // indirect guards reuse the existing element/type reasons, and "call stack exhausted" is not a
+  // WASM trap (Q8). No Phase-1..12 module produces these; `lower` (Q13-04) mints them from the new
+  // `return_call`/`return_call_indirect` opcodes (Q13-02), so they are inert-by-default (Q6). ──
+  /// A DIRECT tail call to same-module function `fn_name` (WASM `return_call $f`). BOTTOM: transfers
+  /// control to the callee whose results BECOME this function's results, so the rest of the block is
+  /// unreachable (exactly like `Return`). Carries only `Value` `args` (a leaf in every traversal);
+  /// an effectful barrier (§effect). `emit_core` (Q13-05) emits it as a GENUINE BEAM tail call — the
+  /// direct-call logic forced under `KReturn` — so cross-function tail recursion runs in CONSTANT
+  /// stack. Only `lower` of a `return_call` to a DEFINED function produces this node (a
+  /// `return_call` to an import produces `ReturnCallImport`). The result-type equality rule (Q13-03
+  /// validation) guarantees the callee's results equal the caller's, so the transfer is value-typed.
+  ReturnCall(fn_name: String, args: List(Value))
+  /// An INDIRECT tail call through `table` at `index`, type-checked against `ty` (WASM
+  /// `return_call_indirect`). BOTTOM: the selected callee's results become this function's results
+  /// (like `Return`). Carries only `Value` operands (`index` + `args`); an effectful barrier
+  /// (§effect). `emit_core` (Q13-05) emits the lookup seam then TAIL-APPLIES the returned target in
+  /// the ok-arm — the SAME three fail-closed guards, the same traps (`UndefinedElement` →
+  /// `UninitializedElement` → `IndirectCallTypeMismatch`), and the same order as `CallIndirect`, but
+  /// in constant stack. `table` is the table NAME (resolved to an absolute tableidx by `emit_core`);
+  /// `ty` is the call-site `FuncType` that guard 3 matches structurally.
+  ReturnCallIndirect(
+    table: String,
+    index: Value,
+    ty: FuncType,
+    args: List(Value),
+  )
+  /// A tail call to an IMPORTED function by its positional func-import `slot` (WASM `return_call $f`
+  /// where `f` resolves to an import). BOTTOM: the import's results become this function's results
+  /// (like `Return`). Carries only `Value` `args`; an effectful barrier (§effect). `emit_core`
+  /// (Q13-05) reads the linker-built closure from the instance's func-import `slot` and TAIL-APPLIES
+  /// `link.call_import(closure, args)` under `KReturn` (D3a — a handed-in capability, never an
+  /// ambient `apply`); value-correct with a bounded caller frame (cross-module constant-stack tail
+  /// recursion through imports is a documented honest-scope sub-case, Q8). Distinct from `ReturnCall`
+  /// (a same-module `apply`) for a clean per-node emit path (mirrors the existing
+  /// `CallImport` ≠ `CallDirect` split). `slot` counts function imports only (the low funcidx range);
+  /// `ty` is the import's declared signature.
+  ReturnCallImport(slot: Int, ty: FuncType, args: List(Value))
   // ── Phase-7 exception handling (J1/J2, INLINE-HANDLER shaped — T1) — three effectful barriers.
   // A generic structured-exception model (throw a value / guard-and-catch by class / re-raise a
   // handle), NOT WASM opcodes (D6). The IR is binary-encoding-neutral: the LEGACY `try/catch`

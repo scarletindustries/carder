@@ -585,8 +585,19 @@ pub type Instr {
   Call(func: Int)
   // 0x10
   CallIndirect(type_idx: Int, table: Int)
-
   // 0x11
+  /// `return_call $f` (0x12, WASM tail-call proposal). Immediate: one u32 funcidx —
+  /// IDENTICAL to `Call`. A BOTTOM transfer (stack-polymorphic like `Return`): the callee's
+  /// results become the current function's results. The keystone (Q13-01) adds only the
+  /// constructor; **Q13-02 owns the 0x12 decode + the `return_call` WAT keyword.**
+  ReturnCall(func: Int)
+  /// `return_call_indirect (type $t) $tbl` (0x13, WASM tail-call proposal). Immediates: a u32
+  /// typeidx THEN a u32 tableidx — IDENTICAL to `CallIndirect` (field naming ANTI-SWAP:
+  /// `type_idx` before `table`). A BOTTOM transfer (stack-polymorphic like `Return`). The
+  /// keystone adds only the constructor; **Q13-02 owns the 0x13 decode + the
+  /// `return_call_indirect` WAT keyword.**
+  ReturnCallIndirect(type_idx: Int, table: Int)
+
   // --- parametric (0x1A..0x1B) ---
   Drop
   // 0x1A

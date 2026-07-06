@@ -38,7 +38,12 @@ pub fn may_clobber(e: Expr, f: Footprint) -> Bool {
     | ir.CallIndirect(_, _, _, _)
     | ir.CallHost(_, _, _)
     | ir.CallImport(_, _, _)
-    | ir.CallClosure(_, _) -> True
+    | ir.CallClosure(_, _)
+    | // Phase-13 tail calls: a tail call is a call — it may write any memory in the callee, so it
+      // clobbers any footprint, exactly like `CallImport`. ──
+      ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _) -> True
     // sequencing / structured control: clobbers iff any sub-expression clobbers.
     ir.Let(_, rhs, body) -> may_clobber(rhs, f) || may_clobber(body, f)
     ir.Charge(_, body) -> may_clobber(body, f)
@@ -77,6 +82,12 @@ pub fn may_write_memory(e: Expr) -> Bool {
     | ir.CallHost(_, _, _)
     | ir.CallImport(_, _, _)
     | ir.CallClosure(_, _)
+    | // Phase-13 tail calls: a tail call both may write any memory (a call) AND transfers control
+      // non-locally out of the region (a bottom transfer, like `Return`) — a DSE look-through must
+      // stop here on both counts. ──
+      ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _)
     | // a non-local control transfer could exit before a later store, so a DSE look-through must
       // stop here (a store BEFORE such a transfer might be the last write on that path).
       ir.Break(_, _)

@@ -235,6 +235,13 @@ fn lower_expr(
     | ir.SimdLoadLane(_, _, _, _, _, _)
     | ir.SimdStoreLane(_, _, _, _, _, _)
     | ir.CallImport(_, _, _)
+    | // Phase-13 tail-call nodes carry only `Value` operands (no sub-`Expr`, no `CallHost`, no
+      // `Loop`), so this CallHost-gate + Loop-meter pass leaves them unchanged and charges NOTHING
+      // (metering stays identical to an ordinary call — `Charge` is fn-entry + loop body only,
+      // never per call, Q8). They are bottom transfers, not `CallHost`s (no capability-policy gate).
+      ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _)
     | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`, no `CallHost`, no
       // `Loop`), so this CallHost-gate + Loop-meter pass leaves them unchanged.
       ir.Throw(_, _)

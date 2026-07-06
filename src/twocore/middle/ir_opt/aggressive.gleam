@@ -639,6 +639,20 @@ fn apply_rename_subst(
       )
     ir.CallImport(slot, ty, cargs) ->
       ir.CallImport(slot, ty, rs_values(cargs, rename, subst))
+    // ── Phase-13 tail calls: rewrite their `Value` operands (the indirect `index` + the args);
+    // the `fn_name`/`table`/`slot`/`ty` are static. Value-only bottom transfers, like
+    // `CallImport`/`CallIndirect`. Never CSE/hoist/DCE across them (barriers, from `effect`). ──
+    ir.ReturnCall(fn_name, cargs) ->
+      ir.ReturnCall(fn_name, rs_values(cargs, rename, subst))
+    ir.ReturnCallIndirect(table, index, ty, cargs) ->
+      ir.ReturnCallIndirect(
+        table,
+        rs_value(index, rename, subst),
+        ty,
+        rs_values(cargs, rename, subst),
+      )
+    ir.ReturnCallImport(slot, ty, cargs) ->
+      ir.ReturnCallImport(slot, ty, rs_values(cargs, rename, subst))
     // ── Phase-7 EH nodes: rewrite their `Value` operands (the tag NAME is static). `Try`
     // recurses into its body + each handler's inline handler expression (the handler's own
     // `payload`/`exnref` binders are left untouched — a static-name introduction). Conservative:

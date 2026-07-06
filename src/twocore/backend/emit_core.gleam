@@ -1094,6 +1094,21 @@ fn emit(
     // an ambient `apply` of a data-named `module:atom` — D3a). ──
     ir.CallImport(slot, ty, args) ->
       emit_call_import(slot, ty, args, cont, sc, state, ctx)
+    // ── Phase-13 tail calls (Q1/Q5) — CONSERVATIVE-SOUND PLACEHOLDER (Q13-05 completes as genuine
+    // constant-stack tail calls). Each routes through the EXISTING ordinary-call emitter under a
+    // `KBind(fresh_names, Return(vars), KReturn)` continuation, so the call sits in a `let`-binding
+    // (a real frame, NOT tail position) and its results are then function-returned. Result-identical
+    // to the real tail call (same values, same traps, same order) — it differs ONLY in stack growth,
+    // which is not WASM-observable — so the whole matrix stays green + byte-identical while the
+    // keystone deliberately does NOT claim the constant-stack property. Q13-05 replaces these with
+    // the forced-`KReturn` tail emit + the `rt_table.call_indirect_lookup` seam + the funcref-ABI
+    // change (overview §2 ⚠ ABI reconciliation note). ──
+    ir.ReturnCall(fn_name, args) ->
+      emit_return_call(fn_name, args, sc, state, ctx)
+    ir.ReturnCallIndirect(table, index, ty, args) ->
+      emit_return_call_indirect(table, index, ty, args, sc, state, ctx)
+    ir.ReturnCallImport(slot, ty, args) ->
+      emit_return_call_import(slot, ty, args, sc, state, ctx)
     // ── Phase-7 EH nodes (§J/T1/T5/T7): BEAM-native exceptions through the `rt_exn` chokepoint.
     // `Throw`/`ThrowRef` are BOTTOM transfers (like `Trap`/`Return`) — they drop `cont`; `Try`
     // installs a Core Erlang `try…catch` (the `CTry` node) around its body. EH ships CELL-ONLY
@@ -3398,6 +3413,100 @@ fn emit_call_import(
     ctx,
   ))
   Ok(#(CLet([cvar], closure, CLet([lvar], applied, rest)), state4))
+}
+
+// ─────────────────────────── Phase-13 tail calls (§Q1/Q5) ───────────────────────────
+// CONSERVATIVE-SOUND, VALUE-CORRECT, NON-CONSTANT-STACK PLACEHOLDERS. Each routes the matching
+// ordinary-call emitter under `KBind(fresh_names, Return(vars), KReturn)` — the call is bound to
+// fresh result names, then those names are function-returned, so the `apply`/seam sits in a `let`
+// RHS (a REAL frame, NOT tail position). Result-identical to the genuine tail call (same values,
+// same traps, same order via the SAME unchanged non-tail seam) — differing only in stack growth,
+// which is not WASM-observable. Q13-05 completes these as forced-`KReturn` genuine tail calls +
+// the `rt_table.call_indirect_lookup` seam + the funcref-ABI change (overview §2 ⚠ ABI note); the
+// keystone deliberately does NOT claim the constant-stack property, keeping the completion boundary
+// crisp. No `rt_table`/`link` function is added or edited here (their tail seam is Q13-05's).
+
+/// Emit `ir.ReturnCall(fn_name, args)` — the DIRECT tail-call PLACEHOLDER. Routes the direct-call
+/// logic through `emit_call_direct` under `KBind(fresh_names, Return(vars), KReturn)`: the call is
+/// bound to fresh result names, then function-returned. Value-correct (the callee's results become
+/// this function's results, value-typed by the Q13-03 result-equality rule) but NON-constant-stack.
+/// `r` — the callee's result count, from `ctx.fn_results` (defaulting to 1 like `emit_call_direct`)
+/// — sizes the fresh-name/`Return` vector. `Error(UnknownFunction)` if `fn_name` is undefined
+/// (fail-closed; only reachable on an unvalidated module). Q13-05 completes it as a forced-`KReturn`
+/// bare tail `apply`.
+fn emit_return_call(
+  fn_name: String,
+  args: List(Value),
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let r = result.unwrap(dict.get(ctx.fn_results, fn_name), 1)
+  let #(names, state2) = fresh_n_vars(state, r)
+  emit_call_direct(
+    fn_name,
+    args,
+    KBind(names, Return(list.map(names, Var)), KReturn),
+    sc,
+    state2,
+    ctx,
+  )
+}
+
+/// Emit `ir.ReturnCallIndirect(table, index, ty, args)` — the INDIRECT tail-call PLACEHOLDER.
+/// Routes the EXISTING non-tail `emit_call_indirect` (the frozen 3-guard `rt_table` dispatch —
+/// `UndefinedElement` → `UninitializedElement` → `IndirectCallTypeMismatch`, same traps, same
+/// order) under `KBind(fresh_names, Return(vars), KReturn)`. Value-correct but NON-constant-stack.
+/// `r = list.length(ty.results)` sizes the fresh-name/`Return` vector. Q13-05 completes it with the
+/// `rt_table.call_indirect_lookup` seam then a tail-apply of the package-ABI target in the ok-arm.
+fn emit_return_call_indirect(
+  table: String,
+  index: Value,
+  ty: FuncType,
+  args: List(Value),
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let r = list.length(ty.results)
+  let #(names, state2) = fresh_n_vars(state, r)
+  emit_call_indirect(
+    table,
+    index,
+    ty,
+    args,
+    KBind(names, Return(list.map(names, Var)), KReturn),
+    sc,
+    state2,
+    ctx,
+  )
+}
+
+/// Emit `ir.ReturnCallImport(slot, ty, args)` — the IMPORTED tail-call PLACEHOLDER. Routes the
+/// EXISTING `emit_call_import` (reads the linker-built closure from the instance's func-import
+/// `slot`, then `link.call_import(closure, args)` — a capability, never an ambient `apply`, D3a)
+/// under `KBind(fresh_names, Return(vars), KReturn)`. Value-correct but NON-constant-stack.
+/// `r = list.length(ty.results)` sizes the fresh-name/`Return` vector. Q13-05 completes it as the
+/// existing import path under `KReturn` (value-correct, bounded caller frame — NO `link` change).
+fn emit_return_call_import(
+  slot: Int,
+  ty: FuncType,
+  args: List(Value),
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let r = list.length(ty.results)
+  let #(names, state2) = fresh_n_vars(state, r)
+  emit_call_import(
+    slot,
+    ty,
+    args,
+    KBind(names, Return(list.map(names, Var)), KReturn),
+    sc,
+    state2,
+    ctx,
+  )
 }
 
 // ─────────────────────────── Phase-5 reference layer (§B) ───────────────────────────
@@ -6260,6 +6369,13 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     ir.SimdStoreLane(_, _, addr, _, _, vec) ->
       collect_value(vec, collect_value(addr, acc))
     ir.CallImport(_, _, args) -> collect_values(args, acc)
+    // ── Phase-13 tail calls: collect the `Var` names in their `Value` operands (the direct/import
+    // args, plus the indirect `index`) so gensym avoids them (over-approximating is safe), exactly
+    // like `CallImport`/`CallIndirect`. ──
+    ir.ReturnCall(_, args) -> collect_values(args, acc)
+    ir.ReturnCallIndirect(_, index, _, args) ->
+      collect_values(args, collect_value(index, acc))
+    ir.ReturnCallImport(_, _, args) -> collect_values(args, acc)
     // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions so gensym
     // avoids them (over-approximating is safe). `Try` recurses into its body + each handler's
     // inline handler expression and includes the handler's `payload`/`exnref` binder names. ──

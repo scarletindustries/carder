@@ -504,6 +504,10 @@ fn go(
         // calls ---------------------------------------------------------------------
         ast.Call(f) -> lower_call(f, tail, ctx, st)
 
+        // tail calls (Phase 13) — CONSERVATIVE-SOUND PLACEHOLDER lowering (Q13-04 completes
+        // with the real `ir.ReturnCall*` bottom nodes). See `lower_return_call`.
+        ast.ReturnCall(f) -> lower_return_call(f, tail, ctx, st)
+
         // structured control --------------------------------------------------------
         ast.Block(bt) -> lower_block(bt, tail, ctx, st)
         ast.Loop(bt) -> lower_loop(bt, tail, ctx, st)
@@ -745,6 +749,10 @@ fn go(
         // indirect call + select ----------------------------------------------------
         ast.CallIndirect(ty, table) ->
           lower_call_indirect(ty, table, tail, ctx, st)
+        // tail call indirect (Phase 13) — CONSERVATIVE-SOUND PLACEHOLDER lowering (Q13-04
+        // completes with the real `ir.ReturnCallIndirect` bottom node). See below.
+        ast.ReturnCallIndirect(ty, table) ->
+          lower_return_call_indirect(ty, table, tail, ctx, st)
         ast.Select -> lower_select(tail, ctx, st)
         ast.SelectT(types) -> lower_select_t(types, tail, ctx, st)
 
@@ -1394,6 +1402,81 @@ fn lower_call(
         False -> ir.CallDirect("f" <> int.to_string(f), args)
       }
       Ok(wrap_let(names, call, inner))
+    }
+  }
+}
+
+/// Lower `return_call $f` (Phase 13, Q4) — CONSERVATIVE-SOUND, VALUE-CORRECT PLACEHOLDER (Q13-04
+/// completes it with the real `ir.ReturnCall`/`ir.ReturnCallImport` bottom node in CONSTANT stack).
+///
+/// A tail call is a BOTTOM transfer (like `Return`): its continuation is dead by spec, and the
+/// callee's results become this function's results. The keystone desugars it to an ORDINARY call
+/// bound to fresh names followed by `ir.Return` of those names — `Let(names, call, Return(vars))` —
+/// then consumes the dead tail to the frame's closing marker (`consume_dead` + `end_or_else`). This
+/// is RESULT-IDENTICAL to the real tail call (the Q13-03 result-equality rule guarantees the
+/// callee's results equal the function's), routed through the UNCHANGED emit path, so the pipeline
+/// stays byte-identical — but it is NOT the constant-stack node yet. The import-vs-defined split
+/// mirrors `lower_call` (`f < ctx.imported` → `ir.CallImport`, else `ir.CallDirect`).
+///
+/// `Error(UnknownFuncIndex(f))` if `f` is out of range; `Error(StackUnderflow)` if the stack lacks
+/// the params (both only reachable on an unvalidated module — fail-closed insurance).
+fn lower_return_call(
+  f: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use sig <- result.try(nth_err(ctx.func_types, f, UnknownFuncIndex(f)))
+  let pcount = list.length(sig.params)
+  let args = take_push_order(st.stack, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let #(names, c2) = fresh_n(st.counter, list.length(sig.results))
+      let call = case f < ctx.imported {
+        True -> ir.CallImport(f, ir_functype(sig), args)
+        False -> ir.CallDirect("f" <> int.to_string(f), args)
+      }
+      let node = ir.Let(names, call, ir.Return(list.map(names, ir.Var)))
+      use #(marker, rest) <- result.try(consume_dead(tail, 0))
+      Ok(end_or_else(marker, node, rest, c2))
+    }
+  }
+}
+
+/// Lower `return_call_indirect (type $ty) $table` (Phase 13, Q4) — CONSERVATIVE-SOUND, VALUE-CORRECT
+/// PLACEHOLDER (Q13-04 completes it with the real `ir.ReturnCallIndirect` bottom node in CONSTANT
+/// stack). Desugars to an ORDINARY `ir.CallIndirect` bound to fresh names then `ir.Return` of them
+/// (the same bottom-transfer template as `lower_return_call`), popping the i32 index (top of stack)
+/// then the type's params in the frozen `call_indirect` order. Result-identical, NOT constant-stack.
+///
+/// `Error(UnknownTypeIndex(ty))` if `ty` is out of range; `Error(StackUnderflow)` if the stack lacks
+/// the index/params (both only reachable on an unvalidated module).
+fn lower_return_call_indirect(
+  type_idx: Int,
+  table: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use sig <- result.try(nth_err(ctx.types, type_idx, UnknownTypeIndex(type_idx)))
+  let ir_ty =
+    ir.FuncType(list.map(sig.params, to_ir_vt), list.map(sig.results, to_ir_vt))
+  use #(index, stack1) <- result.try(pop1(st.stack))
+  let pcount = list.length(sig.params)
+  let args = take_push_order(stack1, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let #(names, c2) = fresh_n(st.counter, list.length(sig.results))
+      let node =
+        ir.Let(
+          names,
+          ir.CallIndirect(tname(table), index, ir_ty, args),
+          ir.Return(list.map(names, ir.Var)),
+        )
+      use #(marker, rest) <- result.try(consume_dead(tail, 0))
+      Ok(end_or_else(marker, node, rest, c2))
     }
   }
 }

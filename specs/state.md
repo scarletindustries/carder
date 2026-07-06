@@ -42,13 +42,13 @@ fail** (Safe ≡ Unsafe, every `state_strategy × mem_tier`).
 
 | Milestone | Produced by | Status | Unblocks |
 |---|---|---|---|
-| `«TC-FROZEN»` — the 3 IR nodes (`ReturnCall`/`ReturnCallIndirect`/`ReturnCallImport`), the 2 AST instrs, the `rt_table.call_indirect_lookup` (+ `_at` + `t_`) seam signature, the `link` tail-import seam, the `.ir` printer/parser round-trip, and every exhaustiveness-forced arm (effect/optimizer as final barriers; validate/lower/emit as conservative-sound placeholders their units complete) | Q13-01 | `unclaimed` | Q13-02 … Q13-06 |
+| `«TC-FROZEN»` — the 3 IR nodes (`ReturnCall`/`ReturnCallIndirect`/`ReturnCallImport`), the 2 AST instrs (`ReturnCall`/`ReturnCallIndirect`), the `.ir` printer/parser round-trip, and every exhaustiveness-forced arm (effect/optimizer as final barriers; validate/lower/emit as conservative-sound value-correct placeholders their units complete). **Per the reconciled scope (overview §2 ⚠ ABI note), the `rt_table.call_indirect_lookup` seam + the funcref-ABI change + the `link` tail-import path are NOT part of the freeze — they are self-contained in Q13-05; the keystone touched neither `rt_table.gleam` nor `link.gleam`.** | Q13-01 | `FROZEN ✓` | Q13-02 … Q13-06 |
 
 ### Units
 
 | Unit | Owner / status | Depends on (freeze) | Leaves |
 |---|---|---|---|
-| **Q13-01** Keystone: surface + IR + `rt_table`/`link` tail seam freeze | `unclaimed` | — | `«TC-FROZEN»`; byte-identical default output; conservative-sound validate/lower/emit arms for Q13-03/04/05 to complete. |
+| **Q13-01** Keystone: surface + IR vocabulary freeze | `done` | — | `«TC-FROZEN»`; byte-identical default output; 3 documented cross-file reaches (conservative-sound, value-correct **placeholders**) for the completion units: **validate.gleam** (`return`-shape operand typing landed; result-equality check + `assert_invalid` deferred to Q13-03), **lower.gleam** (bottom-transfer desugar to ordinary-call-then-`Return`; the real `ir.ReturnCall*` nodes deferred to Q13-04), **emit_core.gleam** (non-tail delegation via the existing `emit_call_direct`/`emit_call_indirect`/`emit_call_import` under `KBind(_, Return, KReturn)`; forced-`KReturn` constant-stack tail emit + `rt_table` lookup seam + funcref-ABI change deferred to Q13-05). **Did NOT touch `rt_table.gleam` / `link.gleam`** (Q13-05's, per overview §2 ⚠ ABI note). |
 | **Q13-02** decode (0x12/0x13) + WAT text | `unclaimed` | `«TC-FROZEN»` | Binary + text ingest of the two instructions → AST; round-trip tested. |
 | **Q13-03** validate: tail-call typing rule | `unclaimed` | `«TC-FROZEN»` | Callee-results == function-results rule (reuses `TypeMismatch`), stack-polymorphic; `assert_invalid` spec tests. |
 | **Q13-04** lower: bottom-transfer lowering | `unclaimed` | `«TC-FROZEN»` | Return-shaped lowering (dead continuation), import-vs-defined split → the 3 IR nodes. |
@@ -58,6 +58,8 @@ fail** (Safe ≡ Unsafe, every `state_strategy × mem_tier`).
 ### Landing log
 
 _(one line per landing: `unit — N tests (was M, +K), conformance p/s/f, 0 warnings, format clean, byte-identical`)_
+
+- **Q13-01 «TC-FROZEN»** — 1,984 gleam tests (was 1,978, +6 in `test/twocore/tail_call_freeze_test.gleam`), 0 fail · `gleam build` 0 warnings · `gleam format --check src test` clean · **default output byte-identical** (the 3 IR nodes + 2 AST instrs are inert-by-default — nothing produces them until Q13-02/04; the new effect/optimizer/lower arms are dead until then, and the validate/lower/emit reaches are unreachable at freeze time since no module yet decodes `0x12`/`0x13`). Owns `ir.gleam` (3 nodes) · `ast.gleam` (2 instrs) · `effect.gleam` · `printer.gleam` · `parser.gleam` · `ir_lower.gleam` · `ir_opt/{pass,baseline,aggressive,bce,loop_analysis,mem_clobber,mem_ssa}.gleam` · new freeze test. Reaches (placeholders): `validate.gleam` · `lower.gleam` · `emit_core.gleam`. **Untouched: `rt_table.gleam`, `link.gleam`.**
 
 ---
 

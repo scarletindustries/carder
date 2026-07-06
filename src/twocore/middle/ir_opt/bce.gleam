@@ -389,7 +389,12 @@ fn has_grow_or_call(e: Expr) -> Bool {
     | ir.CallIndirect(_, _, _, _)
     | ir.CallHost(_, _, _)
     | ir.CallImport(_, _, _)
-    | ir.CallClosure(_, _) -> True
+    | ir.CallClosure(_, _)
+    | // Phase-13: a tail CALL is a call — it may change `memory.size` mid-loop (grow inside the
+      // callee) exactly like any other call, so a loop containing one is NOT versioning-eligible. ──
+      ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _) -> True
     ir.Let(_, rhs, body) -> has_grow_or_call(rhs) || has_grow_or_call(body)
     ir.Block(_, _, body) -> has_grow_or_call(body)
     ir.Loop(_, _, _, body) -> has_grow_or_call(body)

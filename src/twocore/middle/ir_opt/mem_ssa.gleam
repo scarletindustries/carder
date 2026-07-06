@@ -216,7 +216,12 @@ pub fn is_memory_barrier(e: Expr) -> Bool {
     | ir.CallIndirect(_, _, _, _)
     | ir.CallHost(_, _, _)
     | ir.CallImport(_, _, _)
-    | ir.CallClosure(_, _) -> True
+    | ir.CallClosure(_, _)
+    | // ── Phase-13 tail calls: a tail call is a call (may touch any memory) AND a control transfer
+      // out of the straight-line region — a barrier on both counts, like `CallImport` + `Return`. ──
+      ir.ReturnCall(_, _)
+    | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallImport(_, _, _) -> True
     // ── barriers: control leaves the straight-line region ──
     ir.Trap(_)
     | ir.Throw(_, _)

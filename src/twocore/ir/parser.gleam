@@ -1442,6 +1442,17 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           Ok(#(CallClosure(callee, args), rest))
         }
         "call_indirect" -> parse_call_indirect(rest)
+        // ── Phase-13 tail calls (Q1/Q2, D5) — the inverse of `printer.print_expr`'s three tail-call
+        // arms. Three exact-string keywords (unambiguous: distinct full words; the `"return"` arm
+        // below is a different string). `return_call @f (args)` reads the target name + arg list;
+        // the indirect/import forms clone the frozen `parse_call_indirect`/`parse_call_import`. ──
+        "return_call" -> {
+          use #(fname, rest) <- result.try(parse_at_name(rest))
+          use #(args, rest) <- result.try(parse_value_list(rest))
+          Ok(#(ir.ReturnCall(fname, args), rest))
+        }
+        "return_call_indirect" -> parse_return_call_indirect(rest)
+        "return_call_import" -> parse_return_call_import(rest)
         "call_host" -> parse_call_host(rest)
         "let" -> parse_let(rest)
         "block" -> parse_block(rest)
@@ -1712,6 +1723,24 @@ fn parse_call_indirect(
   use #(ty, rest) <- result.try(parse_functype(rest))
   use #(args, rest) <- result.try(parse_value_list(rest))
   Ok(#(CallIndirect(table, index, ty, args), rest))
+}
+
+/// Parses `return_call_indirect @table [<index>] : <functype> (args)` into
+/// `ReturnCallIndirect(table, index, ty, args)` (Q13-01, D5). A verbatim clone of
+/// `parse_call_indirect` that builds the tail-call node, so the two spellings cannot drift. Syntax
+/// only — no arity/type check against `ty`. TOTAL; `ParseError` (never a panic) on a missing
+/// `@table`/`[`/`]`/`:`/functype.
+fn parse_return_call_indirect(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(table, rest) <- result.try(parse_at_name(toks))
+  use rest <- result.try(expect(rest, TLBracket, "["))
+  use #(index, rest) <- result.try(parse_value(rest))
+  use rest <- result.try(expect(rest, TRBracket, "]"))
+  use rest <- result.try(expect(rest, TColon, ":"))
+  use #(ty, rest) <- result.try(parse_functype(rest))
+  use #(args, rest) <- result.try(parse_value_list(rest))
+  Ok(#(ir.ReturnCallIndirect(table, index, ty, args), rest))
 }
 
 /// Parses `call_host "cap" "name" (args)`.
@@ -2097,6 +2126,20 @@ fn parse_call_import(
   use #(ty, rest) <- result.try(parse_functype(rest))
   use #(args, rest) <- result.try(parse_value_list(rest))
   Ok(#(ir.CallImport(slot, ty, args), rest))
+}
+
+/// Parses `return_call_import <slot> : <functype> (args)` into `ReturnCallImport(slot, ty, args)`
+/// (Q13-01, D5). A verbatim clone of `parse_call_import` that builds the tail-call node, so the two
+/// spellings cannot drift. `slot` is the positional func-import index; the `:` + `functype` reuse
+/// the `call_import` signature form. Syntax only — no arity/type check. TOTAL.
+fn parse_return_call_import(
+  toks: List(PToken),
+) -> Result(#(Expr, List(PToken)), ParseError) {
+  use #(slot, rest) <- result.try(expect_number(toks))
+  use rest <- result.try(expect(rest, TColon, ":"))
+  use #(ty, rest) <- result.try(parse_functype(rest))
+  use #(args, rest) <- result.try(parse_value_list(rest))
+  Ok(#(ir.ReturnCallImport(slot, ty, args), rest))
 }
 
 /// Resolves a neutral SIMD-op mnemonic to its `SimdOp` — the **exact inverse** of

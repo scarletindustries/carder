@@ -125,6 +125,12 @@ fn vars_in(acc: Set(String), e: Expr) -> Set(String) {
     ir.CallHost(_, _, args) -> union_values(acc, args)
     ir.CallImport(_, _, args) -> union_values(acc, args)
     ir.CallClosure(callee, args) -> union_values(add_value(acc, callee), args)
+    // Phase-13 tail calls: collect their `Value` operands (the indirect `index` + the args), like
+    // `CallImport`/`CallIndirect`.
+    ir.ReturnCall(_, args) -> union_values(acc, args)
+    ir.ReturnCallIndirect(_, index, _, args) ->
+      union_values(add_value(acc, index), args)
+    ir.ReturnCallImport(_, _, args) -> union_values(acc, args)
     // exceptions
     ir.Throw(_, args) -> union_values(acc, args)
     ir.ThrowRef(exnref) -> add_value(acc, exnref)
