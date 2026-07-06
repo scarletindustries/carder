@@ -1,0 +1,1 @@
+(module (func (delegate 0)))

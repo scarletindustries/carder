@@ -10,30 +10,40 @@
 //// Empirically checked at `vendor/PIN` (testsuite SHA 193e551…, wabt 1.0.41) with
 //// `wast2json --enable-exceptions`:
 ////
-////   | official `.wast`         | encoding | wast2json@pin | why |
-////   |--------------------------|----------|---------------|-----|
-////   | `throw.wast`             | modern   | ✅ converts    | tag section + `throw` + `try_table` catch |
-////   | `throw_ref.wast`         | modern   | ✅ converts    | `try_table catch_ref` + `throw_ref` + `exnref` |
-////   | `legacy/throw.wast`      | legacy   | ✅ converts    | `try`/`catch` (the encoding PORFFOR emits) |
-////   | `legacy/rethrow.wast`    | legacy   | ✅ converts    | `try`/`catch` + `rethrow` |
-////   | `tag.wast`               | modern   | ❌ `(rec …)`    | GC recursive type groups — OUT OF SCOPE (Phase 8 GC) |
-////   | `try_table.wast`         | modern   | ❌ `return_call`/`(ref null $t)`/`exn` | tail-call + typed-ref/GC — OUT OF SCOPE |
-////   | `legacy/try_catch.wast`  | legacy   | ❌ `return_call` | tail-call proposal — OUT OF SCOPE (Phase 8) |
-////   | `legacy/try_delegate.wast`| legacy  | ❌ `return_call` | tail-call proposal — OUT OF SCOPE (Phase 8) |
+////   | official `.wast`         | encoding | wast2json@pin | driven green? | why |
+////   |--------------------------|----------|---------------|---------------|-----|
+////   | `throw.wast`             | modern   | ✅ converts    | ✅ | tag section + `throw` + `try_table` catch |
+////   | `throw_ref.wast`         | modern   | ✅ converts    | ✅ | `try_table catch_ref` + `throw_ref` + `exnref` |
+////   | `legacy/throw.wast`      | legacy   | ✅ converts    | ✅ | `try`/`catch` (the encoding PORFFOR emits) |
+////   | `legacy/rethrow.wast`    | legacy   | ✅ converts    | ✅ | `try`/`catch` + `rethrow` |
+////   | `legacy/try_catch.wast`  | legacy   | ✅ converts (P13 `--enable-tail-call`) | ❌ | cross-module EH function+tag import `(import "test" …)` — a plain `call` (NOT tail-call) |
+////   | `legacy/try_delegate.wast`| legacy  | ✅ converts (P13 `--enable-tail-call`) | ❌ | legacy `delegate` label-targeting semantics (NOT tail-call) + `return_call` inside a `try` must abandon the enclosing (dynamically-scoped BEAM) handler |
+////   | `tag.wast`               | modern   | ❌ `(rec …)`    | ❌ | GC recursive type groups — OUT OF SCOPE (Phase 8 GC) |
+////   | `try_table.wast`         | modern   | ❌ `(ref null $t)`/`exn` | ❌ | typed refs / GC `exn` heap type — OUT OF SCOPE (NOT tail-call) |
 ////
-//// So 4 of the 8 official EH files convert at the pin; the 4 that do not are blocked by
-//// features 2core deliberately defers (GC recursive types, typed references, the `exn` heap type
-//// in a function signature, and the tail-call proposal) — NOT by an EH gap. Each is a NAMED,
-//// categorized deferral below (never a false green). The 4 convertible files exercise BOTH
-//// encodings 2core decodes into the one neutral IR (T1/T2): the modern `try_table`/`throw`/
-//// `throw_ref`/`exnref` surface AND the legacy `try`/`catch`/`rethrow` form Porffor actually emits.
+//// **Phase-13 measured reality (R16 — report the reality, not the plan).** 6 of the 8 official EH
+//// files now CONVERT at the pin: Phase 13 landed the tail-call proposal, so `legacy/try_catch.wast`
+//// + `legacy/try_delegate.wast` (which use `return_call`/`return_call_indirect`) `wast2json`-convert
+//// with `--enable-exceptions --enable-tail-call` (`spectest-interp` 42/42 + 26/26). But driving them
+//// END-TO-END shows they were NOT "blocked purely on `return_call`": they exercise a scope DEEPER
+//// than the tail-call feature — cross-module EH function+tag imports (`try_catch`'s `imported-mismatch`,
+//// a plain `call`), legacy `delegate` LABEL-TARGETING (`try_delegate`'s `delegate-skip`/
+//// `delegate-correct-targets`, no `return_call` at all), and the `return_call`-inside-`try`
+//// interaction (a WASM tail call must ABANDON the enclosing handler, but a BEAM `try/catch` is
+//// DYNAMICALLY scoped, so a tail `apply` inside it stays in the handler's extent). Those are
+//// EH-lowering / cross-module / emit-seam concerns, NOT tail-call — so the CONVERSION bar is met
+//// (both files vendored) while DRIVING them green stays categorized-deferred (see `eh_unconvertible`),
+//// honestly (never a false green). The 4 driven files exercise BOTH encodings 2core decodes into the
+//// one neutral IR (T1/T2): the modern `try_table`/`throw`/`throw_ref`/`exnref` surface AND the legacy
+//// `try`/`catch`/`rethrow` form Porffor actually emits.
 ////
 //// ## The run (proof 1, MEASURED)
 ////
-//// The 4 convertible files are vendored (via `vendor.sh`'s EH section) into `fixtures/eh/` — a
-//// SUBDIRECTORY the main `conformance_test.gleam` top-level glob does not see, so the Phase-1..6
-//// headline (46529/1768/0) stays BYTE-IDENTICAL (proof 3 — the EH files are driven HERE, not
-//// folded into the main allowlist). This file drives them under all THREE shipped profiles —
+//// The 4 driven files are vendored (via `vendor.sh`'s EH section) into `fixtures/eh/` — a
+//// SUBDIRECTORY the main `conformance_test.gleam` top-level glob does not see, so they add NOTHING
+//// to the main headline (which is 46646/1771/0 after Phase 13 folded the two tail-call `.wast` into
+//// the main allowlist — the EH files are driven HERE, not there). This file drives them under all
+//// THREE shipped profiles —
 //// `profiles.safe()` (Baseline optimizer + enforcing fuel, Cell), `profiles.unsafe()` (Aggressive
 //// optimizer + open runtime, Cell), and `profiles.portable()` (Threaded/Paged/`bif`, the
 //// runs-anywhere core) — and asserts, per file and in aggregate, `fail == 0 && pass > 0`.
@@ -41,7 +51,7 @@
 //// **MEASURED tier reach (the precise T6 bound):** EH is BEAM-native control flow — a throw
 //// unwinds the process's native stack, not the `state_strategy` record/cell — so the state-FREE EH
 //// surface (the entire official `.wast` suite + the JS/Porffor subset) runs BYTE-IDENTICALLY under
-//// Cell AND Threaded (`portable`), verified here (all four files green under all three profiles).
+//// Cell AND Threaded (`portable`), verified here (all four driven files green under all three profiles).
 //// The T6 "Cell-only" bound is retained for exactly ONE combination it names: a program that
 //// MUTATES threaded instance state and then relies on that mutation SURVIVING a throw/catch —
 //// under `threaded` the state travels as a data-threaded value a throw unwinds PAST, so post-catch
@@ -78,25 +88,41 @@ import twocore/runtime/profiles
 /// `vendor/vendor.sh`'s EH section (`wast2json --enable-exceptions`).
 const eh_fixtures_dir = "test/twocore/conformance/fixtures/eh"
 
-/// The 4 official EH `.wast` files that convert at the pin (MEASURED — see the module doc). Both
-/// encodings 2core decodes into the one neutral IR: `throw`/`throw_ref` (modern) + `legacy_throw`/
-/// `legacy_rethrow` (the legacy form Porffor emits).
+/// The 4 official EH `.wast` files driven GREEN end-to-end at the pin (MEASURED — see the module
+/// doc). Both encodings 2core decodes into the one neutral IR: `throw`/`throw_ref` (modern) +
+/// `legacy_throw`/`legacy_rethrow` (the legacy form Porffor emits).
+///
+/// **Phase-13 measured reality (R16 — report the reality, not the plan).** Phase 13 landed the
+/// tail-call proposal, so `legacy/try_catch.wast` + `legacy/try_delegate.wast` now CONVERT (vendored
+/// with `--enable-exceptions --enable-tail-call`; `spectest-interp` 42/42 + 26/26). But driving them
+/// end-to-end reveals they were NOT "blocked purely on `return_call`": they exercise a DEEPER scope
+/// than the tail-call feature — see `eh_unconvertible`. So the conversion bar is met (they are
+/// vendored), while driving-green stays categorized-deferred on that deeper scope, NOT on tail-call.
 const eh_files: List(String) = [
   "throw.json", "throw_ref.json", "legacy_throw.json", "legacy_rethrow.json",
 ]
 
-/// The 4 official EH `.wast` files that do NOT convert at the pin, each with the honest reason it
-/// is out of scope (a Phase-8 feature, NOT an EH gap). Printed as a categorized residual so the
-/// closed-residual invariant is auditable (D9/S11) — this is what "the modern EH surface is
-/// spec-conformance-only, bounded by wast2json-ability" means in numbers.
+/// The 4 official EH `.wast` files NOT in the driven-green set, each with the honest MEASURED reason
+/// (D9/S11 — never a false green). Two are un-`wast2json`-able at the pin (GC / typed-refs); two now
+/// CONVERT (Phase 13 landed tail-call) but expose a scope DEEPER than the tail-call feature, so
+/// driving them green is deferred on that scope — NOT on `return_call`.
 const eh_unconvertible: List(#(String, String)) = [
-  #("tag.wast", "GC recursive type groups `(rec …)` — Phase-8 GC"),
+  #(
+    "tag.wast",
+    "un-convertible: GC recursive type groups `(rec …)` — Phase-8 GC",
+  ),
   #(
     "try_table.wast",
-    "tail-call `return_call` + typed-ref `(ref null $t)`/`exn` heap type — Phase-8",
+    "un-convertible: typed-ref `(ref null $t)` / `exn` heap type — GC / typed-refs (NOT tail-call: Phase 13 landed that)",
   ),
-  #("legacy/try_catch.wast", "tail-call `return_call` — Phase-8"),
-  #("legacy/try_delegate.wast", "tail-call `return_call` — Phase-8"),
+  #(
+    "legacy/try_catch.wast",
+    "CONVERTS (Phase-13 `--enable-tail-call`); driving deferred: cross-module EH function+tag import `(import \"test\" …)` — a plain `call $imported-throw` (NOT tail-call), out of scope like `table_copy`'s cross-module funcref-elem",
+  ),
+  #(
+    "legacy/try_delegate.wast",
+    "CONVERTS (Phase-13 `--enable-tail-call`); driving deferred: legacy `delegate` label-targeting semantics (`delegate-skip`/`delegate-correct-targets` — NOT tail-call) + `return_call` inside a `try` must abandon the enclosing handler (BEAM `try/catch` is dynamically scoped) — a deeper return_call×EH interaction",
+  ),
 ]
 
 /// The three shipped deployment profiles the EH `.wast` suite is driven through. `safe` =
@@ -114,7 +140,7 @@ fn eh_profiles() -> List(#(String, Binding)) {
   ]
 }
 
-/// PROOF 1 (EH engine spec-correct end-to-end). The 4 convertible official EH `.wast` files run
+/// PROOF 1 (EH engine spec-correct end-to-end). The 4 driven official EH `.wast` files run
 /// GREEN — `fail == 0` (no EH assertion lit up wrong) and `pass > 0` (the files DID light up,
 /// non-vacuous) — under all THREE shipped profiles (`safe`/`unsafe`/`portable`), so a lowering that
 /// dropped a re-raise,
@@ -195,11 +221,12 @@ fn print_report(results: List(#(String, String, Report))) -> Nil {
   )
 }
 
-/// Print the categorized residual — the 4 official EH files that do NOT convert at the pin, each
-/// with the honest Phase-8 feature that blocks it (never an opaque skip).
+/// Print the categorized residual — the 4 official EH files NOT in the driven-green set, each with
+/// the honest MEASURED reason (2 un-`wast2json`-able GC/typed-ref; 2 convert but exercise a scope
+/// deeper than tail-call — cross-module EH imports / legacy `delegate` / `return_call`-in-`try`).
 fn print_unconvertible() -> Nil {
   io.println(
-    "  categorized parse-skips (official EH .wast un-wast2json-able at the pin — NOT an EH gap):",
+    "  categorized EH residual (NOT driven green — 2 un-wast2json-able GC/typed-ref; 2 convert but a scope deeper than tail-call — NOT an EH gap):",
   )
   list.each(eh_unconvertible, fn(u) {
     io.println("    " <> pad(u.0, 26) <> u.1)

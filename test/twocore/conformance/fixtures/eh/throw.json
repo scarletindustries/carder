@@ -1,4 +1,4 @@
-{"source_filename": "/Users/scotthiett/IdeaProjects/wasm2core/build/conformance-vendor/throw.wast",
+{"source_filename": "/Users/scotthiett/IdeaProjects/wasm2core/test/twocore/conformance/../../../build/conformance-vendor/throw.wast",
  "commands": [
   {"type": "module", "line": 3, "filename": "throw.0.wasm"}, 
   {"type": "assert_return", "line": 38, "action": {"type": "invoke", "field": "throw-if", "args": [{"type": "i32", "value": "0"}]}, "expected": [{"type": "i32", "value": "0"}]}, 

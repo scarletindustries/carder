@@ -16,8 +16,12 @@ a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
 **Recently completed — moved out of this list** (see [`01-status.md`](01-status.md) §3):
 - ✅ **Phase 11 — `--link` self-contained output** (runtime *inclusion* → one `.beam` on a bare OTP node).
 - ✅ **Phase 12 — typed host-language bindings** (companion `.gleam`/`.erl`/`.ex` typed API).
-- ⏳ **Phases 13–15 in flight** — tail-call (§B), cross-module funcref-in-elem init (§C), production C
-  NIF for tier-N memory (§D). Still listed below, tagged **in flight**, until their capstones prove out.
+- ✅ **Phase 13 — WASM tail calls** (`return_call`/`return_call_indirect` → genuine constant-stack BEAM
+  tail calls; +117 conformance pass, 46,646/1,771/0; constant stack proven to 1,000,000). *Measurement
+  correction (R16): the 2 `return_call`-blocked legacy EH files now **convert** but do **not** run green —
+  a deeper non-tail-call scope, newly deferred in §G.*
+- ⏳ **Phases 14–15 in flight** — cross-module funcref-in-elem init (§C), production C NIF for tier-N
+  memory (§D). Still listed below, tagged **in flight**, until their capstones prove out.
 
 ---
 
@@ -48,12 +52,12 @@ a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
 
 WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a categorized skip today:
 
-- **Tail-call proposal (`return_call` / `return_call_indirect`).** ⏳ **Now Phase 13, in flight** — see
-  [`phase-13/00-overview.md`](phase-13/00-overview.md). Maps cleanly onto BEAM native tail calls
-  (direct calls already emit in tail position; `return_call_indirect` needs a raise-or-tail-apply
-  `rt_table` seam to stay constant-stack). It **unblocks the 2 pure-`return_call` official EH `.wast`
-  files** (`legacy/try_catch`, `legacy/try_delegate`) and is a necessary-but-not-sufficient unblock for
-  `try_table` (also needs typed refs / GC). Flagged a plausible fast-follow by Phases 6 & 7.
+- ✅ **Tail-call proposal (`return_call` / `return_call_indirect`).** **Done — Phase 13** (see
+  [`01-status.md`](01-status.md) §3, row 13). Genuine constant-stack BEAM tail calls: direct reuses the
+  `KReturn` tail path; indirect goes through the new `rt_table.call_indirect_lookup` seam (3 ordered
+  guards → tail-apply the package-ABI target); imports are value-correct/bounded-frame (Q8 sub-case).
+  Funcref/`elem` modules became result-identical (the funcref closure is now package-ABI tail-transparent).
+  *It did NOT run the 2 EH files green — measurement (R16) showed they need a deeper scope; see §G.*
 - **GC proposal + GC reference types** (`anyref`, typed function refs, `struct`/`array`/`i31`, `(rec)`
   recursive types). Out of the funcref/externref scope shipped in Phase 5. Porffor confirmed it does
   **not** need GC, so this is spec-completeness, not a JS blocker. (Also gates the `try_table` /
@@ -157,6 +161,17 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 
 ## G. Exception handling — remaining
 
+- **Drive the 2 legacy EH `.wast` files green (`legacy/try_catch`, `legacy/try_delegate`).** ⓘ **Newly
+  measured by Phase 13 (R16).** The tail-call proposal *converts* both files (they now vendor + parse),
+  but running them green needs a **deeper, non-tail-call scope** than the roadmap assumed:
+  - `try_catch` — a **cross-module EH function+tag import** (`(import "test" …)` dispatched via a plain
+    `call`, not a tail call). Relates to "Cross-module EH tags" below + §C cross-module.
+  - `try_delegate` — **(a)** pre-existing **legacy-`delegate` label-targeting** bugs (wrong handler
+    depth, no `return_call` involved) and **(b)** the **`return_call`-inside-`try` interaction**: a WASM
+    tail call must abandon the enclosing handler, but BEAM `try/catch` is *dynamically scoped*, so a tail
+    `apply` emitted inside it stays in scope. Needs an EH-lowering fix (escape the handler before the
+    tail transfer). Both files stay **categorized-deferred, fail=0** (never false-green) until an
+    EH-lowering unit takes them.
 - **Threaded + EH where state threads *through* a throw/catch.** The Phase-7 `cell`-only bound is
   retained *only* for this combination (state-free EH already runs under both cell and threaded).
 - **Modern `exnref` / `throw_ref` / `catch_ref` / `catch_all_ref` as a live/used feature.** Shipped as

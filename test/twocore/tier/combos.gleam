@@ -46,9 +46,19 @@ pub const corpus_dir = "test/twocore/conformance/corpus"
 /// scoped them. Memory/table/global programs (`mem`/`memgrow`/`oobdata`/`callind`/`gvar`) are the
 /// tier-sensitive ones; the pure-numeric programs pin that the threaded seam adds no change to
 /// pure functions (keystone §A.3).
+///
+/// `tailrec` (Phase 13) is the tail-call program: a `return_call` self-loop, a mutually-recursive
+/// even/odd, a `return_call_indirect` self-loop through a table slot, plus the three ordered
+/// indirect fail-closed traps (undefined → uninitialized → type-mismatch). It uses a `funcref`
+/// table + `elem`, so under the Phase-13 funcref-ABI change (funcref closures became package-ABI
+/// tail-transparent) it is a **result-identical**, NOT byte-identical, module: its indirect tail
+/// call threads `cur` under `threaded`, so its emitted Core differs across `cell`/`threaded`, but
+/// the differential asserts identical VALUES + TRAPS (the `Outcome`), not identical Core bytes — so
+/// it stays green across every combo. (The constant-stack space proof to 1,000,000 lives in the
+/// dedicated `tier/tailcall_capstone_test.gleam`, exactly as `sum_to`'s space proof does.)
 pub const corpus_programs: List(String) = [
   "add", "intops", "sum_to", "fib", "fac", "floatops", "hostimport", "mem",
-  "callind", "gvar", "memgrow", "trunc", "trapstart", "oobdata",
+  "callind", "gvar", "memgrow", "trunc", "trapstart", "oobdata", "tailrec",
 ]
 
 /// The bounded Safe max-pages cap this suite bakes into EVERY combination (D1/P6). A finite,

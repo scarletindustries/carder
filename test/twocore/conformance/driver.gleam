@@ -327,10 +327,14 @@ fn module_calls_import(module: ir.Module) -> Bool {
 }
 
 /// True iff `expr` (recursively, through the control-flow containers that hold sub-`Expr`s) contains
-/// a `CallImport` node. Mirrors emit_core's private `expr_has_call_import`.
+/// a `CallImport` node — OR a Phase-13 `ReturnCallImport` (an imported TAIL call). Mirrors
+/// emit_core's private `expr_has_call_import`, which weaves the function-import dispatch vector (and
+/// so emits `instantiate/1`) for BOTH import-call shapes; the driver must match it so an
+/// import-tail-calling module is started through `instantiate/1` rather than the absent
+/// `instantiate/0` (which would surface as `instantiate: undef`).
 fn expr_calls_import(expr: ir.Expr) -> Bool {
   case expr {
-    ir.CallImport(..) -> True
+    ir.CallImport(..) | ir.ReturnCallImport(..) -> True
     ir.Let(_, rhs, body) -> expr_calls_import(rhs) || expr_calls_import(body)
     ir.If(_, _, t, e) -> expr_calls_import(t) || expr_calls_import(e)
     ir.Switch(_, _, arms, default) ->

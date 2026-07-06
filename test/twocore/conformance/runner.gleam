@@ -375,7 +375,27 @@ fn run_return(
           )
       }
     Ok(Trapped(r)) ->
-      fail(rep, at(src, line) <> field <> ": expected return, trapped " <> r)
+      // A HOST-CAPABILITY DENIAL (`{capability_denied, Cap, Name}`) is NOT a WASM `{wasm_trap, _}`
+      // trap: it is the fail-closed Safe host (deny-all) refusing a host import that the spec's
+      // `spectest` host would service (e.g. a `return_call`/`call` to `spectest.print_i32_f32`). That
+      // is a POLICY outcome, not a spec mismatch — so it is a categorized SKIP (out of scope for the
+      // deny-all conformance host), never a false fail. Under an open-host profile (`unsafe`) the same
+      // call returns `[]` and the assert PASSES. EVERY OTHER trap during `assert_return` is a genuine
+      // spec violation → fail (a real `{wasm_trap, _}` where the spec expects a value stays red).
+      case string.contains(r, "capability_denied") {
+        True ->
+          skip(
+            rep,
+            at(src, line)
+              <> field
+              <> ": host import denied under the fail-closed Safe host (capability_denied)",
+          )
+        False ->
+          fail(
+            rep,
+            at(src, line) <> field <> ": expected return, trapped " <> r,
+          )
+      }
     Ok(DriverError(d)) -> skip(rep, at(src, line) <> field <> ": driver: " <> d)
   }
 }

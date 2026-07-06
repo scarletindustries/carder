@@ -39,11 +39,18 @@ fn allowed_phrases() -> List(String) {
     "BadHeapType", "arrayref", "ref null", "extended-const",
     // memory64 / threads / shared — categorised
     "memory64", "shared", "atomic.",
-    // post-2.0 proposals & harness paths (each a NAMED coverage gap, S12)
-    "unhandled command: assert_exhaustion", "call stack", "return_call", "tag",
-    "module definition", "link: unknown import", "unlinkable (out of scope)",
-    "cross-module", "import-section construct", "uninstantiable (out of scope)",
-    "register:", "no such export", "driver:",
+    // post-2.0 proposals & harness paths (each a NAMED coverage gap, S12). NOTE (Phase 13): the
+    // blanket `"return_call"` and `"call stack"` phrases are DELIBERATELY GONE — tail-call is now
+    // DRIVEN (return_call.wast / return_call_indirect.wast run green), so no residual skip should
+    // carry a `return_call` reason and the tail-call-adjacent "call stack" stack-model phrase should
+    // categorize nothing. Removing them means a return_call-shaped regression (a re-skipped tail
+    // call) goes RED (uncategorised) instead of hiding.
+    "unhandled command: assert_exhaustion", "tag",
+    // the ONE tail-call residual: a host-import tail/direct call (`spectest.print_i32_f32`) DENIED
+    // under the deny-all Safe host — a POLICY denial, not a spec trap (it PASSES under `unsafe`).
+    "capability_denied", "module definition", "link: unknown import",
+    "unlinkable (out of scope)", "cross-module", "import-section construct",
+    "uninstantiable (out of scope)", "register:", "no such export", "driver:",
   ]
 }
 

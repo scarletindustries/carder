@@ -26,8 +26,9 @@ import twocore/frontend/wasm/wat
 
 // ───────────────────────── differential harness ─────────────────────────
 
-/// Assemble `text` with `wat2wasm` (standardized Phase-5 feature flags only);
-/// `Ok(bytes)` on success, `Error(reason)` if wat2wasm is absent or rejects it.
+/// Assemble `text` with `wat2wasm` (standardized feature flags our frontend owns:
+/// multi-memory + memory64 + Phase-13 tail-call); `Ok(bytes)` on success, `Error(reason)`
+/// if wat2wasm is absent or rejects it.
 fn wat2wasm_bytes(text: String) -> Result(BitArray, String) {
   case ffi.find_executable("wat2wasm") {
     Error(_) -> Error("wat2wasm not found")
@@ -39,16 +40,20 @@ fn wat2wasm_bytes(text: String) -> Result(BitArray, String) {
       case simplifile.write(watp, text) {
         Error(_) -> Error("cannot write temp wat")
         Ok(_) -> {
-          // Enable ONLY the standardized Phase-5 features. NOT `--enable-all`:
+          // Enable ONLY the standardized features our parser owns. NOT `--enable-all`:
           // that turns on wabt's experimental `--enable-compact-imports` (a
           // grouped-import encoding that `wasm-tools validate` itself rejects as
           // invalid core WASM). reference-types + bulk-memory are default-on in
-          // wabt 1.0.41, so only multi-memory + memory64 need flags.
+          // wabt 1.0.41, so only multi-memory + memory64 need flags; `--enable-tail-call`
+          // (Phase 13, NOT default-on at 1.0.41) lets this differential assemble the
+          // `return_call`/`return_call_indirect` corpus (`tailrec.wat`) so our WAT parser's
+          // tail-call ingest is verified byte-identically against the wabt oracle here too.
           let #(code, out) =
             ffi.run(exe, [
               watp,
               "--enable-multi-memory",
               "--enable-memory64",
+              "--enable-tail-call",
               "-o",
               wasmp,
             ])

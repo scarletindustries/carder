@@ -1,0 +1,1 @@
+(module (func (try (do) (catch_all) (catch_all))))

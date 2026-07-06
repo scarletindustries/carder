@@ -158,6 +158,18 @@ simd_store32_lane
 simd_store64_lane
 simd_store8_lane
 
+# ── Phase-13 — TAIL CALLS (the tail-call proposal: return_call 0x12 / return_call_indirect 0x13).
+#    Lowered to GENUINE constant-stack BEAM tail calls (direct reuses the KReturn tail path; indirect
+#    goes through the `rt_table.call_indirect_lookup` seam then tail-applies the package-ABI target;
+#    imported reuses the import path under KReturn — value-correct/bounded-frame). At wabt 1.0.41 the
+#    tail-call opcode is NOT default-on, so `wast2json` needs the trailing FLAG COLUMN
+#    `--enable-tail-call` (measured: bare conversion errors "opcode not allowed: return_call"). Both
+#    files self-consistency-check under `spectest-interp --enable-tail-call` (47/47, 79/79). The single
+#    `spectest.print_i32_f32` host tail call in each is a categorized skip under the deny-all Safe host
+#    (a POLICY denial, not a spec trap — it PASSES under the open-host `unsafe` profile).
+return_call	--enable-tail-call
+return_call_indirect	--enable-tail-call
+
 # ── DEFERRED — honest, MEASURED categorized skips (R16); NOT added (would be false-green):
 #   GC-proposal reference types (typed function references / anyref / array) — un-wast2json-able at
 #   the pin AND out of our funcref/externref scope (H8):
@@ -183,6 +195,8 @@ simd_store8_lane
 #     its verifier imports module `a`'s functions and inits `elem` segments with `ref.func` of those
 #     IMPORTED functions (cross-module funcref-in-elem-segment init), a DEEPER feature than the
 #     `CallImport` direct dispatch this phase landed. NOT the impossible "1649 flip" (S11).
-#   * Post-2.0 proposals — categorized-deferred (S12): return_call.wast / return_call_indirect.wast
-#     (tail-call), GC (typed refs / struct/array/i31), exception-handling, stack-switching, the
-#     component model, relaxed-SIMD. The Phase-6 close is "the complete WebAssembly 2.0 surface".
+#   * TAIL CALL (return_call.wast / return_call_indirect.wast) is now DRIVEN (Phase 13, allowlisted
+#     above with `--enable-tail-call`) — no longer deferred. The remaining post-2.0 proposals stay
+#     categorized-deferred (S12): GC (typed refs / struct/array/i31), stack-switching, the component
+#     model, relaxed-SIMD. (Exception-handling's engine suite is driven separately via the `eh/`
+#     subdir; Phase 13 additionally unblocked its two `return_call`-blocked legacy files.)

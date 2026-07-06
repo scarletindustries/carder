@@ -1,4 +1,4 @@
-{"source_filename": "/Users/scotthiett/IdeaProjects/wasm2core/build/conformance-vendor/legacy/rethrow.wast",
+{"source_filename": "/Users/scotthiett/IdeaProjects/wasm2core/test/twocore/conformance/../../../build/conformance-vendor/legacy/rethrow.wast",
  "commands": [
   {"type": "module", "line": 3, "filename": "legacy_rethrow.0.wasm"}, 
   {"type": "assert_exception", "line": 75, "action": {"type": "invoke", "field": "catch-rethrow-0", "args": []}, "expected": []}, 

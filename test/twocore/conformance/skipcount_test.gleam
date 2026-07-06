@@ -12,10 +12,15 @@
 ////       global element-init) is BELOW the Phase-4 baseline of 409 — the material drop, honestly
 ////       stated once the two quantified engine gaps are discounted.
 ////
-//// ## The MEASURED headline (Safe profile, full re-vendored allowlist WITH the SIMD file set — P6-10)
+//// ## The MEASURED headline (Safe profile, full re-vendored allowlist WITH the SIMD file set — P6-10;
+//// Phase-13 re-measured)
 ////
-//// pass = 46529 (+25004 over the 21525 Phase-5 close — the 59 `simd_*` files lit up, the single
-//// largest conformance movement in the project's history), fail = 0, skip = 1768. The skip is
+//// pass = 46646 (+117 over the Phase-6 close 46529 — the two official tail-call `.wast` lit up:
+//// return_call.wast +43, return_call_indirect.wast +74), fail = 0, skip = 1771 (+3 over 1768 — one
+//// host-import tail/direct call per tail-call file DENIED under the deny-all Safe host, a categorised
+//// POLICY denial that PASSES under `unsafe`; plus one already-categorised text-format residual in
+//// return_call_indirect). The pre-Phase-13 baseline was pass = 46529 (+25004 over the 21525 Phase-5
+//// close — the 59 `simd_*` files, the single largest movement in the project's history). The skip is
 //// dominated by two MEASURED, categorised residuals (never a false green — R16/S11):
 ////   1. `table_copy.wast`'s **1080** cross-module funcref-in-`elem`-segment asserts — its verifier
 ////      imports module `a`'s functions and initialises `elem` segments with `ref.func` of those
@@ -50,8 +55,9 @@ const phase4_baseline_pass: Int = 15_749
 /// over this once the SIMD file set is present (SIMD alone adds ~25k execution passes).
 const phase5_baseline_pass: Int = 21_525
 
-/// The total-skip regression ceiling under the full re-vendored allowlist WITH SIMD (measured 1768;
-/// headroom for minor drift). A FURTHER inflation goes red. It is dominated by the two MEASURED
+/// The total-skip regression ceiling under the full re-vendored allowlist WITH SIMD (measured 1771
+/// after Phase 13 folded the two tail-call `.wast` in — +3 over the pre-Phase-13 1768; headroom for
+/// minor drift). A FURTHER inflation goes red. It is dominated by the two MEASURED
 /// residuals: table_copy's ~1080 cross-module funcref-elem-init + the ~511 SIMD text-format frontend
 /// asserts (S13). Without SIMD vendored (a curated-subset checkout) the skip is far lower (~1257),
 /// still under this ceiling — so the ceiling holds for both fixture sets.
@@ -83,9 +89,13 @@ fn allowed_phrases() -> List(String) {
     "extended-const",
     // the extended-const proposal (const-expr arithmetic)
     // ── categorised harness paths (each a NAMED coverage gap, never a silent drop) ──
-    "unhandled command: assert_exhaustion", "call stack",
-    // BEAM/WASM stack-model mismatch
-    "link: unknown import", "unlinkable (out of scope)", "cross-module",
+    "unhandled command: assert_exhaustion",
+    // Phase 13: the blanket "call stack" stack-model phrase is GONE (reconciled toward the tighter
+    // `residual_audit_test` set) — tail-call is now DRIVEN, so a return_call-shaped regression goes
+    // red instead of hiding. The ONE tail-call residual is a host-import call (`spectest.print_*`)
+    // DENIED under the deny-all Safe host — a POLICY denial (not a spec trap; PASSES under `unsafe`).
+    "capability_denied", "link: unknown import", "unlinkable (out of scope)",
+    "cross-module",
     // cross-module STATE import (§D.2 depth honesty)
     "import-section construct",
     // an import-section malformation our decoder cannot judge
