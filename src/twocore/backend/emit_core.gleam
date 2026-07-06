@@ -108,7 +108,7 @@ import twocore/ir.{
 }
 import twocore/runtime/instance.{
   type Binding, type HostPolicy, Atomics, HostDenyAll, HostOpen, HostWhitelist,
-  MeterFuel, MeterOff, Paged, Threaded,
+  MeterFuel, MeterOff, Nif, Paged, Threaded,
 }
 import twocore/runtime/profiles
 
@@ -1702,10 +1702,11 @@ fn emit_mem_store(
 }
 
 /// `MemLoadUnchecked` (Phase-10, N4/N5) — a bounds-check-free load the BCE pass proved in-bounds.
-/// On a tier that supports it (paged/atomics, single memory), lower to the `load_unchecked`/
+/// On a tier that supports it (paged/atomics/nif, single memory), lower to the `load_unchecked`/
 /// `t_load_unchecked` seam, which returns a BARE `Int` (no `Result`) — so it binds DIRECTLY via
-/// `apply_cont` (like `global.get`), NOT through the trapping-result reducer. On nif / multi-memory
-/// it falls back to the CHECKED `emit_mem_load` (sound; the guard proved in-bounds either way).
+/// `apply_cont` (like `global.get`), NOT through the trapping-result reducer. On multi-memory
+/// (`mem != 0`) or an unknown module it falls back to the CHECKED `emit_mem_load` (sound; the guard
+/// proved in-bounds either way).
 fn emit_mem_load_unchecked(
   mem: Int,
   op: ir.MemAccess,
@@ -1741,9 +1742,10 @@ fn emit_mem_load_unchecked(
 }
 
 /// `MemStoreUnchecked` (Phase-10, N4/N5) — a bounds-check-free store the BCE pass proved in-bounds.
-/// On paged/atomics (single memory) it lowers to `store_unchecked`/`t_store_unchecked`, which return
-/// `Nil` (cell) / the record (threaded) DIRECTLY (no `Result`) — the NON-trapping mutator shape of
-/// `global.set`. On nif / multi-memory it falls back to the CHECKED `emit_mem_store`.
+/// On paged/atomics/nif (single memory) it lowers to `store_unchecked`/`t_store_unchecked`, which
+/// return `Nil` (cell) / the record (threaded) DIRECTLY (no `Result`) — the NON-trapping mutator
+/// shape of `global.set`. On multi-memory (`mem != 0`) or an unknown module it falls back to the
+/// CHECKED `emit_mem_store`.
 fn emit_mem_store_unchecked(
   mem: Int,
   op: ir.MemAccess,
@@ -1792,12 +1794,17 @@ fn emit_mem_store_unchecked(
 }
 
 /// Does the linked memory backend `mem_module` provide the Phase-10 UNCHECKED entry points? A
-/// FAIL-CLOSED name whitelist (N5): exactly the paged + atomics runtime modules. An unknown/future
-/// module (or nif) is NOT whitelisted → the caller falls back to the checked path, which is always
-/// sound. Compared by module name (G5 — the emitter never branches on the tier ENUM).
+/// FAIL-CLOSED name whitelist (N5 / S4): exactly the paged + atomics + nif runtime modules. An
+/// unknown/future module is NOT whitelisted → the caller falls back to the checked path, which is
+/// always sound. Compared by module name (G5 — the emitter never branches on the tier ENUM).
+///
+/// Nif (tier-N) joins the whitelist because it now ships real `*_unchecked` heads (S15-02): it is a
+/// BEAM-memory-UNSAFE tier where eliding the bounds compare is the whole point, and the arm is only
+/// reached inside a BCE-versioned loop's fast branch whose guard already proved the range in-bounds.
 fn mem_supports_unchecked(mem_module: String) -> Bool {
   mem_module == profiles.mem_module_for(Paged)
   || mem_module == profiles.mem_module_for(Atomics)
+  || mem_module == profiles.mem_module_for(Nif)
 }
 
 /// `global.get` (read-only). Routes by global TYPE (via `ctx.ref_global_names`, which holds the
