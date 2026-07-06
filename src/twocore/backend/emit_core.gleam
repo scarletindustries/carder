@@ -1030,6 +1030,14 @@ fn emit(
     // ── Phase-5 reference layer (H1/H2) — PURE, state-neutral (they touch no memory/table/
     // global, §B). `cur` flows through unchanged under `Threading`. ──
     ir.RefFunc(name) -> emit_ref_func(name, cont, sc, state, ctx)
+    // Phase-14 `RefFuncImport` (R1): FAIL-CLOSED reach — reproduces the exact byte-identical skip an
+    // imported `ref.func` produced before this node existed (`ir.RefFunc("f<slot>")` →
+    // `UnknownFunction("f<slot>")`, since an import name is absent from `ctx.fn_sig`). R14-02
+    // COMPLETES this arm with the real `emit_ref_func_import` (the D3a `link.call_import` adapter
+    // closure). It fails BEFORE any `func_import_at` read, so no `instantiate/0`↔`/1` desync is
+    // exposed at freeze time (the module simply skips, as today).
+    ir.RefFuncImport(slot, _) ->
+      Error(UnknownFunction("f" <> int.to_string(slot)))
     ir.RefIsNull(arg) -> emit_ref_is_null(arg, cont, sc, state, ctx)
     // ── Phase-5 table layer (H2) — state-reaching (§C). ──
     ir.TableGet(table, index) ->
@@ -4189,6 +4197,13 @@ fn render_ref_item(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case item {
     ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
+    // Phase-14 `RefFuncImport` (R1): DELIBERATE fail-closed arm (the wildcard below would skip it as
+    // `UnsupportedNode`). A `RefFuncImport` makes its segment non-`all_reffunc` → non-`byte_ident_funcref`,
+    // so an imported-`ref.func` segment routes here (the general `init_elem_ref` path). We reproduce the
+    // EXACT byte-identical skip today's fast path gave (`element_entry("f<slot>")` →
+    // `UnknownFunction("f<slot>")`). R14-02 COMPLETES this arm with the real adapter-closure entry.
+    ir.RefFuncImport(slot, _) ->
+      Error(UnknownFunction("f" <> int.to_string(slot)))
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
     GlobalGet(name) -> Ok(#(ref_global_read(name, state_ref, ctx), state))
     _ -> Error(UnsupportedNode("elem_item"))
@@ -5333,6 +5348,13 @@ fn render_ref_global_init(
   case init {
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
     ir.RefFunc(name) -> reference_func_entry(name, ctx, state)
+    // Phase-14 `RefFuncImport` (R1): DELIBERATE fail-closed arm (the wildcard below would skip it as
+    // `NonConstInit`). A reference GLOBAL initialised by an imported `ref.func` (not exercised by
+    // `table_copy`, but armed so no path silently re-categorises the skip). Reproduces the exact
+    // byte-identical `UnknownFunction("f<slot>")` skip. R14-02 COMPLETES this arm (a funcref global
+    // holding an imported funcref is well-defined and cheap).
+    ir.RefFuncImport(slot, _) ->
+      Error(UnknownFunction("f" <> int.to_string(slot)))
     Values([ir.ConstV128(bytes)]) -> Ok(#(core_binary_bytes(bytes), state))
     _ -> Error(NonConstInit("non-constant reference global init"))
   }
@@ -6312,6 +6334,10 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     // ── Phase-5 reference/table/bulk nodes: collect the `Var` names in their operands so
     // gensym avoids them (over-approximating is safe). ──
     ir.RefFunc(_) -> acc
+    // Phase-14 `RefFuncImport` (R1): PASS-THROUGH — a slot + type only (no `Var` operands), so it
+    // contributes nothing to collect, exactly like `RefFunc`. NEVER an `Error` (this is a collector,
+    // not the dispatch/render fail-closed reach). This arm is PERMANENT — R14-02 does not touch it.
+    ir.RefFuncImport(_, _) -> acc
     ir.RefIsNull(arg) -> collect_value(arg, acc)
     ir.TableGet(_, index) -> collect_value(index, acc)
     ir.TableSet(_, index, value) ->

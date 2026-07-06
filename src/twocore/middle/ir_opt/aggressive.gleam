@@ -495,6 +495,8 @@ fn apply_rename_subst(
     // ── Phase-5 reference/table/bulk nodes: rewrite their `Value` operands so an inlined
     // callee's params are substituted into them (their names/segment indices are static). ──
     ir.RefFunc(_) -> e
+    // Phase-14 `RefFuncImport` (R1): a static slot + type — no `Value` operands to rewrite.
+    ir.RefFuncImport(_, _) -> e
     ir.RefIsNull(arg) -> ir.RefIsNull(rs_value(arg, rename, subst))
     ir.TableGet(table, index) ->
       ir.TableGet(table, rs_value(index, rename, subst))

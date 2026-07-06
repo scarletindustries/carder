@@ -60,10 +60,11 @@ import twocore/ir.{
   DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
   Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad,
   MemLoadUnchecked, MemSize, MemStore, MemStoreUnchecked, Num, NumTerm, RefFunc,
-  RefIsNull, Return, ReturnCall, ReturnCallImport, ReturnCallIndirect, Simd,
-  SimdLoad, SimdLoadLane, SimdShuffle, SimdStore, SimdStoreLane, Switch,
-  TableCopy, TableFill, TableGet, TableGrow, TableInit, TableSet, TableSize,
-  TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS, TruncU, Try, Values,
+  RefFuncImport, RefIsNull, Return, ReturnCall, ReturnCallImport,
+  ReturnCallIndirect, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
+  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
+  TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS,
+  TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -117,10 +118,15 @@ pub fn is_effectful_node(e: Expr) -> Bool {
     | // ── Phase-5 reference / table / bulk ops (H2): ALL barriers. ──
       // Every one reads and/or writes mutable instance state (a table slot, a memory range,
       // passive-segment drop state, or an instance-linked closure) → no CSE, no reorder, no DCE,
-      // exactly like `MemStore`/`GlobalSet` (§E). `RefFunc`/`RefIsNull` are conservatively
-      // classified as barriers too (the maximally-safe freeze posture — narrowing them to `Pure`
-      // is an explicit, tested refinement a later unit may make; strictly the safe direction).
+      // exactly like `MemStore`/`GlobalSet` (§E). `RefFunc`/`RefFuncImport`/`RefIsNull` are
+      // conservatively classified as barriers too (the maximally-safe freeze posture — narrowing
+      // them to `Pure` is an explicit, tested refinement a later unit may make; strictly the safe
+      // direction). `RefFuncImport` (R14) materialises an INSTANCE-LINKED imported funcref — a
+      // barrier exactly like `RefFunc`; it carries only a slot + type (no sub-`Expr`), so
+      // `children_all_pure`'s `_ -> True` catch-all is reached vacuously and NO arm is needed there,
+      // giving `classify == Effectful`, `can_cse == False`, `can_eliminate_if_unused == False`.
       RefFunc(_)
+    | RefFuncImport(_, _)
     | RefIsNull(_)
     | TableGet(_, _)
     | TableSet(_, _, _)

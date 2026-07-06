@@ -382,7 +382,13 @@ fn extend_source(n: Value) -> Value {
 
 /// Does `e` (recursively) contain a `MemGrow` or any CALL? Such a node could change `memory.size`
 /// mid-loop, invalidating the range guard — so a loop containing one is NOT eligible for versioning.
-fn has_grow_or_call(e: Expr) -> Bool {
+///
+/// Phase-14 note: a `RefFuncImport` (R1) is NOT a call — it constructs a funcref, it dispatches
+/// nothing — so it is NOT in the `-> True` group and falls to the `_ -> False` default, exactly like
+/// `RefFunc`. A loop containing only a `RefFuncImport` therefore stays versioning-eligible. This is
+/// the one place `RefFuncImport` deliberately does NOT mirror `CallImport` (which IS a call). Public
+/// so the keystone freeze test can assert this directly (not confirm it by silence).
+pub fn has_grow_or_call(e: Expr) -> Bool {
   case e {
     ir.MemGrow(_, _)
     | ir.CallDirect(_, _)

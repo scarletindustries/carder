@@ -758,6 +758,28 @@ pub type Expr {
   /// CAPABILITY, never an ambient `apply` of a data-named `module:atom` (D3a). Effectful (it is a
   /// call — §effect). No Phase-1..5 module produces this node; P6-05 lowers imported calls to it.
   CallImport(slot: Int, ty: FuncType, args: List(Value))
+  // ── Phase-14 cross-module funcref (R1) — a reference-materialising barrier ──
+  /// `ref.func $f` where `$f` is an IMPORTED function (R1). A funcref to the imported function at
+  /// positional func-import `slot` — the build-controlled type-tagged closure `#(FuncType, closure)`
+  /// whose closure routes through the D3a import capability (`link.call_import` over the instance's
+  /// func-import vector), rendered by `emit_core` (R14-02). `slot` counts function imports only
+  /// (imports occupy the low funcidx range, so `slot == funcidx`); `ty` is the import's declared
+  /// signature — the SAME `func_type_term(ty)` renderer `call_indirect`'s guard-3 uses, so a stored
+  /// imported funcref structurally type-matches unchanged.
+  ///
+  /// SHAPE mirrors `CallImport` (a positional func-import slot + the imported `FuncType`); ARM
+  /// TREATMENT mirrors `RefFunc` everywhere downstream (a nullary reference construction). It carries
+  /// **only** a `slot: Int` and a `ty: FuncType` — no sub-`Expr`, no `Value` operands — so it is a
+  /// LEAF in every traversal (collectors pass it through, contributing no `Var` names) and a barrier
+  /// in `ir/effect` (materialising instance-linked state → no CSE, no reorder, no DCE). Unlike
+  /// `CallImport`, it is NOT a call: it constructs a funcref, dispatches nothing, and writes no
+  /// linear memory (so mem-clobber / loop-versioning analyses see it as inert). Introduces NO new
+  /// `TrapReason` — building a funcref never traps; the indirect-dispatch guards a stored imported
+  /// funcref later feeds reuse the existing `UndefinedElement` / `UninitializedElement` /
+  /// `IndirectCallTypeMismatch` reasons. Distinct from `RefFunc`, which keeps its invariant —
+  /// `fn_name` names a DEFINED function. Only `lower` of a `ref.func` to an IMPORTED funcidx produces
+  /// this node (defined → `RefFunc`). No Phase-1..13 module produces it.
+  RefFuncImport(slot: Int, ty: FuncType)
   // ── Phase-13 tail calls (Q1/Q2) — three effectful BOTTOM-TRANSFER barriers, each a sibling of
   // `Return` (control leaves; the rest of the block is unreachable) AND of `CallImport`
   // (Value-only, capability dispatch). Each carries ONLY `Value` operands (no sub-`Expr`), so it

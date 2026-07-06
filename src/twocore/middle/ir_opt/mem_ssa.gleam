@@ -238,6 +238,9 @@ pub fn is_memory_barrier(e: Expr) -> Bool {
     // ── barriers (conservative v1): reference / table ops touch the disjoint table state,
     //     never linear memory, but are forgotten to keep the audit surface small ──
     ir.RefFunc(_)
+    | // Phase-14 `RefFuncImport` (R1): materialises an imported funcref — touches disjoint
+      // table/instance state, never linear memory — conservatively a barrier, exactly like `RefFunc`.
+      ir.RefFuncImport(_, _)
     | ir.RefIsNull(_)
     | ir.TableGet(_, _)
     | ir.TableSet(_, _, _)

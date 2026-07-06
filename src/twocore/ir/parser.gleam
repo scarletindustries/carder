@@ -1323,6 +1323,15 @@ fn parse_expr(toks: List(PToken)) -> Result(#(Expr, List(PToken)), ParseError) {
           use #(n, rest) <- result.try(parse_at_name(rest))
           Ok(#(ir.RefFunc(n), rest))
         }
+        // ── Phase-14 cross-module funcref (R1, D5): `ref.func_import <slot> : <functype>`. The
+        // exact inverse of `printer`'s spelling — mirrors `parse_call_import`'s `slot : functype`
+        // form minus the arg list (a `ref.func_import` carries no operands). ──
+        "ref.func_import" -> {
+          use #(slot, rest) <- result.try(expect_number(rest))
+          use rest <- result.try(expect(rest, TColon, ":"))
+          use #(ty, rest) <- result.try(parse_functype(rest))
+          Ok(#(ir.RefFuncImport(slot, ty), rest))
+        }
         "ref.is_null" -> {
           use #(v, rest) <- result.try(parse_value(rest))
           Ok(#(ir.RefIsNull(v), rest))

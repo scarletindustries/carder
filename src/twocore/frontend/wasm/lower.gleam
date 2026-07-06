@@ -276,9 +276,22 @@ pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
     }),
   )
   use imports <- result.try(lower_imports(module))
-  use globals <- result.try(lower_globals(module, typed.imported_global_count))
-  use elements <- result.try(lower_elements(module))
-  use data_segments <- result.try(lower_data(module))
+  use globals <- result.try(lower_globals(
+    module,
+    typed.imported_global_count,
+    typed.imported_func_count,
+    typed.func_types,
+  ))
+  use elements <- result.try(lower_elements(
+    module,
+    typed.imported_func_count,
+    typed.func_types,
+  ))
+  use data_segments <- result.try(lower_data(
+    module,
+    typed.imported_func_count,
+    typed.func_types,
+  ))
   use tags <- result.try(lower_tags(module, typed.imported_tag_count))
   Ok(ir.Module(
     name: "twocore@wasm@" <> module_base(module),
@@ -762,14 +775,14 @@ fn go(
         // `ref.is_null` produce value-producing `Expr`s bound to fresh names.
         ast.RefNull(rt) ->
           go(tail, ctx, push(st, ir.ConstNull(to_ir_reftype(rt))))
-        ast.RefFunc(f) ->
-          emit_nullary(
-            ir.RefFunc("f" <> int.to_string(f)),
-            ir.TFuncRef,
-            tail,
-            ctx,
-            st,
-          )
+        ast.RefFunc(f) -> {
+          use ref_expr <- result.try(lower_ref_func(
+            f,
+            ctx.imported,
+            ctx.func_types,
+          ))
+          emit_nullary(ref_expr, ir.TFuncRef, tail, ctx, st)
+        }
         ast.RefIsNull ->
           emit_value_op_t(
             1,
@@ -3088,9 +3101,15 @@ fn lower_memory(module: ast.Module) -> List(ir.MemoryDecl) {
 fn lower_globals(
   module: ast.Module,
   imported_global_count: Int,
+  imported_func_count: Int,
+  func_types: List(ast.FuncType),
 ) -> Result(List(ir.GlobalDecl), LowerError) {
   list.index_map(module.globals, fn(g, i) {
-    use init <- result.try(lower_const_expr(g.init))
+    use init <- result.try(lower_const_expr(
+      g.init,
+      imported_func_count,
+      func_types,
+    ))
     Ok(ir.GlobalDecl(
       gname(imported_global_count + i),
       to_ir_vt(g.ty),
@@ -3160,12 +3179,18 @@ fn lower_tags(
 /// `Error(NonConstInitExpr(_))` on an inadmissible offset/item.
 fn lower_elements(
   module: ast.Module,
+  imported: Int,
+  func_types: List(ast.FuncType),
 ) -> Result(List(ir.ElementSegment), LowerError) {
   list.try_map(module.elements, fn(e) {
-    use init <- result.try(lower_elem_init(e.init))
+    use init <- result.try(lower_elem_init(e.init, imported, func_types))
     use mode <- result.try(case e.mode {
       ast.ElemActive(table, offset_expr) -> {
-        use offset <- result.try(lower_const_expr(offset_expr))
+        use offset <- result.try(lower_const_expr(
+          offset_expr,
+          imported,
+          func_types,
+        ))
         Ok(ir.ElemActive(tname(table), offset))
       }
       ast.ElemPassive -> Ok(ir.ElemPassive)
@@ -3175,14 +3200,22 @@ fn lower_elements(
   })
 }
 
-/// Lower an element segment's init items to ref-producing const-expr `Expr`s. The legacy
-/// funcidx vector maps each funcidx to `RefFunc("f<idx>")` (the same funcidx→name convention,
-/// so element targets resolve to real functions); the expression form lowers each const-expr.
-fn lower_elem_init(init: ast.ElemInit) -> Result(List(ir.Expr), LowerError) {
+/// Lower an element segment's init items to ref-producing const-expr `Expr`s. Both forms apply the
+/// R14 `ref.func` import split (`lower_ref_func`): the legacy funcidx vector maps each funcidx to a
+/// DEFINED `RefFunc("f<idx>")` or, for an imported funcidx, a `RefFuncImport(idx, ty)` (each funcidx
+/// is an implicit `ref.func` — the same funcidx→name convention for defined targets); the expression
+/// form lowers each const-expr (a `ref.func x` there splits the same way). `imported`/`func_types`
+/// drive the split (see `lower_ref_func`).
+fn lower_elem_init(
+  init: ast.ElemInit,
+  imported: Int,
+  func_types: List(ast.FuncType),
+) -> Result(List(ir.Expr), LowerError) {
   case init {
     ast.ElemFuncs(funcs) ->
-      Ok(list.map(funcs, fn(idx) { ir.RefFunc("f" <> int.to_string(idx)) }))
-    ast.ElemExprs(exprs) -> list.try_map(exprs, lower_const_expr)
+      list.try_map(funcs, fn(idx) { lower_ref_func(idx, imported, func_types) })
+    ast.ElemExprs(exprs) ->
+      list.try_map(exprs, fn(e) { lower_const_expr(e, imported, func_types) })
   }
 }
 
@@ -3193,11 +3226,19 @@ fn lower_elem_init(init: ast.ElemInit) -> Result(List(ir.Expr), LowerError) {
 /// - **Passive** → `DataPassive`; the bytes are the source for a later `memory.init`.
 ///
 /// `Error(NonConstInitExpr(_))` on a non-constant active offset.
-fn lower_data(module: ast.Module) -> Result(List(ir.DataSegment), LowerError) {
+fn lower_data(
+  module: ast.Module,
+  imported: Int,
+  func_types: List(ast.FuncType),
+) -> Result(List(ir.DataSegment), LowerError) {
   list.try_map(module.data, fn(d) {
     case d.mode {
       ast.DataActive(mem, offset_expr) -> {
-        use offset <- result.try(lower_const_expr(offset_expr))
+        use offset <- result.try(lower_const_expr(
+          offset_expr,
+          imported,
+          func_types,
+        ))
         Ok(ir.DataSegment(ir.DataActive(mem, offset), d.bytes))
       }
       ast.DataPassive -> Ok(ir.DataSegment(ir.DataPassive, d.bytes))
@@ -3265,6 +3306,37 @@ fn ir_functype(sig: ast.FuncType) -> ir.FuncType {
   ir.FuncType(list.map(sig.params, to_ir_vt), list.map(sig.results, to_ir_vt))
 }
 
+/// Lower a `ref.func $f` funcidx to its IR reference expression, splitting on whether `$f` names
+/// an IMPORTED or a DEFINED function — the exact mirror of `lower_call`'s import split (R14
+/// keystone). The WASM funcidx space is UNIFIED: function imports occupy funcidx `0..imported-1`
+/// and defined functions follow, so an imported and a defined `ref.func` differ only in which half
+/// of the index space `f` falls in.
+///
+/// - `f < imported` (a function import) → `ir.RefFuncImport(f, ty)`, where `ty` is the import's IR
+///   signature and `slot == funcidx == f` (imports occupy the low funcidx range). This is the
+///   cross-module funcref the emitter later routes through `link.call_import` (R14-02); until then
+///   it fails closed with the same `UnknownFunction("f<f>")` skip as before (byte-identical).
+/// - `f >= imported` (a same-module function) → `ir.RefFunc("f<f>")` (unchanged, byte-identical).
+///
+/// Used by every `ref.func` lowering site — a function-body instruction, an element-segment item
+/// (`ElemFuncs`/`ElemExprs`), and a reference-global initialiser — so the import split cannot drift
+/// across them. `func_types` spans `imports ++ defined` (`typed.func_types`), so an imported funcidx
+/// recovers its signature. Returns `Error(UnknownFuncIndex(f))` if `f` is out of range (only
+/// reachable on an unvalidated module — fail-closed insurance).
+fn lower_ref_func(
+  f: Int,
+  imported: Int,
+  func_types: List(ast.FuncType),
+) -> Result(ir.Expr, LowerError) {
+  case f < imported {
+    True -> {
+      use sig <- result.try(nth_err(func_types, f, UnknownFuncIndex(f)))
+      Ok(ir.RefFuncImport(f, ir_functype(sig)))
+    }
+    False -> Ok(ir.RefFunc("f" <> int.to_string(f)))
+  }
+}
+
 /// Lower the start section's funcidx (if present) to the IR function name `f<funcidx>`
 /// (run once at instantiation). The funcidx is absolute (imports ++ defined).
 fn lower_start(module: ast.Module) -> Option(String) {
@@ -3283,7 +3355,11 @@ fn lower_start(module: ast.Module) -> Option(String) {
 /// - `t.const` → `Values([Const…])`. Integers are stored as their raw unsigned bit pattern;
 ///   floats keep their raw IEEE-754 bits (D5); `v128.const` keeps its raw 16 little-endian
 ///   bytes as `ConstV128(bytes)` (I1 — a `v128` global's initialiser).
-/// - `ref.func x` → `RefFunc("f<x>")` (a funcref to that function).
+/// - `ref.func x` → `RefFunc("f<x>")` for a DEFINED `x`, or `RefFuncImport(x, ty)` for an IMPORTED
+///   `x` (the R14 import split, via `lower_ref_func` — so a funcref-in-`elem`/global init to an
+///   imported function is a first-class cross-module funcref, not an `UnknownFunction`-named
+///   defined ref). `imported`/`func_types` drive that split (see `lower_ref_func`); an element/data
+///   OFFSET is never a `ref.func`, so those callers pass the params through unused.
 /// - `ref.null t` → `Values([ConstNull(t)])` (the null reference literal — R1c: `ref.null`
 ///   reduces to the `ConstNull` value, not a separate `Expr`).
 /// - `global.get i` → `GlobalGet("g<i>")` (an immutable imported global's value; now
@@ -3292,7 +3368,11 @@ fn lower_start(module: ast.Module) -> Option(String) {
 /// Anything else (an extended-const arithmetic chain — a separate proposal) →
 /// `Error(NonConstInitExpr(_))`, fail-closed. Validation already enforces the const-expr
 /// rule; this is the constructive counterpart + defence.
-fn lower_const_expr(instrs: List(ast.Instr)) -> Result(ir.Expr, LowerError) {
+fn lower_const_expr(
+  instrs: List(ast.Instr),
+  imported: Int,
+  func_types: List(ast.FuncType),
+) -> Result(ir.Expr, LowerError) {
   let stripped = case list.reverse(instrs) {
     [ast.End, ..rest] -> list.reverse(rest)
     _ -> instrs
@@ -3305,7 +3385,7 @@ fn lower_const_expr(instrs: List(ast.Instr)) -> Result(ir.Expr, LowerError) {
     // `v128.const` is a constant instruction (spec valid/instructions §constant-expressions),
     // so a `v128` global's initialiser is a single `v128.const` — the raw 16 bytes verbatim.
     [ast.V128Const(bytes)] -> Ok(ir.Values([ir.ConstV128(bytes)]))
-    [ast.RefFunc(x)] -> Ok(ir.RefFunc("f" <> int.to_string(x)))
+    [ast.RefFunc(x)] -> lower_ref_func(x, imported, func_types)
     [ast.RefNull(rt)] -> Ok(ir.Values([ir.ConstNull(to_ir_reftype(rt))]))
     [ast.GlobalGet(i)] -> Ok(ir.GlobalGet(gname(i)))
     _ -> Error(NonConstInitExpr("non-constant init expression"))

@@ -843,6 +843,8 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
       )
     // ── Phase-5 reference/table/bulk nodes: substitute into their `Value` operands. ──
     ir.RefFunc(_) -> e
+    // Phase-14 `RefFuncImport` (R1): no `Value` operands to substitute, so returned unchanged.
+    ir.RefFuncImport(_, _) -> e
     ir.RefIsNull(arg) -> ir.RefIsNull(subst_value(arg, subs))
     ir.TableGet(table, index) -> ir.TableGet(table, subst_value(index, subs))
     ir.TableSet(table, index, value) ->
@@ -1060,6 +1062,8 @@ fn expr_vars(e: ir.Expr) -> List(String) {
       list.append(value_name(addr), value_name(value))
     // ── Phase-5 reference/table/bulk nodes: collect the `Var` names in their operands. ──
     ir.RefFunc(_) -> []
+    // Phase-14 `RefFuncImport` (R1): a slot + type only — no `Var` names to collect.
+    ir.RefFuncImport(_, _) -> []
     ir.RefIsNull(arg) -> value_name(arg)
     ir.TableGet(_, index) -> value_name(index)
     ir.TableSet(_, index, value) ->

@@ -125,6 +125,10 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
       // barriers (`ir/effect`), so no pass hoists across them; a pass that rewrites their `Value`
       // operands does so in its own per-node arm, not here.
       ir.RefFunc(..)
+    | // Phase-14 `RefFuncImport` (R1): a `Value`-free leaf (only a slot + type), returned unchanged
+      // from this `Expr`-traversal combinator, exactly like `RefFunc`. It is a barrier (`ir/effect`),
+      // so no pass hoists across it.
+      ir.RefFuncImport(..)
     | ir.RefIsNull(..)
     | ir.TableGet(..)
     | ir.TableSet(..)

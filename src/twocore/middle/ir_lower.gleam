@@ -212,6 +212,10 @@ fn lower_expr(
     | ir.Return(_)
     | ir.Trap(_)
     | ir.RefFunc(_)
+    | // Phase-14 `RefFuncImport` (R1) carries only a static slot + type (no sub-`Expr`), so like
+      // `RefFunc` this CallHost-gate + Loop-meter pass leaves it unchanged and charges NOTHING
+      // (building a funcref is not a call — no per-node `Charge`, R8/metering unchanged).
+      ir.RefFuncImport(_, _)
     | ir.RefIsNull(_)
     | ir.TableGet(_, _)
     | ir.TableSet(_, _, _)

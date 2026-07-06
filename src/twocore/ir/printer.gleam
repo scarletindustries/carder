@@ -868,6 +868,12 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_functype(ty)
       <> " "
       <> value_list(args)
+    // ── Phase-14 cross-module funcref (R1, D5). No Phase-1..13 module contains this node, so any
+    // spelling is conformance-neutral; the keystone makes it the LOSSLESS round-trip spelling
+    // (`parser.parse_expr` reads it back). It carries no args, so no `value_list`; reuse the frozen
+    // `print_functype` so the spelling cannot drift from `call_import`'s. ──
+    ir.RefFuncImport(slot, ty) ->
+      "ref.func_import " <> int.to_string(slot) <> " : " <> print_functype(ty)
     // ── Phase-13 tail calls (Q1/Q2, D5). No Phase-1..12 module contains these, so any spelling is
     // conformance-neutral by construction; the keystone makes it the LOSSLESS round-trip spelling
     // (`parser.parse_expr` reads it back — proven by the freeze test's D5 round-trip). Each reuses

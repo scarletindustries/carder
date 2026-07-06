@@ -87,6 +87,8 @@ fn vars_in(acc: Set(String), e: Expr) -> Set(String) {
     ir.SimdShuffle(_, a, b) -> add_value(add_value(acc, a), b)
     // reference / table layer
     ir.RefFunc(_) -> acc
+    // Phase-14 `RefFuncImport` (R1): a slot + type only — contributes no loop-variant operand.
+    ir.RefFuncImport(_, _) -> acc
     ir.RefIsNull(arg) -> add_value(acc, arg)
     ir.TableGet(_, index) -> add_value(acc, index)
     ir.TableSet(_, index, value) -> add_value(add_value(acc, index), value)
