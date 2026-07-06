@@ -1221,6 +1221,19 @@ fn decode_instr(
           use #(table, r2) <- result.try(decode_u_n(r1, 32))
           Ok(#(ast.CallIndirect(type_idx: ty, table: table), r2))
         }
+        // tail-call proposal (Q13): the two tail-call opcodes read immediates
+        // BYTE-IDENTICAL to their non-tail siblings `0x10`/`0x11` (Q2). `0x12`
+        // takes one `u32` funcidx (same as `Call`); `0x13` takes a `u32` typeidx
+        // THEN a `u32` tableidx (same as `CallIndirect`).
+        0x12 -> idx_instr(rest, ast.ReturnCall)
+        // The two reads are kept OPEN (not collapsed into a shared helper) so the
+        // typeidx-before-tableidx order mirrors `0x11` exactly — the labelled
+        // `type_idx:`/`table:` lock the anti-swap field order.
+        0x13 -> {
+          use #(ty, r1) <- result.try(decode_u_n(rest, 32))
+          use #(table, r2) <- result.try(decode_u_n(r1, 32))
+          Ok(#(ast.ReturnCallIndirect(type_idx: ty, table: table), r2))
+        }
         // exception handling — legacy (Porffor's headline path, §F): try 0x06 /
         // catch 0x07 / rethrow 0x09 / delegate 0x18 / catch_all 0x19.
         0x06 -> {

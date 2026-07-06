@@ -3173,11 +3173,17 @@ fn parse_immediate_instr(
     "global.get" -> one_idx(toks, env.globals, "global", ast.GlobalGet, types)
     "global.set" -> one_idx(toks, env.globals, "global", ast.GlobalSet, types)
     "call" -> one_idx(toks, env.funcs, "func", ast.Call, types)
+    // tail-call proposal (Q13): `return_call`/`return_call_indirect` share the
+    // exact index / typeuse resolution machinery of `call`/`call_indirect`.
+    "return_call" -> one_idx(toks, env.funcs, "func", ast.ReturnCall, types)
     "ref.func" -> one_idx(toks, env.funcs, "func", ast.RefFunc, types)
     "br" -> label_instr(toks, labels, ast.Br, types)
     "br_if" -> label_instr(toks, labels, ast.BrIf, types)
     "br_table" -> br_table_instr(toks, labels, types)
-    "call_indirect" -> call_indirect_instr(toks, env, types, pos)
+    "call_indirect" ->
+      call_indirect_instr(toks, env, types, pos, ast.CallIndirect)
+    "return_call_indirect" ->
+      call_indirect_instr(toks, env, types, pos, ast.ReturnCallIndirect)
     "select" -> select_instr(toks, types)
     "ref.null" -> ref_null_instr(toks, types)
     "memory.size" ->
@@ -3328,11 +3334,26 @@ fn br_table_instr(
   }
 }
 
+/// Parse the shared `tableidx? typeuse` operand grammar of `call_indirect` /
+/// `return_call_indirect` and build the instruction with `ctor`.
+///
+/// The text is `tableidx? (type $ft)? (param …)* (result …)*`: an optional table
+/// index (name or number; absent → table `0`) followed by a typeuse that either
+/// names an existing `(type $ft)` or is matched/appended by `finalize_typeuse`.
+/// `ctor(type_idx, table)` selects which AST node is produced, so ONE
+/// implementation backs BOTH `call_indirect` (`ast.CallIndirect`) and the
+/// tail-call `return_call_indirect` (`ast.ReturnCallIndirect`) — the two forms
+/// can never diverge. `type_idx` is the resolved/created typeidx; `table` the
+/// resolved tableidx. Returns the single-instruction sequence, the unconsumed
+/// tokens, and the possibly-extended `types`. Fails with the typeuse errors of
+/// `finalize_typeuse` or an `UnboundIdentifier`/`UnexpectedToken` from an
+/// unresolvable table reference.
 fn call_indirect_instr(
   toks: List(Token),
   env: Env,
   types: List(ast.FuncType),
   pos: Pos,
+  ctor: fn(Int, Int) -> ast.Instr,
 ) -> Result(#(List(ast.Instr), List(Token), List(ast.FuncType)), WatError) {
   let #(tbl_tok, r1) = take_num_or_id(toks)
   use table <- result.try(case tbl_tok {
@@ -3347,7 +3368,7 @@ fn call_indirect_instr(
     types,
     pos,
   ))
-  Ok(one(ast.CallIndirect(type_idx, table), r2, types1))
+  Ok(one(ctor(type_idx, table), r2, types1))
 }
 
 fn select_instr(
