@@ -504,8 +504,8 @@ fn go(
         // calls ---------------------------------------------------------------------
         ast.Call(f) -> lower_call(f, tail, ctx, st)
 
-        // tail calls (Phase 13) — CONSERVATIVE-SOUND PLACEHOLDER lowering (Q13-04 completes
-        // with the real `ir.ReturnCall*` bottom nodes). See `lower_return_call`.
+        // tail calls (Phase 13, Q4) — REAL bottom-transfer lowering to `ir.ReturnCall` /
+        // `ir.ReturnCallImport`. See `lower_return_call`.
         ast.ReturnCall(f) -> lower_return_call(f, tail, ctx, st)
 
         // structured control --------------------------------------------------------
@@ -749,8 +749,8 @@ fn go(
         // indirect call + select ----------------------------------------------------
         ast.CallIndirect(ty, table) ->
           lower_call_indirect(ty, table, tail, ctx, st)
-        // tail call indirect (Phase 13) — CONSERVATIVE-SOUND PLACEHOLDER lowering (Q13-04
-        // completes with the real `ir.ReturnCallIndirect` bottom node). See below.
+        // tail call indirect (Phase 13, Q4) — REAL bottom-transfer lowering to the
+        // `ir.ReturnCallIndirect` bottom node. See `lower_return_call_indirect`.
         ast.ReturnCallIndirect(ty, table) ->
           lower_return_call_indirect(ty, table, tail, ctx, st)
         ast.Select -> lower_select(tail, ctx, st)
@@ -1406,20 +1406,33 @@ fn lower_call(
   }
 }
 
-/// Lower `return_call $f` (Phase 13, Q4) — CONSERVATIVE-SOUND, VALUE-CORRECT PLACEHOLDER (Q13-04
-/// completes it with the real `ir.ReturnCall`/`ir.ReturnCallImport` bottom node in CONSTANT stack).
+/// Lower `return_call f` (tail-call proposal, opcode 0x12) as a BOTTOM transfer (Phase 13, Q4).
 ///
-/// A tail call is a BOTTOM transfer (like `Return`): its continuation is dead by spec, and the
-/// callee's results become this function's results. The keystone desugars it to an ORDINARY call
-/// bound to fresh names followed by `ir.Return` of those names — `Let(names, call, Return(vars))` —
-/// then consumes the dead tail to the frame's closing marker (`consume_dead` + `end_or_else`). This
-/// is RESULT-IDENTICAL to the real tail call (the Q13-03 result-equality rule guarantees the
-/// callee's results equal the function's), routed through the UNCHANGED emit path, so the pipeline
-/// stays byte-identical — but it is NOT the constant-stack node yet. The import-vs-defined split
-/// mirrors `lower_call` (`f < ctx.imported` → `ir.CallImport`, else `ir.CallDirect`).
+/// Per the tail-call proposal, `return_call` replaces the current activation with a call to `f`:
+/// it pops `f`'s params, transfers control, and the rest of the block is UNREACHABLE
+/// (stack-polymorphic, exactly like `return`). Therefore lower builds a single leaf
+/// bottom-transfer node from the top operands and DISCARDS the dead continuation — it does NOT
+/// bind result names or recurse into a live tail (there are no result values to bind in the
+/// caller; the callee's results become the caller's, per the Q13-03 result-equality rule). This
+/// is the `Return` shape, not the `Call` shape: no `fresh_n`, no `record_types`, no `wrap_let`,
+/// no `go(tail, …)` recursion, and the name counter stays UNADVANCED (as `ir.Return` / `throw`).
 ///
-/// `Error(UnknownFuncIndex(f))` if `f` is out of range; `Error(StackUnderflow)` if the stack lacks
-/// the params (both only reachable on an unvalidated module — fail-closed insurance).
+/// The callee signature is fetched from `ctx.func_types` (which spans imports ++ defined, so an
+/// imported funcidx recovers its signature) — identical to `lower_call`. The import split mirrors
+/// `lower_call`:
+/// - `f < ctx.imported` (a function import) → `ir.ReturnCallImport(slot: f, ty, args)`; `slot` is
+///   the positional function-import index (= `f`, since imports occupy funcidx `0 .. imported-1`);
+///   `ty` is the import's IR signature (`ir_functype(sig)`). emit_core (Q13-05) tail-applies the
+///   linker-built `link.call_import` capability under `KReturn` — never a name lookup (D3a).
+/// - `f >= ctx.imported` (a same-module function) → `ir.ReturnCall("f<f>", args)`.
+///
+/// - `tail`: the instructions AFTER this `return_call` in the current frame — dead code, consumed
+///   to the frame's closing marker by `consume_dead`.
+///
+/// Returns `Ok(GoResult)` (the transfer node closed on the frame's `end`/`else`). Fail-closed
+/// (never a panic): `Error(UnknownFuncIndex(f))` if `f` is out of range, `Error(StackUnderflow)`
+/// if the stack lacks the params — both only reachable on an UNVALIDATED module (validate is the
+/// real boundary).
 fn lower_return_call(
   f: Int,
   tail: List(ast.Instr),
@@ -1432,26 +1445,34 @@ fn lower_return_call(
   case list.length(args) == pcount {
     False -> Error(StackUnderflow)
     True -> {
-      let #(names, c2) = fresh_n(st.counter, list.length(sig.results))
-      let call = case f < ctx.imported {
-        True -> ir.CallImport(f, ir_functype(sig), args)
-        False -> ir.CallDirect("f" <> int.to_string(f), args)
+      let node = case f < ctx.imported {
+        True -> ir.ReturnCallImport(f, ir_functype(sig), args)
+        False -> ir.ReturnCall("f" <> int.to_string(f), args)
       }
-      let node = ir.Let(names, call, ir.Return(list.map(names, ir.Var)))
       use #(marker, rest) <- result.try(consume_dead(tail, 0))
-      Ok(end_or_else(marker, node, rest, c2))
+      Ok(end_or_else(marker, node, rest, st.counter))
     }
   }
 }
 
-/// Lower `return_call_indirect (type $ty) $table` (Phase 13, Q4) — CONSERVATIVE-SOUND, VALUE-CORRECT
-/// PLACEHOLDER (Q13-04 completes it with the real `ir.ReturnCallIndirect` bottom node in CONSTANT
-/// stack). Desugars to an ORDINARY `ir.CallIndirect` bound to fresh names then `ir.Return` of them
-/// (the same bottom-transfer template as `lower_return_call`), popping the i32 index (top of stack)
-/// then the type's params in the frozen `call_indirect` order. Result-identical, NOT constant-stack.
+/// Lower `return_call_indirect y x` (tail-call proposal, opcode 0x13) as a BOTTOM transfer
+/// (Phase 13, Q4).
 ///
-/// `Error(UnknownTypeIndex(ty))` if `ty` is out of range; `Error(StackUnderflow)` if the stack lacks
-/// the index/params (both only reachable on an unvalidated module).
+/// Pops the i32 table index (top of stack), then the type's params (push order beneath it), and
+/// builds a single leaf `ir.ReturnCallIndirect(table, index, ty, args)`; the dead continuation is
+/// discarded. `ty` is the STRUCTURAL expected type `module.types[y]` (the runtime does the
+/// per-call type check via the Q13-01 `rt_table` lookup seam — E3/D3a); the table immediate `x`
+/// maps to the stable name `t<x>` (`tname`). Lower carries NO funcidx and NO `apply` — the
+/// build-controlled dispatch stays the runtime's job, exactly as for non-tail `call_indirect`. The
+/// 3 ordered traps (undefined element → uninitialized element → type mismatch) are preserved by
+/// emit_core + rt_table (Q13-05/Q13-01), NOT here. This is the `Return` shape: no `fresh_n`, no
+/// `record_types`, no `wrap_let`, no `go(tail, …)` recursion, and the counter stays UNADVANCED.
+///
+/// - `tail`: dead code after this instruction — consumed to the frame's closing marker.
+///
+/// Returns `Ok(GoResult)`. Fail-closed (never a panic): `Error(UnknownTypeIndex(y))` if `y` is out
+/// of range, `Error(StackUnderflow)` if the stack lacks the index/params — both only reachable on
+/// an UNVALIDATED module.
 fn lower_return_call_indirect(
   type_idx: Int,
   table: Int,
@@ -1468,15 +1489,9 @@ fn lower_return_call_indirect(
   case list.length(args) == pcount {
     False -> Error(StackUnderflow)
     True -> {
-      let #(names, c2) = fresh_n(st.counter, list.length(sig.results))
-      let node =
-        ir.Let(
-          names,
-          ir.CallIndirect(tname(table), index, ir_ty, args),
-          ir.Return(list.map(names, ir.Var)),
-        )
+      let node = ir.ReturnCallIndirect(tname(table), index, ir_ty, args)
       use #(marker, rest) <- result.try(consume_dead(tail, 0))
-      Ok(end_or_else(marker, node, rest, c2))
+      Ok(end_or_else(marker, node, rest, st.counter))
     }
   }
 }
