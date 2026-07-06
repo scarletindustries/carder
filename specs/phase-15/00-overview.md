@@ -120,8 +120,9 @@ cannot be merged under any mode). tier-N stays excluded from the `--link` differ
 phase adds capability; it does not widen posture.
 
 **S6 — CI builds the NIF or categorizes the skip; never a false green.** The test-time build gates on a C
-toolchain (`cc`, fallback `gcc`) resolved with `os:find_executable`, with `erl_nif.h` located via
-`code:lib_dir(erts, include)`. Present (CI ubuntu, dev macOS) ⇒ the tier-N differential runs against the
+toolchain (`cc`, fallback `gcc`) resolved with `os:find_executable`, with `erl_nif.h` located via the frozen
+`erts_include/0` candidate-list resolver (keystone §3.5 — not the bare `code:lib_dir(erts, include)`, which
+returns a header-less path on some layouts). Present (CI ubuntu, dev macOS) ⇒ the tier-N differential runs against the
 real NIF. Absent ⇒ every tier-N-native assertion is a **categorized skip** (the `cc`-absent path is
 itself tested to skip, mirroring the Elixir binding arm), and the paged-delegate remains the fallback so
 nothing regresses. The conformance `fail=0` gate holds regardless.
