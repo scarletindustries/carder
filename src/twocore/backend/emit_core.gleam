@@ -2425,7 +2425,21 @@ fn emit_gc(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
-  apply_cont(cont, [call], sc, state, ctx)
+  case gc_is_void(op) {
+    // struct.set / array.set / fill / copy push no value — sequence the call and
+    // continue with zero results.
+    True -> emit_zero_effect(call, cont, sc, state, ctx)
+    // Every other GC op pushes exactly its one result (a ref, an i32, or a term).
+    False -> apply_cont(cont, [call], sc, state, ctx)
+  }
+}
+
+/// The GC ops that produce no stack value (a pure heap mutation).
+fn gc_is_void(op: ir.GcOp) -> Bool {
+  case op {
+    ir.GcStructSet(_) | ir.GcArraySet | ir.GcArrayFill | ir.GcArrayCopy -> True
+    _ -> False
+  }
 }
 
 /// The `rt_gc` function name for a GC op. Packed reads and the signed/unsigned
