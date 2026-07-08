@@ -61,3 +61,37 @@ pub fn gc_ref_eq_test() {
   embed.invoke(inst, "eq_test", []) |> should.equal(Ok([10]))
   embed.stop(inst)
 }
+
+fn branch_instance() {
+  let assert Ok(wasm) =
+    simplifile.read_bits("test/twocore/frontend/wasm/gc_fixtures/gcbranch.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(inst) = embed.instantiate(compiled, no_host)
+  inst
+}
+
+/// br_on_cast success: an `anyref` holding a `$pt` downcasts and branches, then
+/// reads field 0 = 42.
+pub fn gc_br_on_cast_hit_test() {
+  let inst = branch_instance()
+  embed.invoke(inst, "cast_hit", []) |> should.equal(Ok([42]))
+  embed.stop(inst)
+}
+
+/// br_on_cast miss: an `anyref` holding an i31 fails the `$pt` cast, falls through
+/// → -1 (0xFFFFFFFF unsigned).
+pub fn gc_br_on_cast_miss_test() {
+  let inst = branch_instance()
+  embed.invoke(inst, "cast_miss", []) |> should.equal(Ok([4_294_967_295]))
+  embed.stop(inst)
+}
+
+/// br_on_null: a non-null `$pt` falls through to read field 0 = 7; a null branches
+/// away → -1.
+pub fn gc_br_on_null_test() {
+  let inst = branch_instance()
+  embed.invoke(inst, "brnull", [1]) |> should.equal(Ok([7]))
+  embed.invoke(inst, "brnull", [0]) |> should.equal(Ok([4_294_967_295]))
+  embed.stop(inst)
+}

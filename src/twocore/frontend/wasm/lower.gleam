@@ -1216,6 +1216,14 @@ fn go(
         // (`{ref_null}`) — the same one funcref/externref null uses, so ref.eq/
         // test/cast treat all nulls uniformly.
         ast.RefNullHt(_) -> go(tail, ctx, push(st, ir.ConstNull(ir.FuncRef)))
+        // Branch casts — a conditional `If` around the ref's nullness / cast test,
+        // keeping or dropping the ref on each side per the spec stack types.
+        ast.BrOnNull(l) -> lower_br_on_null(l, True, tail, ctx, st)
+        ast.BrOnNonNull(l) -> lower_br_on_null(l, False, tail, ctx, st)
+        ast.BrOnCast(l, _rt1, rt2) ->
+          lower_br_on_cast(l, rt2, False, tail, ctx, st)
+        ast.BrOnCastFail(l, _rt1, rt2) ->
+          lower_br_on_cast(l, rt2, True, tail, ctx, st)
 
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
@@ -1549,6 +1557,92 @@ fn subtype_set(t: Int, types: List(ast.DefType)) -> List(Int) {
   types
   |> list.index_map(fn(_dt, i) { i })
   |> list.filter(fn(i) { gc_reaches(i, t, types, n) })
+}
+
+/// Lower `br_on_null`/`br_on_non_null l`: pop the ref, branch on `ref.is_null`.
+/// `br_on_null` (on_null = True) branches on the null case carrying the stack sans
+/// the ref, and falls through keeping the (now non-null) ref; `br_on_non_null`
+/// swaps which side branches and which keeps the ref.
+fn lower_br_on_null(
+  l: Int,
+  on_null: Bool,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(ref, stack1) <- result.try(pop1(st.stack))
+  let #(cond_name, c2) = fresh(st.counter)
+  use cur <- result.try(current_frame(st))
+  let st_without = LState(..st, stack: stack1, counter: c2)
+  let st_with = LState(..st, stack: [ref, ..stack1], counter: c2)
+  case on_null {
+    True -> {
+      use transfer <- result.try(build_transfer(l, st_without))
+      use inner <- result.try(go(tail, ctx, st_with))
+      Ok(finish_br_cond(cond_name, ref, cur, transfer, inner, True))
+    }
+    False -> {
+      use transfer <- result.try(build_transfer(l, st_with))
+      use inner <- result.try(go(tail, ctx, st_without))
+      Ok(finish_br_cond(cond_name, ref, cur, transfer, inner, False))
+    }
+  }
+}
+
+/// Lower `br_on_cast`/`br_on_cast_fail l _ rt2`: pop the ref, branch on
+/// `ref.test rt2`. Both sides keep the ref on the stack (the spec fall-through /
+/// branch both carry a ref); `br_on_cast` branches when the test succeeds,
+/// `br_on_cast_fail` (is_fail = True) when it fails.
+fn lower_br_on_cast(
+  l: Int,
+  rt2: ast.RefType,
+  is_fail: Bool,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(ref, stack1) <- result.try(pop1(st.stack))
+  let #(cond_name, c2) = fresh(st.counter)
+  use cur <- result.try(current_frame(st))
+  let #(matcher, null_ok) = gc_matcher(rt2, ctx)
+  let st_with = LState(..st, stack: [ref, ..stack1], counter: c2)
+  use transfer <- result.try(build_transfer(l, st_with))
+  use inner <- result.try(go(tail, ctx, st_with))
+  let mk = fn(e) {
+    case is_fail {
+      False -> ir.If(ir.Var(cond_name), cur.result_types, transfer, e)
+      True -> ir.If(ir.Var(cond_name), cur.result_types, e, transfer)
+    }
+  }
+  let gr = case inner {
+    GEnd(e, rest, c) -> GEnd(mk(e), rest, c)
+    GElse(e, rest, c) -> GElse(mk(e), rest, c)
+  }
+  Ok(wrap_let([cond_name], ir.Gc(ir.GcRefTest(matcher, null_ok), [ref]), gr))
+}
+
+/// Assemble a branch-cast `If`: bind `cond = ref.is_null(ref)`, then choose which
+/// arm branches. `branch_when_null` puts the transfer in the then-arm (br_on_null)
+/// or the else-arm (br_on_non_null).
+fn finish_br_cond(
+  cond_name: String,
+  ref: ir.Value,
+  cur: LFrame,
+  transfer: ir.Expr,
+  inner: GoResult,
+  branch_when_null: Bool,
+) -> GoResult {
+  let mk = fn(e) {
+    case branch_when_null {
+      True -> ir.If(ir.Var(cond_name), cur.result_types, transfer, e)
+      False -> ir.If(ir.Var(cond_name), cur.result_types, e, transfer)
+    }
+  }
+  let gr = case inner {
+    GEnd(e, rest, c) -> GEnd(mk(e), rest, c)
+    GElse(e, rest, c) -> GElse(mk(e), rest, c)
+  }
+  wrap_let([cond_name], ir.RefIsNull(ref), gr)
 }
 
 fn gc_reaches(i: Int, t: Int, types: List(ast.DefType), fuel: Int) -> Bool {
@@ -3274,7 +3368,10 @@ fn zero_value(t: ir.ValType) -> ir.Value {
     ir.TI64 -> ir.ConstI64(0)
     ir.TF32 -> ir.ConstF32(0)
     ir.TF64 -> ir.ConstF64(0)
-    ir.TTerm -> ir.ConstI32(0)
+    // A `TTerm` WASM local is a GC reference (only `ast.Ref` lowers to `TTerm`);
+    // its zero value is the null sentinel `{ref_null}` (shared with funcref/
+    // externref null), never an integer.
+    ir.TTerm -> ir.ConstNull(ir.FuncRef)
     // A reference-typed slot's zero value is the null reference (H1). Never arises from the
     // Phase-1..4 WASM surface (only numeric locals); P5-05 exercises reference locals.
     ir.TFuncRef -> ir.ConstNull(ir.FuncRef)

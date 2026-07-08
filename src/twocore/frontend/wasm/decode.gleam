@@ -1284,19 +1284,32 @@ fn decode_locals_groups(
 fn decode_blocktype(
   bytes: BitArray,
 ) -> Result(#(BlockType, BitArray), ast.DecodeError) {
-  use #(v, rest) <- result.try(decode_s_n(bytes, 33))
-  case v {
-    _ if v >= 0 -> Ok(#(ast.BlockTypeIdx(v), rest))
-    _ if v == -64 -> Ok(#(ast.BlockEmpty, rest))
-    _ if v == -1 -> Ok(#(ast.BlockVal(ast.I32), rest))
-    _ if v == -2 -> Ok(#(ast.BlockVal(ast.I64), rest))
-    _ if v == -3 -> Ok(#(ast.BlockVal(ast.F32), rest))
-    _ if v == -4 -> Ok(#(ast.BlockVal(ast.F64), rest))
-    _ if v == -5 -> Ok(#(ast.BlockVal(ast.V128), rest))
-    _ if v == -16 -> Ok(#(ast.BlockVal(ast.FuncRef), rest))
-    _ if v == -17 -> Ok(#(ast.BlockVal(ast.ExternRef), rest))
-    _ if v == -23 -> Ok(#(ast.BlockVal(ast.ExnRef), rest))
-    _ -> Error(ast.BadBlockType)
+  case bytes {
+    // 0x40 — the empty block type (no result).
+    <<0x40, rest:bytes>> -> Ok(#(ast.BlockEmpty, rest))
+    // A single-value block type: any value type, encoded with its own byte(s).
+    // This covers the numeric shorthands (0x7B–0x7F), the reference shorthands,
+    // AND the GC general `(ref null? ht)` forms (0x63/0x64) — none of which fit
+    // the negative-`s33` scheme. A value-type lead byte is always ≥ 0x63, and no
+    // valid non-negative type index encodes with a lead byte in that range, so
+    // the two cases never collide.
+    <<b:8, _:bytes>> if b >= 0x63 && b <= 0x7F -> {
+      // A byte in this range that is not actually a value type (e.g. the packed
+      // storage codes 0x77/0x78, which are struct/array-field-only) is a malformed
+      // block type.
+      case decode_valtype(bytes) {
+        Ok(#(vt, rest)) -> Ok(#(ast.BlockVal(vt), rest))
+        Error(_) -> Error(ast.BadBlockType)
+      }
+    }
+    // Otherwise a type index (a multi-value block), as a non-negative `s33`.
+    _ -> {
+      use #(v, rest) <- result.try(decode_s_n(bytes, 33))
+      case v >= 0 {
+        True -> Ok(#(ast.BlockTypeIdx(v), rest))
+        False -> Error(ast.BadBlockType)
+      }
+    }
   }
 }
 
