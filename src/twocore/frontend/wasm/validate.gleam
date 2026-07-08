@@ -1957,30 +1957,36 @@ fn validate_instr(
     }
     ast.BrOnNull(l) -> {
       use #(t, st1) <- result.try(pop_val(st))
+      // The label index must be valid even in dead code (before splitting on
+      // reachability); on null, the branch carries the stack sans the ref.
+      use frame <- result.try(label_frame(st1, l))
+      use _ <- result.try(pop_vals(st1, label_types(frame)))
       case t {
         Unknown -> Ok(push_stack(st1, Unknown))
         Known(vt) ->
           case ast.normalize_reftype(vt) {
             Error(_) -> Error(TypeMismatch)
-            Ok(rt) -> {
-              use frame <- result.try(label_frame(st1, l))
-              // On null, branch to `l` with the stack sans the ref.
-              use _ <- result.try(pop_vals(st1, label_types(frame)))
-              Ok(push_val(st1, ast.Ref(ast.RefType(False, rt.heap))))
-            }
+            Ok(rt) -> Ok(push_val(st1, ast.Ref(ast.RefType(False, rt.heap))))
           }
       }
     }
     ast.BrOnNonNull(l) -> {
       use #(t, st1) <- result.try(pop_val(st))
+      // Validate the label in dead code too; on non-null the branch carries the
+      // (non-null) ref, so the label check pushes it before matching.
+      use frame <- result.try(label_frame(st1, l))
       case t {
-        Unknown -> Ok(st1)
+        Unknown -> {
+          use _ <- result.try(pop_vals(
+            push_stack(st1, Unknown),
+            label_types(frame),
+          ))
+          Ok(st1)
+        }
         Known(vt) ->
           case ast.normalize_reftype(vt) {
             Error(_) -> Error(TypeMismatch)
             Ok(rt) -> {
-              use frame <- result.try(label_frame(st1, l))
-              // On non-null, branch to `l` carrying the (non-null) ref.
               let sb = push_val(st1, ast.Ref(ast.RefType(False, rt.heap)))
               use _ <- result.try(pop_vals(sb, label_types(frame)))
               Ok(st1)
