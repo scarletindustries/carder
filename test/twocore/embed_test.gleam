@@ -49,3 +49,28 @@ pub fn no_import_guest_invokes_test() {
   embed.invoke(instance, "add", [3, 5]) |> should.equal(Ok([8]))
   embed.stop(instance)
 }
+
+/// Compile-once caching: a `Compiled` serializes to an artifact blob and reloads
+/// into a working instance WITHOUT recompiling (no access to the original
+/// `.wasm`). This is the deploy-time-compile / boot-from-cache contract an
+/// embedder relies on.
+pub fn artifact_round_trip_reinstantiates_test() {
+  let assert Ok(wasm) =
+    simplifile.read_bits("test/twocore/conformance/corpus/add.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+
+  // Serialize (deploy time) and reload (boot time) — no recompile.
+  let blob = embed.to_artifact(compiled)
+  let assert Ok(reloaded) = embed.from_artifact(blob)
+
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(instance) = embed.instantiate(reloaded, no_host)
+  embed.invoke(instance, "add", [3, 5]) |> should.equal(Ok([8]))
+  embed.stop(instance)
+}
+
+/// A malformed artifact blob fails closed, never crashes.
+pub fn artifact_malformed_is_error_test() {
+  embed.from_artifact(<<"not a real artifact">>)
+  |> should.be_error
+}

@@ -132,3 +132,41 @@ pub fn mem_write(ptr: Int, bytes: BitArray) -> Result(Nil, Nil) {
   rt_mem.store_bytes(ptr, bytes, 0)
   |> result.replace_error(Nil)
 }
+
+// ── Compile-once artifact caching ──────────────────────────────────────────
+//
+// `compile` is the expensive stage (`wasm → IR → Core Erlang → .beam`) and can
+// take a long time for a large guest. An embedder should run it ONCE — at deploy
+// time — and cache the result, then `instantiate` cheaply per instance. These
+// two functions turn a `Compiled` into an opaque blob and back, so the cache can
+// live in object storage (S3, disk, …). The blob carries the loadable `.beam`
+// AND the import metadata `instantiate` needs, so a reloaded artifact needs no
+// recompilation and no access to the original `.wasm`.
+
+/// `erlang:term_to_binary/1` — serialize any term to its external binary form.
+@external(erlang, "erlang", "term_to_binary")
+fn term_to_binary(term: a) -> BitArray
+
+/// Catching `erlang:binary_to_term/2` (`[safe]`) — `Ok(Compiled)` for a valid
+/// artifact, `Error(message)` for a malformed / foreign blob. See
+/// `twocore_embed_ffi`.
+@external(erlang, "twocore_embed_ffi", "from_binary")
+fn ffi_from_binary(bytes: BitArray) -> Result(Compiled, String)
+
+/// Serialize a compiled guest to a single cacheable blob.
+///
+/// Store this (keyed by e.g. deployment + module) so a guest is compiled ONCE
+/// and reloaded cheaply. The blob carries the loadable `.beam` plus the module
+/// metadata `instantiate` needs — reloading it requires neither recompilation
+/// nor the original `.wasm`. Total.
+pub fn to_artifact(compiled: Compiled) -> BitArray {
+  term_to_binary(compiled)
+}
+
+/// Reload a compiled guest from a blob produced by `to_artifact`.
+///
+/// - Returns `Ok(Compiled)` ready for `instantiate`, or `Error(reason)` if the
+///   blob is malformed / truncated / not a 2core artifact. Total — never panics.
+pub fn from_artifact(bytes: BitArray) -> Result(Compiled, String) {
+  ffi_from_binary(bytes)
+}
