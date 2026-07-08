@@ -1043,9 +1043,17 @@ fn go(
         // ═══════════════════════ WasmGC (this proposal) ═══════════════════════
         // Each GC value/effect op lowers to a single `ir.Gc(op, args)` node routed
         // through the shared value/effect emitters. Operands are deepest-first,
-        // matching `ir.Gc`'s convention. Branch casts, `call_ref`, and the
-        // data/elem-segment array ops are not yet lowered (they fall through to
-        // `Unsupported`); a validated module using them fails cleanly, never miscompiles.
+        // matching `ir.Gc`'s convention.
+        //
+        // NOT YET LOWERED — these fall through to `Unsupported`, so a validated
+        // module that uses one fails cleanly at lowering (never miscompiles):
+        //   - `return_call_ref` (a tail call — needs a bottom-transfer node like
+        //     `ir.ReturnCallIndirect`);
+        //   - `array.new_data` / `array.new_elem` / `array.init_data` /
+        //     `array.init_elem` (array init from a passive data/element segment —
+        //     needs the segment-payload drop-gate plumbing plus per-element-type
+        //     byte decoding).
+        // Everything else in the GC + typed-function-references surface is lowered.
         ast.StructNew(t) -> {
           use fields <- result.try(gc_struct_fields(ctx, t))
           emit_value_op_t(

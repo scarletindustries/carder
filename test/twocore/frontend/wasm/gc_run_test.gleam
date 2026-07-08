@@ -122,3 +122,12 @@ pub fn gc_call_ref_dispatch_test() {
   embed.invoke(inst, "dispatch", [0, 10, 3]) |> should.equal(Ok([7]))
   embed.stop(inst)
 }
+
+/// The segment-sourced array ops are validated by the spec but not yet lowered by
+/// 2core. A module using `array.new_data` must fail CLEANLY at compile (an Error),
+/// never miscompile or crash — documenting the boundary of what is implemented.
+pub fn gc_unsupported_array_new_data_fails_clean_test() {
+  let assert Ok(wasm) =
+    simplifile.read_bits("test/twocore/frontend/wasm/gc_fixtures/gcunsup.wasm")
+  embed.compile(wasm) |> should.be_error
+}
