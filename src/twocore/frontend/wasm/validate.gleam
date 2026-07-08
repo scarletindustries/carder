@@ -68,7 +68,7 @@ import gleam/result
 import gleam/set.{type Set}
 import twocore/frontend/wasm/ast.{
   type FuncType, type IdxType, type Instr, type Limits, type MemArg, type Module,
-  type ValType,
+  type ValType, ExnRef, ExternRef, F32, F64, FuncRef, I32, I64, Ref, V128,
 }
 
 // ─────────────────────────────── public types ───────────────────────────────
@@ -416,18 +416,370 @@ type CtrlFrame {
 /// The validator's threaded state: the operand-type stack (`vals`, top at head) and
 /// the control-frame stack (`ctrls`, innermost at head).
 type VState {
-  VState(vals: List(StackType), ctrls: List(CtrlFrame))
+  VState(
+    vals: List(StackType),
+    ctrls: List(CtrlFrame),
+    /// The module's defined types, so operand matching can consult the GC
+    /// subtype relation (concrete supertype chains + the abstract hierarchy).
+    types: List(ast.DefType),
+  )
 }
 
 // ─────────────────────────────── stack operations ───────────────────────────────
 
 /// `True` if a stack type satisfies an expectation, honoring `Unknown` polymorphism
 /// in either position (spec: `Unknown` matches any type).
-fn types_match(a: StackType, b: StackType) -> Bool {
+/// Does a value of stack type `a` satisfy an expected type `b`? `Unknown` (the
+/// bottom produced after unreachable) matches anything; otherwise `a` must be a
+/// **subtype** of `b` under the GC hierarchy (identity for non-GC types).
+fn types_match(a: StackType, b: StackType, types: List(ast.DefType)) -> Bool {
   case a, b {
     Unknown, _ -> True
     _, Unknown -> True
-    Known(x), Known(y) -> x == y
+    Known(x), Known(y) -> val_subtype(x, y, types)
+  }
+}
+
+/// `a <: b` on value types: equal, or both reference types with `a`'s reference
+/// type a subtype of `b`'s (non-null ≤ nullable, heap types via `heap_matches`).
+fn val_subtype(a: ValType, b: ValType, types: List(ast.DefType)) -> Bool {
+  case a == b {
+    True -> True
+    False ->
+      case ast.normalize_reftype(a), ast.normalize_reftype(b) {
+        Ok(ra), Ok(rb) -> ref_matches(ra, rb, types)
+        _, _ -> False
+      }
+  }
+}
+
+/// `(ref null? h1) <: (ref null? h2)`: a non-null ref is a subtype of the
+/// nullable one (not vice-versa), and `h1 <: h2`.
+fn ref_matches(
+  a: ast.RefType,
+  b: ast.RefType,
+  types: List(ast.DefType),
+) -> Bool {
+  { !a.nullable || b.nullable } && heap_matches(a.heap, b.heap, types)
+}
+
+/// The heap-type subtype relation: the three abstract hierarchies (internal
+/// `none <: {i31,struct,array} <: eq <: any`, `nofunc <: func`, `noextern <:
+/// extern`, `noexn <: exn`) plus concrete types (a concrete struct/array/func is
+/// under its abstract top; a concrete type is under any ancestor in its declared
+/// supertype chain; the relevant bottom is under every concrete type of its kind).
+fn heap_matches(
+  a: ast.HeapType,
+  b: ast.HeapType,
+  types: List(ast.DefType),
+) -> Bool {
+  case a == b {
+    True -> True
+    False ->
+      case a {
+        ast.HNone -> is_internal_ht(b, types)
+        ast.HNoFunc -> is_func_ht(b, types)
+        ast.HNoExtern -> b == ast.HExtern
+        ast.HNoExn -> b == ast.HExn
+        ast.HI31 -> b == ast.HEq || b == ast.HAny
+        ast.HStruct -> b == ast.HEq || b == ast.HAny
+        ast.HArray -> b == ast.HEq || b == ast.HAny
+        ast.HEq -> b == ast.HAny
+        ast.HConcrete(i) -> concrete_matches(i, b, types)
+        // tops (any/func/extern/exn) are only their own supertype.
+        _ -> False
+      }
+  }
+}
+
+fn is_internal_ht(b: ast.HeapType, types: List(ast.DefType)) -> Bool {
+  case b {
+    ast.HAny | ast.HEq | ast.HI31 | ast.HStruct | ast.HArray | ast.HNone -> True
+    ast.HConcrete(j) -> is_struct_or_array_type(j, types)
+    _ -> False
+  }
+}
+
+fn is_func_ht(b: ast.HeapType, types: List(ast.DefType)) -> Bool {
+  case b {
+    ast.HFunc | ast.HNoFunc -> True
+    ast.HConcrete(j) ->
+      case ast.func_type_at(types, j) {
+        Ok(_) -> True
+        Error(_) -> False
+      }
+    _ -> False
+  }
+}
+
+/// A concrete type `i` (a struct/array/func) is a subtype of heap type `b`.
+fn concrete_matches(i: Int, b: ast.HeapType, types: List(ast.DefType)) -> Bool {
+  case b {
+    ast.HConcrete(j) -> supertype_reaches(i, j, types, list.length(types))
+    _ ->
+      case ast.def_type_at(types, i) {
+        Ok(ast.DefType(comp: ast.CtStruct(_), ..)) ->
+          b == ast.HStruct || b == ast.HEq || b == ast.HAny
+        Ok(ast.DefType(comp: ast.CtArray(_), ..)) ->
+          b == ast.HArray || b == ast.HEq || b == ast.HAny
+        Ok(ast.DefType(comp: ast.CtFunc(_), ..)) -> b == ast.HFunc
+        Error(_) -> False
+      }
+  }
+}
+
+/// Does `i`'s declared supertype chain reach `j`? Bounded by `fuel` (chain length
+/// ≤ #types) so a malformed cyclic chain can't loop.
+fn supertype_reaches(
+  i: Int,
+  j: Int,
+  types: List(ast.DefType),
+  fuel: Int,
+) -> Bool {
+  case i == j {
+    True -> True
+    False ->
+      case fuel <= 0 {
+        True -> False
+        False ->
+          case ast.def_type_at(types, i) {
+            Ok(ast.DefType(supertype: option.Some(s), ..)) ->
+              supertype_reaches(s, j, types, fuel - 1)
+            _ -> False
+          }
+      }
+  }
+}
+
+fn is_struct_or_array_type(j: Int, types: List(ast.DefType)) -> Bool {
+  case ast.def_type_at(types, j) {
+    Ok(ast.DefType(comp: ast.CtStruct(_), ..)) -> True
+    Ok(ast.DefType(comp: ast.CtArray(_), ..)) -> True
+    _ -> False
+  }
+}
+
+// ─────────────────────── GC instruction typing helpers ───────────────────────
+
+/// The unpacked operand type of a storage type: packed `i8`/`i16` are read/written
+/// as `i32`; any other storage type is itself.
+fn unpack(s: ast.StorageType) -> ValType {
+  case s {
+    ast.StI8 | ast.StI16 -> I32
+    ast.StVal(v) -> v
+  }
+}
+
+/// The struct fields at type index `i` — `UnknownType` if out of range,
+/// `TypeMismatch` if `i` is not a struct type.
+fn struct_fields(
+  ctx: Ctx,
+  i: Int,
+) -> Result(List(ast.FieldType), ValidateError) {
+  case ast.def_type_at(ctx.types, i) {
+    Ok(ast.DefType(comp: ast.CtStruct(fs), ..)) -> Ok(fs)
+    Ok(_) -> Error(TypeMismatch)
+    Error(_) -> Error(UnknownType(i))
+  }
+}
+
+/// The array element field type at type index `i`.
+fn array_field(ctx: Ctx, i: Int) -> Result(ast.FieldType, ValidateError) {
+  case ast.def_type_at(ctx.types, i) {
+    Ok(ast.DefType(comp: ast.CtArray(ft), ..)) -> Ok(ft)
+    Ok(_) -> Error(TypeMismatch)
+    Error(_) -> Error(UnknownType(i))
+  }
+}
+
+fn field_at(
+  fields: List(ast.FieldType),
+  f: Int,
+) -> Result(ast.FieldType, ValidateError) {
+  case nth(fields, f) {
+    Ok(x) -> Ok(x)
+    Error(_) -> Error(TypeMismatch)
+  }
+}
+
+fn require_mutable(field: ast.FieldType) -> Result(Nil, ValidateError) {
+  case field.mutable {
+    True -> Ok(Nil)
+    False -> Error(TypeMismatch)
+  }
+}
+
+/// A field read: `struct.get`/`array.get` reject a packed field (must use `_s`/
+/// `_u`); the signed/unsigned variants require a packed field. Returns the
+/// unpacked read type.
+fn field_read_type(
+  storage: ast.StorageType,
+  packed_variant: Bool,
+) -> Result(ValType, ValidateError) {
+  case storage, packed_variant {
+    ast.StVal(v), False -> Ok(v)
+    ast.StVal(_), True -> Error(TypeMismatch)
+    ast.StI8, True | ast.StI16, True -> Ok(I32)
+    ast.StI8, False | ast.StI16, False -> Error(TypeMismatch)
+  }
+}
+
+/// Whether a value type has a default value (numerics/v128, and nullable refs);
+/// `struct.new_default`/`array.new_default` require all fields defaultable.
+fn is_defaultable(vt: ValType) -> Bool {
+  case vt {
+    I32 | I64 | F32 | F64 | V128 -> True
+    FuncRef | ExternRef | ExnRef -> True
+    Ref(rt) -> rt.nullable
+  }
+}
+
+fn storage_defaultable(s: ast.StorageType) -> Bool {
+  case s {
+    ast.StI8 | ast.StI16 -> True
+    ast.StVal(v) -> is_defaultable(v)
+  }
+}
+
+/// The top heap type of a heap type's hierarchy (`any`/`func`/`extern`/`exn`) —
+/// the operand a `ref.test`/`ref.cast` accepts (`(ref null top)`).
+fn heap_top(ht: ast.HeapType, types: List(ast.DefType)) -> ast.HeapType {
+  case ht {
+    ast.HFunc | ast.HNoFunc -> ast.HFunc
+    ast.HExtern | ast.HNoExtern -> ast.HExtern
+    ast.HExn | ast.HNoExn -> ast.HExn
+    ast.HAny | ast.HEq | ast.HI31 | ast.HStruct | ast.HArray | ast.HNone ->
+      ast.HAny
+    ast.HConcrete(i) ->
+      case ast.def_type_at(types, i) {
+        Ok(ast.DefType(comp: ast.CtFunc(_), ..)) -> ast.HFunc
+        _ -> ast.HAny
+      }
+  }
+}
+
+/// The result type of a failed `br_on_cast` / successful `br_on_cast_fail` — the
+/// input `rt1` minus `rt2`: same heap, non-null iff a null would have matched
+/// `rt2` (so a failure/miss implies non-null).
+fn diff_reftype(rt1: ast.RefType, rt2: ast.RefType) -> ast.RefType {
+  ast.RefType(nullable: rt1.nullable && !rt2.nullable, heap: rt1.heap)
+}
+
+/// `array.new_data`/`init_data` require a numeric (or vector) element; `_elem`
+/// require a reference element. These gate which segment source is legal.
+fn is_numeric_or_vec(vt: ValType) -> Bool {
+  case vt {
+    I32 | I64 | F32 | F64 | V128 -> True
+    _ -> False
+  }
+}
+
+/// A boolean side condition → `Ok`/`TypeMismatch`.
+fn require(cond: Bool) -> Result(Nil, ValidateError) {
+  case cond {
+    True -> Ok(Nil)
+    False -> Error(TypeMismatch)
+  }
+}
+
+fn require_data(ctx: Ctx, d: Int) -> Result(Nil, ValidateError) {
+  case d < ctx.data_count && d >= 0 {
+    True -> Ok(Nil)
+    False -> Error(UnknownData(d))
+  }
+}
+
+fn elem_seg_type(ctx: Ctx, e: Int) -> Result(ValType, ValidateError) {
+  case nth(ctx.elem_types, e) {
+    Ok(x) -> Ok(x)
+    Error(_) -> Error(UnknownElem(e))
+  }
+}
+
+fn push_stack(st: VState, s: StackType) -> VState {
+  VState(..st, vals: [s, ..st.vals])
+}
+
+/// `struct.get[_s|_u] $t $f`: pop `(ref null $t)`, push the field's read type.
+fn validate_struct_get(
+  st: VState,
+  ctx: Ctx,
+  t: Int,
+  f: Int,
+  packed: Bool,
+) -> Result(VState, ValidateError) {
+  use fields <- result.try(struct_fields(ctx, t))
+  use field <- result.try(field_at(fields, f))
+  use read_ty <- result.try(field_read_type(field.storage, packed))
+  use st2 <- result.try(pop_expect(
+    st,
+    ast.Ref(ast.RefType(True, ast.HConcrete(t))),
+  ))
+  Ok(push_val(st2, read_ty))
+}
+
+/// `array.get[_s|_u] $t`: pop `[i32 index, (ref null $t)]`, push the read type.
+fn validate_array_get(
+  st: VState,
+  ctx: Ctx,
+  t: Int,
+  packed: Bool,
+) -> Result(VState, ValidateError) {
+  use ft <- result.try(array_field(ctx, t))
+  use read_ty <- result.try(field_read_type(ft.storage, packed))
+  use st2 <- result.try(pop_expect(st, I32))
+  use st3 <- result.try(pop_expect(
+    st2,
+    ast.Ref(ast.RefType(True, ast.HConcrete(t))),
+  ))
+  Ok(push_val(st3, read_ty))
+}
+
+/// `br_on_cast[_fail] l rt1 rt2` (`rt2 <: rt1`): consumes an `rt1` input; on the
+/// taken branch the stack carries `branch_top` to label `l`; the fall-through
+/// pushes `fall_top`. For `br_on_cast` the branch is the success (`rt2`), the
+/// fall-through the miss (`rt1\rt2`); `br_on_cast_fail` swaps them.
+fn validate_br_on_cast(
+  st: VState,
+  ctx: Ctx,
+  l: Int,
+  rt1: ast.RefType,
+  rt2: ast.RefType,
+  is_fail: Bool,
+) -> Result(VState, ValidateError) {
+  use _ <- result.try(require(ref_matches(rt2, rt1, ctx.types)))
+  use frame <- result.try(label_frame(st, l))
+  let lt = label_types(frame)
+  let #(branch_top, fall_top) = case is_fail {
+    False -> #(ast.Ref(rt2), ast.Ref(diff_reftype(rt1, rt2)))
+    True -> #(ast.Ref(diff_reftype(rt1, rt2)), ast.Ref(rt2))
+  }
+  use st1 <- result.try(pop_expect(st, ast.Ref(rt1)))
+  // The branch carries `branch_top` on top of the outer stack — check the label.
+  use _ <- result.try(pop_vals(push_val(st1, branch_top), lt))
+  Ok(push_val(st1, fall_top))
+}
+
+/// `any.convert_extern` / `extern.convert_any`: pop a ref in the `from` hierarchy
+/// and push the corresponding ref in the `to` hierarchy, preserving nullability.
+fn convert_ref(
+  st: VState,
+  ctx: Ctx,
+  from_top: ast.HeapType,
+  to_top: ast.HeapType,
+) -> Result(VState, ValidateError) {
+  use #(t, st2) <- result.try(pop_val(st))
+  case t {
+    Unknown -> Ok(push_stack(st2, Unknown))
+    Known(vt) ->
+      case ast.normalize_reftype(vt) {
+        Ok(rt) ->
+          case heap_matches(rt.heap, from_top, ctx.types) {
+            True -> Ok(push_val(st2, ast.Ref(ast.RefType(rt.nullable, to_top))))
+            False -> Error(TypeMismatch)
+          }
+        Error(_) -> Error(TypeMismatch)
+      }
   }
 }
 
@@ -460,7 +812,7 @@ fn pop_val(st: VState) -> Result(#(StackType, VState), ValidateError) {
 /// Pop one operand and check it matches `expect` (spec appendix `pop_val(expect)`).
 fn pop_expect(st: VState, expect: ValType) -> Result(VState, ValidateError) {
   use #(t, st2) <- result.try(pop_val(st))
-  case types_match(t, Known(expect)) {
+  case types_match(t, Known(expect), st.types) {
     True -> Ok(st2)
     False -> Error(TypeMismatch)
   }
@@ -534,7 +886,7 @@ fn mark_unreachable(st: VState) -> Result(VState, ValidateError) {
   let kept = list.drop(st.vals, drop_n)
   let frame2 = CtrlFrame(..frame, unreachable: True)
   case st.ctrls {
-    [_, ..rest] -> Ok(VState(vals: kept, ctrls: [frame2, ..rest]))
+    [_, ..rest] -> Ok(VState(..st, vals: kept, ctrls: [frame2, ..rest]))
     [] -> Error(UnexpectedEnd)
   }
 }
@@ -857,7 +1209,7 @@ fn validate_func(
       // The implicit function frame: a `block`-like frame whose results are the
       // function's results (spec: a function body is validated as a block).
       let st0 =
-        VState(vals: [], ctrls: [
+        VState(types: fctx.types, vals: [], ctrls: [
           CtrlFrame(
             kind: KFunc,
             start_types: [],
@@ -1061,7 +1413,7 @@ fn validate_instr(
       use st2 <- result.try(pop_expect(st, ast.I32))
       use #(t1, st3) <- result.try(pop_val(st2))
       use #(t2, st4) <- result.try(pop_val(st3))
-      case types_match(t1, t2) {
+      case types_match(t1, t2, st.types) {
         False -> Error(TypeMismatch)
         True -> {
           // The result type is the first concrete of the two operands.
@@ -1428,6 +1780,250 @@ fn validate_instr(
     }
 
     // numeric / comparison / conversion / float leaves --------------------------
+    // ══════════════════════════ GC proposal ══════════════════════════
+    // -- structs --
+    ast.StructNew(t) -> {
+      use fields <- result.try(struct_fields(ctx, t))
+      use st2 <- result.try(pop_vals(
+        st,
+        list.map(fields, fn(f) { unpack(f.storage) }),
+      ))
+      Ok(push_val(st2, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+    }
+    ast.StructNewDefault(t) -> {
+      use fields <- result.try(struct_fields(ctx, t))
+      case list.all(fields, fn(f) { storage_defaultable(f.storage) }) {
+        True -> Ok(push_val(st, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+        False -> Error(TypeMismatch)
+      }
+    }
+    ast.StructGet(t, f) -> validate_struct_get(st, ctx, t, f, False)
+    ast.StructGetS(t, f) -> validate_struct_get(st, ctx, t, f, True)
+    ast.StructGetU(t, f) -> validate_struct_get(st, ctx, t, f, True)
+    ast.StructSet(t, f) -> {
+      use fields <- result.try(struct_fields(ctx, t))
+      use field <- result.try(field_at(fields, f))
+      use _ <- result.try(require_mutable(field))
+      use st2 <- result.try(pop_expect(st, unpack(field.storage)))
+      pop_expect(st2, ast.Ref(ast.RefType(True, ast.HConcrete(t))))
+    }
+    // -- arrays --
+    ast.ArrayNew(t) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, unpack(ft.storage)))
+      Ok(push_val(st3, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+    }
+    ast.ArrayNewDefault(t) -> {
+      use ft <- result.try(array_field(ctx, t))
+      case storage_defaultable(ft.storage) {
+        False -> Error(TypeMismatch)
+        True -> {
+          use st2 <- result.try(pop_expect(st, I32))
+          Ok(push_val(st2, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+        }
+      }
+    }
+    ast.ArrayNewFixed(t, n) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use st2 <- result.try(pop_vals(st, list.repeat(unpack(ft.storage), n)))
+      Ok(push_val(st2, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+    }
+    ast.ArrayNewData(t, d) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use _ <- result.try(require(is_numeric_or_vec(unpack(ft.storage))))
+      use _ <- result.try(require_data(ctx, d))
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, I32))
+      Ok(push_val(st3, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+    }
+    ast.ArrayNewElem(t, e) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use seg <- result.try(elem_seg_type(ctx, e))
+      use _ <- result.try(
+        require(val_subtype(seg, unpack(ft.storage), ctx.types)),
+      )
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, I32))
+      Ok(push_val(st3, ast.Ref(ast.RefType(False, ast.HConcrete(t)))))
+    }
+    ast.ArrayGet(t) -> validate_array_get(st, ctx, t, False)
+    ast.ArrayGetS(t) -> validate_array_get(st, ctx, t, True)
+    ast.ArrayGetU(t) -> validate_array_get(st, ctx, t, True)
+    ast.ArraySet(t) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use _ <- result.try(require_mutable(ft))
+      use st2 <- result.try(pop_expect(st, unpack(ft.storage)))
+      use st3 <- result.try(pop_expect(st2, I32))
+      pop_expect(st3, ast.Ref(ast.RefType(True, ast.HConcrete(t))))
+    }
+    ast.ArrayLen -> {
+      use st2 <- result.try(pop_expect(
+        st,
+        ast.Ref(ast.RefType(True, ast.HArray)),
+      ))
+      Ok(push_val(st2, I32))
+    }
+    ast.ArrayFill(t) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use _ <- result.try(require_mutable(ft))
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, unpack(ft.storage)))
+      use st4 <- result.try(pop_expect(st3, I32))
+      pop_expect(st4, ast.Ref(ast.RefType(True, ast.HConcrete(t))))
+    }
+    ast.ArrayCopy(t1, t2) -> {
+      use dst <- result.try(array_field(ctx, t1))
+      use _ <- result.try(require_mutable(dst))
+      use src <- result.try(array_field(ctx, t2))
+      use _ <- result.try(
+        require(val_subtype(unpack(src.storage), unpack(dst.storage), ctx.types)),
+      )
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, I32))
+      use st4 <- result.try(pop_expect(
+        st3,
+        ast.Ref(ast.RefType(True, ast.HConcrete(t2))),
+      ))
+      use st5 <- result.try(pop_expect(st4, I32))
+      pop_expect(st5, ast.Ref(ast.RefType(True, ast.HConcrete(t1))))
+    }
+    ast.ArrayInitData(t, d) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use _ <- result.try(require_mutable(ft))
+      use _ <- result.try(require(is_numeric_or_vec(unpack(ft.storage))))
+      use _ <- result.try(require_data(ctx, d))
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, I32))
+      use st4 <- result.try(pop_expect(st3, I32))
+      pop_expect(st4, ast.Ref(ast.RefType(True, ast.HConcrete(t))))
+    }
+    ast.ArrayInitElem(t, e) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use _ <- result.try(require_mutable(ft))
+      use seg <- result.try(elem_seg_type(ctx, e))
+      use _ <- result.try(
+        require(val_subtype(seg, unpack(ft.storage), ctx.types)),
+      )
+      use st2 <- result.try(pop_expect(st, I32))
+      use st3 <- result.try(pop_expect(st2, I32))
+      use st4 <- result.try(pop_expect(st3, I32))
+      pop_expect(st4, ast.Ref(ast.RefType(True, ast.HConcrete(t))))
+    }
+    // -- i31 --
+    ast.RefI31 -> {
+      use st2 <- result.try(pop_expect(st, I32))
+      Ok(push_val(st2, ast.Ref(ast.RefType(False, ast.HI31))))
+    }
+    ast.I31GetS | ast.I31GetU -> {
+      use st2 <- result.try(pop_expect(st, ast.Ref(ast.RefType(True, ast.HI31))))
+      Ok(push_val(st2, I32))
+    }
+    // -- casts / tests --
+    ast.RefTest(rt) -> {
+      use st2 <- result.try(pop_expect(
+        st,
+        ast.Ref(ast.RefType(True, heap_top(rt.heap, ctx.types))),
+      ))
+      Ok(push_val(st2, I32))
+    }
+    ast.RefCast(rt) -> {
+      use st2 <- result.try(pop_expect(
+        st,
+        ast.Ref(ast.RefType(True, heap_top(rt.heap, ctx.types))),
+      ))
+      Ok(push_val(st2, ast.Ref(rt)))
+    }
+    ast.BrOnCast(l, rt1, rt2) ->
+      validate_br_on_cast(st, ctx, l, rt1, rt2, False)
+    ast.BrOnCastFail(l, rt1, rt2) ->
+      validate_br_on_cast(st, ctx, l, rt1, rt2, True)
+    // -- eq / null / conversions --
+    ast.RefEq -> {
+      use st2 <- result.try(pop_expect(st, ast.Ref(ast.RefType(True, ast.HEq))))
+      use st3 <- result.try(pop_expect(st2, ast.Ref(ast.RefType(True, ast.HEq))))
+      Ok(push_val(st3, I32))
+    }
+    ast.RefAsNonNull -> {
+      use #(t, st2) <- result.try(pop_val(st))
+      case t {
+        Unknown -> Ok(push_stack(st2, Unknown))
+        Known(vt) ->
+          case ast.normalize_reftype(vt) {
+            Ok(rt) -> Ok(push_val(st2, ast.Ref(ast.RefType(False, rt.heap))))
+            Error(_) -> Error(TypeMismatch)
+          }
+      }
+    }
+    ast.BrOnNull(l) -> {
+      use #(t, st1) <- result.try(pop_val(st))
+      case t {
+        Unknown -> Ok(push_stack(st1, Unknown))
+        Known(vt) ->
+          case ast.normalize_reftype(vt) {
+            Error(_) -> Error(TypeMismatch)
+            Ok(rt) -> {
+              use frame <- result.try(label_frame(st1, l))
+              // On null, branch to `l` with the stack sans the ref.
+              use _ <- result.try(pop_vals(st1, label_types(frame)))
+              Ok(push_val(st1, ast.Ref(ast.RefType(False, rt.heap))))
+            }
+          }
+      }
+    }
+    ast.BrOnNonNull(l) -> {
+      use #(t, st1) <- result.try(pop_val(st))
+      case t {
+        Unknown -> Ok(st1)
+        Known(vt) ->
+          case ast.normalize_reftype(vt) {
+            Error(_) -> Error(TypeMismatch)
+            Ok(rt) -> {
+              use frame <- result.try(label_frame(st1, l))
+              // On non-null, branch to `l` carrying the (non-null) ref.
+              let sb = push_val(st1, ast.Ref(ast.RefType(False, rt.heap)))
+              use _ <- result.try(pop_vals(sb, label_types(frame)))
+              Ok(st1)
+            }
+          }
+      }
+    }
+    ast.AnyConvertExtern -> convert_ref(st, ctx, ast.HExtern, ast.HAny)
+    ast.ExternConvertAny -> convert_ref(st, ctx, ast.HAny, ast.HExtern)
+    ast.RefNullHt(ht) -> Ok(push_val(st, ast.Ref(ast.RefType(True, ht))))
+    // -- typed function references --
+    ast.CallRef(t) -> {
+      use sig <- result.try(case ast.func_type_at(ctx.types, t) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error(UnknownType(t))
+      })
+      use st2 <- result.try(pop_expect(
+        st,
+        ast.Ref(ast.RefType(True, ast.HConcrete(t))),
+      ))
+      use st3 <- result.try(pop_vals(st2, sig.params))
+      Ok(push_vals(st3, sig.results))
+    }
+    ast.ReturnCallRef(t) -> {
+      use sig <- result.try(case ast.func_type_at(ctx.types, t) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error(UnknownType(t))
+      })
+      use func_frame <- result.try(case list.last(st.ctrls) {
+        Ok(fr) -> Ok(fr)
+        Error(_) -> Error(UnexpectedEnd)
+      })
+      use st2 <- result.try(pop_expect(
+        st,
+        ast.Ref(ast.RefType(True, ast.HConcrete(t))),
+      ))
+      use st3 <- result.try(pop_vals(st2, sig.params))
+      case sig.results == func_frame.end_types {
+        False -> Error(TypeMismatch)
+        True -> mark_unreachable(st3)
+      }
+    }
+
     _ -> validate_numeric(st, instr)
   }
 }
