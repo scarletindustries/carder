@@ -123,11 +123,49 @@ pub fn gc_call_ref_dispatch_test() {
   embed.stop(inst)
 }
 
-/// The segment-sourced array ops are validated by the spec but not yet lowered by
-/// 2core. A module using `array.new_data` must fail CLEANLY at compile (an Error),
-/// never miscompile or crash — documenting the boundary of what is implemented.
-pub fn gc_unsupported_array_new_data_fails_clean_test() {
+fn seg_instance() {
   let assert Ok(wasm) =
-    simplifile.read_bits("test/twocore/frontend/wasm/gc_fixtures/gcunsup.wasm")
-  embed.compile(wasm) |> should.be_error
+    simplifile.read_bits("test/twocore/frontend/wasm/gc_fixtures/gcseg.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(inst) = embed.instantiate(compiled, no_host)
+  inst
+}
+
+/// array.new_data on a packed i8 array: data "\01\02\03\04" → element 2 (get_u) = 3.
+pub fn gc_array_new_data_i8_test() {
+  let inst = seg_instance()
+  embed.invoke(inst, "new_data_i8", []) |> should.equal(Ok([3]))
+  embed.stop(inst)
+}
+
+/// array.new_data on an i32 array: two little-endian i32s (10, 20) → 30.
+pub fn gc_array_new_data_i32_test() {
+  let inst = seg_instance()
+  embed.invoke(inst, "new_data_i32", []) |> should.equal(Ok([30]))
+  embed.stop(inst)
+}
+
+/// array.init_data: [0,0,0] initialized at [1..2] from the data segment → [0,1,2],
+/// element 1 + element 2 = 3.
+pub fn gc_array_init_data_test() {
+  let inst = seg_instance()
+  embed.invoke(inst, "init_data", []) |> should.equal(Ok([3]))
+  embed.stop(inst)
+}
+
+/// array.new_elem: an array of funcrefs [add, sub] from an element segment; calling
+/// element 0 (add) with (3, 4) = 7.
+pub fn gc_array_new_elem_test() {
+  let inst = seg_instance()
+  embed.invoke(inst, "new_elem", []) |> should.equal(Ok([7]))
+  embed.stop(inst)
+}
+
+/// array.init_elem: an array of nulls, element 0 initialized from the segment's
+/// element 1 (sub); calling it with (10, 3) = 7.
+pub fn gc_array_init_elem_test() {
+  let inst = seg_instance()
+  embed.invoke(inst, "init_elem", []) |> should.equal(Ok([7]))
+  embed.stop(inst)
 }

@@ -1086,6 +1086,21 @@ pub type GcOp {
   /// can unpack the returned package into that many stack values. The only GC op
   /// that yields ≠1 result — handled on a dedicated emission path.
   GcCallRef(result_count: Int)
+  /// `array.new_data $t $d` (args = `[byte_offset, count]`) — a new array of
+  /// `count` elements decoded from passive data segment `d`, each `elem_width`
+  /// little-endian bytes (numeric elements are their raw bit pattern). `data_idx`
+  /// and `elem_width` drive `emit_core`'s drop-gated segment-bytes emission.
+  GcArrayNewData(type_idx: Int, data_idx: Int, elem_width: Int)
+  /// `array.init_data $t $d` (args = `[arrayref, dst_index, src_byte_offset,
+  /// count]`) — copy `count` elements from data segment `d` into an existing array.
+  GcArrayInitData(data_idx: Int, elem_width: Int)
+  /// `array.new_elem $t $e` (args = `[elem_offset, count]`) — a new array of
+  /// `count` references taken from element segment `e`. `elem_idx` drives the
+  /// drop-gated segment-values emission.
+  GcArrayNewElem(type_idx: Int, elem_idx: Int)
+  /// `array.init_elem $t $e` (args = `[arrayref, dst_index, src_index, count]`) —
+  /// copy `count` references from element segment `e` into an existing array.
+  GcArrayInitElem(elem_idx: Int)
 }
 
 /// How a packed (`i8`/`i16`) or plain field/element is read back out.

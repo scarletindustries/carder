@@ -2428,6 +2428,16 @@ fn emit_gc(
     // call_ref returns the callee's N results (a package) — a dedicated path
     // unpacks it and threads state, exactly like an indirect call.
     ir.GcCallRef(rc) -> emit_gc_call_ref(rc, args, cont, sc, state, ctx)
+    // Segment-sourced array ops resolve their drop-gated segment payload (bytes
+    // for data, rendered ref values for elem) before the arena call.
+    ir.GcArrayNewData(t, d, w) ->
+      emit_gc_array_new_data(t, d, w, args, cont, sc, state, ctx)
+    ir.GcArrayInitData(d, w) ->
+      emit_gc_array_init_data(d, w, args, cont, sc, state, ctx)
+    ir.GcArrayNewElem(t, e) ->
+      emit_gc_array_new_elem(t, e, args, cont, sc, state, ctx)
+    ir.GcArrayInitElem(e) ->
+      emit_gc_array_init_elem(e, args, cont, sc, state, ctx)
     _ -> {
       let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
       case gc_is_void(op) {
@@ -2513,6 +2523,214 @@ fn gc_is_void(op: ir.GcOp) -> Bool {
   }
 }
 
+/// Emit `array.new_data $t $d`: resolve the drop-gated bytes of data segment `d`
+/// (empty if dropped), then build the array from `count` elements of `width`
+/// little-endian bytes at `byte_offset` (`[byte_offset, count]` operands). The
+/// arena call raises the OOB trap itself and returns the new array reference.
+fn emit_gc_array_new_data(
+  type_idx: Int,
+  data_idx: Int,
+  width: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.data_segments, data_idx)
+    |> result.replace_error(UnsupportedNode("array_new_data_seg")),
+  )
+  let #(offset, count) = gc_two_args(args)
+  let #(gated, state2) =
+    drop_gate(
+      data_idx,
+      "data_dropped",
+      core_binary_bytes(<<>>),
+      core_binary_bytes(segment.bytes),
+      sc,
+      state,
+      ctx,
+    )
+  let #(segvar, state3) = fresh_var(state2)
+  let call =
+    seam_call(gc_module, "array_new_data", [
+      CInt(type_idx),
+      CVar(segvar),
+      emit_value(offset),
+      emit_value(count),
+      CInt(width),
+    ])
+  use #(rest, state4) <- result.try(apply_cont(cont, [call], sc, state3, ctx))
+  Ok(#(CLet([segvar], gated, rest), state4))
+}
+
+/// Emit `array.init_data $t $d`: like `array.new_data`, but copy into an existing
+/// array (`[arrayref, dst_index, src_byte_offset, count]` operands). No result.
+fn emit_gc_array_init_data(
+  data_idx: Int,
+  width: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.data_segments, data_idx)
+    |> result.replace_error(UnsupportedNode("array_init_data_seg")),
+  )
+  let #(arrayref, dst, src, count) = gc_four_args(args)
+  let #(gated, state2) =
+    drop_gate(
+      data_idx,
+      "data_dropped",
+      core_binary_bytes(<<>>),
+      core_binary_bytes(segment.bytes),
+      sc,
+      state,
+      ctx,
+    )
+  let #(segvar, state3) = fresh_var(state2)
+  let call =
+    seam_call(gc_module, "array_init_data", [
+      emit_value(arrayref),
+      emit_value(dst),
+      CVar(segvar),
+      emit_value(src),
+      emit_value(count),
+      CInt(width),
+    ])
+  use #(rest, state4) <- result.try(emit_zero_effect(
+    call,
+    cont,
+    sc,
+    state3,
+    ctx,
+  ))
+  Ok(#(CLet([segvar], gated, rest), state4))
+}
+
+/// Emit `array.new_elem $t $e`: render element segment `e`'s init items to a
+/// drop-gated Core reference list (empty if dropped), then build the array from
+/// `count` of them starting at `elem_offset` (`[elem_offset, count]` operands).
+fn emit_gc_array_new_elem(
+  type_idx: Int,
+  elem_idx: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.elements, elem_idx)
+    |> result.replace_error(UnsupportedNode("array_new_elem_seg")),
+  )
+  let #(offset, count) = gc_two_args(args)
+  let items_state_ref = case sc {
+    NoState -> None
+    Threading(cur) -> Some(cur)
+  }
+  use #(entries, state2) <- result.try(render_ref_items(
+    segment.init,
+    ctx,
+    items_state_ref,
+    state,
+  ))
+  let #(gated, state3) =
+    drop_gate(
+      elem_idx,
+      "elem_dropped",
+      CNil,
+      core_list(entries),
+      sc,
+      state2,
+      ctx,
+    )
+  let #(segvar, state4) = fresh_var(state3)
+  let call =
+    seam_call(gc_module, "array_new_elem", [
+      CInt(type_idx),
+      CVar(segvar),
+      emit_value(offset),
+      emit_value(count),
+    ])
+  use #(rest, state5) <- result.try(apply_cont(cont, [call], sc, state4, ctx))
+  Ok(#(CLet([segvar], gated, rest), state5))
+}
+
+/// Emit `array.init_elem $t $e`: like `array.new_elem`, but copy into an existing
+/// array (`[arrayref, dst_index, src_index, count]` operands). No result.
+fn emit_gc_array_init_elem(
+  elem_idx: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.elements, elem_idx)
+    |> result.replace_error(UnsupportedNode("array_init_elem_seg")),
+  )
+  let #(arrayref, dst, src, count) = gc_four_args(args)
+  let items_state_ref = case sc {
+    NoState -> None
+    Threading(cur) -> Some(cur)
+  }
+  use #(entries, state2) <- result.try(render_ref_items(
+    segment.init,
+    ctx,
+    items_state_ref,
+    state,
+  ))
+  let #(gated, state3) =
+    drop_gate(
+      elem_idx,
+      "elem_dropped",
+      CNil,
+      core_list(entries),
+      sc,
+      state2,
+      ctx,
+    )
+  let #(segvar, state4) = fresh_var(state3)
+  let call =
+    seam_call(gc_module, "array_init_elem", [
+      emit_value(arrayref),
+      emit_value(dst),
+      CVar(segvar),
+      emit_value(src),
+      emit_value(count),
+    ])
+  use #(rest, state5) <- result.try(emit_zero_effect(
+    call,
+    cont,
+    sc,
+    state4,
+    ctx,
+  ))
+  Ok(#(CLet([segvar], gated, rest), state5))
+}
+
+/// Split a two-operand GC arg list `[a, b]` (a defensive zero pair otherwise —
+/// arity is already validated).
+fn gc_two_args(args: List(Value)) -> #(Value, Value) {
+  case args {
+    [a, b] -> #(a, b)
+    _ -> #(ir.ConstI32(0), ir.ConstI32(0))
+  }
+}
+
+/// Split a four-operand GC arg list `[a, b, c, d]`.
+fn gc_four_args(args: List(Value)) -> #(Value, Value, Value, Value) {
+  case args {
+    [a, b, c, d] -> #(a, b, c, d)
+    _ -> #(ir.ConstI32(0), ir.ConstI32(0), ir.ConstI32(0), ir.ConstI32(0))
+  }
+}
+
 /// The `rt_gc` function name for a GC op. Packed reads and the signed/unsigned
 /// i31 reads dispatch to distinct helpers so the runtime need not carry the width.
 fn gc_op_name(op: ir.GcOp) -> String {
@@ -2538,8 +2756,12 @@ fn gc_op_name(op: ir.GcOp) -> String {
     ir.GcRefAsNonNull -> "ref_as_non_null"
     ir.GcAnyConvertExtern -> "any_convert_extern"
     ir.GcExternConvertAny -> "extern_convert_any"
-    // Handled by `emit_gc_call_ref` before this table is consulted.
+    // Handled by dedicated emitters before this table is consulted.
     ir.GcCallRef(_) -> "call_ref"
+    ir.GcArrayNewData(_, _, _) -> "array_new_data"
+    ir.GcArrayInitData(_, _) -> "array_init_data"
+    ir.GcArrayNewElem(_, _) -> "array_new_elem"
+    ir.GcArrayInitElem(_) -> "array_init_elem"
   }
 }
 
@@ -2578,8 +2800,12 @@ fn gc_call_args(op: ir.GcOp, args: List(Value)) -> List(CExpr) {
     ir.GcRefAsNonNull -> ev
     ir.GcAnyConvertExtern -> ev
     ir.GcExternConvertAny -> ev
-    // Handled by `emit_gc_call_ref` before this table is consulted.
-    ir.GcCallRef(_) -> ev
+    // Handled by dedicated emitters before this table is consulted.
+    ir.GcCallRef(_)
+    | ir.GcArrayNewData(_, _, _)
+    | ir.GcArrayInitData(_, _)
+    | ir.GcArrayNewElem(_, _)
+    | ir.GcArrayInitElem(_) -> ev
   }
 }
 

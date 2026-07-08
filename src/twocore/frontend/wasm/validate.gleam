@@ -2770,12 +2770,35 @@ fn validate_const_expr(
     // other `Simd(_)`/`SimdLoad`/… in a const-expr falls to `NonConstantExpr` below.
     [ast.V128Const(_)] -> expect_const_type(ast.V128, expected)
     [ast.RefNull(rt)] -> expect_const_type(rt, expected)
+    // `ref.null ht` for a GC heap type → a nullable typed reference; valid if it is
+    // a subtype of the expected type (e.g. a `(ref null $t)` element segment).
+    [ast.RefNullHt(ht)] ->
+      expect_const_subtype(ast.Ref(ast.RefType(True, ht)), expected, ctx)
     [ast.RefFunc(x)] -> {
       use _ <- result.try(check_ref_declared(ctx, x))
-      expect_const_type(ast.FuncRef, expected)
+      // Function-references: `ref.func x` is the concrete `(ref $t)`; accept it
+      // wherever a supertype (its concrete type, or `funcref`) is expected.
+      let actual = case nth(ctx.func_type_idxs, x) {
+        Ok(ti) -> ast.Ref(ast.RefType(False, ast.HConcrete(ti)))
+        Error(_) -> ast.FuncRef
+      }
+      expect_const_subtype(actual, expected, ctx)
     }
     [ast.GlobalGet(x)] -> const_global_get(ctx, x, expected)
     _ -> Error(NonConstantExpr)
+  }
+}
+
+/// A constant-expression type check that accepts a subtype (the const value's type
+/// need only be a subtype of the declared slot type — spec constant expressions).
+fn expect_const_subtype(
+  actual: ValType,
+  expected: ValType,
+  ctx: Ctx,
+) -> Result(Nil, ValidateError) {
+  case val_subtype(actual, expected, ctx.types) {
+    True -> Ok(Nil)
+    False -> Error(TypeMismatch)
   }
 }
 

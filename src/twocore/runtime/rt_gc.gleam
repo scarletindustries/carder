@@ -141,3 +141,48 @@ pub fn t_call_ref(
   args: List(Dynamic),
   result_count: Int,
 ) -> #(List(Dynamic), Dynamic)
+
+/// `array.new_data $t $d` — a new array of `count` elements decoded from the
+/// (drop-gated) data segment `bytes`, each `width` little-endian bytes at byte
+/// `offset`. Traps if the span exceeds the segment.
+@external(erlang, "twocore_rt_gc_ffi", "array_new_data")
+pub fn array_new_data(
+  type_idx: Int,
+  bytes: BitArray,
+  offset: Int,
+  count: Int,
+  width: Int,
+) -> Dynamic
+
+/// `array.init_data $t $d` — copy `count` elements from data segment `bytes` (at
+/// byte `src_offset`) into `ref` at `dst_index`. Traps on null or out-of-range.
+@external(erlang, "twocore_rt_gc_ffi", "array_init_data")
+pub fn array_init_data(
+  ref: Dynamic,
+  dst_index: Int,
+  bytes: BitArray,
+  src_offset: Int,
+  count: Int,
+  width: Int,
+) -> Dynamic
+
+/// `array.new_elem $t $e` — a new array of `count` references taken from the
+/// (drop-gated) element segment values `refs` starting at index `offset`.
+@external(erlang, "twocore_rt_gc_ffi", "array_new_elem")
+pub fn array_new_elem(
+  type_idx: Int,
+  refs: List(Dynamic),
+  offset: Int,
+  count: Int,
+) -> Dynamic
+
+/// `array.init_elem $t $e` — copy `count` references from element segment `refs`
+/// (at index `src_offset`) into `ref` at `dst_index`. Traps on null/out-of-range.
+@external(erlang, "twocore_rt_gc_ffi", "array_init_elem")
+pub fn array_init_elem(
+  ref: Dynamic,
+  dst_index: Int,
+  refs: List(Dynamic),
+  src_offset: Int,
+  count: Int,
+) -> Dynamic

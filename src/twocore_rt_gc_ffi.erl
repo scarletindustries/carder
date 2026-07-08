@@ -42,7 +42,8 @@
     ref_i31/1, i31_get_s/1, i31_get_u/1,
     ref_test/3, ref_cast/3, ref_eq/2, ref_as_non_null/1,
     any_convert_extern/1, extern_convert_any/1,
-    call_ref/3, t_call_ref/4
+    call_ref/3, t_call_ref/4,
+    array_new_data/5, array_init_data/6, array_new_elem/4, array_init_elem/5
 ]).
 
 %% ─────────────────────────────── allocation ───────────────────────────────
@@ -212,6 +213,75 @@ t_call_ref(St, {_Type, Closure}, Args, RC) ->
 pkg_to_list(_Pkg, 0) -> [];
 pkg_to_list(Pkg, 1) -> [Pkg];
 pkg_to_list(Pkg, _) -> tuple_to_list(Pkg).
+
+%% ─────────────────────── segment-sourced array init ───────────────────────
+
+%% array.new_data $t $d : a new array of `Count` elements decoded from the (drop-
+%% gated) data segment `Bytes`, each `Width` little-endian bytes starting at byte
+%% `Offset`. Numeric elements are their raw bit pattern (2core represents both
+%% integers and floats as the unsigned bit pattern), so every width decodes with
+%% one `binary:decode_unsigned/2`. OOB if the span exceeds the segment.
+array_new_data(TypeIdx, Bytes, Offset, Count, Width) ->
+    case Offset >= 0 andalso Count >= 0
+        andalso Offset + Count * Width =< byte_size(Bytes) of
+        false -> oob_trap();
+        true ->
+            new_array(TypeIdx, decode_data_elems(Bytes, Offset, Count, Width))
+    end.
+
+%% array.init_data $t $d : copy `Count` elements from data segment `Bytes` (at byte
+%% `SrcOff`) into the array at index `DstIdx`. OOB on either range; null-traps.
+array_init_data({ref_null}, _DstIdx, _Bytes, _SrcOff, _Count, _Width) ->
+    null_trap();
+array_init_data({gc, Id}, DstIdx, Bytes, SrcOff, Count, Width) ->
+    {array, T, Es} = get({gc_obj, Id}),
+    case DstIdx >= 0 andalso Count >= 0 andalso SrcOff >= 0
+        andalso DstIdx + Count =< tuple_size(Es)
+        andalso SrcOff + Count * Width =< byte_size(Bytes) of
+        false -> oob_trap();
+        true ->
+            Vals = decode_data_elems(Bytes, SrcOff, Count, Width),
+            put({gc_obj, Id}, {array, T, write_slice(Es, DstIdx, Vals)}),
+            ok
+    end.
+
+%% array.new_elem $t $e : a new array of `Count` references taken from the (drop-
+%% gated) element segment value list `Refs` starting at index `Offset`.
+array_new_elem(TypeIdx, Refs, Offset, Count) ->
+    case Offset >= 0 andalso Count >= 0 andalso Offset + Count =< length(Refs) of
+        false -> oob_trap();
+        true -> new_array(TypeIdx, lists:sublist(Refs, Offset + 1, Count))
+    end.
+
+%% array.init_elem $t $e : copy `Count` references from element segment `Refs` (at
+%% index `SrcOff`) into the array at index `DstIdx`. OOB on either range; null-traps.
+array_init_elem({ref_null}, _DstIdx, _Refs, _SrcOff, _Count) ->
+    null_trap();
+array_init_elem({gc, Id}, DstIdx, Refs, SrcOff, Count) ->
+    {array, T, Es} = get({gc_obj, Id}),
+    case DstIdx >= 0 andalso Count >= 0 andalso SrcOff >= 0
+        andalso DstIdx + Count =< tuple_size(Es)
+        andalso SrcOff + Count =< length(Refs) of
+        false -> oob_trap();
+        true ->
+            Vals = lists:sublist(Refs, SrcOff + 1, Count),
+            put({gc_obj, Id}, {array, T, write_slice(Es, DstIdx, Vals)}),
+            ok
+    end.
+
+%% Decode `N` little-endian unsigned integers of `W` bytes each from `Bytes` at
+%% byte `Off` (bounds already checked by the caller).
+decode_data_elems(_Bytes, _Off, 0, _W) -> [];
+decode_data_elems(Bytes, Off, N, W) ->
+    <<_:Off/binary, Chunk:W/binary, _/binary>> = Bytes,
+    [binary:decode_unsigned(Chunk, little)
+     | decode_data_elems(Bytes, Off + W, N - 1, W)].
+
+%% Allocate a fresh array object holding `Elems`.
+new_array(TypeIdx, Elems) ->
+    Id = alloc(),
+    put({gc_obj, Id}, {array, TypeIdx, list_to_tuple(Elems)}),
+    {gc, Id}.
 
 %% ─────────────────────────────── type matching ────────────────────────────
 

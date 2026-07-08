@@ -1045,15 +1045,9 @@ fn go(
         // through the shared value/effect emitters. Operands are deepest-first,
         // matching `ir.Gc`'s convention.
         //
-        // NOT YET LOWERED — these fall through to `Unsupported`, so a validated
-        // module that uses one fails cleanly at lowering (never miscompiles):
-        //   - `return_call_ref` (a tail call — needs a bottom-transfer node like
-        //     `ir.ReturnCallIndirect`);
-        //   - `array.new_data` / `array.new_elem` / `array.init_data` /
-        //     `array.init_elem` (array init from a passive data/element segment —
-        //     needs the segment-payload drop-gate plumbing plus per-element-type
-        //     byte decoding).
-        // Everything else in the GC + typed-function-references surface is lowered.
+        // `return_call_ref` is the only instruction not yet lowered (a tail call —
+        // needs a bottom-transfer node); it falls through to `Unsupported`, so a
+        // validated module using it fails cleanly at lowering (never miscompiles).
         ast.StructNew(t) -> {
           use fields <- result.try(gc_struct_fields(ctx, t))
           emit_value_op_t(
@@ -1135,6 +1129,49 @@ fn go(
           emit_effect(4, fn(a) { ir.Gc(ir.GcArrayFill, a) }, tail, ctx, st)
         ast.ArrayCopy(_, _) ->
           emit_effect(5, fn(a) { ir.Gc(ir.GcArrayCopy, a) }, tail, ctx, st)
+        // Segment-sourced array ops: the element byte width (data) drives the
+        // uniform little-endian decode; emit resolves the drop-gated segment
+        // payload. args are `[offset, count]` (new_*) / `[ref, dst, src, count]`.
+        ast.ArrayNewData(t, d) -> {
+          use fd <- result.try(gc_array_field(ctx, t))
+          let w = storage_byte_width(fd.storage)
+          emit_value_op_t(
+            2,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNewData(t, d, w), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.ArrayInitData(t, d) -> {
+          use fd <- result.try(gc_array_field(ctx, t))
+          let w = storage_byte_width(fd.storage)
+          emit_effect(
+            4,
+            fn(a) { ir.Gc(ir.GcArrayInitData(d, w), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.ArrayNewElem(t, e) ->
+          emit_value_op_t(
+            2,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNewElem(t, e), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayInitElem(_, e) ->
+          emit_effect(
+            4,
+            fn(a) { ir.Gc(ir.GcArrayInitElem(e), a) },
+            tail,
+            ctx,
+            st,
+          )
         ast.RefI31 ->
           emit_value_op_t(
             1,
@@ -1526,6 +1563,20 @@ fn gc_field_read(
     ast.StVal(vt) -> #(ir.ReadPlain, to_ir_vt(vt))
     ast.StI8 -> #(ir.ReadPacked(8, sign_of(signed)), ir.TI32)
     ast.StI16 -> #(ir.ReadPacked(16, sign_of(signed)), ir.TI32)
+  }
+}
+
+/// The byte width of a storage type — the stride `array.new_data`/`init_data`
+/// decode each element at (numeric elements are their raw little-endian bit
+/// pattern, so width is all the runtime needs). Reference elements never reach
+/// the data ops (validate rejects them); 4 is a harmless default.
+fn storage_byte_width(s: ast.StorageType) -> Int {
+  case s {
+    ast.StI8 -> 1
+    ast.StI16 -> 2
+    ast.StVal(ast.I64) | ast.StVal(ast.F64) -> 8
+    ast.StVal(ast.V128) -> 16
+    ast.StVal(_) -> 4
   }
 }
 
