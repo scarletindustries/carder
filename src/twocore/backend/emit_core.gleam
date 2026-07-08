@@ -90,21 +90,22 @@ import twocore/backend/core_erlang.{
 import twocore/ir.{
   type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
   type Module, type NumOp, type SwitchArm, type TrapReason, type ValType,
-  type Value, Block, BoxFloat, BoxInt, Break, CallClosure, CallDirect, CallHost,
-  CallIndirect, Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue,
-  Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
-  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
-  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
-  GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S,
-  I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz,
-  ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU,
-  IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub,
-  IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Loop, MakeClosure, MapOp, MemGrow, MemLoad,
-  MemSize, MemStore, MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF,
-  Return, Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds,
-  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt,
-  UndefinedElement, UninitializedElement, Unreachable, Values, Var, W32, W64,
+  type Value, ArrayOutOfBounds, Block, BoxFloat, BoxInt, Break, CallClosure,
+  CallDirect, CallHost, CallIndirect, CastFailure, Charge, ConstF32, ConstF64,
+  ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU, F32DemoteF64,
+  F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe,
+  FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64,
+  FuelExhausted, FuncType, Gc, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S,
+  I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S,
+  I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU,
+  IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU,
+  IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If, IndirectCallTypeMismatch,
+  IntDivByZero, IntOverflow, InvalidConversionToInteger, Let, Loop, MakeClosure,
+  MapOp, MemGrow, MemLoad, MemSize, MemStore, MemoryOutOfBounds, NullReference,
+  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
+  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS,
+  TruncSatU, TruncU, UnboxFloat, UnboxInt, UndefinedElement,
+  UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
   type Binding, type HostPolicy, Atomics, HostDenyAll, HostOpen, HostWhitelist,
@@ -136,6 +137,11 @@ const link_module = "twocore@runtime@link"
 /// would swap this one atom — the whole `emit_core` SIMD surface routes through it and nothing
 /// else, I3/I8.)
 const simd_module = "twocore@runtime@rt_simd"
+
+/// The WasmGC arena runtime (this proposal). Bound only into programs that use a
+/// GC instruction (`Gc` lowers to a `seam_call` here), so plain core-WASM modules
+/// never pull `rt_gc` in — the whole-program linker's reachability walk drops it.
+const gc_module = "twocore@runtime@rt_gc"
 
 /// The tagged-exception runtime module (`runtime/rt_exn` → `twocore@runtime@rt_exn`, J1/T3).
 /// The EH binding chokepoint — every `Throw`/`Try`/`ThrowRef` seam call targets it
@@ -1075,6 +1081,7 @@ fn emit(
     // family composes the bounds-checked `rt_mem` byte-slice seam with pure `rt_simd` lane
     // assembly (S4). ──
     ir.Simd(op, args) -> emit_simd(op, args, cont, sc, state, ctx)
+    Gc(op, args) -> emit_gc(op, args, cont, sc, state, ctx)
     ir.SimdShuffle(lanes, a, b) ->
       emit_simd_shuffle(lanes, a, b, cont, sc, state, ctx)
     ir.SimdLoad(mem, kind, addr, offset) ->
@@ -2403,6 +2410,123 @@ fn emit_simd(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let call = seam_call(simd_module, simd_op_name(op), simd_call_args(op, args))
   apply_cont(cont, [call], sc, state, ctx)
+}
+
+/// Lower a `Gc(op, args)` to a single `rt_gc` seam call. Every GC op is one call
+/// (the runtime raises any trap itself — `ref.cast` cast-failure, `array.*` OOB,
+/// null deref — so no trap plumbing is needed here); its result is the operation's
+/// single pushed value (or `ok` for a `void` op, discarded by the continuation).
+fn emit_gc(
+  op: ir.GcOp,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
+  apply_cont(cont, [call], sc, state, ctx)
+}
+
+/// The `rt_gc` function name for a GC op. Packed reads and the signed/unsigned
+/// i31 reads dispatch to distinct helpers so the runtime need not carry the width.
+fn gc_op_name(op: ir.GcOp) -> String {
+  case op {
+    ir.GcStructNew(_) -> "struct_new"
+    ir.GcStructGet(_, ir.ReadPlain) -> "struct_get"
+    ir.GcStructGet(_, ir.ReadPacked(_, _)) -> "struct_get_packed"
+    ir.GcStructSet(_) -> "struct_set"
+    ir.GcArrayNew(_) -> "array_new"
+    ir.GcArrayNewFixed(_) -> "array_new_fixed"
+    ir.GcArrayGet(ir.ReadPlain) -> "array_get"
+    ir.GcArrayGet(ir.ReadPacked(_, _)) -> "array_get_packed"
+    ir.GcArraySet -> "array_set"
+    ir.GcArrayLen -> "array_len"
+    ir.GcArrayFill -> "array_fill"
+    ir.GcArrayCopy -> "array_copy"
+    ir.GcRefI31 -> "ref_i31"
+    ir.GcI31Get(True) -> "i31_get_s"
+    ir.GcI31Get(False) -> "i31_get_u"
+    ir.GcRefTest(_, _) -> "ref_test"
+    ir.GcRefCast(_, _) -> "ref_cast"
+    ir.GcRefEq -> "ref_eq"
+    ir.GcRefAsNonNull -> "ref_as_non_null"
+    ir.GcAnyConvertExtern -> "any_convert_extern"
+    ir.GcExternConvertAny -> "extern_convert_any"
+  }
+}
+
+/// The Core argument list for a GC op: the operand values (bottom-of-stack first)
+/// with the op's compile-time immediates spliced in — the type index / field
+/// index / packed width+signedness / RTTI matcher the runtime needs. Field lists
+/// (`struct.new`, `array.new_fixed`) are passed as a single Core list.
+fn gc_call_args(op: ir.GcOp, args: List(Value)) -> List(CExpr) {
+  let ev = list.map(args, emit_value)
+  case op {
+    ir.GcStructNew(t) -> [CInt(t), core_list(ev)]
+    ir.GcStructGet(f, ir.ReadPlain) -> list.append(ev, [CInt(f)])
+    ir.GcStructGet(f, ir.ReadPacked(bits, signed)) ->
+      list.append(ev, [CInt(f), CInt(bits), cbool(signed)])
+    ir.GcStructSet(f) ->
+      case ev {
+        [ref, val] -> [ref, CInt(f), val]
+        _ -> ev
+      }
+    ir.GcArrayNew(t) -> [CInt(t), ..ev]
+    ir.GcArrayNewFixed(t) -> [CInt(t), core_list(ev)]
+    ir.GcArrayGet(ir.ReadPlain) -> ev
+    ir.GcArrayGet(ir.ReadPacked(bits, signed)) ->
+      list.append(ev, [CInt(bits), cbool(signed)])
+    ir.GcArraySet -> ev
+    ir.GcArrayLen -> ev
+    ir.GcArrayFill -> ev
+    ir.GcArrayCopy -> ev
+    ir.GcRefI31 -> ev
+    ir.GcI31Get(_) -> ev
+    ir.GcRefTest(m, null_ok) ->
+      list.append(ev, [emit_matcher(m), cbool(null_ok)])
+    ir.GcRefCast(m, null_ok) ->
+      list.append(ev, [emit_matcher(m), cbool(null_ok)])
+    ir.GcRefEq -> ev
+    ir.GcRefAsNonNull -> ev
+    ir.GcAnyConvertExtern -> ev
+    ir.GcExternConvertAny -> ev
+  }
+}
+
+/// Render a compile-time RTTI matcher as a Core literal: `{concrete, [I0,I1,…]}`
+/// (the closed set of subtype indices) or `{abstract, Kind}` (an object-kind atom).
+fn emit_matcher(m: ir.GcMatcher) -> CExpr {
+  case m {
+    ir.MatchConcrete(ts) ->
+      CTuple([CAtom("concrete"), core_list(list.map(ts, CInt))])
+    ir.MatchAbstract(k) -> CTuple([CAtom("abstract"), CAtom(gc_kind_atom(k))])
+  }
+}
+
+fn gc_kind_atom(k: ir.GcKind) -> String {
+  case k {
+    ir.KStruct -> "struct"
+    ir.KArray -> "array"
+    ir.KI31 -> "i31"
+    ir.KEq -> "eq"
+    ir.KAny -> "any"
+    ir.KNone -> "none"
+    ir.KFunc -> "func"
+    ir.KNoFunc -> "nofunc"
+    ir.KExtern -> "extern"
+    ir.KNoExtern -> "noextern"
+    ir.KExn -> "exn"
+    ir.KNoExn -> "noexn"
+  }
+}
+
+/// A Core boolean atom (`'true'`/`'false'`).
+fn cbool(b: Bool) -> CExpr {
+  case b {
+    True -> CAtom("true")
+    False -> CAtom("false")
+  }
 }
 
 /// Build the concrete Core argument list for a `Simd(op, args)`, splicing any static lane
@@ -6469,6 +6593,10 @@ fn trap_ctor_name(reason: TrapReason) -> String {
     TableOutOfBounds -> "TableOutOfBounds"
     // Runtime-only policy reason (F5); never emitted by lowering, but the match is exhaustive.
     FuelExhausted -> "FuelExhausted"
+    // WasmGC traps (this proposal).
+    CastFailure -> "CastFailure"
+    NullReference -> "NullReference"
+    ArrayOutOfBounds -> "ArrayOutOfBounds"
   }
 }
 
@@ -6510,6 +6638,7 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Num(_, args) -> collect_values(args, acc)
     Convert(_, arg) -> collect_value(arg, acc)
     TermOp(_, args) -> collect_values(args, acc)
+    Gc(_, args) -> collect_values(args, acc)
     // ── Phase-8 native closures: collect the `Var` names in their `Value` operands (the captures /
     // the callee + args) so gensym avoids them. `MakeClosure`'s `fn_name` is a function name, not a
     // `Var`. Over-approximating is safe. ──

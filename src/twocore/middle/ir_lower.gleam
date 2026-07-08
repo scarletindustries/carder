@@ -233,6 +233,8 @@ fn lower_expr(
       // CallHost-gate + Loop-meter pass leaves them unchanged. `CallImport` is a call but NOT a
       // `CallHost` (no capability-policy gate applies; it resolves to a linker-built closure, S5).
       ir.Simd(_, _)
+    | // WasmGC `Gc` carries only `Value` operands — unchanged by this pass.
+      ir.Gc(_, _)
     | ir.SimdShuffle(_, _, _)
     | ir.SimdLoad(_, _, _, _)
     | ir.SimdStore(_, _, _, _)

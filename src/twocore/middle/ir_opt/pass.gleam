@@ -180,6 +180,9 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
       // rewrites their `Value` operands does so in its own per-node arm, not here.
       ir.TermTest(..)
     | ir.TermTag(..)
+    | // WasmGC (this proposal): `Gc` carries only `Value` operands (no sub-`Expr`),
+      // so like the other leaves it is returned unchanged and rewritten as itself.
+      ir.Gc(..)
     | ir.NumTerm(..) -> e
     // structured-control / sequencing — recurse into each sub-`Expr`, preserving shape.
     // Phase-7 `Try` recurses into its `body` and each handler's inline `handler` expression

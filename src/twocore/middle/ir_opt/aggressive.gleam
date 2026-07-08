@@ -636,6 +636,7 @@ fn apply_rename_subst(
     // ── Phase-6 SIMD nodes + `CallImport`: rewrite their `Value` operands (their op tag / lane
     // immediates / mem index / import slot are static). ──
     ir.Simd(op, sargs) -> ir.Simd(op, rs_values(sargs, rename, subst))
+    ir.Gc(op, gargs) -> ir.Gc(op, rs_values(gargs, rename, subst))
     ir.SimdShuffle(lanes, a, b) ->
       ir.SimdShuffle(
         lanes,

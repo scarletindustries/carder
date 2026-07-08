@@ -249,7 +249,11 @@ pub fn is_memory_barrier(e: Expr) -> Bool {
     | ir.TableFill(_, _, _, _)
     | ir.TableInit(_, _, _, _, _)
     | ir.TableCopy(_, _, _, _, _)
-    | ir.ElemDrop(_) -> True
+    | ir.ElemDrop(_)
+    | // ── WasmGC (this proposal): `Gc` ops touch the disjoint per-process GC arena
+      // (never linear memory) and several can trap — conservatively a barrier,
+      // exactly like the reference/table ops above. ──
+      ir.Gc(_, _) -> True
   }
 }
 

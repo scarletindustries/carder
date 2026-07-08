@@ -84,6 +84,7 @@ fn vars_in(acc: Set(String), e: Expr) -> Set(String) {
     ir.TermTag(arg) -> add_value(acc, arg)
     ir.NumTerm(_, lhs, rhs) -> add_value(add_value(acc, lhs), rhs)
     ir.Simd(_, args) -> union_values(acc, args)
+    ir.Gc(_, args) -> union_values(acc, args)
     ir.SimdShuffle(_, a, b) -> add_value(add_value(acc, a), b)
     // reference / table layer
     ir.RefFunc(_) -> acc

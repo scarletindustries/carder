@@ -1040,6 +1040,183 @@ fn go(
             st,
           )
 
+        // ═══════════════════════ WasmGC (this proposal) ═══════════════════════
+        // Each GC value/effect op lowers to a single `ir.Gc(op, args)` node routed
+        // through the shared value/effect emitters. Operands are deepest-first,
+        // matching `ir.Gc`'s convention. Branch casts, `call_ref`, and the
+        // data/elem-segment array ops are not yet lowered (they fall through to
+        // `Unsupported`); a validated module using them fails cleanly, never miscompiles.
+        ast.StructNew(t) -> {
+          use fields <- result.try(gc_struct_fields(ctx, t))
+          emit_value_op_t(
+            list.length(fields),
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcStructNew(t), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.StructNewDefault(t) -> {
+          use fields <- result.try(gc_struct_fields(ctx, t))
+          let defaults =
+            list.map(fields, fn(fd) { default_storage_value(fd.storage) })
+          emit_value_op_t(
+            0,
+            gc_ref_ty(),
+            fn(_) { ir.Gc(ir.GcStructNew(t), defaults) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.StructGet(t, f) ->
+          lower_struct_get(t, f, option.None, tail, ctx, st)
+        ast.StructGetS(t, f) ->
+          lower_struct_get(t, f, option.Some(True), tail, ctx, st)
+        ast.StructGetU(t, f) ->
+          lower_struct_get(t, f, option.Some(False), tail, ctx, st)
+        ast.StructSet(_, f) ->
+          emit_effect(2, fn(a) { ir.Gc(ir.GcStructSet(f), a) }, tail, ctx, st)
+        ast.ArrayNew(t) ->
+          emit_value_op_t(
+            2,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNew(t), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayNewDefault(t) -> {
+          use fd <- result.try(gc_array_field(ctx, t))
+          let d = default_storage_value(fd.storage)
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNew(t), [d, ..a]) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.ArrayNewFixed(t, n) ->
+          emit_value_op_t(
+            n,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNewFixed(t), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayGet(t) -> lower_array_get(t, option.None, tail, ctx, st)
+        ast.ArrayGetS(t) -> lower_array_get(t, option.Some(True), tail, ctx, st)
+        ast.ArrayGetU(t) ->
+          lower_array_get(t, option.Some(False), tail, ctx, st)
+        ast.ArraySet(_) ->
+          emit_effect(3, fn(a) { ir.Gc(ir.GcArraySet, a) }, tail, ctx, st)
+        ast.ArrayLen ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcArrayLen, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayFill(_) ->
+          emit_effect(4, fn(a) { ir.Gc(ir.GcArrayFill, a) }, tail, ctx, st)
+        ast.ArrayCopy(_, _) ->
+          emit_effect(5, fn(a) { ir.Gc(ir.GcArrayCopy, a) }, tail, ctx, st)
+        ast.RefI31 ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcRefI31, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.I31GetS ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcI31Get(True), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.I31GetU ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcI31Get(False), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.RefTest(rt) -> {
+          let #(m, null_ok) = gc_matcher(rt, ctx)
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcRefTest(m, null_ok), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.RefCast(rt) -> {
+          let #(m, null_ok) = gc_matcher(rt, ctx)
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcRefCast(m, null_ok), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.RefEq ->
+          emit_value_op_t(
+            2,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcRefEq, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.RefAsNonNull ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcRefAsNonNull, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.AnyConvertExtern ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcAnyConvertExtern, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ExternConvertAny ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcExternConvertAny, a) },
+            tail,
+            ctx,
+            st,
+          )
+        // `ref.null ht` for a GC heap type: the reftype-agnostic null sentinel
+        // (`{ref_null}`) — the same one funcref/externref null uses, so ref.eq/
+        // test/cast treat all nulls uniformly.
+        ast.RefNullHt(_) -> go(tail, ctx, push(st, ir.ConstNull(ir.FuncRef)))
+
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
       }
@@ -1230,6 +1407,164 @@ fn one(args: List(ir.Value)) -> ir.Value {
 /// exhaustiveness). Never appears in the output of a validated module.
 fn z() -> ir.Value {
   ir.ConstI32(0)
+}
+
+// ─────────────────────────── WasmGC lowering helpers ───────────────────────────
+
+/// The IR type a GC reference lowers to — a boxed BEAM term (an arena handle or null).
+fn gc_ref_ty() -> ir.ValType {
+  ir.TTerm
+}
+
+/// The struct fields at type index `t` (`UnknownTypeIndex` if absent / not a struct).
+fn gc_struct_fields(
+  ctx: LCtx,
+  t: Int,
+) -> Result(List(ast.FieldType), LowerError) {
+  case ast.def_type_at(ctx.types, t) {
+    Ok(ast.DefType(comp: ast.CtStruct(fs), ..)) -> Ok(fs)
+    _ -> Error(UnknownTypeIndex(t))
+  }
+}
+
+/// The array element field at type index `t`.
+fn gc_array_field(ctx: LCtx, t: Int) -> Result(ast.FieldType, LowerError) {
+  case ast.def_type_at(ctx.types, t) {
+    Ok(ast.DefType(comp: ast.CtArray(fd), ..)) -> Ok(fd)
+    _ -> Error(UnknownTypeIndex(t))
+  }
+}
+
+/// The default operand for a defaultable storage type (numeric zero / null ref /
+/// packed zero) — used to synthesize `struct.new_default` / `array.new_default`.
+fn default_storage_value(s: ast.StorageType) -> ir.Value {
+  case s {
+    ast.StI8 | ast.StI16 -> ir.ConstI32(0)
+    ast.StVal(vt) -> default_ir_value(vt)
+  }
+}
+
+fn default_ir_value(vt: ast.ValType) -> ir.Value {
+  case vt {
+    ast.I32 -> ir.ConstI32(0)
+    ast.I64 -> ir.ConstI64(0)
+    ast.F32 -> ir.ConstF32(0)
+    ast.F64 -> ir.ConstF64(0)
+    // v128/ref: the null sentinel is a safe zero placeholder (validate already
+    // confirmed the field is defaultable — a nullable ref or a numeric/vector).
+    _ -> ir.ConstNull(ir.FuncRef)
+  }
+}
+
+/// Lower `struct.get[_s|_u]`: resolve the field's storage to pick the read mode
+/// (plain vs packed sign/zero-extend) and the IR result type.
+fn lower_struct_get(
+  t: Int,
+  f: Int,
+  signed: option.Option(Bool),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use fields <- result.try(gc_struct_fields(ctx, t))
+  use field <- result.try(nth_err(fields, f, UnknownTypeIndex(t)))
+  let #(read, rty) = gc_field_read(field.storage, signed)
+  emit_value_op_t(
+    1,
+    rty,
+    fn(a) { ir.Gc(ir.GcStructGet(f, read), a) },
+    tail,
+    ctx,
+    st,
+  )
+}
+
+/// Lower `array.get[_s|_u]`: like `struct.get` but two operands (`[ref, index]`).
+fn lower_array_get(
+  t: Int,
+  signed: option.Option(Bool),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use field <- result.try(gc_array_field(ctx, t))
+  let #(read, rty) = gc_field_read(field.storage, signed)
+  emit_value_op_t(
+    2,
+    rty,
+    fn(a) { ir.Gc(ir.GcArrayGet(read), a) },
+    tail,
+    ctx,
+    st,
+  )
+}
+
+/// The read mode + IR result type of a field/element access: a plain (non-packed)
+/// field reads as its value type; a packed `i8`/`i16` sign/zero-extends to `i32`.
+fn gc_field_read(
+  storage: ast.StorageType,
+  signed: option.Option(Bool),
+) -> #(ir.FieldRead, ir.ValType) {
+  case storage {
+    ast.StVal(vt) -> #(ir.ReadPlain, to_ir_vt(vt))
+    ast.StI8 -> #(ir.ReadPacked(8, sign_of(signed)), ir.TI32)
+    ast.StI16 -> #(ir.ReadPacked(16, sign_of(signed)), ir.TI32)
+  }
+}
+
+fn sign_of(signed: option.Option(Bool)) -> Bool {
+  case signed {
+    option.Some(b) -> b
+    option.None -> False
+  }
+}
+
+/// The RTTI matcher + null-acceptance flag for a `ref.test`/`ref.cast` target: a
+/// concrete target expands to the closed set of subtype indices; abstract targets
+/// map to an object-kind atom. Null is accepted iff the target ref type is nullable.
+fn gc_matcher(rt: ast.RefType, ctx: LCtx) -> #(ir.GcMatcher, Bool) {
+  let m = case rt.heap {
+    ast.HConcrete(t) -> ir.MatchConcrete(subtype_set(t, ctx.types))
+    ast.HStruct -> ir.MatchAbstract(ir.KStruct)
+    ast.HArray -> ir.MatchAbstract(ir.KArray)
+    ast.HI31 -> ir.MatchAbstract(ir.KI31)
+    ast.HEq -> ir.MatchAbstract(ir.KEq)
+    ast.HAny -> ir.MatchAbstract(ir.KAny)
+    ast.HNone -> ir.MatchAbstract(ir.KNone)
+    ast.HFunc -> ir.MatchAbstract(ir.KFunc)
+    ast.HNoFunc -> ir.MatchAbstract(ir.KNoFunc)
+    ast.HExtern -> ir.MatchAbstract(ir.KExtern)
+    ast.HNoExtern -> ir.MatchAbstract(ir.KNoExtern)
+    ast.HExn -> ir.MatchAbstract(ir.KExn)
+    ast.HNoExn -> ir.MatchAbstract(ir.KNoExn)
+  }
+  #(m, rt.nullable)
+}
+
+/// The closed set of concrete type indices `<:` `t` — the runtime match set for a
+/// concrete `ref.test`/`ref.cast` (an object whose stored type index is in this set
+/// matches). Bounded walk (chain ≤ #types) so a malformed cycle can't loop.
+fn subtype_set(t: Int, types: List(ast.DefType)) -> List(Int) {
+  let n = list.length(types)
+  types
+  |> list.index_map(fn(_dt, i) { i })
+  |> list.filter(fn(i) { gc_reaches(i, t, types, n) })
+}
+
+fn gc_reaches(i: Int, t: Int, types: List(ast.DefType), fuel: Int) -> Bool {
+  case i == t {
+    True -> True
+    False ->
+      case fuel <= 0 {
+        True -> False
+        False ->
+          case ast.def_type_at(types, i) {
+            Ok(ast.DefType(supertype: option.Some(s), ..)) ->
+              gc_reaches(s, t, types, fuel - 1)
+            _ -> False
+          }
+      }
+  }
 }
 
 /// A defensive null funcref operand, the reference-typed counterpart of `z/0` (used where
