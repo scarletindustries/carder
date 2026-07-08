@@ -544,7 +544,7 @@ pub fn nonconst_init_fail_closed_test() {
   let m =
     ast.Module(
       imported_func_count: 0,
-      types: [],
+      types: list.map([], ast.func_def),
       imports: [],
       tables: [],
       memories: [],
@@ -1022,7 +1022,7 @@ fn one_func_module(
 ) -> ast.Module {
   ast.Module(
     imported_func_count: 0,
-    types: [ast.FuncType(params, results)],
+    types: list.map([ast.FuncType(params, results)], ast.func_def),
     imports: [],
     tables: [],
     memories: memories,
@@ -1148,7 +1148,7 @@ pub fn v128_global_init_test() {
   let m =
     ast.Module(
       imported_func_count: 0,
-      types: [ast.FuncType([], [ast.V128])],
+      types: list.map([ast.FuncType([], [ast.V128])], ast.func_def),
       imports: [],
       tables: [],
       memories: [],
@@ -1497,7 +1497,7 @@ pub fn memory64_imported_test() {
   let m =
     ast.Module(
       imported_func_count: 0,
-      types: [ast.FuncType([], [])],
+      types: list.map([ast.FuncType([], [])], ast.func_def),
       imports: [
         ast.Import(
           "env",
@@ -1532,7 +1532,10 @@ pub fn imported_call_test() {
   let m =
     ast.Module(
       imported_func_count: 2,
-      types: [ast.FuncType([ast.I32], [ast.I32]), ast.FuncType([ast.I32], [])],
+      types: list.map(
+        [ast.FuncType([ast.I32], [ast.I32]), ast.FuncType([ast.I32], [])],
+        ast.func_def,
+      ),
       imports: [
         ast.Import("host", "inc", ast.ImportFunc(0)),
         ast.Import("host", "log", ast.ImportFunc(1)),
@@ -1866,7 +1869,7 @@ fn eh_module(
 ) -> ast.Module {
   ast.Module(
     imported_func_count: 0,
-    types: types,
+    types: list.map(types, ast.func_def),
     imports: imports,
     tables: [],
     memories: [],
@@ -2365,7 +2368,7 @@ pub fn throw_unknown_tag_fails_closed_test() {
   let m =
     ast.Module(
       imported_func_count: 0,
-      types: [ast.FuncType([], [])],
+      types: list.map([ast.FuncType([], [])], ast.func_def),
       imports: [],
       tables: [],
       memories: [],

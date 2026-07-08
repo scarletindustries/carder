@@ -65,6 +65,121 @@ pub type ValType {
   FuncRef
   ExternRef
   ExnRef
+  /// A GC-proposal reference type `(ref null? ht)` carrying an explicit heap type
+  /// and nullability. The legacy `FuncRef`/`ExternRef`/`ExnRef` are the short
+  /// spellings of `Ref(RefType(True, HFunc/HExtern/HExn))`; `normalize_reftype`
+  /// bridges the two for subtyping. Only the GC decode path produces `Ref(..)`.
+  Ref(RefType)
+}
+
+/// A reference type: whether it may be null, and the heap type it points at.
+pub type RefType {
+  RefType(nullable: Bool, heap: HeapType)
+}
+
+/// A heap type — what a reference points at. Either one of the built-in abstract
+/// types (the roots/leaves of the three type hierarchies) or a concrete type
+/// declared in the type section (by index).
+pub type HeapType {
+  // internal / aggregate hierarchy: any ⊒ eq ⊒ {i31, struct, array} ⊒ none
+  HAny
+  HEq
+  HI31
+  HStruct
+  HArray
+  HNone
+  // function hierarchy: func ⊒ nofunc
+  HFunc
+  HNoFunc
+  // extern hierarchy: extern ⊒ noextern
+  HExtern
+  HNoExtern
+  // exception hierarchy (EH proposal): exn ⊒ noexn
+  HExn
+  HNoExn
+  /// A concrete type at this index in the type section (a struct/array/func).
+  HConcrete(type_idx: Int)
+}
+
+/// The storage type of a struct field or array element. Packed `i8`/`i16` are
+/// stored narrow and widened on read (`struct.get_s`/`_u`); anything else is a
+/// full value type.
+pub type StorageType {
+  StVal(ValType)
+  StI8
+  StI16
+}
+
+/// A field of a struct, or the (single) element type of an array: its storage
+/// type plus whether it is mutable.
+pub type FieldType {
+  FieldType(storage: StorageType, mutable: Bool)
+}
+
+/// A composite type — the three shapes a defined type can take. Func types keep
+/// the existing `FuncType`; structs are an ordered field list; an array is one
+/// field type (its element).
+pub type CompositeType {
+  CtFunc(FuncType)
+  CtStruct(fields: List(FieldType))
+  CtArray(element: FieldType)
+}
+
+/// A defined type in the (now unified) type section: its composite body, an
+/// optional declared supertype (a type index it extends), and whether it is
+/// `final` (may not itself be subtyped). A plain `(type (func …))` decodes to
+/// `DefType(CtFunc(..), None, True)`.
+pub type DefType {
+  DefType(comp: CompositeType, supertype: Option(Int), final: Bool)
+}
+
+/// A final, supertype-less defined type wrapping a func signature — the shape a
+/// plain `(type (func …))` decodes to. Convenient for building type sections.
+pub fn func_def(ft: FuncType) -> DefType {
+  DefType(comp: CtFunc(ft), supertype: option.None, final: True)
+}
+
+/// The func type at `idx` in a defined-type list, or `Error(Nil)` if the index is
+/// out of range or names a non-func type. Every place that used to index a
+/// `List(FuncType)` now goes through this.
+pub fn func_type_at(types: List(DefType), idx: Int) -> Result(FuncType, Nil) {
+  case list_at(types, idx) {
+    Ok(DefType(comp: CtFunc(ft), ..)) -> Ok(ft)
+    _ -> Error(Nil)
+  }
+}
+
+/// The defined type at `idx`, or `Error(Nil)` if out of range.
+pub fn def_type_at(types: List(DefType), idx: Int) -> Result(DefType, Nil) {
+  list_at(types, idx)
+}
+
+fn list_at(xs: List(a), i: Int) -> Result(a, Nil) {
+  case i < 0 {
+    True -> Error(Nil)
+    False ->
+      case xs {
+        [] -> Error(Nil)
+        [x, ..rest] ->
+          case i {
+            0 -> Ok(x)
+            _ -> list_at(rest, i - 1)
+          }
+      }
+  }
+}
+
+/// Normalize a value type to its reference-type form, if it is a reference type.
+/// Bridges the legacy `FuncRef`/`ExternRef`/`ExnRef` spellings and the general
+/// `Ref(..)` form so subtyping has a single representation to reason about.
+pub fn normalize_reftype(vt: ValType) -> Result(RefType, Nil) {
+  case vt {
+    FuncRef -> Ok(RefType(True, HFunc))
+    ExternRef -> Ok(RefType(True, HExtern))
+    ExnRef -> Ok(RefType(True, HExn))
+    Ref(rt) -> Ok(rt)
+    _ -> Error(Nil)
+  }
 }
 
 /// A function type (signature): the parameter value types and the result value
@@ -349,7 +464,11 @@ pub type Tag {
 pub type Module {
   Module(
     imported_func_count: Int,
-    types: List(FuncType),
+    /// The type section (id 1), now a unified list of **defined types**
+    /// (func/struct/array), flat-indexed. A `typeidx` indexes here; use
+    /// `func_type_at` to pull the signature at a func-type index. Rec groups are
+    /// flattened into this list (their members occupy consecutive indices).
+    types: List(DefType),
     imports: List(Import),
     tables: List(TableType),
     memories: List(MemType),
@@ -918,6 +1037,56 @@ pub type Instr {
   F64ReinterpretI64
 
   // 0xBF
+  // ===================== GC + function-references proposal =====================
+  // --- ref.null with an explicit heap type (0xD0 <heaptype>) ---
+  RefNullHt(heap: HeapType)
+  // --- typed function references (single-byte / 0xD3..0xD6) ---
+  RefEq
+  // 0xD3 — pops two eq refs, pushes i32 (1 iff identical)
+  RefAsNonNull
+  // 0xD4 — asserts non-null (traps on null)
+  BrOnNull(label: Int)
+  // 0xD5 — branch if null, else keep the (non-null) ref
+  BrOnNonNull(label: Int)
+  // 0xD6 — branch if non-null (passing the ref), else fall through
+  CallRef(type_idx: Int)
+  // 0x14 <typeidx> — call through a typed function reference
+  ReturnCallRef(type_idx: Int)
+  // 0x15 <typeidx> — tail call through a typed function reference
+  // --- GC prefix (0xFB) : structs ---
+  StructNew(type_idx: Int)
+  StructNewDefault(type_idx: Int)
+  StructGet(type_idx: Int, field: Int)
+  StructGetS(type_idx: Int, field: Int)
+  StructGetU(type_idx: Int, field: Int)
+  StructSet(type_idx: Int, field: Int)
+  // --- GC prefix : arrays ---
+  ArrayNew(type_idx: Int)
+  ArrayNewDefault(type_idx: Int)
+  ArrayNewFixed(type_idx: Int, count: Int)
+  ArrayNewData(type_idx: Int, data_idx: Int)
+  ArrayNewElem(type_idx: Int, elem_idx: Int)
+  ArrayGet(type_idx: Int)
+  ArrayGetS(type_idx: Int)
+  ArrayGetU(type_idx: Int)
+  ArraySet(type_idx: Int)
+  ArrayLen
+  ArrayFill(type_idx: Int)
+  ArrayCopy(dst_type: Int, src_type: Int)
+  ArrayInitData(type_idx: Int, data_idx: Int)
+  ArrayInitElem(type_idx: Int, elem_idx: Int)
+  // --- GC prefix : i31 ---
+  RefI31
+  I31GetS
+  I31GetU
+  // --- GC prefix : casts, tests, conversions ---
+  RefTest(ref_ty: RefType)
+  RefCast(ref_ty: RefType)
+  BrOnCast(label: Int, from: RefType, to: RefType)
+  BrOnCastFail(label: Int, from: RefType, to: RefType)
+  AnyConvertExtern
+  ExternConvertAny
+
   // ===================== Phase 5 («WASM-AST3») =====================
   // --- reference instructions (0xD0..0xD2) — spec binary/instructions §reference ---
   RefNull(ref_ty: ValType)
@@ -1139,4 +1308,9 @@ pub type DecodeError {
   BadTagAttribute
   BadCatchKind
   BadDelegate
+  // --- GC proposal ---
+  BadCompositeType
+  BadStorageType
+  BadSubForm
+  UnknownGcOpcode(Int)
 }

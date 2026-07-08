@@ -344,7 +344,7 @@ pub type ValidateError {
 /// - `locals`: the current function's expanded local types (`params ++ declared`).
 type Ctx {
   Ctx(
-    types: List(FuncType),
+    types: List(ast.DefType),
     func_types: List(FuncType),
     globals: List(#(ValType, Bool)),
     imported_global_count: Int,
@@ -559,13 +559,13 @@ fn nth(xs: List(a), i: Int) -> Result(a, Nil) {
 /// `Error(UnknownType(i))` if a `typeidx` is out of range.
 fn blocktype_types(
   bt: ast.BlockType,
-  types: List(FuncType),
+  types: List(ast.DefType),
 ) -> Result(#(List(ValType), List(ValType)), ValidateError) {
   case bt {
     ast.BlockEmpty -> Ok(#([], []))
     ast.BlockVal(t) -> Ok(#([], [t]))
     ast.BlockTypeIdx(i) ->
-      case nth(types, i) {
+      case ast.func_type_at(types, i) {
         Ok(ast.FuncType(params, results)) -> Ok(#(params, results))
         Error(_) -> Error(UnknownType(i))
       }
@@ -700,7 +700,7 @@ fn imported_func_types(
   list.try_fold(module.imports, [], fn(acc, imp) {
     case imp.desc {
       ast.ImportFunc(type_idx) ->
-        case nth(module.types, type_idx) {
+        case ast.func_type_at(module.types, type_idx) {
           Ok(ft) -> Ok([ft, ..acc])
           Error(_) -> Error(UnknownType(type_idx))
         }
@@ -746,7 +746,7 @@ fn imported_memtypes(module: Module) -> List(ast.MemType) {
 /// range, else `Error(UnknownType(_))`.
 fn resolve_func_types(module: Module) -> Result(List(FuncType), ValidateError) {
   list.try_map(module.funcs, fn(f) {
-    case nth(module.types, f.type_idx) {
+    case ast.func_type_at(module.types, f.type_idx) {
       Ok(ft) -> Ok(ft)
       Error(_) -> Error(UnknownType(f.type_idx))
     }
@@ -791,10 +791,10 @@ fn defined_tag_types(
 /// where a malformed tag is rejected — every use site then trusts `ctx.tags[x]` is a
 /// well-formed operand list.
 fn resolve_tag_type(
-  types: List(FuncType),
+  types: List(ast.DefType),
   type_idx: Int,
 ) -> Result(List(ValType), ValidateError) {
-  case nth(types, type_idx) {
+  case ast.func_type_at(types, type_idx) {
     Error(_) -> Error(UnknownType(type_idx))
     Ok(ast.FuncType(params, results)) ->
       case results {
@@ -844,7 +844,7 @@ fn validate_func(
   module: Module,
   ctx: Ctx,
 ) -> Result(List(ValType), ValidateError) {
-  use sig <- result.try(case nth(module.types, f.type_idx) {
+  use sig <- result.try(case ast.func_type_at(module.types, f.type_idx) {
     Ok(ft) -> Ok(ft)
     Error(_) -> Error(UnknownType(f.type_idx))
   })
@@ -976,7 +976,7 @@ fn validate_instr(
     // the type's results are pushed. The per-call structural type check is purely
     // DYNAMIC (runtime), not validation.
     ast.CallIndirect(type_idx, table) -> {
-      use sig <- result.try(case nth(ctx.types, type_idx) {
+      use sig <- result.try(case ast.func_type_at(ctx.types, type_idx) {
         Ok(s) -> Ok(s)
         Error(_) -> Error(UnknownType(type_idx))
       })
@@ -1026,7 +1026,7 @@ fn validate_instr(
     // polymorphic (`mark_unreachable`). The per-call structural FuncType check stays DYNAMIC
     // (runtime), unchanged from `call_indirect` (WASM tail-call proposal validation).
     ast.ReturnCallIndirect(type_idx, table) -> {
-      use sig <- result.try(case nth(ctx.types, type_idx) {
+      use sig <- result.try(case ast.func_type_at(ctx.types, type_idx) {
         Ok(s) -> Ok(s)
         Error(_) -> Error(UnknownType(type_idx))
       })

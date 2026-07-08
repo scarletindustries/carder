@@ -161,7 +161,7 @@ pub type LowerError {
 ///   rejected by validate — lower fails closed).
 type LCtx {
   LCtx(
-    types: List(ast.FuncType),
+    types: List(ast.DefType),
     func_types: List(ast.FuncType),
     imported: Int,
     local_types: List(ir.ValType),
@@ -349,7 +349,7 @@ fn lower_func(
 ) -> Result(ir.Function, LowerError) {
   let module = typed.module
   let funcidx = typed.imported_func_count + defined_idx
-  use sig <- result.try(nth_err(
+  use sig <- result.try(func_type_err(
     module.types,
     f.type_idx,
     UnknownTypeIndex(f.type_idx),
@@ -1253,7 +1253,11 @@ fn lower_call_indirect(
   ctx: LCtx,
   st: LState,
 ) -> Result(GoResult, LowerError) {
-  use sig <- result.try(nth_err(ctx.types, type_idx, UnknownTypeIndex(type_idx)))
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
   let result_ir_types = list.map(sig.results, to_ir_vt)
   let ir_ty = ir.FuncType(list.map(sig.params, to_ir_vt), result_ir_types)
   use #(index, stack1) <- result.try(pop1(st.stack))
@@ -1493,7 +1497,11 @@ fn lower_return_call_indirect(
   ctx: LCtx,
   st: LState,
 ) -> Result(GoResult, LowerError) {
-  use sig <- result.try(nth_err(ctx.types, type_idx, UnknownTypeIndex(type_idx)))
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
   let ir_ty =
     ir.FuncType(list.map(sig.params, to_ir_vt), list.map(sig.results, to_ir_vt))
   use #(index, stack1) <- result.try(pop1(st.stack))
@@ -2869,7 +2877,7 @@ fn blocktype_io(
     ast.BlockEmpty -> Ok(#([], []))
     ast.BlockVal(t) -> Ok(#([], [to_ir_vt(t)]))
     ast.BlockTypeIdx(i) ->
-      case nth_err(ctx.types, i, UnknownTypeIndex(i)) {
+      case func_type_err(ctx.types, i, UnknownTypeIndex(i)) {
         Ok(ast.FuncType(params, results)) ->
           Ok(#(list.map(params, to_ir_vt), list.map(results, to_ir_vt)))
         Error(e) -> Error(e)
@@ -2894,6 +2902,8 @@ fn to_ir_vt(t: ast.ValType) -> ir.ValType {
     ast.FuncRef -> ir.TFuncRef
     ast.ExternRef -> ir.TExternRef
     ast.ExnRef -> ir.TExnRef
+    // A GC-proposal reference is a boxed BEAM term (an arena handle, or null).
+    ast.Ref(_) -> ir.TTerm
   }
 }
 
@@ -2961,6 +2971,17 @@ fn two_pow(n: Int) -> Int {
 }
 
 /// Total list indexing returning `Error(err)` (the caller's chosen `LowerError`).
+fn func_type_err(
+  types: List(ast.DefType),
+  i: Int,
+  err: LowerError,
+) -> Result(ast.FuncType, LowerError) {
+  case ast.func_type_at(types, i) {
+    Ok(ft) -> Ok(ft)
+    Error(_) -> Error(err)
+  }
+}
+
 fn nth_err(xs: List(a), i: Int, err: LowerError) -> Result(a, LowerError) {
   case xs, i {
     [x, ..], 0 -> Ok(x)
@@ -3150,7 +3171,7 @@ fn lower_tags(
   imported_tag_count: Int,
 ) -> Result(List(ir.TagDecl), LowerError) {
   list.index_map(module.tags, fn(t, i) {
-    use sig <- result.try(nth_err(
+    use sig <- result.try(func_type_err(
       module.types,
       t.type_idx,
       UnknownTypeIndex(t.type_idx),
@@ -3259,7 +3280,7 @@ fn lower_imports(
   list.try_map(module.imports, fn(imp) {
     case imp.desc {
       ast.ImportFunc(tyidx) -> {
-        use sig <- result.try(nth_err(
+        use sig <- result.try(func_type_err(
           module.types,
           tyidx,
           UnknownTypeIndex(tyidx),
@@ -3289,7 +3310,7 @@ fn lower_imports(
       // signature (the exception payload types), resolved from `types[tyidx]` and mapped to
       // IR types. Imported tags occupy the LOW tagidx range (before defined tags).
       ast.ImportTag(tyidx) -> {
-        use sig <- result.try(nth_err(
+        use sig <- result.try(func_type_err(
           module.types,
           tyidx,
           UnknownTypeIndex(tyidx),

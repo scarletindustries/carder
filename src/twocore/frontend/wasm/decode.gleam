@@ -49,8 +49,8 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import twocore/frontend/wasm/ast.{
   type BlockType, type Catch, type DataSegment, type ElementSegment, type Export,
-  type Func, type FuncType, type Global, type Import, type Instr, type Limits,
-  type MemArg, type MemType, type Module, type TableType, type Tag, type ValType,
+  type Func, type Global, type Import, type Instr, type Limits, type MemArg,
+  type MemType, type Module, type TableType, type Tag, type ValType,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ fn two_pow(n: Int) -> Int {
 /// the code section) are paired into `Func`s once decoding finishes.
 type DecodeState {
   DecodeState(
-    types: List(FuncType),
+    types: List(ast.DefType),
     imports: List(Import),
     tables: List(TableType),
     memories: List(MemType),
@@ -327,9 +327,11 @@ fn dispatch_section(
   case id {
     // type section: vec(functype)
     1 -> {
-      use #(types, rest) <- result.try(decode_vec(contents, decode_functype))
+      use #(groups, rest) <- result.try(decode_vec(contents, decode_rectype))
       use _ <- result.try(expect_empty(rest))
-      Ok(DecodeState(..state, types: types))
+      // Rec groups are flattened into one index space (their members occupy
+      // consecutive type indices), matching how the AST/validator index types.
+      Ok(DecodeState(..state, types: list.flatten(groups)))
     }
     // import section: vec(import) — non-function imports are Phase-5 in scope.
     2 -> {
@@ -578,10 +580,55 @@ fn decode_valtype(
         0x7D -> Ok(#(ast.F32, rest))
         0x7C -> Ok(#(ast.F64, rest))
         0x7B -> Ok(#(ast.V128, rest))
+        // Reference types (legacy shorthands, GC abstract shorthands, and the
+        // general `(ref null? ht)` forms) — shared with `decode_reftype`. A byte
+        // that is neither a number nor a reftype is `BadValType` in this position.
+        _ ->
+          decode_reftype(bytes)
+          |> result.map_error(fn(e) {
+            case e {
+              ast.BadHeapType -> ast.BadValType
+              other -> other
+            }
+          })
+      }
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// Decode a reference type. Handles the legacy shorthands (`funcref`/`externref`/
+/// `exnref`), the GC abstract shorthands (`anyref`/`eqref`/`i31ref`/`structref`/
+/// `arrayref`/`nullref`/…), and the general `0x64 heaptype` (`(ref ht)`) /
+/// `0x63 heaptype` (`(ref null ht)`) forms. Used at reftype-only sites too.
+fn decode_reftype(
+  bytes: BitArray,
+) -> Result(#(ValType, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x64, rest:bytes>> -> {
+      use #(ht, r) <- result.try(decode_heaptype(rest))
+      Ok(#(ast.Ref(ast.RefType(nullable: False, heap: ht)), r))
+    }
+    <<0x63, rest:bytes>> -> {
+      use #(ht, r) <- result.try(decode_heaptype(rest))
+      Ok(#(ast.Ref(ast.RefType(nullable: True, heap: ht)), r))
+    }
+    <<b:8, rest:bytes>> ->
+      case b {
+        // Legacy nullable-reftype spellings kept distinct for the non-GC path.
         0x70 -> Ok(#(ast.FuncRef, rest))
         0x6F -> Ok(#(ast.ExternRef, rest))
         0x69 -> Ok(#(ast.ExnRef, rest))
-        _ -> Error(ast.BadValType)
+        // GC abstract shorthands ≡ a nullable ref to the abstract heap type.
+        0x6E -> Ok(#(ast.Ref(ast.RefType(True, ast.HAny)), rest))
+        0x6D -> Ok(#(ast.Ref(ast.RefType(True, ast.HEq)), rest))
+        0x6C -> Ok(#(ast.Ref(ast.RefType(True, ast.HI31)), rest))
+        0x6B -> Ok(#(ast.Ref(ast.RefType(True, ast.HStruct)), rest))
+        0x6A -> Ok(#(ast.Ref(ast.RefType(True, ast.HArray)), rest))
+        0x71 -> Ok(#(ast.Ref(ast.RefType(True, ast.HNone)), rest))
+        0x73 -> Ok(#(ast.Ref(ast.RefType(True, ast.HNoFunc)), rest))
+        0x72 -> Ok(#(ast.Ref(ast.RefType(True, ast.HNoExtern)), rest))
+        0x74 -> Ok(#(ast.Ref(ast.RefType(True, ast.HNoExn)), rest))
+        _ -> Error(ast.BadHeapType)
       }
     _ -> Error(ast.Truncated)
   }
@@ -595,21 +642,6 @@ fn decode_valtype(
 /// binary/types.html#reference-types). Unlike `v128`, `exn` (`0x69`) is accepted here so
 /// `ref.null exn` (`0xD0 0x69`) decodes to `RefNull(ExnRef)`; validate owns whether an
 /// `exnref` may legally appear in a given table/global/element position.
-fn decode_reftype(
-  bytes: BitArray,
-) -> Result(#(ValType, BitArray), ast.DecodeError) {
-  case bytes {
-    <<b:8, rest:bytes>> ->
-      case b {
-        0x70 -> Ok(#(ast.FuncRef, rest))
-        0x6F -> Ok(#(ast.ExternRef, rest))
-        0x69 -> Ok(#(ast.ExnRef, rest))
-        _ -> Error(ast.BadHeapType)
-      }
-    _ -> Error(ast.Truncated)
-  }
-}
-
 /// Decode a global's `mut` byte: `0x00`→`False` (const), `0x01`→`True` (var). Any
 /// other byte is `Error(ast.BadMutability)`; empty input is `Error(ast.Truncated)`.
 fn decode_mut(bytes: BitArray) -> Result(#(Bool, BitArray), ast.DecodeError) {
@@ -623,20 +655,154 @@ fn decode_mut(bytes: BitArray) -> Result(#(Bool, BitArray), ast.DecodeError) {
 
 /// Decode one function type `0x60 vec(valtype) vec(valtype)`. `Error(
 /// ast.BadFuncTypeForm)` if the leading tag is not `0x60`.
-fn decode_functype(
+/// A rec type (a type-section element): either an explicit `0x4E vec(subtype)`
+/// rec group, or a single subtype (an implicit singleton group). Returns the
+/// group's defined types, which the section decoder flattens.
+fn decode_rectype(
   bytes: BitArray,
-) -> Result(#(FuncType, BitArray), ast.DecodeError) {
+) -> Result(#(List(ast.DefType), BitArray), ast.DecodeError) {
   case bytes {
-    <<b:8, after_tag:bytes>> ->
-      case b {
-        0x60 -> {
-          use #(params, r1) <- result.try(decode_vec(after_tag, decode_valtype))
-          use #(results, r2) <- result.try(decode_vec(r1, decode_valtype))
-          Ok(#(ast.FuncType(params: params, results: results), r2))
-        }
-        _ -> Error(ast.BadFuncTypeForm)
-      }
+    <<0x4E, rest:bytes>> -> decode_vec(rest, decode_subtype)
+    _ -> {
+      use #(dt, rest) <- result.try(decode_subtype(bytes))
+      Ok(#([dt], rest))
+    }
+  }
+}
+
+/// A sub type: `0x50 vec(typeidx) comptype` (non-final) / `0x4F vec(typeidx)
+/// comptype` (final), or a bare comptype (≡ final, no supertype). At most one
+/// declared supertype is supported (the GC MVP allows only single inheritance).
+fn decode_subtype(
+  bytes: BitArray,
+) -> Result(#(ast.DefType, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x50, rest:bytes>> -> decode_sub_body(rest, False)
+    <<0x4F, rest:bytes>> -> decode_sub_body(rest, True)
+    _ -> {
+      use #(comp, rest) <- result.try(decode_comptype(bytes))
+      Ok(#(ast.DefType(comp: comp, supertype: option.None, final: True), rest))
+    }
+  }
+}
+
+fn decode_sub_body(
+  bytes: BitArray,
+  final: Bool,
+) -> Result(#(ast.DefType, BitArray), ast.DecodeError) {
+  use #(supers, r1) <- result.try(
+    decode_vec(bytes, fn(b) {
+      use #(i, r) <- result.try(decode_u_n(b, 32))
+      Ok(#(i, r))
+    }),
+  )
+  use super <- result.try(case supers {
+    [] -> Ok(option.None)
+    [s] -> Ok(option.Some(s))
+    // The GC MVP permits at most one supertype.
+    _ -> Error(ast.BadSubForm)
+  })
+  use #(comp, r2) <- result.try(decode_comptype(r1))
+  Ok(#(ast.DefType(comp: comp, supertype: super, final: final), r2))
+}
+
+/// A composite type: `0x60` func, `0x5F` struct (vec(fieldtype)), `0x5E` array
+/// (one fieldtype).
+fn decode_comptype(
+  bytes: BitArray,
+) -> Result(#(ast.CompositeType, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x60, rest:bytes>> -> {
+      use #(params, r1) <- result.try(decode_vec(rest, decode_valtype))
+      use #(results, r2) <- result.try(decode_vec(r1, decode_valtype))
+      Ok(#(ast.CtFunc(ast.FuncType(params:, results:)), r2))
+    }
+    <<0x5F, rest:bytes>> -> {
+      use #(fields, r1) <- result.try(decode_vec(rest, decode_fieldtype))
+      Ok(#(ast.CtStruct(fields), r1))
+    }
+    <<0x5E, rest:bytes>> -> {
+      use #(field, r1) <- result.try(decode_fieldtype(rest))
+      Ok(#(ast.CtArray(field), r1))
+    }
+    <<_:8, _:bytes>> -> Error(ast.BadCompositeType)
     _ -> Error(ast.Truncated)
+  }
+}
+
+/// A field type: a storage type followed by a mutability byte (`0x00`/`0x01`).
+fn decode_fieldtype(
+  bytes: BitArray,
+) -> Result(#(ast.FieldType, BitArray), ast.DecodeError) {
+  use #(storage, r1) <- result.try(decode_storagetype(bytes))
+  case r1 {
+    <<0x00, rest:bytes>> ->
+      Ok(#(ast.FieldType(storage: storage, mutable: False), rest))
+    <<0x01, rest:bytes>> ->
+      Ok(#(ast.FieldType(storage: storage, mutable: True), rest))
+    <<_:8, _:bytes>> -> Error(ast.BadMutability)
+    _ -> Error(ast.Truncated)
+  }
+}
+
+/// A storage type: packed `i8` (0x78) / `i16` (0x77), or any value type.
+fn decode_storagetype(
+  bytes: BitArray,
+) -> Result(#(ast.StorageType, BitArray), ast.DecodeError) {
+  case bytes {
+    <<0x78, rest:bytes>> -> Ok(#(ast.StI8, rest))
+    <<0x77, rest:bytes>> -> Ok(#(ast.StI16, rest))
+    _ -> {
+      use #(vt, rest) <- result.try(decode_valtype(bytes))
+      Ok(#(ast.StVal(vt), rest))
+    }
+  }
+}
+
+/// A heap type, encoded as an `s33`: a non-negative value is a concrete type
+/// index; a negative value is one of the abstract heap types.
+fn decode_heaptype(
+  bytes: BitArray,
+) -> Result(#(ast.HeapType, BitArray), ast.DecodeError) {
+  use #(v, rest) <- result.try(decode_s_n(bytes, 33))
+  case v >= 0 {
+    True -> Ok(#(ast.HConcrete(v), rest))
+    False ->
+      case abstract_heaptype(v) {
+        Ok(ht) -> Ok(#(ht, rest))
+        Error(_) -> Error(ast.BadHeapType)
+      }
+  }
+}
+
+/// Map an abstract-heap-type byte value (as its signed-LEB `s33`) to a `HeapType`.
+fn abstract_heaptype(v: Int) -> Result(ast.HeapType, Nil) {
+  case v {
+    -16 -> Ok(ast.HFunc)
+    // 0x70
+    -17 -> Ok(ast.HExtern)
+    // 0x6F
+    -18 -> Ok(ast.HAny)
+    // 0x6E
+    -19 -> Ok(ast.HEq)
+    // 0x6D
+    -20 -> Ok(ast.HI31)
+    // 0x6C
+    -21 -> Ok(ast.HStruct)
+    // 0x6B
+    -22 -> Ok(ast.HArray)
+    // 0x6A
+    -13 -> Ok(ast.HNoFunc)
+    // 0x73
+    -14 -> Ok(ast.HNoExtern)
+    // 0x72
+    -15 -> Ok(ast.HNone)
+    // 0x71
+    -23 -> Ok(ast.HExn)
+    // 0x69
+    -12 -> Ok(ast.HNoExn)
+    // 0x74
+    _ -> Error(Nil)
   }
 }
 
@@ -1311,13 +1477,27 @@ fn decode_instr(
         // MVP → `mem == 0`, byte-identical; a genuine index under multi-memory).
         0x3F -> idx_instr(rest, ast.MemorySize)
         0x40 -> idx_instr(rest, ast.MemoryGrow)
-        // reference instructions (0xD0..0xD2).
+        // reference instructions (0xD0..0xD6).
         0xD0 -> {
-          use #(ref_ty, r) <- result.try(decode_reftype(rest))
-          Ok(#(ast.RefNull(ref_ty), r))
+          // `ref.null ht` — a heap type (legacy func/extern/exn keep the
+          // `RefNull(ValType)` shape; GC/concrete heap types use `RefNullHt`).
+          use #(ht, r) <- result.try(decode_heaptype(rest))
+          case ht {
+            ast.HFunc -> Ok(#(ast.RefNull(ast.FuncRef), r))
+            ast.HExtern -> Ok(#(ast.RefNull(ast.ExternRef), r))
+            ast.HExn -> Ok(#(ast.RefNull(ast.ExnRef), r))
+            _ -> Ok(#(ast.RefNullHt(ht), r))
+          }
         }
         0xD1 -> Ok(#(ast.RefIsNull, rest))
         0xD2 -> idx_instr(rest, ast.RefFunc)
+        // typed function references (GC / function-references proposal).
+        0xD3 -> Ok(#(ast.RefEq, rest))
+        0xD4 -> Ok(#(ast.RefAsNonNull, rest))
+        0xD5 -> idx_instr(rest, ast.BrOnNull)
+        0xD6 -> idx_instr(rest, ast.BrOnNonNull)
+        0x14 -> idx_instr(rest, ast.CallRef)
+        0x15 -> idx_instr(rest, ast.ReturnCallRef)
         // constants
         0x41 -> {
           use #(v, r) <- result.try(decode_s_n(rest, 32))
@@ -1359,6 +1539,10 @@ fn decode_instr(
                 0xFD -> {
                   use #(sub, r) <- result.try(decode_u_n(rest, 32))
                   decode_simd(sub, r)
+                }
+                0xFB -> {
+                  use #(sub, r) <- result.try(decode_u_n(rest, 32))
+                  decode_gc(sub, r)
                 }
                 _ -> Error(ast.UnknownOpcode(op))
               }
@@ -1680,6 +1864,93 @@ fn sat_instr(sub: Int) -> Result(Instr, Nil) {
 /// relaxed-SIMD sub-opcode (`>= 256`, deferred) — is `Error(ast.UnknownSimdOpcode(sub))`.
 /// Immediate order is WIRE order throughout (§E), and every read is fail-closed
 /// (`Truncated` on any shortfall — never an over-read).
+/// Decode a `0xFB`-prefixed GC instruction from its `u32` sub-opcode + immediates.
+fn decode_gc(
+  sub: Int,
+  bytes: BitArray,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case sub {
+    // structs
+    0 -> idx_instr(bytes, ast.StructNew)
+    1 -> idx_instr(bytes, ast.StructNewDefault)
+    2 -> gc_type_field(bytes, ast.StructGet)
+    3 -> gc_type_field(bytes, ast.StructGetS)
+    4 -> gc_type_field(bytes, ast.StructGetU)
+    5 -> gc_type_field(bytes, ast.StructSet)
+    // arrays
+    6 -> idx_instr(bytes, ast.ArrayNew)
+    7 -> idx_instr(bytes, ast.ArrayNewDefault)
+    8 -> gc_type_field(bytes, ast.ArrayNewFixed)
+    9 -> gc_type_field(bytes, ast.ArrayNewData)
+    10 -> gc_type_field(bytes, ast.ArrayNewElem)
+    11 -> idx_instr(bytes, ast.ArrayGet)
+    12 -> idx_instr(bytes, ast.ArrayGetS)
+    13 -> idx_instr(bytes, ast.ArrayGetU)
+    14 -> idx_instr(bytes, ast.ArraySet)
+    15 -> Ok(#(ast.ArrayLen, bytes))
+    16 -> idx_instr(bytes, ast.ArrayFill)
+    17 -> gc_type_field(bytes, ast.ArrayCopy)
+    18 -> gc_type_field(bytes, ast.ArrayInitData)
+    19 -> gc_type_field(bytes, ast.ArrayInitElem)
+    // tests / casts (a heap type immediate; the sub-opcode carries nullability)
+    20 -> gc_ref_ht(bytes, False, ast.RefTest)
+    21 -> gc_ref_ht(bytes, True, ast.RefTest)
+    22 -> gc_ref_ht(bytes, False, ast.RefCast)
+    23 -> gc_ref_ht(bytes, True, ast.RefCast)
+    24 -> gc_br_on_cast(bytes, ast.BrOnCast)
+    25 -> gc_br_on_cast(bytes, ast.BrOnCastFail)
+    // conversions
+    26 -> Ok(#(ast.AnyConvertExtern, bytes))
+    27 -> Ok(#(ast.ExternConvertAny, bytes))
+    // i31
+    28 -> Ok(#(ast.RefI31, bytes))
+    29 -> Ok(#(ast.I31GetS, bytes))
+    30 -> Ok(#(ast.I31GetU, bytes))
+    _ -> Error(ast.UnknownGcOpcode(sub))
+  }
+}
+
+/// A GC op with two `u32` immediates (typeidx + field/count/data/elem/type).
+fn gc_type_field(
+  bytes: BitArray,
+  build: fn(Int, Int) -> Instr,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  use #(a, r1) <- result.try(decode_u_n(bytes, 32))
+  use #(b, r2) <- result.try(decode_u_n(r1, 32))
+  Ok(#(build(a, b), r2))
+}
+
+/// `ref.test`/`ref.cast`: a heap type immediate; `nullable` from the sub-opcode.
+fn gc_ref_ht(
+  bytes: BitArray,
+  nullable: Bool,
+  build: fn(ast.RefType) -> Instr,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  use #(ht, r) <- result.try(decode_heaptype(bytes))
+  Ok(#(build(ast.RefType(nullable: nullable, heap: ht)), r))
+}
+
+/// `br_on_cast[_fail]`: a flags byte (bit0 = src null, bit1 = dst null), a label,
+/// then the source and destination heap types.
+fn gc_br_on_cast(
+  bytes: BitArray,
+  build: fn(Int, ast.RefType, ast.RefType) -> Instr,
+) -> Result(#(Instr, BitArray), ast.DecodeError) {
+  case bytes {
+    <<flags:8, r0:bytes>> -> {
+      use #(label, r1) <- result.try(decode_u_n(r0, 32))
+      use #(src_ht, r2) <- result.try(decode_heaptype(r1))
+      use #(dst_ht, r3) <- result.try(decode_heaptype(r2))
+      let src =
+        ast.RefType(nullable: int.bitwise_and(flags, 1) != 0, heap: src_ht)
+      let dst =
+        ast.RefType(nullable: int.bitwise_and(flags, 2) != 0, heap: dst_ht)
+      Ok(#(build(label, src, dst), r3))
+    }
+    _ -> Error(ast.Truncated)
+  }
+}
+
 fn decode_simd(
   sub: Int,
   bytes: BitArray,
