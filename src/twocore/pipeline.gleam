@@ -299,6 +299,76 @@ pub fn stop_instance(proc: InstanceProc) -> Nil {
   ffi_stop_instance(pid)
 }
 
+/// **Embedder host injection** — instantiate `beam` (whose IR is `m`) with the EMBEDDER's own
+/// function-import closures, so a host BEAM program (e.g. the `dance` platform) provides the
+/// guest's `(import "cap" "name" (func …))` imports as native Gleam behaviour.
+///
+/// This reuses the existing, D3a-clean `CallImport` seam (the same path a cross-module or
+/// `spectest` function import travels): every `ImportFn(cap, name, ty)` in `m` is wired to a
+/// `link.provided_func(ty, …)` whose dispatch closure calls `host(cap, name, args)`. The closure
+/// runs IN the instance's owned process, so `host` may read/write THIS instance's linear memory
+/// via `rt_mem` (exposed as `embed.mem_read`/`embed.mem_write`). No `rt_host`, `emit_core`, or
+/// frozen ABI is touched — this is purely additive over `link`/`pipeline`.
+///
+/// Safety: the injected closures are supplied by the trusted embedder at instantiate time, never
+/// derived from guest data (D3a); generated code still names no callee. State imports (globals/
+/// tables/memories) are resolved by `link.link_imports` against the built-in providers only (an
+/// embedder host-function guest is expected to import functions, not state) — an unsatisfied
+/// state import fails closed here (`Error`), never a silent default (spec §4.5.4).
+///
+/// - `beam`: the compiled module (from `core_to_beam` / `embed.compile`).
+/// - `m`: that module's IR — its `imports` order drives the woven function-import vector.
+/// - `host`: the embedder's dispatcher. Receives `(capability, name, args)` where `args` are the
+///   call's raw WASM argument bit patterns (D5); returns the raw result bit patterns (`[]` for a
+///   `() ->` host function). `host` MUST be total + node-safe (a host handler that crashes the
+///   node is a sandbox hole — the embedder's contract, mirroring `rt_host.HostHandler`).
+/// - Returns `Ok(InstanceProc)` once the instance is seeded in its owned process, or
+///   `Error(reason)` on an unsatisfied/mismatched state import, a load failure, or an
+///   instantiation-time trap. Total — never panics.
+pub fn instantiate_with_host(
+  beam: BitArray,
+  m: ir.Module,
+  host: fn(String, String, List(Int)) -> List(Int),
+) -> Result(InstanceProc, String) {
+  case link.link_imports(m, []) {
+    Error(e) -> Error(link.import_error_phrase(e))
+    Ok(state) -> {
+      // Mirror `link_porffor_imports`: append the function-import dispatch vector ONLY when the
+      // module actually calls an imported function, so the woven `Imports` arity matches the
+      // generated `instantiate/1` byte-for-byte (an import-but-never-called module stays
+      // state-only). The func vector is one closure per `ImportFn`, in declaration order.
+      let provided = case module_calls_import(m) {
+        False -> state
+        True -> list.append(state, host_func_vector(m, host))
+      }
+      start_provided_instance(beam, m.name, provided)
+    }
+  }
+}
+
+/// Build the positional function-import dispatch vector for `instantiate_with_host`: one
+/// `link.provided_func(ty, closure)` per `ImportFn` in `m.imports` declaration order (the exact
+/// order `link.link_func_imports` and `emit_core`'s dispatch-vector seed use). Each closure
+/// coerces the raw WASM argument list to `Int`s (D5), calls the embedder `host`, and coerces the
+/// results back — the 1-ary `List(Dynamic) -> List(Dynamic)` shape `link.call_import` applies.
+fn host_func_vector(
+  m: ir.Module,
+  host: fn(String, String, List(Int)) -> List(Int),
+) -> List(link.Provided) {
+  list.filter_map(m.imports, fn(imp) {
+    case imp {
+      ir.ImportFn(capability:, name:, ty:) ->
+        Ok(
+          link.provided_func(ty, fn(args) {
+            host(capability, name, list.map(args, dyn_to_int))
+            |> list.map(to_dynamic)
+          }),
+        )
+      _ -> Error(Nil)
+    }
+  })
+}
+
 /// **Exec** a PREBUILT `.beam` (the run-ABI on an already-compiled module — NO compile step).
 /// Reads the module name baked into `beam`, loads + instantiates it in an owned process, then
 /// invokes `export(args)` `repeat` times in that process, timing ONLY the invocations
@@ -366,6 +436,13 @@ fn ffi_start_instance_with(
 /// argument (the same shape ABI the conformance driver uses).
 @external(erlang, "gleam_stdlib", "identity")
 fn to_dynamic(x: a) -> Dynamic
+
+/// Identity coercion of a raw WASM argument (`Dynamic`) to `Int`. Sound: a `CallImport`
+/// argument is always a raw i32/i64/f32/f64 bit pattern rendered as an Erlang integer (D5), so
+/// the runtime term IS an integer. Used by `host_func_vector` to hand the embedder `host` a
+/// `List(Int)` (the same raw-bit ABI `invoke_instance`/`rt_host.HostHandler` use).
+@external(erlang, "gleam_stdlib", "identity")
+fn dyn_to_int(x: Dynamic) -> Int
 
 /// Apply `function(args)` inside an instance's owned process. `Ok(v)` / `Error(reason)`.
 @external(erlang, "twocore_cli_ffi", "call_instance")
@@ -669,7 +746,7 @@ pub fn run_porffor(
               case core_to_beam(core, m.name) {
                 Error(e) -> Error(e)
                 Ok(beam) ->
-                  case start_porffor_instance(beam, m.name, provided) {
+                  case start_provided_instance(beam, m.name, provided) {
                     Error(reason) ->
                       Ok(PorfforRun(<<>>, porffor_abi.PUndefined, Some(reason)))
                     Ok(proc) -> {
@@ -735,7 +812,7 @@ fn link_porffor_imports(m: ir.Module) -> Result(List(link.Provided), String) {
 /// import-bearing one gets `instantiate/1(Imports)` (`ffi_start_instance_with`), where `Imports`
 /// is the positional `Provided` vector. Returns `Ok(InstanceProc)` once seeded, or
 /// `Error(reason)` for a load failure / instantiation-time trap. Total.
-fn start_porffor_instance(
+fn start_provided_instance(
   beam: BitArray,
   mod: String,
   provided: List(link.Provided),
