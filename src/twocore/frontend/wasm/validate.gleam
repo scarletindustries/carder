@@ -2482,11 +2482,13 @@ fn check_simd_store_lane(
 /// no further code: untyped `select` of two `exnref`s is rejected (`BadSelectType`, a
 /// reftype is not number/vector-typed, §C.3) and `ref.is_null` on an `exnref` is accepted
 /// (`exnref` is nullable, §C.4). `V128` stays a NON-reference (it is a vector type).
+/// Whether `vt` is a reference type — the abstract shorthands (`funcref`/
+/// `externref`/`exnref`) AND every GC `(ref null? ht)` form (including the concrete
+/// `(ref $t)` that `ref.func` now produces). Numeric types and `v128` are not
+/// references. Used to reject a reference operand in an untyped `select` and to
+/// accept one in `ref.is_null`.
 fn is_reftype(vt: ValType) -> Bool {
-  case vt {
-    ast.FuncRef | ast.ExternRef | ast.ExnRef -> True
-    _ -> False
-  }
+  result.is_ok(ast.normalize_reftype(vt))
 }
 
 /// The operand types of tag `tagidx` (Phase 7): `ctx.tags[tagidx]` (imports ++ defined),

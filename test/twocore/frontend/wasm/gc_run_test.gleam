@@ -184,3 +184,17 @@ pub fn gc_return_call_ref_test() {
   embed.invoke(inst, "sum", [50_000]) |> should.equal(Ok([1_250_025_000]))
   embed.stop(inst)
 }
+
+/// Regression (verifier finding): ref.is_null on a `ref.func` result must be
+/// accepted (a non-null (ref $t) is a valid (ref null $t) operand) and yield 0.
+pub fn gc_ref_is_null_of_ref_func_test() {
+  let assert Ok(wasm) =
+    simplifile.read_bits(
+      "test/twocore/frontend/wasm/gc_fixtures/gcrefnull.wasm",
+    )
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(inst) = embed.instantiate(compiled, no_host)
+  embed.invoke(inst, "isnull", []) |> should.equal(Ok([0]))
+  embed.stop(inst)
+}

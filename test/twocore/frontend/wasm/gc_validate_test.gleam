@@ -72,3 +72,30 @@ pub fn gc_struct_new_underflow_rejected_test() {
   validate.validate(decoded)
   |> should.equal(Error(validate.Underflow))
 }
+
+/// Regression (verifier finding): an untyped `select` over reference operands must
+/// be rejected. Since `ref.func` now yields the concrete `(ref $t)`, `is_reftype`
+/// must still recognize it as a reference — otherwise the select is wrongly treated
+/// as numeric and accepted. Module: `ref.func 0; ref.func 0; i32.const 0; select`.
+pub fn gc_untyped_select_over_refs_rejected_test() {
+  let m =
+    bytes(
+      list.flatten([
+        [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
+        // type 0: () -> ()
+        [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+        // two funcs of type 0
+        [0x03, 0x03, 0x02, 0x00, 0x00],
+        // declarative funcref elem segment declaring func 0
+        [0x09, 0x05, 0x01, 0x03, 0x00, 0x01, 0x00],
+        // code: func0 empty; func1 = ref.func 0; ref.func 0; i32.const 0; select
+        [
+          0x0A, 0x0E, 0x02, 0x02, 0x00, 0x0B, 0x09, 0x00, 0xD2, 0x00, 0xD2, 0x00,
+          0x41, 0x00, 0x1B, 0x0B,
+        ],
+      ]),
+    )
+  let assert Ok(decoded) = decode.decode(m)
+  validate.validate(decoded)
+  |> should.equal(Error(validate.BadSelectType))
+}
