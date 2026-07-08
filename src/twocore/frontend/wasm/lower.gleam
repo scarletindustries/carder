@@ -1045,9 +1045,7 @@ fn go(
         // through the shared value/effect emitters. Operands are deepest-first,
         // matching `ir.Gc`'s convention.
         //
-        // `return_call_ref` is the only instruction not yet lowered (a tail call —
-        // needs a bottom-transfer node); it falls through to `Unsupported`, so a
-        // validated module using it fails cleanly at lowering (never miscompiles).
+        // The full GC + typed-function-references instruction surface is lowered.
         ast.StructNew(t) -> {
           use fields <- result.try(gc_struct_fields(ctx, t))
           emit_value_op_t(
@@ -1270,6 +1268,8 @@ fn go(
         ast.BrOnCastFail(l, _rt1, rt2) ->
           lower_br_on_cast(l, rt2, True, tail, ctx, st)
         ast.CallRef(type_idx) -> lower_call_ref(type_idx, tail, ctx, st)
+        ast.ReturnCallRef(type_idx) ->
+          lower_return_call_ref(type_idx, tail, ctx, st)
 
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
@@ -1655,6 +1655,33 @@ fn lower_call_ref(
         )
       use inner <- result.try(go(tail, ctx, st2))
       Ok(wrap_let(names, ir.Gc(ir.GcCallRef(rc), [funcref, ..args]), inner))
+    }
+  }
+}
+
+/// Lower `return_call_ref $t`: a tail call through a funcref — pop the funcref
+/// (top) then the params, emit the `ir.ReturnCallRef` bottom node, and consume the
+/// (dead) tail. Mirrors `lower_return_call_indirect` without a table dispatch.
+fn lower_return_call_ref(
+  type_idx: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
+  use #(funcref, stack1) <- result.try(pop1(st.stack))
+  let pcount = list.length(sig.params)
+  let args = take_push_order(stack1, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let node = ir.ReturnCallRef(funcref, args)
+      use #(marker, rest) <- result.try(consume_dead(tail, 0))
+      Ok(end_or_else(marker, node, rest, st.counter))
     }
   }
 }

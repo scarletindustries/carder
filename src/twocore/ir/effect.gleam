@@ -61,10 +61,10 @@ import twocore/ir.{
   Let, Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad,
   MemLoadUnchecked, MemSize, MemStore, MemStoreUnchecked, Num, NumTerm, RefFunc,
   RefFuncImport, RefIsNull, Return, ReturnCall, ReturnCallImport,
-  ReturnCallIndirect, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
-  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
-  TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS,
-  TruncU, Try, Values,
+  ReturnCallIndirect, ReturnCallRef, Simd, SimdLoad, SimdLoadLane, SimdShuffle,
+  SimdStore, SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow,
+  TableInit, TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef,
+  Trap, TruncS, TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -160,6 +160,7 @@ pub fn is_effectful_node(e: Expr) -> Bool {
       ReturnCall(_, _)
     | ReturnCallIndirect(_, _, _, _)
     | ReturnCallImport(_, _, _)
+    | ReturnCallRef(_, _)
     | // ── Phase-7 exception handling (J5/T1): ALL THREE EH nodes are barriers. `Throw`/`ThrowRef`
       // are non-local control transfers that RAISE (like `Trap`/`Return`) — never reorder, hoist,
       // duplicate, or eliminate (they add/remove an exception, an F2 observable). `Try` establishes

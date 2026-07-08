@@ -1000,6 +1000,8 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
         ty,
         subst_values(cargs, subs),
       )
+    ir.ReturnCallRef(funcref, cargs) ->
+      ir.ReturnCallRef(subst_value(funcref, subs), subst_values(cargs, subs))
     ir.ReturnCallImport(slot, ty, cargs) ->
       ir.ReturnCallImport(slot, ty, subst_values(cargs, subs))
     // ── Phase-7 EH nodes: substitute their `Value` operands (the tag NAME is static); `Try`
@@ -1157,6 +1159,8 @@ fn expr_vars(e: ir.Expr) -> List(String) {
     ir.ReturnCall(_, args) -> values_names(args)
     ir.ReturnCallIndirect(_, index, _, args) ->
       list.append(value_name(index), values_names(args))
+    ir.ReturnCallRef(funcref, args) ->
+      list.append(value_name(funcref), values_names(args))
     ir.ReturnCallImport(_, _, args) -> values_names(args)
     // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions (the tag
     // NAME is static). Over-approximating (including handler binders) is safe for liveness —

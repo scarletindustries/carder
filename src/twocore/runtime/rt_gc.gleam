@@ -142,6 +142,20 @@ pub fn t_call_ref(
   result_count: Int,
 ) -> #(List(Dynamic), Dynamic)
 
+/// `return_call_ref $t` (Cell build) — tail-apply the funcref to `args`, returning
+/// the callee's result package. Traps if `funcref` is null.
+@external(erlang, "twocore_rt_gc_ffi", "apply_ref")
+pub fn apply_ref(funcref: Dynamic, args: List(Dynamic)) -> Dynamic
+
+/// `return_call_ref $t` (Threaded build) — tail-apply threading `state`, returning
+/// `#(package, state')`.
+@external(erlang, "twocore_rt_gc_ffi", "t_apply_ref")
+pub fn t_apply_ref(
+  state: Dynamic,
+  funcref: Dynamic,
+  args: List(Dynamic),
+) -> Dynamic
+
 /// `array.new_data $t $d` — a new array of `count` elements decoded from the
 /// (drop-gated) data segment `bytes`, each `width` little-endian bytes at byte
 /// `offset`. Traps if the span exceeds the segment.

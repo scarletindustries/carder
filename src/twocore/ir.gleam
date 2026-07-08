@@ -817,6 +817,12 @@ pub type Expr {
     ty: FuncType,
     args: List(Value),
   )
+  /// A tail call through a typed function reference — `return_call_ref $t`. BOTTOM:
+  /// the callee's results become this function's results (like `Return`). Carries
+  /// the funcref `Value` and the `Value` args; an effectful barrier (§effect).
+  /// `emit_core` tail-applies the funcref's build-strategy closure via the `rt_gc`
+  /// seam (constant-stack tail recursion; a null funcref traps `NullReference`).
+  ReturnCallRef(funcref: Value, args: List(Value))
   /// A tail call to an IMPORTED function by its positional func-import `slot` (WASM `return_call $f`
   /// where `f` resolves to an import). BOTTOM: the import's results become this function's results
   /// (like `Return`). Carries only `Value` `args`; an effectful barrier (§effect). `emit_core`

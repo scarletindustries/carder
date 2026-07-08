@@ -248,6 +248,7 @@ fn lower_expr(
       ir.ReturnCall(_, _)
     | ir.ReturnCallIndirect(_, _, _, _)
     | ir.ReturnCallImport(_, _, _)
+    | ir.ReturnCallRef(_, _)
     | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`, no `CallHost`, no
       // `Loop`), so this CallHost-gate + Loop-meter pass leaves them unchanged.
       ir.Throw(_, _)

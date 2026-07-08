@@ -221,7 +221,8 @@ pub fn is_memory_barrier(e: Expr) -> Bool {
       // out of the straight-line region — a barrier on both counts, like `CallImport` + `Return`. ──
       ir.ReturnCall(_, _)
     | ir.ReturnCallIndirect(_, _, _, _)
-    | ir.ReturnCallImport(_, _, _) -> True
+    | ir.ReturnCallImport(_, _, _)
+    | ir.ReturnCallRef(_, _) -> True
     // ── barriers: control leaves the straight-line region ──
     ir.Trap(_)
     | ir.Throw(_, _)

@@ -133,6 +133,8 @@ fn vars_in(acc: Set(String), e: Expr) -> Set(String) {
     ir.ReturnCall(_, args) -> union_values(acc, args)
     ir.ReturnCallIndirect(_, index, _, args) ->
       union_values(add_value(acc, index), args)
+    ir.ReturnCallRef(funcref, args) ->
+      union_values(add_value(acc, funcref), args)
     ir.ReturnCallImport(_, _, args) -> union_values(acc, args)
     // exceptions
     ir.Throw(_, args) -> union_values(acc, args)

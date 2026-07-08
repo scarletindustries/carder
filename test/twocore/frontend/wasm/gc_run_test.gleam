@@ -169,3 +169,18 @@ pub fn gc_array_init_elem_test() {
   embed.invoke(inst, "init_elem", []) |> should.equal(Ok([7]))
   embed.stop(inst)
 }
+
+/// return_call_ref: a tail-recursive sum(n) = n + (n-1) + … + 0 through a funcref.
+/// sum(10) = 55; a deep count (50000) completes, exercising the constant-stack tail call.
+pub fn gc_return_call_ref_test() {
+  let assert Ok(wasm) =
+    simplifile.read_bits("test/twocore/frontend/wasm/gc_fixtures/gctail.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(inst) = embed.instantiate(compiled, no_host)
+  embed.invoke(inst, "sum", [10]) |> should.equal(Ok([55]))
+  // 50000*50001/2 = 1250025000 (fits in an unsigned i32) — a proper tail call
+  // returns it in constant stack rather than overflowing.
+  embed.invoke(inst, "sum", [50_000]) |> should.equal(Ok([1_250_025_000]))
+  embed.stop(inst)
+}

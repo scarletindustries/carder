@@ -1132,6 +1132,8 @@ fn emit(
       emit_return_call(fn_name, args, sc, state, ctx)
     ir.ReturnCallIndirect(table, index, ty, args) ->
       emit_return_call_indirect(table, index, ty, args, sc, state, ctx)
+    ir.ReturnCallRef(funcref, args) ->
+      emit_return_call_ref(funcref, args, sc, state, ctx)
     ir.ReturnCallImport(slot, ty, args) ->
       emit_return_call_import(slot, ty, args, sc, state, ctx)
     // ── Phase-7 EH nodes (§J/T1/T5/T7): BEAM-native exceptions through the `rt_exn` chokepoint.
@@ -3984,6 +3986,32 @@ fn emit_return_call_indirect(
       ),
     ])
   Ok(#(result_case, state3))
+}
+
+/// Emit `ir.ReturnCallRef(funcref, args)` — a tail call through a typed function
+/// reference. The `rt_gc` `apply_ref` seam null-checks the funcref then tail-applies
+/// its build-strategy closure, and this seam call is itself the whole (tail) result
+/// expression — so the tail-recursion is constant-stack across both hops. NoState:
+/// `apply_ref` returns the callee package; Threaded: `t_apply_ref` returns
+/// `{package, st'}`, exactly this function's threaded return shape.
+fn emit_return_call_ref(
+  funcref: Value,
+  args: List(Value),
+  sc: StateChan,
+  state: EmitState,
+  _ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let cargs = core_list(list.map(args, emit_value))
+  let call = case sc {
+    NoState -> seam_call(gc_module, "apply_ref", [emit_value(funcref), cargs])
+    Threading(cur) ->
+      seam_call(gc_module, "t_apply_ref", [
+        CVar(cur),
+        emit_value(funcref),
+        cargs,
+      ])
+  }
+  Ok(#(call, state))
 }
 
 /// Emit `ir.ReturnCallImport(slot, ty, args)` — an IMPORTED tail call. Routes through the EXISTING
@@ -7056,6 +7084,8 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     ir.ReturnCallIndirect(_, index, _, args) ->
       collect_values(args, collect_value(index, acc))
     ir.ReturnCallImport(_, _, args) -> collect_values(args, acc)
+    ir.ReturnCallRef(funcref, args) ->
+      collect_values(args, collect_value(funcref, acc))
     // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions so gensym
     // avoids them (over-approximating is safe). `Try` recurses into its body + each handler's
     // inline handler expression and includes the handler's `payload`/`exnref` binder names. ──

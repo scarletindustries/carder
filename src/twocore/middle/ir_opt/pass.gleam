@@ -160,6 +160,7 @@ pub fn map_expr(e: Expr, rewrite: fn(Expr) -> Expr) -> Expr {
       ir.ReturnCall(..)
     | ir.ReturnCallIndirect(..)
     | ir.ReturnCallImport(..)
+    | ir.ReturnCallRef(..)
     | // Phase-7 `Throw`/`ThrowRef` carry only `Value` operands (no sub-`Expr`), so like the leaves
       // they return unchanged. They are barriers (`ir/effect`), so no pass hoists across them.
       ir.Throw(..)

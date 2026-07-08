@@ -893,6 +893,8 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_functype(ty)
       <> " "
       <> value_list(args)
+    ir.ReturnCallRef(funcref, args) ->
+      "return_call_ref " <> print_value(funcref) <> " " <> value_list(args)
     ir.ReturnCallImport(slot, ty, args) ->
       "return_call_import "
       <> int.to_string(slot)

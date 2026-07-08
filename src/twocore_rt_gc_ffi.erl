@@ -42,7 +42,7 @@
     ref_i31/1, i31_get_s/1, i31_get_u/1,
     ref_test/3, ref_cast/3, ref_eq/2, ref_as_non_null/1,
     any_convert_extern/1, extern_convert_any/1,
-    call_ref/3, t_call_ref/4,
+    call_ref/3, t_call_ref/4, apply_ref/2, t_apply_ref/3,
     array_new_data/5, array_init_data/6, array_new_elem/4, array_init_elem/5
 ]).
 
@@ -206,6 +206,22 @@ t_call_ref(_St, {ref_null}, _Args, _RC) ->
 t_call_ref(St, {_Type, Closure}, Args, RC) ->
     {Pkg, St2} = Closure(St, Args),
     {pkg_to_list(Pkg, RC), St2}.
+
+%% return_call_ref $t : TAIL-apply a funcref to `Args`. The closure application is
+%% in tail position of this function, and the generated caller tail-calls it, so a
+%% tail-recursive chain runs in constant stack. Returns the callee's package
+%% verbatim (the caller's tail-return shape). Null → trap. `Cell`-build ABI.
+apply_ref({ref_null}, _Args) ->
+    erlang:error({wasm_trap, null_reference});
+apply_ref({_Type, Closure}, Args) ->
+    Closure(Args).
+
+%% return_call_ref $t, `Threaded`-build ABI: the closure is `fun(St, Args) ->
+%% {Package, St'}`; tail-apply it, threading state. Returns `{Package, St'}`.
+t_apply_ref(_St, {ref_null}, _Args) ->
+    erlang:error({wasm_trap, null_reference});
+t_apply_ref(St, {_Type, Closure}, Args) ->
+    Closure(St, Args).
 
 %% Convert a callee's package-ABI return into the ResultCount-length result list:
 %% 'ok' → [], a bare value → [V], an N-tuple → its element list (mirrors
