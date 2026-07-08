@@ -2424,13 +2424,84 @@ fn emit_gc(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
-  case gc_is_void(op) {
-    // struct.set / array.set / fill / copy push no value — sequence the call and
-    // continue with zero results.
-    True -> emit_zero_effect(call, cont, sc, state, ctx)
-    // Every other GC op pushes exactly its one result (a ref, an i32, or a term).
-    False -> apply_cont(cont, [call], sc, state, ctx)
+  case op {
+    // call_ref returns the callee's N results (a package) — a dedicated path
+    // unpacks it and threads state, exactly like an indirect call.
+    ir.GcCallRef(rc) -> emit_gc_call_ref(rc, args, cont, sc, state, ctx)
+    _ -> {
+      let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
+      case gc_is_void(op) {
+        // struct.set / array.set / fill / copy push no value — sequence the call
+        // and continue with zero results.
+        True -> emit_zero_effect(call, cont, sc, state, ctx)
+        // Every other GC op pushes exactly its one result (a ref, i32, or term).
+        False -> apply_cont(cont, [call], sc, state, ctx)
+      }
+    }
+  }
+}
+
+/// Emit `call_ref $t`: apply the funcref (args = `[funcref, ...params]`) through
+/// the `rt_gc` seam, which null-checks and applies the funcref's build-strategy
+/// closure, returning the callee's `result_count` results as a list (raising the
+/// null trap itself). Under `Threaded` the seam also threads instance state.
+fn emit_gc_call_ref(
+  rc: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(funcref, params) = case args {
+    [f, ..ps] -> #(f, ps)
+    [] -> #(ir.ConstI32(0), [])
+  }
+  let params_c = core_list(list.map(params, emit_value))
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(gc_module, "call_ref", [
+          emit_value(funcref),
+          params_c,
+          CInt(rc),
+        ])
+      let #(lvar, state2) = fresh_var(state)
+      use #(rest, state3) <- result.try(unpack_result_list(
+        lvar,
+        rc,
+        cont,
+        NoState,
+        state2,
+        ctx,
+      ))
+      Ok(#(CLet([lvar], call, rest), state3))
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(gc_module, "t_call_ref", [
+          CVar(cur),
+          emit_value(funcref),
+          params_c,
+          CInt(rc),
+        ])
+      let #(pair, state2) = fresh_var(state)
+      let #(rsvar, state3) = fresh_var(state2)
+      let #(stvar, state4) = fresh_var(state3)
+      use #(rest, state5) <- result.try(unpack_result_list(
+        rsvar,
+        rc,
+        cont,
+        Threading(stvar),
+        state4,
+        ctx,
+      ))
+      let destructure =
+        CCase(CVar(pair), [
+          CClause([PTuple([PVar(rsvar), PVar(stvar)])], CAtom("true"), rest),
+        ])
+      Ok(#(CLet([pair], call, destructure), state5))
+    }
   }
 }
 
@@ -2467,6 +2538,8 @@ fn gc_op_name(op: ir.GcOp) -> String {
     ir.GcRefAsNonNull -> "ref_as_non_null"
     ir.GcAnyConvertExtern -> "any_convert_extern"
     ir.GcExternConvertAny -> "extern_convert_any"
+    // Handled by `emit_gc_call_ref` before this table is consulted.
+    ir.GcCallRef(_) -> "call_ref"
   }
 }
 
@@ -2505,6 +2578,8 @@ fn gc_call_args(op: ir.GcOp, args: List(Value)) -> List(CExpr) {
     ir.GcRefAsNonNull -> ev
     ir.GcAnyConvertExtern -> ev
     ir.GcExternConvertAny -> ev
+    // Handled by `emit_gc_call_ref` before this table is consulted.
+    ir.GcCallRef(_) -> ev
   }
 }
 

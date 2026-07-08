@@ -95,3 +95,30 @@ pub fn gc_br_on_null_test() {
   embed.invoke(inst, "brnull", [0]) |> should.equal(Ok([4_294_967_295]))
   embed.stop(inst)
 }
+
+fn callref_instance() {
+  let assert Ok(wasm) =
+    simplifile.read_bits(
+      "test/twocore/frontend/wasm/gc_fixtures/gccallref.wasm",
+    )
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(inst) = embed.instantiate(compiled, no_host)
+  inst
+}
+
+/// call_ref through a ref.func: apply_add(3, 4) calls $add → 7.
+pub fn gc_call_ref_test() {
+  let inst = callref_instance()
+  embed.invoke(inst, "apply_add", [3, 4]) |> should.equal(Ok([7]))
+  embed.stop(inst)
+}
+
+/// call_ref through a runtime-chosen funcref (a minimal vtable dispatch): flag 1 →
+/// add (10+3=13), flag 0 → sub (10-3=7).
+pub fn gc_call_ref_dispatch_test() {
+  let inst = callref_instance()
+  embed.invoke(inst, "dispatch", [1, 10, 3]) |> should.equal(Ok([13]))
+  embed.invoke(inst, "dispatch", [0, 10, 3]) |> should.equal(Ok([7]))
+  embed.stop(inst)
+}

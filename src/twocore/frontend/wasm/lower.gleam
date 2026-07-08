@@ -1224,6 +1224,7 @@ fn go(
           lower_br_on_cast(l, rt2, False, tail, ctx, st)
         ast.BrOnCastFail(l, _rt1, rt2) ->
           lower_br_on_cast(l, rt2, True, tail, ctx, st)
+        ast.CallRef(type_idx) -> lower_call_ref(type_idx, tail, ctx, st)
 
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
@@ -1557,6 +1558,46 @@ fn subtype_set(t: Int, types: List(ast.DefType)) -> List(Int) {
   types
   |> list.index_map(fn(_dt, i) { i })
   |> list.filter(fn(i) { gc_reaches(i, t, types, n) })
+}
+
+/// Lower `call_ref $t`: pop the funcref (top of stack) then the params, and bind
+/// the callee's results. Mirrors `lower_call_indirect`, but the target is the
+/// funcref value itself (no table dispatch) — `ir.Gc(GcCallRef, [funcref, ...params])`.
+fn lower_call_ref(
+  type_idx: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
+  let result_ir_types = list.map(sig.results, to_ir_vt)
+  let rc = list.length(sig.results)
+  use #(funcref, stack1) <- result.try(pop1(st.stack))
+  let pcount = list.length(sig.params)
+  let args = take_push_order(stack1, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let rest_stack = list.drop(stack1, pcount)
+      let #(names, c2) = fresh_n(st.counter, rc)
+      let result_vars = list.map(names, ir.Var)
+      let st2 =
+        record_types(
+          LState(
+            ..st,
+            stack: list.append(list.reverse(result_vars), rest_stack),
+            counter: c2,
+          ),
+          list.zip(names, result_ir_types),
+        )
+      use inner <- result.try(go(tail, ctx, st2))
+      Ok(wrap_let(names, ir.Gc(ir.GcCallRef(rc), [funcref, ..args]), inner))
+    }
+  }
 }
 
 /// Lower `br_on_null`/`br_on_non_null l`: pop the ref, branch on `ref.is_null`.

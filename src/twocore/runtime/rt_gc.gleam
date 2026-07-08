@@ -122,3 +122,22 @@ pub fn any_convert_extern(ref: Dynamic) -> Dynamic
 /// `extern.convert_any` — reinterpret an internal reference as an external one.
 @external(erlang, "twocore_rt_gc_ffi", "extern_convert_any")
 pub fn extern_convert_any(ref: Dynamic) -> Dynamic
+
+/// `call_ref $t` (Cell build) — apply the funcref to `args`, returning the
+/// callee's `result_count` results as a list. Traps if `funcref` is null.
+@external(erlang, "twocore_rt_gc_ffi", "call_ref")
+pub fn call_ref(
+  funcref: Dynamic,
+  args: List(Dynamic),
+  result_count: Int,
+) -> List(Dynamic)
+
+/// `call_ref $t` (Threaded build) — like `call_ref` but threads instance `state`,
+/// returning `#(results, state')`.
+@external(erlang, "twocore_rt_gc_ffi", "t_call_ref")
+pub fn t_call_ref(
+  state: Dynamic,
+  funcref: Dynamic,
+  args: List(Dynamic),
+  result_count: Int,
+) -> #(List(Dynamic), Dynamic)

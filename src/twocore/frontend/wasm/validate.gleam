@@ -346,6 +346,10 @@ type Ctx {
   Ctx(
     types: List(ast.DefType),
     func_types: List(FuncType),
+    /// The type-section index each function (imports ++ defined) was declared
+    /// with, by funcidx — so `ref.func x` can push the concrete `(ref $t)` typed
+    /// reference (function-references proposal), not the abstract `funcref`.
+    func_type_idxs: List(Int),
     globals: List(#(ValType, Bool)),
     imported_global_count: Int,
     tables: List(#(ValType, Limits)),
@@ -958,6 +962,17 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
 
   use def_funcs <- result.try(resolve_func_types(module))
   let func_types = list.append(imp_funcs, def_funcs)
+  // The type-section index per funcidx (imports ++ defined), for `ref.func`'s
+  // concrete `(ref $t)` result type.
+  let imp_func_idxs =
+    list.filter_map(module.imports, fn(imp) {
+      case imp.desc {
+        ast.ImportFunc(ti) -> Ok(ti)
+        _ -> Error(Nil)
+      }
+    })
+  let func_type_idxs =
+    list.append(imp_func_idxs, list.map(module.funcs, fn(f) { f.type_idx }))
   let globals =
     list.append(
       imp_globals,
@@ -1002,6 +1017,7 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
     Ctx(
       types: module.types,
       func_types: func_types,
+      func_type_idxs: func_type_idxs,
       globals: globals,
       imported_global_count: imported_global_count,
       tables: tables,
@@ -1468,7 +1484,14 @@ fn validate_instr(
     // declared). Push `funcref`.
     ast.RefFunc(x) -> {
       use _ <- result.try(check_ref_declared(ctx, x))
-      Ok(push_val(st, ast.FuncRef))
+      // Function-references: `ref.func x : (ref $t)` where `$t` is `x`'s declared
+      // type index — the concrete non-null typed reference (a subtype of `funcref`,
+      // so every existing `funcref` use still type-checks via the subtype relation).
+      case nth(ctx.func_type_idxs, x) {
+        Ok(ti) ->
+          Ok(push_val(st, ast.Ref(ast.RefType(False, ast.HConcrete(ti)))))
+        Error(_) -> Ok(push_val(st, ast.FuncRef))
+      }
     }
 
     // table instructions (spec `valid/instructions` §table) -----------------------

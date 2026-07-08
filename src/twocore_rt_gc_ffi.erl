@@ -41,7 +41,8 @@
     array_set/3, array_len/1, array_fill/4, array_copy/5,
     ref_i31/1, i31_get_s/1, i31_get_u/1,
     ref_test/3, ref_cast/3, ref_eq/2, ref_as_non_null/1,
-    any_convert_extern/1, extern_convert_any/1
+    any_convert_extern/1, extern_convert_any/1,
+    call_ref/3, t_call_ref/4
 ]).
 
 %% ─────────────────────────────── allocation ───────────────────────────────
@@ -184,6 +185,33 @@ ref_as_non_null(Ref) -> Ref.
 %% representation-identity here (the same term flows, nullability preserved).
 any_convert_extern(Ref) -> Ref.
 extern_convert_any(Ref) -> Ref.
+
+%% ─────────────────────── typed function references ────────────────────────
+
+%% call_ref $t : apply a funcref `#(FuncType, Closure)` to `Args`, returning the
+%% callee's `ResultCount` results as a list (null → trap). `Cell`-build ABI: the
+%% stored closure is `fun(Args) -> Package`. The closure is build-controlled (from
+%% ref.func / an element segment), so this is a direct fun application, never an
+%% `apply/3` of program data (D3a).
+call_ref({ref_null}, _Args, _RC) ->
+    erlang:error({wasm_trap, null_reference});
+call_ref({_Type, Closure}, Args, RC) ->
+    pkg_to_list(Closure(Args), RC).
+
+%% call_ref $t, `Threaded`-build ABI: the closure is `fun(St, Args) -> {Package,
+%% St'}`; thread the instance state through and return `{Results, St'}`.
+t_call_ref(_St, {ref_null}, _Args, _RC) ->
+    erlang:error({wasm_trap, null_reference});
+t_call_ref(St, {_Type, Closure}, Args, RC) ->
+    {Pkg, St2} = Closure(St, Args),
+    {pkg_to_list(Pkg, RC), St2}.
+
+%% Convert a callee's package-ABI return into the ResultCount-length result list:
+%% 'ok' → [], a bare value → [V], an N-tuple → its element list (mirrors
+%% rt_table's package_to_list, the frozen call_indirect result contract).
+pkg_to_list(_Pkg, 0) -> [];
+pkg_to_list(Pkg, 1) -> [Pkg];
+pkg_to_list(Pkg, _) -> tuple_to_list(Pkg).
 
 %% ─────────────────────────────── type matching ────────────────────────────
 

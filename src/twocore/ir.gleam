@@ -1081,6 +1081,11 @@ pub type GcOp {
   GcRefAsNonNull
   GcAnyConvertExtern
   GcExternConvertAny
+  /// `call_ref $t` — call a typed function reference (args = `[funcref, ...params]`,
+  /// funcref first). `result_count` is the callee's result arity, so `emit_core`
+  /// can unpack the returned package into that many stack values. The only GC op
+  /// that yields ≠1 result — handled on a dedicated emission path.
+  GcCallRef(result_count: Int)
 }
 
 /// How a packed (`i8`/`i16`) or plain field/element is read back out.
