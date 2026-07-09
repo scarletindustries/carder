@@ -753,7 +753,11 @@ fn is_reference_type(ty: ValType) -> Bool {
     // `TExnRef` (Phase-7, T9) is a reference type — a semantic MUST-ADD (not a hard compile
     // break): an exnref-typed global must route through `rt_state`'s boxed `ref_globals` map, not
     // the numeric raw-bit path. Leaving it at the `_ -> False` default would mis-box it.
-    ir.TFuncRef | ir.TExternRef | ir.TExnRef -> True
+    // `TTerm` (Phase-8 GC) is a boxed reference: a GC `(ref …)` global holds a `{gc,Id}` /
+    // `{i31,V}` / `{ref_null}` handle, which must route through `rt_state`'s boxed `ref_globals`
+    // map, not the numeric raw-bit path. TTerm globals arise ONLY from GC `ast.Ref(_)`, so this
+    // is additive — no non-GC module has a TTerm global (headline byte-identical).
+    ir.TFuncRef | ir.TExternRef | ir.TExnRef | ir.TTerm -> True
     _ -> False
   }
 }
@@ -4817,6 +4821,11 @@ fn render_ref_item(
       imported_reference_func_entry(slot, ty, ctx, state)
     Values([ir.ConstNull(_)]) -> Ok(#(null_ref_term(), state))
     GlobalGet(name) -> Ok(#(ref_global_read(name, state_ref, ctx), state))
+    // A GC constant-expression element item (Phase-8 GC): a `(ref $t)`/i31/array element
+    // initialised by an allocator (possibly a nested `Let`-chain). Evaluate in-process; the
+    // boxed handle is placed into the table by the existing `init_elem_ref` path. NoState is
+    // correct for the arena in both the cell (state_ref=None) and threaded callers.
+    Gc(_, _) | Let(_, _, _) -> emit(item, KReturn, NoState, state, ctx)
     _ -> Error(UnsupportedNode("elem_item"))
   }
 }
@@ -6016,6 +6025,11 @@ fn render_ref_global_init(
     ir.RefFuncImport(slot, ty) ->
       imported_reference_func_entry(slot, ty, ctx, state)
     Values([ir.ConstV128(bytes)]) -> Ok(#(core_binary_bytes(bytes), state))
+    // A GC constant-expression global init (Phase-8 GC): a `ref.i31`/`struct.new`/`array.new*`
+    // allocation, possibly a `Let`-chain of nested allocations. Evaluate it in-process via the
+    // general emitter — `emit` yields the boxed arena handle `{gc,Id}`/`{i31,V}`. GC ops are
+    // state-neutral (arena = process dictionary), so `NoState` is correct under cell AND threaded.
+    Gc(_, _) | Let(_, _, _) -> emit(init, KReturn, NoState, state, ctx)
     _ -> Error(NonConstInit("non-constant reference global init"))
   }
 }

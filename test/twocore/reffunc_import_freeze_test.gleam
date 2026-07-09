@@ -96,6 +96,7 @@ fn typed_module(
   validate.TypedModule(
     module: ast.Module(
       imported_func_count: imported,
+      rec_groups: [],
       types: list.map(types, ast.func_def),
       imports: imports,
       tables: [],

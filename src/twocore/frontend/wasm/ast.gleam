@@ -469,6 +469,19 @@ pub type Module {
     /// `func_type_at` to pull the signature at a func-type index. Rec groups are
     /// flattened into this list (their members occupy consecutive indices).
     types: List(DefType),
+    /// The **member count of each recursive type group**, in type-section order
+    /// (GC iso-recursive typing). The type section is a sequence of `rectype`s;
+    /// this records how many defined types each contributed, so a downstream pass
+    /// can recover the rec-group boundaries that `types` (flattened) erased. The
+    /// spans partition `types`: group `k` occupies indices
+    /// `[sum(rec_groups[..k]), sum(rec_groups[..k]) + rec_groups[k])`. Iso-recursive
+    /// canonicalization (identity of a `HConcrete` reference) and type-section
+    /// declaration validation both consult these boundaries. `[]` is the **non-GC
+    /// default** — every type is treated as its own singleton group (a plain
+    /// `(type (func …))` module carries `[]` and behaves byte-identically). It is
+    /// also the fallback when `sum(rec_groups) != length(types)` (a defensive
+    /// singleton reading), so a stale/absent value can never mis-slice.
+    rec_groups: List(Int),
     imports: List(Import),
     tables: List(TableType),
     memories: List(MemType),

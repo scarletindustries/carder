@@ -70,6 +70,7 @@ import twocore/frontend/wasm/ast.{
   type FuncType, type IdxType, type Instr, type Limits, type MemArg, type Module,
   type ValType, ExnRef, ExternRef, F32, F64, FuncRef, I32, I64, Ref, V128,
 }
+import twocore/frontend/wasm/canon as canon_mod
 
 // ─────────────────────────────── public types ───────────────────────────────
 
@@ -275,6 +276,15 @@ pub type TypedModule {
 ///   `[t*] -> []` (an exception carries operands but never returns). Analogous to
 ///   `BadStartType` (the `[] -> []` start rule); carries no index (message text is not
 ///   asserted by the conformance runner, only the variant).
+/// - `InvalidSubtype(detail)` (GC): a **type-section declaration** that violates the
+///   GC sub-typing rules for a declared `sub` clause (spec `valid/types`, the
+///   `subtype` rule) — a supertype that is `final` (may not be extended), a supertype
+///   of a **different composite kind** (a struct extending a func, …), or a composite
+///   that is not **structurally a subtype** of its declared supertype (func params
+///   not contravariant / results not covariant; struct with fewer or mismatched
+///   fields; array element not field-matching). Carries a human-readable `detail`;
+///   the conformance runner asserts only that the module is rejected (any `Error`),
+///   never the phrase. Distinct from `UnknownType` (an out-of-range type reference).
 pub type ValidateError {
   TypeMismatch
   Underflow
@@ -307,6 +317,7 @@ pub type ValidateError {
   BadLaneIndex(index: Int)
   UnknownTag(index: Int)
   BadTagType
+  InvalidSubtype(detail: String)
 }
 
 // ─────────────────────────────── validation context ───────────────────────────────
@@ -358,6 +369,11 @@ type Ctx {
     elem_types: List(ValType),
     refs: Set(Int),
     tags: List(List(ValType)),
+    /// The iso-recursive **canonical id** of every type by index (`canon.canon_ids`).
+    /// Consulted only when matching concrete heap types: `HConcrete(i)` and
+    /// `HConcrete(j)` denote the same type iff `canon[i] == canon[j]`. Empty/singleton
+    /// for a non-GC module, where it reduces to declared-index identity.
+    canon: List(Int),
     locals: List(ValType),
   )
 }
@@ -426,6 +442,10 @@ type VState {
     /// The module's defined types, so operand matching can consult the GC
     /// subtype relation (concrete supertype chains + the abstract hierarchy).
     types: List(ast.DefType),
+    /// The iso-recursive canonical id of every type by index — threaded so
+    /// operand matching (`types_match` → `val_subtype`) compares concrete heap
+    /// types by structural identity, not declared index (see `Ctx.canon`).
+    canon: List(Int),
   )
 }
 
@@ -436,22 +456,35 @@ type VState {
 /// Does a value of stack type `a` satisfy an expected type `b`? `Unknown` (the
 /// bottom produced after unreachable) matches anything; otherwise `a` must be a
 /// **subtype** of `b` under the GC hierarchy (identity for non-GC types).
-fn types_match(a: StackType, b: StackType, types: List(ast.DefType)) -> Bool {
+fn types_match(
+  a: StackType,
+  b: StackType,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Bool {
   case a, b {
     Unknown, _ -> True
     _, Unknown -> True
-    Known(x), Known(y) -> val_subtype(x, y, types)
+    Known(x), Known(y) -> val_subtype(x, y, types, canon)
   }
 }
 
 /// `a <: b` on value types: equal, or both reference types with `a`'s reference
 /// type a subtype of `b`'s (non-null ≤ nullable, heap types via `heap_matches`).
-fn val_subtype(a: ValType, b: ValType, types: List(ast.DefType)) -> Bool {
+/// `canon` (the iso-recursive canonical ids) is consulted only when both heap types
+/// are concrete — so two structurally-equal concrete types match even at different
+/// declared indices.
+fn val_subtype(
+  a: ValType,
+  b: ValType,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Bool {
   case a == b {
     True -> True
     False ->
       case ast.normalize_reftype(a), ast.normalize_reftype(b) {
-        Ok(ra), Ok(rb) -> ref_matches(ra, rb, types)
+        Ok(ra), Ok(rb) -> ref_matches(ra, rb, types, canon)
         _, _ -> False
       }
   }
@@ -463,8 +496,9 @@ fn ref_matches(
   a: ast.RefType,
   b: ast.RefType,
   types: List(ast.DefType),
+  canon: List(Int),
 ) -> Bool {
-  { !a.nullable || b.nullable } && heap_matches(a.heap, b.heap, types)
+  { !a.nullable || b.nullable } && heap_matches(a.heap, b.heap, types, canon)
 }
 
 /// The heap-type subtype relation: the three abstract hierarchies (internal
@@ -476,6 +510,7 @@ fn heap_matches(
   a: ast.HeapType,
   b: ast.HeapType,
   types: List(ast.DefType),
+  canon: List(Int),
 ) -> Bool {
   case a == b {
     True -> True
@@ -489,7 +524,7 @@ fn heap_matches(
         ast.HStruct -> b == ast.HEq || b == ast.HAny
         ast.HArray -> b == ast.HEq || b == ast.HAny
         ast.HEq -> b == ast.HAny
-        ast.HConcrete(i) -> concrete_matches(i, b, types)
+        ast.HConcrete(i) -> concrete_matches(i, b, types, canon)
         // tops (any/func/extern/exn) are only their own supertype.
         _ -> False
       }
@@ -516,10 +551,20 @@ fn is_func_ht(b: ast.HeapType, types: List(ast.DefType)) -> Bool {
   }
 }
 
-/// A concrete type `i` (a struct/array/func) is a subtype of heap type `b`.
-fn concrete_matches(i: Int, b: ast.HeapType, types: List(ast.DefType)) -> Bool {
+/// A concrete type `i` (a struct/array/func) is a subtype of heap type `b`. When `b`
+/// is itself concrete (`HConcrete(j)`), the match is iso-recursive: `i <: j` iff `i`
+/// — or some ancestor of `i` in its declared supertype chain — is **canonically
+/// equal** to `j` (`canon[i'] == canon[j]`), so structurally-equal types match even
+/// across rec groups / different declared indices.
+fn concrete_matches(
+  i: Int,
+  b: ast.HeapType,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Bool {
   case b {
-    ast.HConcrete(j) -> supertype_reaches(i, j, types, list.length(types))
+    ast.HConcrete(j) ->
+      supertype_reaches(i, j, types, canon, list.length(types))
     _ ->
       case ast.def_type_at(types, i) {
         Ok(ast.DefType(comp: ast.CtStruct(_), ..)) ->
@@ -532,15 +577,20 @@ fn concrete_matches(i: Int, b: ast.HeapType, types: List(ast.DefType)) -> Bool {
   }
 }
 
-/// Does `i`'s declared supertype chain reach `j`? Bounded by `fuel` (chain length
-/// ≤ #types) so a malformed cyclic chain can't loop.
+/// Does `i` — or an ancestor of `i` in its declared supertype chain — canonically
+/// equal `j`? The base case is **canonical** equality (`canon[i] == canon[j]`), not
+/// declared-index equality, so a concrete type matches every iso-recursively
+/// equivalent concrete type (identity across rec groups). Bounded by `fuel` (chain
+/// length ≤ #types) so a malformed cyclic chain can't loop. For a non-GC module
+/// `canon` is the singleton mapping, so this reduces to `i == j`.
 fn supertype_reaches(
   i: Int,
   j: Int,
   types: List(ast.DefType),
+  canon: List(Int),
   fuel: Int,
 ) -> Bool {
-  case i == j {
+  case canon_eq(canon, i, j) {
     True -> True
     False ->
       case fuel <= 0 {
@@ -548,9 +598,24 @@ fn supertype_reaches(
         False ->
           case ast.def_type_at(types, i) {
             Ok(ast.DefType(supertype: option.Some(s), ..)) ->
-              supertype_reaches(s, j, types, fuel - 1)
+              supertype_reaches(s, j, types, canon, fuel - 1)
             _ -> False
           }
+      }
+  }
+}
+
+/// `True` iff type indices `i` and `j` have the same iso-recursive canonical id
+/// (`canon[i] == canon[j]`). If either index is out of range of `canon`, falls back
+/// to declared-index equality `i == j` (defensive; a well-formed call passes in-range
+/// indices).
+fn canon_eq(canon: List(Int), i: Int, j: Int) -> Bool {
+  case i == j {
+    True -> True
+    False ->
+      case nth(canon, i), nth(canon, j) {
+        Ok(ci), Ok(cj) -> ci == cj
+        _, _ -> False
       }
   }
 }
@@ -739,10 +804,17 @@ fn validate_array_get(
   Ok(push_val(st3, read_ty))
 }
 
-/// `br_on_cast[_fail] l rt1 rt2` (`rt2 <: rt1`): consumes an `rt1` input; on the
-/// taken branch the stack carries `branch_top` to label `l`; the fall-through
-/// pushes `fall_top`. For `br_on_cast` the branch is the success (`rt2`), the
-/// fall-through the miss (`rt1\rt2`); `br_on_cast_fail` swaps them.
+/// `br_on_cast[_fail] l rt1 rt2` (`rt2 <: rt1`): types as `[t* rt1] -> [t* rt1\rt2]`
+/// (resp. `-> [t* r2]` for `_fail`), where `[t* rtl]` is the target label's type —
+/// so the label's **prefix** `t*` is what both the input below `rt1` is checked
+/// against AND what the fall-through re-pushes (the operands below the tested ref are
+/// **re-typed** to the label's declared prefix, spec `valid/instructions` br_on_cast).
+///
+/// The taken branch carries `branch_ref` into the label's LAST slot `rtl`
+/// (`rt2` for `br_on_cast` — the cast success; `rt1\rt2` for `br_on_cast_fail` — the
+/// miss), which must satisfy `branch_ref <: rtl`. The fall-through leaves `fall_ref`
+/// (the complementary reftype). `Error(BranchArityMismatch)` if the label has no
+/// slot for the cast value (empty label type).
 fn validate_br_on_cast(
   st: VState,
   ctx: Ctx,
@@ -751,17 +823,27 @@ fn validate_br_on_cast(
   rt2: ast.RefType,
   is_fail: Bool,
 ) -> Result(VState, ValidateError) {
-  use _ <- result.try(require(ref_matches(rt2, rt1, ctx.types)))
+  use _ <- result.try(require(ref_matches(rt2, rt1, ctx.types, ctx.canon)))
   use frame <- result.try(label_frame(st, l))
   let lt = label_types(frame)
-  let #(branch_top, fall_top) = case is_fail {
+  // The label's last type is the cast value's slot; the rest is the prefix `t*`.
+  use #(prefix, last) <- result.try(case list.reverse(lt) {
+    [last, ..rev_prefix] -> Ok(#(list.reverse(rev_prefix), last))
+    [] -> Error(BranchArityMismatch)
+  })
+  let #(branch_ref, fall_ref) = case is_fail {
     False -> #(ast.Ref(rt2), ast.Ref(diff_reftype(rt1, rt2)))
     True -> #(ast.Ref(diff_reftype(rt1, rt2)), ast.Ref(rt2))
   }
+  // The value the taken branch carries must fit the label's last slot.
+  use _ <- result.try(
+    require(val_subtype(branch_ref, last, ctx.types, ctx.canon)),
+  )
+  // Pop the tested ref `rt1`, then the prefix `t*` (checked against the operands
+  // below), and re-push `t*` (the label's declared types) then the fall-through ref.
   use st1 <- result.try(pop_expect(st, ast.Ref(rt1)))
-  // The branch carries `branch_top` on top of the outer stack — check the label.
-  use _ <- result.try(pop_vals(push_val(st1, branch_top), lt))
-  Ok(push_val(st1, fall_top))
+  use st2 <- result.try(pop_vals(st1, prefix))
+  Ok(push_val(push_vals(st2, prefix), fall_ref))
 }
 
 /// `any.convert_extern` / `extern.convert_any`: pop a ref in the `from` hierarchy
@@ -778,7 +860,7 @@ fn convert_ref(
     Known(vt) ->
       case ast.normalize_reftype(vt) {
         Ok(rt) ->
-          case heap_matches(rt.heap, from_top, ctx.types) {
+          case heap_matches(rt.heap, from_top, ctx.types, ctx.canon) {
             True -> Ok(push_val(st2, ast.Ref(ast.RefType(rt.nullable, to_top))))
             False -> Error(TypeMismatch)
           }
@@ -816,7 +898,7 @@ fn pop_val(st: VState) -> Result(#(StackType, VState), ValidateError) {
 /// Pop one operand and check it matches `expect` (spec appendix `pop_val(expect)`).
 fn pop_expect(st: VState, expect: ValType) -> Result(VState, ValidateError) {
   use #(t, st2) <- result.try(pop_val(st))
-  case types_match(t, Known(expect), st.types) {
+  case types_match(t, Known(expect), st.types, st.canon) {
     True -> Ok(st2)
     False -> Error(TypeMismatch)
   }
@@ -947,6 +1029,19 @@ fn blocktype_types(
 /// `Error(ValidateError)` ⇒ the module is invalid; the security boundary REJECTS it
 /// (fail-closed). Total over any decoded AST — never panics or diverges.
 pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
+  // Iso-recursive canonical ids (GC): one per type index, s.t. `canon[i] == canon[j]`
+  // iff types `i`,`j` are structurally equivalent. Computed once up front and threaded
+  // into every concrete-heap-type matcher. Singleton (index-identity) for a non-GC
+  // module, so every path below is byte-identical there.
+  let canon = canon_mod.canon_ids(module.types, module.rec_groups)
+
+  // Type-section DECLARATION validation (GC `valid/types`): every rec group's types
+  // must reference only in-scope types and each declared `sub` clause must be a
+  // well-formed structural subtype of its (non-final, same-kind) supertype. Run FIRST
+  // — a malformed type section is rejected before any body/const-expr is typed. Inert
+  // for a non-GC module (no `sub` clauses, no concrete heap types).
+  use _ <- result.try(validate_types(module.types, module.rec_groups, canon))
+
   // Build every index space `imports ++ defined` (imports precede definitions, in
   // import order) so a funcidx/globalidx/tableidx/memidx addresses the combined
   // space directly (spec `valid/modules`). A module with no import section keeps the
@@ -1026,6 +1121,7 @@ pub fn validate(module: Module) -> Result(TypedModule, ValidateError) {
       elem_types: elem_types,
       refs: refs,
       tags: tags,
+      canon: canon,
       locals: [],
     )
 
@@ -1225,7 +1321,7 @@ fn validate_func(
       // The implicit function frame: a `block`-like frame whose results are the
       // function's results (spec: a function body is validated as a block).
       let st0 =
-        VState(types: fctx.types, vals: [], ctrls: [
+        VState(types: fctx.types, canon: fctx.canon, vals: [], ctrls: [
           CtrlFrame(
             kind: KFunc,
             start_types: [],
@@ -1349,10 +1445,14 @@ fn validate_instr(
         Error(_) -> Error(UnknownType(type_idx))
       })
       use #(ref_ty, _) <- result.try(table_entry(ctx, table))
-      use _ <- result.try(case ref_ty {
-        ast.FuncRef -> Ok(Nil)
-        _ -> Error(RefTypeMismatch)
-      })
+      // The table's element type must be a subtype of `funcref` (a concrete
+      // `(ref null $ft)` func table is legal; an `externref` table is not).
+      use _ <- result.try(
+        case val_subtype(ref_ty, ast.FuncRef, ctx.types, ctx.canon) {
+          True -> Ok(Nil)
+          False -> Error(RefTypeMismatch)
+        },
+      )
       use st2 <- result.try(pop_expect(st, ast.I32))
       use st3 <- result.try(pop_vals(st2, sig.params))
       Ok(push_vals(st3, sig.results))
@@ -1399,10 +1499,13 @@ fn validate_instr(
         Error(_) -> Error(UnknownType(type_idx))
       })
       use #(ref_ty, _) <- result.try(table_entry(ctx, table))
-      use _ <- result.try(case ref_ty {
-        ast.FuncRef -> Ok(Nil)
-        _ -> Error(RefTypeMismatch)
-      })
+      // The table's element type must be a subtype of `funcref` (as `call_indirect`).
+      use _ <- result.try(
+        case val_subtype(ref_ty, ast.FuncRef, ctx.types, ctx.canon) {
+          True -> Ok(Nil)
+          False -> Error(RefTypeMismatch)
+        },
+      )
       use func_frame <- result.try(case list.last(st.ctrls) {
         Ok(fr) -> Ok(fr)
         Error(_) -> Error(UnexpectedEnd)
@@ -1429,7 +1532,7 @@ fn validate_instr(
       use st2 <- result.try(pop_expect(st, ast.I32))
       use #(t1, st3) <- result.try(pop_val(st2))
       use #(t2, st4) <- result.try(pop_val(st3))
-      case types_match(t1, t2, st.types) {
+      case types_match(t1, t2, st.types, st.canon) {
         False -> Error(TypeMismatch)
         True -> {
           // The result type is the first concrete of the two operands.
@@ -1569,10 +1672,14 @@ fn validate_instr(
     ast.TableInit(e, t) -> {
       use elem_rt <- result.try(elem_type(ctx, e))
       use #(tbl_rt, _) <- result.try(table_entry(ctx, t))
-      use _ <- result.try(case elem_rt == tbl_rt {
-        True -> Ok(Nil)
-        False -> Error(RefTypeMismatch)
-      })
+      // Spec: the element segment's reftype must be a SUBTYPE of the table's
+      // (not merely equal) — and the concrete match is iso-recursively canonical.
+      use _ <- result.try(
+        case val_subtype(elem_rt, tbl_rt, ctx.types, ctx.canon) {
+          True -> Ok(Nil)
+          False -> Error(RefTypeMismatch)
+        },
+      )
       pop_three_i32(st)
     }
     // `elem.drop e`: `[] → []` — e indexes an element segment.
@@ -1585,10 +1692,14 @@ fn validate_instr(
     ast.TableCopy(dt, stbl) -> {
       use #(dst_rt, _) <- result.try(table_entry(ctx, dt))
       use #(src_rt, _) <- result.try(table_entry(ctx, stbl))
-      use _ <- result.try(case dst_rt == src_rt {
-        True -> Ok(Nil)
-        False -> Error(RefTypeMismatch)
-      })
+      // Spec: the source table's reftype must be a SUBTYPE of the destination's
+      // (concrete match iso-recursively canonical).
+      use _ <- result.try(
+        case val_subtype(src_rt, dst_rt, ctx.types, ctx.canon) {
+          True -> Ok(Nil)
+          False -> Error(RefTypeMismatch)
+        },
+      )
       pop_three_i32(st)
     }
 
@@ -1864,7 +1975,7 @@ fn validate_instr(
       use ft <- result.try(array_field(ctx, t))
       use seg <- result.try(elem_seg_type(ctx, e))
       use _ <- result.try(
-        require(val_subtype(seg, unpack(ft.storage), ctx.types)),
+        require(val_subtype(seg, unpack(ft.storage), ctx.types, ctx.canon)),
       )
       use st2 <- result.try(pop_expect(st, I32))
       use st3 <- result.try(pop_expect(st2, I32))
@@ -1899,8 +2010,12 @@ fn validate_instr(
       use dst <- result.try(array_field(ctx, t1))
       use _ <- result.try(require_mutable(dst))
       use src <- result.try(array_field(ctx, t2))
+      // The source element's STORAGE type must be a subtype of the destination's —
+      // a packed field (`i8`/`i16`) matches only its own width (spec `array.copy`),
+      // so an `i16`→`i8` copy is rejected. `storage_subtype` (not `val_subtype` on the
+      // unpacked types) keeps the packed distinction.
       use _ <- result.try(
-        require(val_subtype(unpack(src.storage), unpack(dst.storage), ctx.types)),
+        require(storage_subtype(src.storage, dst.storage, ctx.types, ctx.canon)),
       )
       use st2 <- result.try(pop_expect(st, I32))
       use st3 <- result.try(pop_expect(st2, I32))
@@ -1926,7 +2041,7 @@ fn validate_instr(
       use _ <- result.try(require_mutable(ft))
       use seg <- result.try(elem_seg_type(ctx, e))
       use _ <- result.try(
-        require(val_subtype(seg, unpack(ft.storage), ctx.types)),
+        require(val_subtype(seg, unpack(ft.storage), ctx.types, ctx.canon)),
       )
       use st2 <- result.try(pop_expect(st, I32))
       use st3 <- result.try(pop_expect(st2, I32))
@@ -2787,7 +2902,170 @@ fn validate_const_expr(
       expect_const_subtype(actual, expected, ctx)
     }
     [ast.GlobalGet(x)] -> const_global_get(ctx, x, expected)
+    // GC constant expressions (function-references + GC proposal's extension of the
+    // constant-expression set): multi-instruction allocator SEQUENCES — `ref.i31`,
+    // `struct.new[_default]`, `array.new[_default|_fixed]` — that NEST (a field/element
+    // operand may itself be an allocation). A small stack type-checker validates them;
+    // any non-constant sequence (extended-const arithmetic, `array.new_data`, malformed)
+    // still falls through to `NonConstantExpr`. Additive: non-GC modules only ever emit
+    // single-instruction const-exprs, which hit the fast-path arms above.
+    _ -> validate_const_seq(init, expected, ctx)
+  }
+}
+
+/// Type-check a GC constant-expression SEQUENCE (spec `valid/instructions`, the
+/// function-references + GC extension of constant instructions). Folds the instruction
+/// list through `const_step` as an abstract operand stack; the sequence is a valid
+/// constant expression iff it leaves EXACTLY one value whose type is a subtype of
+/// `expected`. Empty / multi-value / non-constant sequences → `NonConstantExpr`.
+fn validate_const_seq(
+  init: List(Instr),
+  expected: ValType,
+  ctx: Ctx,
+) -> Result(Nil, ValidateError) {
+  use stack <- result.try(
+    list.try_fold(init, [], fn(s, i) { const_step(s, i, ctx) }),
+  )
+  case stack {
+    [produced] -> expect_const_subtype(produced, expected, ctx)
     _ -> Error(NonConstantExpr)
+  }
+}
+
+/// One step of the constant-expression abstract stack machine: push the type a constant
+/// instruction produces, popping (and subtype-checking) its constant operands. A
+/// non-constant instruction → `Error(NonConstantExpr)`; an operand type mismatch →
+/// `Error(TypeMismatch)`. The GC allocators pop their operands TOP-first (the reverse of
+/// declaration order), mirroring the body typing rules.
+fn const_step(
+  stack: List(ValType),
+  instr: Instr,
+  ctx: Ctx,
+) -> Result(List(ValType), ValidateError) {
+  case instr {
+    ast.I32Const(_) -> Ok([I32, ..stack])
+    ast.I64Const(_) -> Ok([I64, ..stack])
+    ast.F32Const(_) -> Ok([F32, ..stack])
+    ast.F64Const(_) -> Ok([F64, ..stack])
+    ast.V128Const(_) -> Ok([V128, ..stack])
+    ast.RefNull(rt) -> Ok([rt, ..stack])
+    ast.RefNullHt(ht) -> Ok([Ref(ast.RefType(True, ht)), ..stack])
+    ast.RefFunc(x) -> {
+      use _ <- result.try(check_ref_declared(ctx, x))
+      let t = case nth(ctx.func_type_idxs, x) {
+        Ok(ti) -> Ref(ast.RefType(False, ast.HConcrete(ti)))
+        Error(_) -> FuncRef
+      }
+      Ok([t, ..stack])
+    }
+    ast.GlobalGet(x) -> {
+      use ty <- result.try(const_global_get_type(ctx, x))
+      Ok([ty, ..stack])
+    }
+    ast.RefI31 -> {
+      use rest <- result.try(pop_const(stack, I32, ctx))
+      Ok([Ref(ast.RefType(False, ast.HI31)), ..rest])
+    }
+    ast.StructNew(t) -> {
+      use fs <- result.try(struct_fields(ctx, t))
+      use rest <- result.try(pop_const_list(
+        stack,
+        list.reverse(list.map(fs, fn(f) { unpack(f.storage) })),
+        ctx,
+      ))
+      Ok([Ref(ast.RefType(False, ast.HConcrete(t))), ..rest])
+    }
+    ast.StructNewDefault(t) -> {
+      use fs <- result.try(struct_fields(ctx, t))
+      case list.all(fs, fn(f) { storage_defaultable(f.storage) }) {
+        True -> Ok([Ref(ast.RefType(False, ast.HConcrete(t))), ..stack])
+        False -> Error(TypeMismatch)
+      }
+    }
+    ast.ArrayNew(t) -> {
+      use ft <- result.try(array_field(ctx, t))
+      // stack (top→down): count, elem.
+      use r1 <- result.try(pop_const(stack, I32, ctx))
+      use r2 <- result.try(pop_const(r1, unpack(ft.storage), ctx))
+      Ok([Ref(ast.RefType(False, ast.HConcrete(t))), ..r2])
+    }
+    ast.ArrayNewDefault(t) -> {
+      use ft <- result.try(array_field(ctx, t))
+      case storage_defaultable(ft.storage) {
+        False -> Error(TypeMismatch)
+        True -> {
+          use rest <- result.try(pop_const(stack, I32, ctx))
+          Ok([Ref(ast.RefType(False, ast.HConcrete(t))), ..rest])
+        }
+      }
+    }
+    ast.ArrayNewFixed(t, n) -> {
+      use ft <- result.try(array_field(ctx, t))
+      use rest <- result.try(pop_const_list(
+        stack,
+        list.repeat(unpack(ft.storage), n),
+        ctx,
+      ))
+      Ok([Ref(ast.RefType(False, ast.HConcrete(t))), ..rest])
+    }
+    // `any.convert_extern` (external → internal) / `extern.convert_any` (internal → external) are
+    // GC constant instructions (representation-identity boxing, nullability preserved). Pop the
+    // input ref (any subtype), push the converted ref family.
+    ast.AnyConvertExtern -> {
+      use rest <- result.try(pop_const(stack, ast.ExternRef, ctx))
+      Ok([Ref(ast.RefType(True, ast.HAny)), ..rest])
+    }
+    ast.ExternConvertAny -> {
+      use rest <- result.try(pop_const(
+        stack,
+        Ref(ast.RefType(True, ast.HAny)),
+        ctx,
+      ))
+      Ok([ast.ExternRef, ..rest])
+    }
+    _ -> Error(NonConstantExpr)
+  }
+}
+
+/// Pop one operand off the const-expr stack, requiring it to be a subtype of `expected`.
+/// Underflow → `NonConstantExpr`; type mismatch → `TypeMismatch`.
+fn pop_const(
+  stack: List(ValType),
+  expected: ValType,
+  ctx: Ctx,
+) -> Result(List(ValType), ValidateError) {
+  case stack {
+    [top, ..rest] ->
+      case val_subtype(top, expected, ctx.types, ctx.canon) {
+        True -> Ok(rest)
+        False -> Error(TypeMismatch)
+      }
+    [] -> Error(NonConstantExpr)
+  }
+}
+
+/// Pop a list of operands (given TOP-first), subtype-checking each. Used for
+/// `struct.new`/`array.new_fixed` whose operands are popped in reverse of declared order.
+fn pop_const_list(
+  stack: List(ValType),
+  expected_top_first: List(ValType),
+  ctx: Ctx,
+) -> Result(List(ValType), ValidateError) {
+  list.try_fold(expected_top_first, stack, fn(s, e) { pop_const(s, e, ctx) })
+}
+
+/// The type a constant `global.get x` produces — valid only for an imported, immutable
+/// global (`x < imported_global_count`, non-mutable). Mirrors `const_global_get` but
+/// returns the type (for the stack machine) instead of checking it against a slot.
+fn const_global_get_type(ctx: Ctx, x: Int) -> Result(ValType, ValidateError) {
+  case x >= 0 && x < ctx.imported_global_count {
+    False -> Error(NonConstantExpr)
+    True ->
+      case nth(ctx.globals, x) {
+        Ok(#(ty, False)) -> Ok(ty)
+        Ok(#(_, True)) -> Error(NonConstantExpr)
+        Error(_) -> Error(NonConstantExpr)
+      }
   }
 }
 
@@ -2798,7 +3076,7 @@ fn expect_const_subtype(
   expected: ValType,
   ctx: Ctx,
 ) -> Result(Nil, ValidateError) {
-  case val_subtype(actual, expected, ctx.types) {
+  case val_subtype(actual, expected, ctx.types, ctx.canon) {
     True -> Ok(Nil)
     False -> Error(TypeMismatch)
   }
@@ -2861,10 +3139,14 @@ fn check_elements(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
     case e.mode {
       ast.ElemActive(table, offset) -> {
         use #(tbl_rt, _) <- result.try(table_entry(ctx, table))
-        use _ <- result.try(case tbl_rt == e.ref_ty {
-          True -> Ok(Nil)
-          False -> Error(RefTypeMismatch)
-        })
+        // Spec: the segment's reftype must be a SUBTYPE of the target table's
+        // (concrete match iso-recursively canonical), not merely equal.
+        use _ <- result.try(
+          case val_subtype(e.ref_ty, tbl_rt, ctx.types, ctx.canon) {
+            True -> Ok(Nil)
+            False -> Error(RefTypeMismatch)
+          },
+        )
         validate_const_expr(offset, ast.I32, ctx)
       }
       ast.ElemPassive -> Ok(Nil)
@@ -2946,6 +3228,280 @@ fn check_export_names_unique(
   case list.length(names) == set.size(set.from_list(names)) {
     True -> Ok(Nil)
     False -> Error(UnknownImportKind("duplicate export"))
+  }
+}
+
+// ─────────────────────────────── type-section declaration validation (GC) ───────────────────────────────
+
+/// Validate the type SECTION's declarations (GC `valid/types` — the `rectype` /
+/// `subtype` / `comptype` rules). Runs before any body: a malformed type section is
+/// rejected up front. For every rec group `[s, e)` and every member `i` in it:
+///
+/// - **(a) reference bounds** — every concrete heap-type reference (`HConcrete(j)`)
+///   appearing in the composite (func params/results, struct fields, array element)
+///   must satisfy `0 <= j < e`. Forward references are permitted only *within the
+///   member's own rec group* (the iso-recursive scope is all earlier groups plus the
+///   current one); a reference to a later group is out of scope → `UnknownType(j)`.
+/// - **(b) declared subtype** — if the member declares a supertype `sup`, it must be
+///   in range (`UnknownType`), **non-final** (a `final` type may not be extended →
+///   `InvalidSubtype`), of the **same composite kind** (`InvalidSubtype`), and the
+///   member's composite must be **structurally a subtype** of the supertype's
+///   (func: equal arities, params contravariant, results covariant; struct: at least
+///   the supertype's fields, each shared field matching; array: element field-match)
+///   → `InvalidSubtype` otherwise. Structural matching uses the canonical matchers so
+///   it is correct across rec groups.
+///
+/// Inert for a non-GC module: every type is a `final`, supertype-less func type with
+/// no concrete references, so both (a) and (b) pass trivially.
+fn validate_types(
+  types: List(ast.DefType),
+  rec_groups: List(Int),
+  canon: List(Int),
+) -> Result(Nil, ValidateError) {
+  let n = list.length(types)
+  let spans = canon_mod.group_spans(n, rec_groups)
+  list.try_each(spans, fn(span) {
+    let #(s, e) = span
+    list.try_each(index_range(s, e), fn(i) {
+      validate_def_type(types, i, e, n, canon)
+    })
+  })
+}
+
+/// The indices `[s, e)` in order (empty when `e <= s`). Hand-rolled — this stdlib has
+/// no `list.range`.
+fn index_range(s: Int, e: Int) -> List(Int) {
+  build_index_range(s, e, [])
+}
+
+fn build_index_range(s: Int, e: Int, acc: List(Int)) -> List(Int) {
+  case s >= e {
+    True -> list.reverse(acc)
+    False -> build_index_range(s + 1, e, [s, ..acc])
+  }
+}
+
+/// Validate one defined type `i` in a rec group whose end index is `e` (`n` = total
+/// type count) — checks (a) reference bounds and (b) the declared subtype clause
+/// (see `validate_types`).
+fn validate_def_type(
+  types: List(ast.DefType),
+  i: Int,
+  e: Int,
+  n: Int,
+  canon: List(Int),
+) -> Result(Nil, ValidateError) {
+  use dt <- result.try(case ast.def_type_at(types, i) {
+    Ok(dt) -> Ok(dt)
+    Error(_) -> Error(UnknownType(i))
+  })
+  // (a) every concrete reference in the composite must resolve within `[0, e)`.
+  use _ <- result.try(
+    list.try_each(comp_concrete_refs(dt.comp), fn(j) {
+      case j >= 0 && j < e {
+        True -> Ok(Nil)
+        False -> Error(UnknownType(j))
+      }
+    }),
+  )
+  // (b) the declared subtype clause, if any.
+  case dt.supertype {
+    option.None -> Ok(Nil)
+    option.Some(sup) -> check_declared_subtype(types, dt, sup, n, canon)
+  }
+}
+
+/// Every concrete type index (`HConcrete(j)`) referenced by a composite type — its
+/// func params/results, struct field storage types, or array element storage type.
+/// Used by the (a) reference-bounds check.
+fn comp_concrete_refs(comp: ast.CompositeType) -> List(Int) {
+  case comp {
+    ast.CtFunc(ast.FuncType(params, results)) ->
+      list.append(
+        list.flat_map(params, valtype_concrete_refs),
+        list.flat_map(results, valtype_concrete_refs),
+      )
+    ast.CtStruct(fields) ->
+      list.flat_map(fields, fn(f) { storage_concrete_refs(f.storage) })
+    ast.CtArray(element) -> storage_concrete_refs(element.storage)
+  }
+}
+
+/// The concrete type index of a value type, if it is a concrete reference
+/// (`(ref null? $t)`) — `[t]` — else `[]`. The abstract reftypes and number/vector
+/// types reference no defined type.
+fn valtype_concrete_refs(vt: ValType) -> List(Int) {
+  case ast.normalize_reftype(vt) {
+    Ok(ast.RefType(heap: ast.HConcrete(t), ..)) -> [t]
+    _ -> []
+  }
+}
+
+/// The concrete type index referenced by a storage type, if any.
+fn storage_concrete_refs(s: ast.StorageType) -> List(Int) {
+  case s {
+    ast.StVal(v) -> valtype_concrete_refs(v)
+    ast.StI8 | ast.StI16 -> []
+  }
+}
+
+/// Validate a declared `sub sup` clause on type `dt` (GC `valid/types` subtype rule):
+/// `sup` in range (`UnknownType`), non-final (`InvalidSubtype`), same composite kind
+/// (`InvalidSubtype`), and `dt.comp` structurally a subtype of the supertype's
+/// composite (`InvalidSubtype`). `canon`/`n` thread the canonical matchers.
+fn check_declared_subtype(
+  types: List(ast.DefType),
+  dt: ast.DefType,
+  sup: Int,
+  n: Int,
+  canon: List(Int),
+) -> Result(Nil, ValidateError) {
+  use super_dt <- result.try(case sup >= 0 && sup < n {
+    True ->
+      case ast.def_type_at(types, sup) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error(UnknownType(sup))
+      }
+    False -> Error(UnknownType(sup))
+  })
+  // A final supertype may not be extended.
+  use _ <- result.try(case super_dt.final {
+    True -> Error(InvalidSubtype("supertype is final"))
+    False -> Ok(Nil)
+  })
+  // Same composite kind, and structurally a subtype.
+  comp_subtype(dt.comp, super_dt.comp, types, canon)
+}
+
+/// `sub.comp` is a structural subtype of `super.comp` (GC `valid/types`). The two
+/// must be the same composite kind (`InvalidSubtype` otherwise). Then:
+///
+/// - **func**: equal param/result arities; params **contravariant**
+///   (`super_param <: sub_param`); results **covariant** (`sub_result <: super_result`).
+/// - **struct**: the subtype has **at least** the supertype's fields (in order); each
+///   shared field matches (a mutable field invariantly, an immutable field covariantly
+///   — `field_subtype`).
+/// - **array**: the single element field matches (as a struct field would).
+///
+/// Any violation → `Error(InvalidSubtype(_))`.
+fn comp_subtype(
+  sub: ast.CompositeType,
+  sup: ast.CompositeType,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Result(Nil, ValidateError) {
+  case sub, sup {
+    ast.CtFunc(ast.FuncType(sp, sr)), ast.CtFunc(ast.FuncType(pp, pr)) -> {
+      // params contravariant: each supertype param <: the corresponding subtype param.
+      use _ <- result.try(
+        case
+          list.length(sp) == list.length(pp)
+          && list.length(sr) == list.length(pr)
+        {
+          True -> Ok(Nil)
+          False -> Error(InvalidSubtype("func arity mismatch"))
+        },
+      )
+      use _ <- result.try(all_subtype(list.zip(pp, sp), types, canon))
+      all_subtype(list.zip(sr, pr), types, canon)
+    }
+    ast.CtStruct(sub_fields), ast.CtStruct(sup_fields) -> {
+      // The subtype must have at least as many fields (width subtyping), and each of
+      // the supertype's fields must field-match the subtype's field at that position.
+      use _ <- result.try(
+        case list.length(sub_fields) >= list.length(sup_fields) {
+          True -> Ok(Nil)
+          False ->
+            Error(InvalidSubtype("struct has fewer fields than supertype"))
+        },
+      )
+      list.try_each(zip_prefix(sub_fields, sup_fields), fn(pair) {
+        let #(sub_f, sup_f) = pair
+        field_subtype(sub_f, sup_f, types, canon)
+      })
+    }
+    ast.CtArray(sub_el), ast.CtArray(sup_el) ->
+      field_subtype(sub_el, sup_el, types, canon)
+    _, _ -> Error(InvalidSubtype("supertype kind differs from subtype"))
+  }
+}
+
+/// Every `#(a, b)` pair satisfies `a <: b` (canonical), else `InvalidSubtype`. Used
+/// for the contravariant param / covariant result lists of a func subtype.
+fn all_subtype(
+  pairs: List(#(ValType, ValType)),
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Result(Nil, ValidateError) {
+  list.try_each(pairs, fn(pair) {
+    case val_subtype(pair.0, pair.1, types, canon) {
+      True -> Ok(Nil)
+      False -> Error(InvalidSubtype("field/param/result not a subtype"))
+    }
+  })
+}
+
+/// A struct field / array element `sub_f` is a subtype of `sup_f` (GC field subtyping):
+/// the mutability must agree (a mutable field is INVARIANT — the storage types must be
+/// mutual subtypes; an immutable field is COVARIANT — `sub <: sup`). Packed storage
+/// types must match exactly (they are not subtype-related to anything but themselves).
+/// Any violation → `Error(InvalidSubtype(_))`.
+fn field_subtype(
+  sub_f: ast.FieldType,
+  sup_f: ast.FieldType,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Result(Nil, ValidateError) {
+  case sub_f.mutable == sup_f.mutable {
+    False -> Error(InvalidSubtype("field mutability differs"))
+    True ->
+      case sub_f.mutable {
+        // mutable ⇒ invariant: storage types must be equal-up-to-mutual-subtype.
+        True ->
+          case
+            storage_subtype(sub_f.storage, sup_f.storage, types, canon)
+            && storage_subtype(sup_f.storage, sub_f.storage, types, canon)
+          {
+            True -> Ok(Nil)
+            False -> Error(InvalidSubtype("mutable field not invariant"))
+          }
+        // immutable ⇒ covariant.
+        False ->
+          case storage_subtype(sub_f.storage, sup_f.storage, types, canon) {
+            True -> Ok(Nil)
+            False -> Error(InvalidSubtype("immutable field not covariant"))
+          }
+      }
+  }
+}
+
+/// `a <: b` on storage types: the packed forms `i8`/`i16` match only themselves; a
+/// value-typed storage uses the canonical `val_subtype`. A packed vs. unpacked pair
+/// never matches.
+fn storage_subtype(
+  a: ast.StorageType,
+  b: ast.StorageType,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> Bool {
+  case a, b {
+    ast.StI8, ast.StI8 -> True
+    ast.StI16, ast.StI16 -> True
+    ast.StVal(va), ast.StVal(vb) -> val_subtype(va, vb, types, canon)
+    _, _ -> False
+  }
+}
+
+/// Zip two lists to the length of the SECOND (the supertype's fields) — pairs each of
+/// the supertype's fields with the subtype's field at the same position. The subtype
+/// has already been checked to be at least as long, so no supertype field is dropped.
+fn zip_prefix(
+  sub: List(ast.FieldType),
+  sup: List(ast.FieldType),
+) -> List(#(ast.FieldType, ast.FieldType)) {
+  case sub, sup {
+    [a, ..ra], [b, ..rb] -> [#(a, b), ..zip_prefix(ra, rb)]
+    _, _ -> []
   }
 }
 

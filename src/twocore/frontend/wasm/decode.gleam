@@ -184,6 +184,12 @@ fn two_pow(n: Int) -> Int {
 type DecodeState {
   DecodeState(
     types: List(ast.DefType),
+    /// The member count of each recursive type group, in section order (GC
+    /// iso-recursive typing). Set alongside `types` when the type section decodes:
+    /// `list.map(groups, list.length)`, where `groups: List(List(DefType))` is the
+    /// pre-flatten rec-group structure. `[]` (the initial value) means no type
+    /// section decoded — a singleton reading, byte-identical to a non-GC module.
+    rec_groups: List(Int),
     imports: List(Import),
     tables: List(TableType),
     memories: List(MemType),
@@ -202,6 +208,7 @@ type DecodeState {
 fn empty_state() -> DecodeState {
   DecodeState(
     types: [],
+    rec_groups: [],
     imports: [],
     tables: [],
     memories: [],
@@ -330,8 +337,25 @@ fn dispatch_section(
       use #(groups, rest) <- result.try(decode_vec(contents, decode_rectype))
       use _ <- result.try(expect_empty(rest))
       // Rec groups are flattened into one index space (their members occupy
-      // consecutive type indices), matching how the AST/validator index types.
-      Ok(DecodeState(..state, types: list.flatten(groups)))
+      // consecutive type indices), matching how the AST/validator index types; the
+      // per-group member counts are retained (`rec_groups`) so the flattened index
+      // space can be re-partitioned into rec groups for GC iso-recursive typing.
+      // An **all-singleton** type section (no multi-member `(rec …)`) collapses to
+      // `[]` — the non-GC canonical default (semantically identical: every index is
+      // still its own group), so a non-rec module decodes byte-identically to the
+      // WAT parser's `rec_groups: []` (their differential equality is preserved).
+      let lengths = list.map(groups, list.length)
+      let rec_groups = case list.all(lengths, fn(l) { l == 1 }) {
+        True -> []
+        False -> lengths
+      }
+      Ok(
+        DecodeState(
+          ..state,
+          types: list.flatten(groups),
+          rec_groups: rec_groups,
+        ),
+      )
     }
     // import section: vec(import) — non-function imports are Phase-5 in scope.
     2 -> {
@@ -465,6 +489,7 @@ fn assemble(state: DecodeState) -> Result(Module, ast.DecodeError) {
   Ok(ast.Module(
     imported_func_count: imported_func_count,
     types: state.types,
+    rec_groups: state.rec_groups,
     imports: state.imports,
     tables: state.tables,
     memories: state.memories,
