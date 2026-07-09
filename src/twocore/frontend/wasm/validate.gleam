@@ -2876,6 +2876,7 @@ fn validate_const_expr(
   init: List(Instr),
   expected: ValType,
   ctx: Ctx,
+  bound: Int,
 ) -> Result(Nil, ValidateError) {
   case init {
     [ast.I32Const(_)] -> expect_const_type(ast.I32, expected)
@@ -2901,7 +2902,7 @@ fn validate_const_expr(
       }
       expect_const_subtype(actual, expected, ctx)
     }
-    [ast.GlobalGet(x)] -> const_global_get(ctx, x, expected)
+    [ast.GlobalGet(x)] -> const_global_get(ctx, x, expected, bound)
     // GC constant expressions (function-references + GC proposal's extension of the
     // constant-expression set): multi-instruction allocator SEQUENCES — `ref.i31`,
     // `struct.new[_default]`, `array.new[_default|_fixed]` — that NEST (a field/element
@@ -2909,7 +2910,7 @@ fn validate_const_expr(
     // any non-constant sequence (extended-const arithmetic, `array.new_data`, malformed)
     // still falls through to `NonConstantExpr`. Additive: non-GC modules only ever emit
     // single-instruction const-exprs, which hit the fast-path arms above.
-    _ -> validate_const_seq(init, expected, ctx)
+    _ -> validate_const_seq(init, expected, ctx, bound)
   }
 }
 
@@ -2922,9 +2923,10 @@ fn validate_const_seq(
   init: List(Instr),
   expected: ValType,
   ctx: Ctx,
+  bound: Int,
 ) -> Result(Nil, ValidateError) {
   use stack <- result.try(
-    list.try_fold(init, [], fn(s, i) { const_step(s, i, ctx) }),
+    list.try_fold(init, [], fn(s, i) { const_step(s, i, ctx, bound) }),
   )
   case stack {
     [produced] -> expect_const_subtype(produced, expected, ctx)
@@ -2941,6 +2943,7 @@ fn const_step(
   stack: List(ValType),
   instr: Instr,
   ctx: Ctx,
+  bound: Int,
 ) -> Result(List(ValType), ValidateError) {
   case instr {
     ast.I32Const(_) -> Ok([I32, ..stack])
@@ -2959,7 +2962,7 @@ fn const_step(
       Ok([t, ..stack])
     }
     ast.GlobalGet(x) -> {
-      use ty <- result.try(const_global_get_type(ctx, x))
+      use ty <- result.try(const_global_get_type(ctx, x, bound))
       Ok([ty, ..stack])
     }
     ast.RefI31 -> {
@@ -3054,11 +3057,17 @@ fn pop_const_list(
   list.try_fold(expected_top_first, stack, fn(s, e) { pop_const(s, e, ctx) })
 }
 
-/// The type a constant `global.get x` produces — valid only for an imported, immutable
-/// global (`x < imported_global_count`, non-mutable). Mirrors `const_global_get` but
-/// returns the type (for the stack machine) instead of checking it against a slot.
-fn const_global_get_type(ctx: Ctx, x: Int) -> Result(ValType, ValidateError) {
-  case x >= 0 && x < ctx.imported_global_count {
+/// The type a constant `global.get x` produces — valid for an immutable global available
+/// at this point (`0 <= x < bound`, non-mutable; see `const_global_get` for how `bound`
+/// captures the function-references/GC "preceding immutable global" rule). Mirrors
+/// `const_global_get` but returns the type (for the stack machine) instead of checking it
+/// against a slot.
+fn const_global_get_type(
+  ctx: Ctx,
+  x: Int,
+  bound: Int,
+) -> Result(ValType, ValidateError) {
+  case x >= 0 && x < bound {
     False -> Error(NonConstantExpr)
     True ->
       case nth(ctx.globals, x) {
@@ -3082,22 +3091,26 @@ fn expect_const_subtype(
   }
 }
 
-/// A `global.get x` in a constant expression is constant ONLY when `x` refers to an
-/// **imported, immutable** global (spec constant expressions): `x < imported_global_count`
-/// and `globals[x].mutable == False`. Otherwise (a defined or mutable global) it is
-/// `Error(NonConstantExpr)`. On success the referenced global's type must equal
-/// `expected`, else `Error(TypeMismatch)`.
+/// A `global.get x` in a constant expression is constant when `x` refers to an
+/// **immutable** global that is available at this point — `0 <= x < bound` and
+/// `globals[x].mutable == False`. Per the function-references/GC extension of constant
+/// expressions, `bound` is not merely the imported-global count: a global's initializer
+/// may reference any PRECEDING immutable global (imported or defined-earlier), and an
+/// element/data const-expr may reference any immutable global (all are initialized before
+/// segments). A mutable, forward, or self referent is `Error(NonConstantExpr)`; a type
+/// disagreement is `Error(TypeMismatch)`.
 fn const_global_get(
   ctx: Ctx,
   x: Int,
   expected: ValType,
+  bound: Int,
 ) -> Result(Nil, ValidateError) {
-  case x >= 0 && x < ctx.imported_global_count {
+  case x >= 0 && x < bound {
     False -> Error(NonConstantExpr)
     True ->
       case nth(ctx.globals, x) {
         Ok(#(ty, False)) -> expect_const_type(ty, expected)
-        // an imported MUTABLE global is not a constant referent
+        // a MUTABLE global is not a constant referent
         Ok(#(_, True)) -> Error(NonConstantExpr)
         Error(_) -> Error(NonConstantExpr)
       }
@@ -3124,7 +3137,14 @@ fn check_global_inits(
   globals: List(ast.Global),
   ctx: Ctx,
 ) -> Result(Nil, ValidateError) {
-  list.try_each(globals, fn(g) { validate_const_expr(g.init, g.ty, ctx) })
+  // Each global's init may reference any PRECEDING immutable global (imported or
+  // defined-earlier), per the function-references/GC const-expr extension — so thread a
+  // bound that starts at the imported-global count and grows by one per defined global.
+  list.try_fold(globals, ctx.imported_global_count, fn(bound, g) {
+    use _ <- result.try(validate_const_expr(g.init, g.ty, ctx, bound))
+    Ok(bound + 1)
+  })
+  |> result.replace(Nil)
 }
 
 /// Validate every element segment (spec `valid/modules` elements). For every mode each
@@ -3147,7 +3167,9 @@ fn check_elements(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
             False -> Error(RefTypeMismatch)
           },
         )
-        validate_const_expr(offset, ast.I32, ctx)
+        // Segments follow all globals, so their const-exprs may reference any immutable
+        // global — the bound is the full global count.
+        validate_const_expr(offset, ast.I32, ctx, list.length(ctx.globals))
       }
       ast.ElemPassive -> Ok(Nil)
       ast.ElemDeclarative -> Ok(Nil)
@@ -3169,7 +3191,9 @@ fn check_elem_init(
       list.try_each(funcs, fn(x) { check_ref_declared(ctx, x) })
     }
     ast.ElemExprs(exprs) ->
-      list.try_each(exprs, fn(expr) { validate_const_expr(expr, e.ref_ty, ctx) })
+      list.try_each(exprs, fn(expr) {
+        validate_const_expr(expr, e.ref_ty, ctx, list.length(ctx.globals))
+      })
   }
 }
 
@@ -3182,7 +3206,7 @@ fn check_data(module: Module, ctx: Ctx) -> Result(Nil, ValidateError) {
     case d.mode {
       ast.DataActive(mem, offset) -> {
         use at <- result.try(mem_addr_type(ctx, mem))
-        validate_const_expr(offset, at, ctx)
+        validate_const_expr(offset, at, ctx, list.length(ctx.globals))
       }
       ast.DataPassive -> Ok(Nil)
     }

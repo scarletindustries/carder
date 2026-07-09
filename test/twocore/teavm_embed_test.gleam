@@ -33,3 +33,17 @@ pub fn embed_teavm_imported_memory_test() {
   io.println("\n[embed] memtest() = " <> string.inspect(r))
   assert r == Ok([49])
 }
+
+/// Full SDK-generated TeaVM guests compile through 2core. Both fixtures are the Dance Java SDK's
+/// per-module WASM GC output (a `Counter` and a record-rich `Channel` service — sources in the SDK's
+/// example). They exercise **GC constant expressions** beyond a single allocator instruction — in
+/// particular `global.get` of a PRECEDING immutable DEFINED global feeding a `struct.new` in a
+/// global initializer — which the function-references/GC proposal admits as constant and which
+/// `wasm-tools validate` accepts. A guest smaller than these (the hand-written `echo`) never emitted
+/// such an init, so this is the regression guard for that const-expr rule end to end.
+pub fn embed_compiles_sdk_guests_test() {
+  let assert Ok(counter) = ffi.read_file("test/twocore/teavm/counter_java.wasm")
+  let assert Ok(_) = embed.compile(counter)
+  let assert Ok(channel) = ffi.read_file("test/twocore/teavm/channel_java.wasm")
+  let assert Ok(_) = embed.compile(channel)
+}
