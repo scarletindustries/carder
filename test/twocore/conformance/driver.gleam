@@ -58,6 +58,7 @@ import twocore/runtime/instance.{type Binding}
 import twocore/runtime/link
 import twocore/runtime/profiles
 import twocore/runtime/rt_ref
+import twocore/runtime/rt_teavm
 
 /// Coerce any Gleam value to `Dynamic` (identity at runtime). Used to hand the positional
 /// `List(Provided)` import list to the generated `instantiate/1` as one opaque argument.
@@ -304,7 +305,11 @@ fn func_imports_all_provided(
   list.all(module.imports, fn(imp) {
     case imp {
       ir.ImportFn(capability, _name, _ty) ->
-        capability == "spectest" || is_registered(capability, providers)
+        capability == "spectest"
+        || is_registered(capability, providers)
+        // TeaVM WASM GC host imports are provided by rt_teavm (term-native `ProvidedFunc` closures
+        // built in `link.resolve_func_provided`), so they count as satisfied here (experimental).
+        || rt_teavm.is_teavm_capability(capability)
       _ -> True
     }
   })
