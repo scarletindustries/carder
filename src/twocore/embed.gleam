@@ -22,6 +22,7 @@
 //// pointers it is passed; a bad guest pointer is a bounds-checked `Error`, never a node crash.
 
 import gleam/int
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import twocore/ir
 import twocore/pipeline
@@ -52,10 +53,46 @@ pub type InvokeResult =
 /// - `wasm`: the guest's binary `.wasm` bytes.
 /// - Returns `Ok(Compiled)` (beam + IR), or `Error(text)` describing the failing pipeline stage
 ///   (decode / validate / lower / codegen). Total.
+///
+/// The generated BEAM module atom is derived from the guest's first exported function
+/// (`twocore@wasm@<firstexport>`). NOTE: two guests that share that first export name (e.g. any
+/// two TeaVM/Java modules, which all export `teavm.stringToJs` first) compile to the SAME atom
+/// and CANNOT be loaded into one node together — the second `code:load_binary` overwrites the
+/// first. An embedder deploying MULTIPLE guests to one node (e.g. a Dance app with several WASM
+/// modules) must give each a distinct atom via `compile_named`.
 pub fn compile(wasm: BitArray) -> Result(Compiled, String) {
+  compile_with_name(wasm, None)
+}
+
+/// **Compile** WASM guest bytes like `compile`, but OVERRIDE the generated BEAM module atom with
+/// `name` verbatim (it becomes the `.core`/`.beam` module header AND every intra-module qualified
+/// reference, so the override is fully self-consistent — indirect calls, funcref tables and the
+/// `rt_table` seam all resolve against the same atom).
+///
+/// - `name`: the module atom to bake in. MUST be a valid Erlang atom string and UNIQUE across the
+///   guests an embedder loads into one node (e.g. `"twocore@wasm@" <> deployment <> "_" <> slug`).
+///   Passing a colliding name reintroduces the load-overwrite hazard `compile` warns about.
+/// - Returns `Ok(Compiled)` whose `module.name` is `name`, or `Error(text)` (same failure modes as
+///   `compile`; an atom-invalid `name` surfaces as a codegen `Error` from `core_to_beam`). Total.
+pub fn compile_named(wasm: BitArray, name: String) -> Result(Compiled, String) {
+  compile_with_name(wasm, Some(name))
+}
+
+/// Shared compile path for `compile`/`compile_named`. When `name_override` is `Some`, the IR
+/// module's `name` (set by `lower` to `twocore@wasm@<firstexport>`) is replaced BEFORE `ir_to_core`
+/// so `emit_core` (which reads the emitted-module atom solely from `ir.Module.name`, and every
+/// downstream stage after `lower` has no wasm to re-derive it from) threads the override everywhere.
+fn compile_with_name(
+  wasm: BitArray,
+  name_override: Option(String),
+) -> Result(Compiled, String) {
   case pipeline.source_to_ir(wasm) {
     Error(e) -> Error(pipeline.describe(e))
-    Ok(m) ->
+    Ok(m0) -> {
+      let m = case name_override {
+        Some(name) -> ir.Module(..m0, name: name)
+        None -> m0
+      }
       case pipeline.ir_to_core(m, profiles.safe()) {
         Error(e) -> Error(pipeline.describe(e))
         Ok(core) ->
@@ -64,6 +101,7 @@ pub fn compile(wasm: BitArray) -> Result(Compiled, String) {
             Ok(beam) -> Ok(Compiled(beam:, module: m))
           }
       }
+    }
   }
 }
 
