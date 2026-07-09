@@ -229,7 +229,10 @@ pub fn decode_add_fixture_test() {
     Ok(
       ast.Module(
         imported_func_count: 0,
-        types: [ast.FuncType(params: [ast.I32, ast.I32], results: [ast.I32])],
+        types: list.map(
+          [ast.FuncType(params: [ast.I32, ast.I32], results: [ast.I32])],
+          ast.func_def,
+        ),
         imports: [],
         tables: [],
         memories: [],
@@ -373,7 +376,9 @@ pub fn decode_mv_blocktype_idx_test() {
   let assert Ok(m) = decode.decode(mv_wasm)
   // type 0 is () -> (i32, i32).
   m.types
-  |> should.equal([ast.FuncType(params: [], results: [ast.I32, ast.I32])])
+  |> should.equal([
+    ast.func_def(ast.FuncType(params: [], results: [ast.I32, ast.I32])),
+  ])
   let assert [func] = m.funcs
   func.body
   |> should.equal([
@@ -714,7 +719,7 @@ pub fn bad_functype_form_test() {
       ]),
     ),
   )
-  |> should.equal(Error(ast.BadFuncTypeForm))
+  |> should.equal(Error(ast.BadCompositeType))
 }
 
 pub fn bad_valtype_test() {
@@ -731,9 +736,9 @@ pub fn bad_valtype_test() {
 }
 
 pub fn unknown_opcode_test() {
-  // Replace the I32Add (0x6A) byte of `add` with 0xD5 (not in the op set).
-  decode.decode(bytes(replace(add_fixture, 39, 0xD5)))
-  |> should.equal(Error(ast.UnknownOpcode(0xD5)))
+  // Replace the I32Add (0x6A) byte of `add` with 0x27 (unassigned).
+  decode.decode(bytes(replace(add_fixture, 39, 0x27)))
+  |> should.equal(Error(ast.UnknownOpcode(0x27)))
 }
 
 pub fn bad_export_kind_test() {
@@ -1638,7 +1643,7 @@ pub fn decode_v128_param_result_test() {
       ),
     )
   m.types
-  |> should.equal([ast.FuncType([ast.V128], [ast.V128])])
+  |> should.equal([ast.func_def(ast.FuncType([ast.V128], [ast.V128]))])
   let assert [func] = m.funcs
   func.body
   |> should.equal([ast.LocalGet(0), ast.End])
@@ -1910,7 +1915,7 @@ pub fn decode_simd_neutrality_test() {
   // additions — no `Simd*`/`V128Const` node, no `V128` valtype appears.
   let assert Ok(m) = decode.decode(bytes(add_fixture))
   m.types
-  |> should.equal([ast.FuncType([ast.I32, ast.I32], [ast.I32])])
+  |> should.equal([ast.func_def(ast.FuncType([ast.I32, ast.I32], [ast.I32]))])
   let assert [func] = m.funcs
   func.body
   |> should.equal([ast.LocalGet(0), ast.LocalGet(1), ast.I32Add, ast.End])
@@ -2121,7 +2126,9 @@ pub fn exnref_param_result_test() {
       ),
     )
   m.types
-  |> should.equal([ast.FuncType(params: [ast.ExnRef], results: [ast.ExnRef])])
+  |> should.equal([
+    ast.func_def(ast.FuncType(params: [ast.ExnRef], results: [ast.ExnRef])),
+  ])
 }
 
 pub fn exnref_local_test() {

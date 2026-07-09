@@ -90,21 +90,22 @@ import twocore/backend/core_erlang.{
 import twocore/ir.{
   type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
   type Module, type NumOp, type SwitchArm, type TrapReason, type ValType,
-  type Value, Block, BoxFloat, BoxInt, Break, CallClosure, CallDirect, CallHost,
-  CallIndirect, Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue,
-  Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
-  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
-  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
-  GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64, I64Extend16S,
-  I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz,
-  ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU,
-  IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub,
-  IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
-  InvalidConversionToInteger, Let, Loop, MakeClosure, MapOp, MemGrow, MemLoad,
-  MemSize, MemStore, MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF,
-  Return, Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds,
-  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, UnboxFloat, UnboxInt,
-  UndefinedElement, UninitializedElement, Unreachable, Values, Var, W32, W64,
+  type Value, ArrayOutOfBounds, Block, BoxFloat, BoxInt, Break, CallClosure,
+  CallDirect, CallHost, CallIndirect, CastFailure, Charge, ConstF32, ConstF64,
+  ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU, F32DemoteF64,
+  F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe,
+  FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64,
+  FuelExhausted, FuncType, Gc, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S,
+  I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S,
+  I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU,
+  IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU,
+  IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If, IndirectCallTypeMismatch,
+  IntDivByZero, IntOverflow, InvalidConversionToInteger, Let, Loop, MakeClosure,
+  MapOp, MemGrow, MemLoad, MemSize, MemStore, MemoryOutOfBounds, NullReference,
+  Num, ReinterpretFToI, ReinterpretIToF, Return, Switch, SwitchArm, TF32, TF64,
+  TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap, TruncS, TruncSatS,
+  TruncSatU, TruncU, UnboxFloat, UnboxInt, UndefinedElement,
+  UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
   type Binding, type HostPolicy, Atomics, HostDenyAll, HostOpen, HostWhitelist,
@@ -136,6 +137,11 @@ const link_module = "twocore@runtime@link"
 /// would swap this one atom — the whole `emit_core` SIMD surface routes through it and nothing
 /// else, I3/I8.)
 const simd_module = "twocore@runtime@rt_simd"
+
+/// The WasmGC arena runtime (this proposal). Bound only into programs that use a
+/// GC instruction (`Gc` lowers to a `seam_call` here), so plain core-WASM modules
+/// never pull `rt_gc` in — the whole-program linker's reachability walk drops it.
+const gc_module = "twocore@runtime@rt_gc"
 
 /// The tagged-exception runtime module (`runtime/rt_exn` → `twocore@runtime@rt_exn`, J1/T3).
 /// The EH binding chokepoint — every `Throw`/`Try`/`ThrowRef` seam call targets it
@@ -1075,6 +1081,7 @@ fn emit(
     // family composes the bounds-checked `rt_mem` byte-slice seam with pure `rt_simd` lane
     // assembly (S4). ──
     ir.Simd(op, args) -> emit_simd(op, args, cont, sc, state, ctx)
+    Gc(op, args) -> emit_gc(op, args, cont, sc, state, ctx)
     ir.SimdShuffle(lanes, a, b) ->
       emit_simd_shuffle(lanes, a, b, cont, sc, state, ctx)
     ir.SimdLoad(mem, kind, addr, offset) ->
@@ -1125,6 +1132,8 @@ fn emit(
       emit_return_call(fn_name, args, sc, state, ctx)
     ir.ReturnCallIndirect(table, index, ty, args) ->
       emit_return_call_indirect(table, index, ty, args, sc, state, ctx)
+    ir.ReturnCallRef(funcref, args) ->
+      emit_return_call_ref(funcref, args, sc, state, ctx)
     ir.ReturnCallImport(slot, ty, args) ->
       emit_return_call_import(slot, ty, args, sc, state, ctx)
     // ── Phase-7 EH nodes (§J/T1/T5/T7): BEAM-native exceptions through the `rt_exn` chokepoint.
@@ -2405,6 +2414,438 @@ fn emit_simd(
   apply_cont(cont, [call], sc, state, ctx)
 }
 
+/// Lower a `Gc(op, args)` to a single `rt_gc` seam call. Every GC op is one call
+/// (the runtime raises any trap itself — `ref.cast` cast-failure, `array.*` OOB,
+/// null deref — so no trap plumbing is needed here); its result is the operation's
+/// single pushed value (or `ok` for a `void` op, discarded by the continuation).
+fn emit_gc(
+  op: ir.GcOp,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case op {
+    // call_ref returns the callee's N results (a package) — a dedicated path
+    // unpacks it and threads state, exactly like an indirect call.
+    ir.GcCallRef(rc) -> emit_gc_call_ref(rc, args, cont, sc, state, ctx)
+    // Segment-sourced array ops resolve their drop-gated segment payload (bytes
+    // for data, rendered ref values for elem) before the arena call.
+    ir.GcArrayNewData(t, d, w) ->
+      emit_gc_array_new_data(t, d, w, args, cont, sc, state, ctx)
+    ir.GcArrayInitData(d, w) ->
+      emit_gc_array_init_data(d, w, args, cont, sc, state, ctx)
+    ir.GcArrayNewElem(t, e) ->
+      emit_gc_array_new_elem(t, e, args, cont, sc, state, ctx)
+    ir.GcArrayInitElem(e) ->
+      emit_gc_array_init_elem(e, args, cont, sc, state, ctx)
+    _ -> {
+      let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
+      case gc_is_void(op) {
+        // struct.set / array.set / fill / copy push no value — sequence the call
+        // and continue with zero results.
+        True -> emit_zero_effect(call, cont, sc, state, ctx)
+        // Every other GC op pushes exactly its one result (a ref, i32, or term).
+        False -> apply_cont(cont, [call], sc, state, ctx)
+      }
+    }
+  }
+}
+
+/// Emit `call_ref $t`: apply the funcref (args = `[funcref, ...params]`) through
+/// the `rt_gc` seam, which null-checks and applies the funcref's build-strategy
+/// closure, returning the callee's `result_count` results as a list (raising the
+/// null trap itself). Under `Threaded` the seam also threads instance state.
+fn emit_gc_call_ref(
+  rc: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(funcref, params) = case args {
+    [f, ..ps] -> #(f, ps)
+    [] -> #(ir.ConstI32(0), [])
+  }
+  let params_c = core_list(list.map(params, emit_value))
+  case sc {
+    NoState -> {
+      let call =
+        seam_call(gc_module, "call_ref", [
+          emit_value(funcref),
+          params_c,
+          CInt(rc),
+        ])
+      let #(lvar, state2) = fresh_var(state)
+      use #(rest, state3) <- result.try(unpack_result_list(
+        lvar,
+        rc,
+        cont,
+        NoState,
+        state2,
+        ctx,
+      ))
+      Ok(#(CLet([lvar], call, rest), state3))
+    }
+    Threading(cur) -> {
+      let call =
+        seam_call(gc_module, "t_call_ref", [
+          CVar(cur),
+          emit_value(funcref),
+          params_c,
+          CInt(rc),
+        ])
+      let #(pair, state2) = fresh_var(state)
+      let #(rsvar, state3) = fresh_var(state2)
+      let #(stvar, state4) = fresh_var(state3)
+      use #(rest, state5) <- result.try(unpack_result_list(
+        rsvar,
+        rc,
+        cont,
+        Threading(stvar),
+        state4,
+        ctx,
+      ))
+      let destructure =
+        CCase(CVar(pair), [
+          CClause([PTuple([PVar(rsvar), PVar(stvar)])], CAtom("true"), rest),
+        ])
+      Ok(#(CLet([pair], call, destructure), state5))
+    }
+  }
+}
+
+/// The GC ops that produce no stack value (a pure heap mutation).
+fn gc_is_void(op: ir.GcOp) -> Bool {
+  case op {
+    ir.GcStructSet(_) | ir.GcArraySet | ir.GcArrayFill | ir.GcArrayCopy -> True
+    _ -> False
+  }
+}
+
+/// Emit `array.new_data $t $d`: resolve the drop-gated bytes of data segment `d`
+/// (empty if dropped), then build the array from `count` elements of `width`
+/// little-endian bytes at `byte_offset` (`[byte_offset, count]` operands). The
+/// arena call raises the OOB trap itself and returns the new array reference.
+fn emit_gc_array_new_data(
+  type_idx: Int,
+  data_idx: Int,
+  width: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.data_segments, data_idx)
+    |> result.replace_error(UnsupportedNode("array_new_data_seg")),
+  )
+  let #(offset, count) = gc_two_args(args)
+  let #(gated, state2) =
+    drop_gate(
+      data_idx,
+      "data_dropped",
+      core_binary_bytes(<<>>),
+      core_binary_bytes(segment.bytes),
+      sc,
+      state,
+      ctx,
+    )
+  let #(segvar, state3) = fresh_var(state2)
+  let call =
+    seam_call(gc_module, "array_new_data", [
+      CInt(type_idx),
+      CVar(segvar),
+      emit_value(offset),
+      emit_value(count),
+      CInt(width),
+    ])
+  use #(rest, state4) <- result.try(apply_cont(cont, [call], sc, state3, ctx))
+  Ok(#(CLet([segvar], gated, rest), state4))
+}
+
+/// Emit `array.init_data $t $d`: like `array.new_data`, but copy into an existing
+/// array (`[arrayref, dst_index, src_byte_offset, count]` operands). No result.
+fn emit_gc_array_init_data(
+  data_idx: Int,
+  width: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.data_segments, data_idx)
+    |> result.replace_error(UnsupportedNode("array_init_data_seg")),
+  )
+  let #(arrayref, dst, src, count) = gc_four_args(args)
+  let #(gated, state2) =
+    drop_gate(
+      data_idx,
+      "data_dropped",
+      core_binary_bytes(<<>>),
+      core_binary_bytes(segment.bytes),
+      sc,
+      state,
+      ctx,
+    )
+  let #(segvar, state3) = fresh_var(state2)
+  let call =
+    seam_call(gc_module, "array_init_data", [
+      emit_value(arrayref),
+      emit_value(dst),
+      CVar(segvar),
+      emit_value(src),
+      emit_value(count),
+      CInt(width),
+    ])
+  use #(rest, state4) <- result.try(emit_zero_effect(
+    call,
+    cont,
+    sc,
+    state3,
+    ctx,
+  ))
+  Ok(#(CLet([segvar], gated, rest), state4))
+}
+
+/// Emit `array.new_elem $t $e`: render element segment `e`'s init items to a
+/// drop-gated Core reference list (empty if dropped), then build the array from
+/// `count` of them starting at `elem_offset` (`[elem_offset, count]` operands).
+fn emit_gc_array_new_elem(
+  type_idx: Int,
+  elem_idx: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.elements, elem_idx)
+    |> result.replace_error(UnsupportedNode("array_new_elem_seg")),
+  )
+  let #(offset, count) = gc_two_args(args)
+  let items_state_ref = case sc {
+    NoState -> None
+    Threading(cur) -> Some(cur)
+  }
+  use #(entries, state2) <- result.try(render_ref_items(
+    segment.init,
+    ctx,
+    items_state_ref,
+    state,
+  ))
+  let #(gated, state3) =
+    drop_gate(
+      elem_idx,
+      "elem_dropped",
+      CNil,
+      core_list(entries),
+      sc,
+      state2,
+      ctx,
+    )
+  let #(segvar, state4) = fresh_var(state3)
+  let call =
+    seam_call(gc_module, "array_new_elem", [
+      CInt(type_idx),
+      CVar(segvar),
+      emit_value(offset),
+      emit_value(count),
+    ])
+  use #(rest, state5) <- result.try(apply_cont(cont, [call], sc, state4, ctx))
+  Ok(#(CLet([segvar], gated, rest), state5))
+}
+
+/// Emit `array.init_elem $t $e`: like `array.new_elem`, but copy into an existing
+/// array (`[arrayref, dst_index, src_index, count]` operands). No result.
+fn emit_gc_array_init_elem(
+  elem_idx: Int,
+  args: List(Value),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use segment <- result.try(
+    nth(ctx.elements, elem_idx)
+    |> result.replace_error(UnsupportedNode("array_init_elem_seg")),
+  )
+  let #(arrayref, dst, src, count) = gc_four_args(args)
+  let items_state_ref = case sc {
+    NoState -> None
+    Threading(cur) -> Some(cur)
+  }
+  use #(entries, state2) <- result.try(render_ref_items(
+    segment.init,
+    ctx,
+    items_state_ref,
+    state,
+  ))
+  let #(gated, state3) =
+    drop_gate(
+      elem_idx,
+      "elem_dropped",
+      CNil,
+      core_list(entries),
+      sc,
+      state2,
+      ctx,
+    )
+  let #(segvar, state4) = fresh_var(state3)
+  let call =
+    seam_call(gc_module, "array_init_elem", [
+      emit_value(arrayref),
+      emit_value(dst),
+      CVar(segvar),
+      emit_value(src),
+      emit_value(count),
+    ])
+  use #(rest, state5) <- result.try(emit_zero_effect(
+    call,
+    cont,
+    sc,
+    state4,
+    ctx,
+  ))
+  Ok(#(CLet([segvar], gated, rest), state5))
+}
+
+/// Split a two-operand GC arg list `[a, b]` (a defensive zero pair otherwise —
+/// arity is already validated).
+fn gc_two_args(args: List(Value)) -> #(Value, Value) {
+  case args {
+    [a, b] -> #(a, b)
+    _ -> #(ir.ConstI32(0), ir.ConstI32(0))
+  }
+}
+
+/// Split a four-operand GC arg list `[a, b, c, d]`.
+fn gc_four_args(args: List(Value)) -> #(Value, Value, Value, Value) {
+  case args {
+    [a, b, c, d] -> #(a, b, c, d)
+    _ -> #(ir.ConstI32(0), ir.ConstI32(0), ir.ConstI32(0), ir.ConstI32(0))
+  }
+}
+
+/// The `rt_gc` function name for a GC op. Packed reads and the signed/unsigned
+/// i31 reads dispatch to distinct helpers so the runtime need not carry the width.
+fn gc_op_name(op: ir.GcOp) -> String {
+  case op {
+    ir.GcStructNew(_) -> "struct_new"
+    ir.GcStructGet(_, ir.ReadPlain) -> "struct_get"
+    ir.GcStructGet(_, ir.ReadPacked(_, _)) -> "struct_get_packed"
+    ir.GcStructSet(_) -> "struct_set"
+    ir.GcArrayNew(_) -> "array_new"
+    ir.GcArrayNewFixed(_) -> "array_new_fixed"
+    ir.GcArrayGet(ir.ReadPlain) -> "array_get"
+    ir.GcArrayGet(ir.ReadPacked(_, _)) -> "array_get_packed"
+    ir.GcArraySet -> "array_set"
+    ir.GcArrayLen -> "array_len"
+    ir.GcArrayFill -> "array_fill"
+    ir.GcArrayCopy -> "array_copy"
+    ir.GcRefI31 -> "ref_i31"
+    ir.GcI31Get(True) -> "i31_get_s"
+    ir.GcI31Get(False) -> "i31_get_u"
+    ir.GcRefTest(_, _) -> "ref_test"
+    ir.GcRefCast(_, _) -> "ref_cast"
+    ir.GcRefEq -> "ref_eq"
+    ir.GcRefAsNonNull -> "ref_as_non_null"
+    ir.GcAnyConvertExtern -> "any_convert_extern"
+    ir.GcExternConvertAny -> "extern_convert_any"
+    // Handled by dedicated emitters before this table is consulted.
+    ir.GcCallRef(_) -> "call_ref"
+    ir.GcArrayNewData(_, _, _) -> "array_new_data"
+    ir.GcArrayInitData(_, _) -> "array_init_data"
+    ir.GcArrayNewElem(_, _) -> "array_new_elem"
+    ir.GcArrayInitElem(_) -> "array_init_elem"
+  }
+}
+
+/// The Core argument list for a GC op: the operand values (bottom-of-stack first)
+/// with the op's compile-time immediates spliced in — the type index / field
+/// index / packed width+signedness / RTTI matcher the runtime needs. Field lists
+/// (`struct.new`, `array.new_fixed`) are passed as a single Core list.
+fn gc_call_args(op: ir.GcOp, args: List(Value)) -> List(CExpr) {
+  let ev = list.map(args, emit_value)
+  case op {
+    ir.GcStructNew(t) -> [CInt(t), core_list(ev)]
+    ir.GcStructGet(f, ir.ReadPlain) -> list.append(ev, [CInt(f)])
+    ir.GcStructGet(f, ir.ReadPacked(bits, signed)) ->
+      list.append(ev, [CInt(f), CInt(bits), cbool(signed)])
+    ir.GcStructSet(f) ->
+      case ev {
+        [ref, val] -> [ref, CInt(f), val]
+        _ -> ev
+      }
+    ir.GcArrayNew(t) -> [CInt(t), ..ev]
+    ir.GcArrayNewFixed(t) -> [CInt(t), core_list(ev)]
+    ir.GcArrayGet(ir.ReadPlain) -> ev
+    ir.GcArrayGet(ir.ReadPacked(bits, signed)) ->
+      list.append(ev, [CInt(bits), cbool(signed)])
+    ir.GcArraySet -> ev
+    ir.GcArrayLen -> ev
+    ir.GcArrayFill -> ev
+    ir.GcArrayCopy -> ev
+    ir.GcRefI31 -> ev
+    ir.GcI31Get(_) -> ev
+    ir.GcRefTest(m, null_ok) ->
+      list.append(ev, [emit_matcher(m), cbool(null_ok)])
+    ir.GcRefCast(m, null_ok) ->
+      list.append(ev, [emit_matcher(m), cbool(null_ok)])
+    ir.GcRefEq -> ev
+    ir.GcRefAsNonNull -> ev
+    ir.GcAnyConvertExtern -> ev
+    ir.GcExternConvertAny -> ev
+    // Handled by dedicated emitters before this table is consulted.
+    ir.GcCallRef(_)
+    | ir.GcArrayNewData(_, _, _)
+    | ir.GcArrayInitData(_, _)
+    | ir.GcArrayNewElem(_, _)
+    | ir.GcArrayInitElem(_) -> ev
+  }
+}
+
+/// Render a compile-time RTTI matcher as a Core literal: `{concrete, [I0,I1,…]}`
+/// (the closed set of subtype indices) or `{abstract, Kind}` (an object-kind atom).
+fn emit_matcher(m: ir.GcMatcher) -> CExpr {
+  case m {
+    ir.MatchConcrete(ts) ->
+      CTuple([CAtom("concrete"), core_list(list.map(ts, CInt))])
+    ir.MatchAbstract(k) -> CTuple([CAtom("abstract"), CAtom(gc_kind_atom(k))])
+  }
+}
+
+fn gc_kind_atom(k: ir.GcKind) -> String {
+  case k {
+    ir.KStruct -> "struct"
+    ir.KArray -> "array"
+    ir.KI31 -> "i31"
+    ir.KEq -> "eq"
+    ir.KAny -> "any"
+    ir.KNone -> "none"
+    ir.KFunc -> "func"
+    ir.KNoFunc -> "nofunc"
+    ir.KExtern -> "extern"
+    ir.KNoExtern -> "noextern"
+    ir.KExn -> "exn"
+    ir.KNoExn -> "noexn"
+  }
+}
+
+/// A Core boolean atom (`'true'`/`'false'`).
+fn cbool(b: Bool) -> CExpr {
+  case b {
+    True -> CAtom("true")
+    False -> CAtom("false")
+  }
+}
+
 /// Build the concrete Core argument list for a `Simd(op, args)`, splicing any static lane
 /// immediate at the position the frozen `rt_simd` head expects.
 ///
@@ -3545,6 +3986,32 @@ fn emit_return_call_indirect(
       ),
     ])
   Ok(#(result_case, state3))
+}
+
+/// Emit `ir.ReturnCallRef(funcref, args)` — a tail call through a typed function
+/// reference. The `rt_gc` `apply_ref` seam null-checks the funcref then tail-applies
+/// its build-strategy closure, and this seam call is itself the whole (tail) result
+/// expression — so the tail-recursion is constant-stack across both hops. NoState:
+/// `apply_ref` returns the callee package; Threaded: `t_apply_ref` returns
+/// `{package, st'}`, exactly this function's threaded return shape.
+fn emit_return_call_ref(
+  funcref: Value,
+  args: List(Value),
+  sc: StateChan,
+  state: EmitState,
+  _ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let cargs = core_list(list.map(args, emit_value))
+  let call = case sc {
+    NoState -> seam_call(gc_module, "apply_ref", [emit_value(funcref), cargs])
+    Threading(cur) ->
+      seam_call(gc_module, "t_apply_ref", [
+        CVar(cur),
+        emit_value(funcref),
+        cargs,
+      ])
+  }
+  Ok(#(call, state))
 }
 
 /// Emit `ir.ReturnCallImport(slot, ty, args)` — an IMPORTED tail call. Routes through the EXISTING
@@ -6469,6 +6936,10 @@ fn trap_ctor_name(reason: TrapReason) -> String {
     TableOutOfBounds -> "TableOutOfBounds"
     // Runtime-only policy reason (F5); never emitted by lowering, but the match is exhaustive.
     FuelExhausted -> "FuelExhausted"
+    // WasmGC traps (this proposal).
+    CastFailure -> "CastFailure"
+    NullReference -> "NullReference"
+    ArrayOutOfBounds -> "ArrayOutOfBounds"
   }
 }
 
@@ -6510,6 +6981,7 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Num(_, args) -> collect_values(args, acc)
     Convert(_, arg) -> collect_value(arg, acc)
     TermOp(_, args) -> collect_values(args, acc)
+    Gc(_, args) -> collect_values(args, acc)
     // ── Phase-8 native closures: collect the `Var` names in their `Value` operands (the captures /
     // the callee + args) so gensym avoids them. `MakeClosure`'s `fn_name` is a function name, not a
     // `Var`. Over-approximating is safe. ──
@@ -6612,6 +7084,8 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     ir.ReturnCallIndirect(_, index, _, args) ->
       collect_values(args, collect_value(index, acc))
     ir.ReturnCallImport(_, _, args) -> collect_values(args, acc)
+    ir.ReturnCallRef(funcref, args) ->
+      collect_values(args, collect_value(funcref, acc))
     // ── Phase-7 EH nodes: collect the `Var` names in their operands / sub-expressions so gensym
     // avoids them (over-approximating is safe). `Try` recurses into its body + each handler's
     // inline handler expression and includes the handler's `payload`/`exnref` binder names. ──

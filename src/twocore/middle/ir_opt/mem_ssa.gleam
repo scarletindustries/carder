@@ -221,7 +221,8 @@ pub fn is_memory_barrier(e: Expr) -> Bool {
       // out of the straight-line region — a barrier on both counts, like `CallImport` + `Return`. ──
       ir.ReturnCall(_, _)
     | ir.ReturnCallIndirect(_, _, _, _)
-    | ir.ReturnCallImport(_, _, _) -> True
+    | ir.ReturnCallImport(_, _, _)
+    | ir.ReturnCallRef(_, _) -> True
     // ── barriers: control leaves the straight-line region ──
     ir.Trap(_)
     | ir.Throw(_, _)
@@ -249,7 +250,11 @@ pub fn is_memory_barrier(e: Expr) -> Bool {
     | ir.TableFill(_, _, _, _)
     | ir.TableInit(_, _, _, _, _)
     | ir.TableCopy(_, _, _, _, _)
-    | ir.ElemDrop(_) -> True
+    | ir.ElemDrop(_)
+    | // ── WasmGC (this proposal): `Gc` ops touch the disjoint per-process GC arena
+      // (never linear memory) and several can trap — conservatively a barrier,
+      // exactly like the reference/table ops above. ──
+      ir.Gc(_, _) -> True
   }
 }
 

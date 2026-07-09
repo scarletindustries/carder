@@ -93,7 +93,7 @@ fn module(
 ) -> ast.Module {
   ast.Module(
     imported_func_count: 0,
-    types: types,
+    types: list.map(types, ast.func_def),
     imports: [],
     tables: tables,
     memories: memories,
@@ -775,7 +775,7 @@ pub fn accept_ref_null_is_null_test() {
 pub fn accept_ref_func_declared_test() {
   ast.Module(
     imported_func_count: 0,
-    types: [ft([], [ast.FuncRef])],
+    types: list.map([ft([], [ast.FuncRef])], ast.func_def),
     imports: [],
     tables: [],
     memories: [],
@@ -1126,7 +1126,7 @@ pub fn accept_non_function_imports_test() {
   let assert Ok(tm) =
     ast.Module(
       imported_func_count: 0,
-      types: [],
+      types: list.map([], ast.func_def),
       imports: [
         ast.Import("env", "g", ast.ImportGlobal(ast.I32, False)),
         ast.Import("env", "t", ast.ImportTable(rtbl(ast.FuncRef, 1))),
@@ -1181,7 +1181,7 @@ pub fn typed_module_refs_from_export_test() {
   let assert Ok(tm) =
     ast.Module(
       imported_func_count: 0,
-      types: [ft([], [])],
+      types: list.map([ft([], [])], ast.func_def),
       imports: [],
       tables: [],
       memories: [],
@@ -1627,7 +1627,7 @@ pub fn reject_elem_drop_out_of_range_test() {
 pub fn reject_const_global_get_mutable_import_test() {
   ast.Module(
     imported_func_count: 0,
-    types: [],
+    types: list.map([], ast.func_def),
     imports: [ast.Import("env", "g", ast.ImportGlobal(ast.I32, True))],
     tables: [],
     memories: [],
@@ -1649,7 +1649,7 @@ pub fn reject_const_global_get_mutable_import_test() {
 pub fn reject_duplicate_export_test() {
   ast.Module(
     imported_func_count: 0,
-    types: [ft([], [])],
+    types: list.map([ft([], [])], ast.func_def),
     imports: [],
     tables: [],
     memories: [],
@@ -1674,7 +1674,7 @@ pub fn reject_duplicate_export_test() {
 pub fn reject_export_out_of_range_test() {
   ast.Module(
     imported_func_count: 0,
-    types: [],
+    types: list.map([], ast.func_def),
     imports: [],
     tables: [],
     memories: [],
@@ -2115,7 +2115,7 @@ pub fn accept_mem64_limit_max_test() {
 pub fn accept_imported_func_call_test() {
   ast.Module(
     imported_func_count: 1,
-    types: [ft([ast.I32], [ast.I32]), ft([], [])],
+    types: list.map([ft([ast.I32], [ast.I32]), ft([], [])], ast.func_def),
     imports: [ast.Import("env", "f", ast.ImportFunc(0))],
     tables: [],
     memories: [],
@@ -3196,7 +3196,7 @@ fn eh_mod(
 ) -> ast.Module {
   ast.Module(
     imported_func_count: 0,
-    types: types,
+    types: list.map(types, ast.func_def),
     imports: imports,
     tables: [],
     memories: [],

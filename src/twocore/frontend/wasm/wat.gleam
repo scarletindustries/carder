@@ -1484,7 +1484,11 @@ fn phase_b(
   }
   Ok(ast.Module(
     imported_func_count: imported_func_count,
-    types: st.types,
+    // The WAT parser only produces func types today; wrap each as a final,
+    // supertype-less defined type for the unified type section.
+    types: list.map(st.types, fn(ft) {
+      ast.DefType(comp: ast.CtFunc(ft), supertype: option.None, final: True)
+    }),
     imports: list.reverse(st.imports),
     tables: list.reverse(st.tables),
     memories: list.reverse(st.memories),

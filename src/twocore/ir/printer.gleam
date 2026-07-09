@@ -36,22 +36,24 @@ import twocore/ir.{
   type ConvOp, type Expr, type FloatWidth, type FuncType, type Function,
   type IntWidth, type Local, type LoopParam, type MemAccess, type Module,
   type NumOp, type SwitchArm, type TermOp, type TrapReason, type ValType,
-  type Value, Block, BoxFloat, BoxInt, Break, CallClosure, CallDirect, CallHost,
-  CallIndirect, Charge, ConstF32, ConstF64, ConstI32, ConstI64, Continue,
-  Convert, ConvertS, ConvertU, F32DemoteF64, F64PromoteF32, FAbs, FAdd, FCeil,
-  FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe, FLt, FMax, FMin, FMul, FNe,
-  FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64, FuelExhausted, FuncType,
-  Function, GlobalGet, GlobalSet, I32Extend16S, I32Extend8S, I32WrapI64,
-  I64Extend16S, I64Extend32S, I64Extend8S, I64ExtendI32S, I64ExtendI32U, IAdd,
-  IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz, IGeS, IGeU, IGtS, IGtU, ILeS, ILeU,
-  ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS, IRemU, IRotl, IRotr, IShl, IShrS,
-  IShrU, ISub, IXor, If, IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  type Value, ArrayOutOfBounds, Block, BoxFloat, BoxInt, Break, CallClosure,
+  CallDirect, CallHost, CallIndirect, CastFailure, Charge, ConstF32, ConstF64,
+  ConstI32, ConstI64, Continue, Convert, ConvertS, ConvertU, F32DemoteF64,
+  F64PromoteF32, FAbs, FAdd, FCeil, FCopysign, FDiv, FEq, FFloor, FGe, FGt, FLe,
+  FLt, FMax, FMin, FMul, FNe, FNearest, FNeg, FSqrt, FSub, FTrunc, FW32, FW64,
+  FuelExhausted, FuncType, Function, GlobalGet, GlobalSet, I32Extend16S,
+  I32Extend8S, I32WrapI64, I64Extend16S, I64Extend32S, I64Extend8S,
+  I64ExtendI32S, I64ExtendI32U, IAdd, IAnd, IClz, ICtz, IDivS, IDivU, IEq, IEqz,
+  IGeS, IGeU, IGtS, IGtU, ILeS, ILeU, ILtS, ILtU, IMul, INe, IOr, IPopcnt, IRemS,
+  IRemU, IRotl, IRotr, IShl, IShrS, IShrU, ISub, IXor, If,
+  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
   InvalidConversionToInteger, Let, Loop, LoopParam, MakeClosure, MakeCons,
   MakeTuple, MapOp, MemAccess, MemGrow, MemLoad, MemSize, MemStore,
-  MemoryOutOfBounds, Num, ReinterpretFToI, ReinterpretIToF, Return, Switch,
-  SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds, TermOp, Trap,
-  TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat, UnboxInt,
-  UndefinedElement, UninitializedElement, Unreachable, Values, Var, W32, W64,
+  MemoryOutOfBounds, NullReference, Num, ReinterpretFToI, ReinterpretIToF,
+  Return, Switch, SwitchArm, TF32, TF64, TI32, TI64, TTerm, TableOutOfBounds,
+  TermOp, Trap, TruncS, TruncSatS, TruncSatU, TruncU, TupleGet, UnboxFloat,
+  UnboxInt, UndefinedElement, UninitializedElement, Unreachable, Values, Var,
+  W32, W64,
 }
 
 // ───────────────────────────── public entry point ─────────────────────────────
@@ -814,6 +816,7 @@ fn print_expr(indent: Int, e: Expr) -> String {
     // spelling. SIMD-memory nodes elide `mem=0` (like the scalar memory nodes, §A.6). ──
     ir.Simd(op, args) ->
       "simd " <> simdop_to_string(op) <> " " <> value_list(args)
+    ir.Gc(op, args) -> "gc " <> string.inspect(op) <> " " <> value_list(args)
     ir.SimdShuffle(lanes, a, b) ->
       "simd.shuffle ["
       <> string.join(list.map(lanes, int.to_string), ", ")
@@ -890,6 +893,8 @@ fn print_expr(indent: Int, e: Expr) -> String {
       <> print_functype(ty)
       <> " "
       <> value_list(args)
+    ir.ReturnCallRef(funcref, args) ->
+      "return_call_ref " <> print_value(funcref) <> " " <> value_list(args)
     ir.ReturnCallImport(slot, ty, args) ->
       "return_call_import "
       <> int.to_string(slot)
@@ -1338,6 +1343,10 @@ fn trapreason_to_string(r: TrapReason) -> String {
     TableOutOfBounds -> "table_out_of_bounds"
     // Runtime-only policy reason (F5); never emitted by lowering, but the match is exhaustive.
     FuelExhausted -> "fuel_exhausted"
+    // WasmGC traps (this proposal).
+    CastFailure -> "cast_failure"
+    NullReference -> "null_reference"
+    ArrayOutOfBounds -> "array_out_of_bounds"
   }
 }
 

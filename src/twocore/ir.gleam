@@ -711,6 +711,12 @@ pub type Expr {
   /// PURE (no trap, no state — I3): participates in const-fold / DCE / CSE exactly like a
   /// non-trapping `Num`. `emit_core` (P6-06) maps `op` → a concrete `rt_simd` fn (the binding
   /// chokepoint, like `NumOp → rt_num`).
+  /// A WebAssembly **GC** operation (struct/array/i31/cast/…), bound by
+  /// `emit_core` to an `rt_gc` runtime helper. Every GC value is a per-process
+  /// arena handle, so all of these read/write the GC heap (an effect barrier).
+  /// `args` are the operand values in stack order (bottom-first).
+  Gc(op: GcOp, args: List(Value))
+
   Simd(op: SimdOp, args: List(Value))
   /// `i8x16.shuffle` — 16 immediate lane indices (each 0..31), selecting bytes from `a ++ b`
   /// (indices 0..15 pick from `a`, 16..31 from `b`). Kept a DEDICATED node (not a `Simd`
@@ -811,6 +817,12 @@ pub type Expr {
     ty: FuncType,
     args: List(Value),
   )
+  /// A tail call through a typed function reference — `return_call_ref $t`. BOTTOM:
+  /// the callee's results become this function's results (like `Return`). Carries
+  /// the funcref `Value` and the `Value` args; an effectful barrier (§effect).
+  /// `emit_core` tail-applies the funcref's build-strategy closure via the `rt_gc`
+  /// seam (constant-stack tail recursion; a null funcref traps `NullReference`).
+  ReturnCallRef(funcref: Value, args: List(Value))
   /// A tail call to an IMPORTED function by its positional func-import `slot` (WASM `return_call $f`
   /// where `f` resolves to an import). BOTTOM: the import's results become this function's results
   /// (like `Return`). Carries only `Value` `args`; an effectful barrier (§effect). `emit_core`
@@ -1050,6 +1062,82 @@ pub type SimdHalf {
 ///   NaN canonicalization/propagation per the SIMD spec (mirrors scalar).
 /// - SIMD ops do NOT trap (I3). The only trap on the SIMD surface is the memory-bounds trap on
 ///   a SIMD load/store, via the `rt_mem` seam (the `SimdLoad*`/`SimdStore*` `Expr` nodes).
+/// A WebAssembly GC operation, immediates baked in. Struct/array `*_default`
+/// forms are lowered as the plain `new` with computed default operands, so the
+/// runtime needs only `new`/`new_fixed`. `args` order (bottom-first) is per op:
+/// struct.new = fields; array.new = [elem, count]; get = [ref(, idx)]; set =
+/// [ref(, idx), value]; fill = [ref, idx, value, count]; copy = [dst, di, src,
+/// si, count]; ref.test/cast/eq/as_non_null/i31 take their refs.
+pub type GcOp {
+  GcStructNew(type_idx: Int)
+  GcStructGet(field: Int, read: FieldRead)
+  GcStructSet(field: Int)
+  GcArrayNew(type_idx: Int)
+  GcArrayNewFixed(type_idx: Int)
+  GcArrayGet(read: FieldRead)
+  GcArraySet
+  GcArrayLen
+  GcArrayFill
+  GcArrayCopy
+  GcRefI31
+  GcI31Get(signed: Bool)
+  GcRefTest(matcher: GcMatcher, null_ok: Bool)
+  GcRefCast(matcher: GcMatcher, null_ok: Bool)
+  GcRefEq
+  GcRefAsNonNull
+  GcAnyConvertExtern
+  GcExternConvertAny
+  /// `call_ref $t` — call a typed function reference (args = `[funcref, ...params]`,
+  /// funcref first). `result_count` is the callee's result arity, so `emit_core`
+  /// can unpack the returned package into that many stack values. The only GC op
+  /// that yields ≠1 result — handled on a dedicated emission path.
+  GcCallRef(result_count: Int)
+  /// `array.new_data $t $d` (args = `[byte_offset, count]`) — a new array of
+  /// `count` elements decoded from passive data segment `d`, each `elem_width`
+  /// little-endian bytes (numeric elements are their raw bit pattern). `data_idx`
+  /// and `elem_width` drive `emit_core`'s drop-gated segment-bytes emission.
+  GcArrayNewData(type_idx: Int, data_idx: Int, elem_width: Int)
+  /// `array.init_data $t $d` (args = `[arrayref, dst_index, src_byte_offset,
+  /// count]`) — copy `count` elements from data segment `d` into an existing array.
+  GcArrayInitData(data_idx: Int, elem_width: Int)
+  /// `array.new_elem $t $e` (args = `[elem_offset, count]`) — a new array of
+  /// `count` references taken from element segment `e`. `elem_idx` drives the
+  /// drop-gated segment-values emission.
+  GcArrayNewElem(type_idx: Int, elem_idx: Int)
+  /// `array.init_elem $t $e` (args = `[arrayref, dst_index, src_index, count]`) —
+  /// copy `count` references from element segment `e` into an existing array.
+  GcArrayInitElem(elem_idx: Int)
+}
+
+/// How a packed (`i8`/`i16`) or plain field/element is read back out.
+pub type FieldRead {
+  ReadPlain
+  ReadPacked(bits: Int, signed: Bool)
+}
+
+/// A runtime type test, resolved at compile time from the target heap type: a
+/// concrete target expands to the closed set of type indices that are subtypes
+/// of it; an abstract target is matched by object kind.
+pub type GcMatcher {
+  MatchConcrete(type_idxs: List(Int))
+  MatchAbstract(kind: GcKind)
+}
+
+pub type GcKind {
+  KStruct
+  KArray
+  KI31
+  KEq
+  KAny
+  KNone
+  KFunc
+  KNoFunc
+  KExtern
+  KNoExtern
+  KExn
+  KNoExn
+}
+
 pub type SimdOp {
   // ── lane-uniform integer arithmetic (shape ∈ integer shapes) ─────────────────
   /// Lane-wise integer add. `SMul` is illegal for `I8x16` (there is no `i8x16.mul`).
@@ -1517,4 +1605,10 @@ pub type TrapReason {
   UninitializedElement
   TableOutOfBounds
   FuelExhausted
+  /// A `ref.cast` whose operand's runtime type is not a subtype of the target.
+  CastFailure
+  /// `ref.as_non_null` (or a non-null `ref.cast`) applied to a null reference.
+  NullReference
+  /// A GC array access (`array.get`/`set`/`fill`/`copy`) out of bounds.
+  ArrayOutOfBounds
 }

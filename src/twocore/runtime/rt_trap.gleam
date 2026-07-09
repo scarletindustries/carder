@@ -24,8 +24,9 @@
 //// distinguish a *WASM trap* from any incidental BEAM error.
 
 import twocore/ir.{
-  type TrapReason, FuelExhausted, IndirectCallTypeMismatch, IntDivByZero,
-  IntOverflow, InvalidConversionToInteger, MemoryOutOfBounds, TableOutOfBounds,
+  type TrapReason, ArrayOutOfBounds, CastFailure, FuelExhausted,
+  IndirectCallTypeMismatch, IntDivByZero, IntOverflow,
+  InvalidConversionToInteger, MemoryOutOfBounds, NullReference, TableOutOfBounds,
   UndefinedElement, UninitializedElement, Unreachable,
 }
 
@@ -84,5 +85,11 @@ pub fn spec_trap_message(reason: TrapReason) -> String {
     // spec's "call stack exhausted" (`assert_exhaustion`), so the conformance harness can
     // never mis-map a real WASM trap to it or vice versa.
     FuelExhausted -> "fuel exhausted"
+    // ── WasmGC (this proposal) trap messages, matching the spec test-suite
+    // expectations (`ref.wast`/`array.wast`): a failed downcast, a null-reference
+    // access, and an out-of-bounds array access. Each substring is distinct. ──
+    CastFailure -> "cast failure"
+    NullReference -> "null reference"
+    ArrayOutOfBounds -> "out of bounds array access"
   }
 }

@@ -161,7 +161,7 @@ pub type LowerError {
 ///   rejected by validate — lower fails closed).
 type LCtx {
   LCtx(
-    types: List(ast.FuncType),
+    types: List(ast.DefType),
     func_types: List(ast.FuncType),
     imported: Int,
     local_types: List(ir.ValType),
@@ -349,7 +349,7 @@ fn lower_func(
 ) -> Result(ir.Function, LowerError) {
   let module = typed.module
   let funcidx = typed.imported_func_count + defined_idx
-  use sig <- result.try(nth_err(
+  use sig <- result.try(func_type_err(
     module.types,
     f.type_idx,
     UnknownTypeIndex(f.type_idx),
@@ -1040,6 +1040,237 @@ fn go(
             st,
           )
 
+        // ═══════════════════════ WasmGC (this proposal) ═══════════════════════
+        // Each GC value/effect op lowers to a single `ir.Gc(op, args)` node routed
+        // through the shared value/effect emitters. Operands are deepest-first,
+        // matching `ir.Gc`'s convention.
+        //
+        // The full GC + typed-function-references instruction surface is lowered.
+        ast.StructNew(t) -> {
+          use fields <- result.try(gc_struct_fields(ctx, t))
+          emit_value_op_t(
+            list.length(fields),
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcStructNew(t), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.StructNewDefault(t) -> {
+          use fields <- result.try(gc_struct_fields(ctx, t))
+          let defaults =
+            list.map(fields, fn(fd) { default_storage_value(fd.storage) })
+          emit_value_op_t(
+            0,
+            gc_ref_ty(),
+            fn(_) { ir.Gc(ir.GcStructNew(t), defaults) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.StructGet(t, f) ->
+          lower_struct_get(t, f, option.None, tail, ctx, st)
+        ast.StructGetS(t, f) ->
+          lower_struct_get(t, f, option.Some(True), tail, ctx, st)
+        ast.StructGetU(t, f) ->
+          lower_struct_get(t, f, option.Some(False), tail, ctx, st)
+        ast.StructSet(_, f) ->
+          emit_effect(2, fn(a) { ir.Gc(ir.GcStructSet(f), a) }, tail, ctx, st)
+        ast.ArrayNew(t) ->
+          emit_value_op_t(
+            2,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNew(t), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayNewDefault(t) -> {
+          use fd <- result.try(gc_array_field(ctx, t))
+          let d = default_storage_value(fd.storage)
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNew(t), [d, ..a]) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.ArrayNewFixed(t, n) ->
+          emit_value_op_t(
+            n,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNewFixed(t), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayGet(t) -> lower_array_get(t, option.None, tail, ctx, st)
+        ast.ArrayGetS(t) -> lower_array_get(t, option.Some(True), tail, ctx, st)
+        ast.ArrayGetU(t) ->
+          lower_array_get(t, option.Some(False), tail, ctx, st)
+        ast.ArraySet(_) ->
+          emit_effect(3, fn(a) { ir.Gc(ir.GcArraySet, a) }, tail, ctx, st)
+        ast.ArrayLen ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcArrayLen, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayFill(_) ->
+          emit_effect(4, fn(a) { ir.Gc(ir.GcArrayFill, a) }, tail, ctx, st)
+        ast.ArrayCopy(_, _) ->
+          emit_effect(5, fn(a) { ir.Gc(ir.GcArrayCopy, a) }, tail, ctx, st)
+        // Segment-sourced array ops: the element byte width (data) drives the
+        // uniform little-endian decode; emit resolves the drop-gated segment
+        // payload. args are `[offset, count]` (new_*) / `[ref, dst, src, count]`.
+        ast.ArrayNewData(t, d) -> {
+          use fd <- result.try(gc_array_field(ctx, t))
+          let w = storage_byte_width(fd.storage)
+          emit_value_op_t(
+            2,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNewData(t, d, w), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.ArrayInitData(t, d) -> {
+          use fd <- result.try(gc_array_field(ctx, t))
+          let w = storage_byte_width(fd.storage)
+          emit_effect(
+            4,
+            fn(a) { ir.Gc(ir.GcArrayInitData(d, w), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.ArrayNewElem(t, e) ->
+          emit_value_op_t(
+            2,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcArrayNewElem(t, e), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ArrayInitElem(_, e) ->
+          emit_effect(
+            4,
+            fn(a) { ir.Gc(ir.GcArrayInitElem(e), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.RefI31 ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcRefI31, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.I31GetS ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcI31Get(True), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.I31GetU ->
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcI31Get(False), a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.RefTest(rt) -> {
+          let #(m, null_ok) = gc_matcher(rt, ctx)
+          emit_value_op_t(
+            1,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcRefTest(m, null_ok), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.RefCast(rt) -> {
+          let #(m, null_ok) = gc_matcher(rt, ctx)
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcRefCast(m, null_ok), a) },
+            tail,
+            ctx,
+            st,
+          )
+        }
+        ast.RefEq ->
+          emit_value_op_t(
+            2,
+            ir.TI32,
+            fn(a) { ir.Gc(ir.GcRefEq, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.RefAsNonNull ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcRefAsNonNull, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.AnyConvertExtern ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcAnyConvertExtern, a) },
+            tail,
+            ctx,
+            st,
+          )
+        ast.ExternConvertAny ->
+          emit_value_op_t(
+            1,
+            gc_ref_ty(),
+            fn(a) { ir.Gc(ir.GcExternConvertAny, a) },
+            tail,
+            ctx,
+            st,
+          )
+        // `ref.null ht` for a GC heap type: the reftype-agnostic null sentinel
+        // (`{ref_null}`) — the same one funcref/externref null uses, so ref.eq/
+        // test/cast treat all nulls uniformly.
+        ast.RefNullHt(_) -> go(tail, ctx, push(st, ir.ConstNull(ir.FuncRef)))
+        // Branch casts — a conditional `If` around the ref's nullness / cast test,
+        // keeping or dropping the ref on each side per the spec stack types.
+        ast.BrOnNull(l) -> lower_br_on_null(l, True, tail, ctx, st)
+        ast.BrOnNonNull(l) -> lower_br_on_null(l, False, tail, ctx, st)
+        ast.BrOnCast(l, _rt1, rt2) ->
+          lower_br_on_cast(l, rt2, False, tail, ctx, st)
+        ast.BrOnCastFail(l, _rt1, rt2) ->
+          lower_br_on_cast(l, rt2, True, tail, ctx, st)
+        ast.CallRef(type_idx) -> lower_call_ref(type_idx, tail, ctx, st)
+        ast.ReturnCallRef(type_idx) ->
+          lower_return_call_ref(type_idx, tail, ctx, st)
+
         // numeric / comparison / conversion / float leaves --------------------------
         _ -> lower_numeric(instr, tail, ctx, st)
       }
@@ -1232,6 +1463,331 @@ fn z() -> ir.Value {
   ir.ConstI32(0)
 }
 
+// ─────────────────────────── WasmGC lowering helpers ───────────────────────────
+
+/// The IR type a GC reference lowers to — a boxed BEAM term (an arena handle or null).
+fn gc_ref_ty() -> ir.ValType {
+  ir.TTerm
+}
+
+/// The struct fields at type index `t` (`UnknownTypeIndex` if absent / not a struct).
+fn gc_struct_fields(
+  ctx: LCtx,
+  t: Int,
+) -> Result(List(ast.FieldType), LowerError) {
+  case ast.def_type_at(ctx.types, t) {
+    Ok(ast.DefType(comp: ast.CtStruct(fs), ..)) -> Ok(fs)
+    _ -> Error(UnknownTypeIndex(t))
+  }
+}
+
+/// The array element field at type index `t`.
+fn gc_array_field(ctx: LCtx, t: Int) -> Result(ast.FieldType, LowerError) {
+  case ast.def_type_at(ctx.types, t) {
+    Ok(ast.DefType(comp: ast.CtArray(fd), ..)) -> Ok(fd)
+    _ -> Error(UnknownTypeIndex(t))
+  }
+}
+
+/// The default operand for a defaultable storage type (numeric zero / null ref /
+/// packed zero) — used to synthesize `struct.new_default` / `array.new_default`.
+fn default_storage_value(s: ast.StorageType) -> ir.Value {
+  case s {
+    ast.StI8 | ast.StI16 -> ir.ConstI32(0)
+    ast.StVal(vt) -> default_ir_value(vt)
+  }
+}
+
+fn default_ir_value(vt: ast.ValType) -> ir.Value {
+  case vt {
+    ast.I32 -> ir.ConstI32(0)
+    ast.I64 -> ir.ConstI64(0)
+    ast.F32 -> ir.ConstF32(0)
+    ast.F64 -> ir.ConstF64(0)
+    // v128/ref: the null sentinel is a safe zero placeholder (validate already
+    // confirmed the field is defaultable — a nullable ref or a numeric/vector).
+    _ -> ir.ConstNull(ir.FuncRef)
+  }
+}
+
+/// Lower `struct.get[_s|_u]`: resolve the field's storage to pick the read mode
+/// (plain vs packed sign/zero-extend) and the IR result type.
+fn lower_struct_get(
+  t: Int,
+  f: Int,
+  signed: option.Option(Bool),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use fields <- result.try(gc_struct_fields(ctx, t))
+  use field <- result.try(nth_err(fields, f, UnknownTypeIndex(t)))
+  let #(read, rty) = gc_field_read(field.storage, signed)
+  emit_value_op_t(
+    1,
+    rty,
+    fn(a) { ir.Gc(ir.GcStructGet(f, read), a) },
+    tail,
+    ctx,
+    st,
+  )
+}
+
+/// Lower `array.get[_s|_u]`: like `struct.get` but two operands (`[ref, index]`).
+fn lower_array_get(
+  t: Int,
+  signed: option.Option(Bool),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use field <- result.try(gc_array_field(ctx, t))
+  let #(read, rty) = gc_field_read(field.storage, signed)
+  emit_value_op_t(
+    2,
+    rty,
+    fn(a) { ir.Gc(ir.GcArrayGet(read), a) },
+    tail,
+    ctx,
+    st,
+  )
+}
+
+/// The read mode + IR result type of a field/element access: a plain (non-packed)
+/// field reads as its value type; a packed `i8`/`i16` sign/zero-extends to `i32`.
+fn gc_field_read(
+  storage: ast.StorageType,
+  signed: option.Option(Bool),
+) -> #(ir.FieldRead, ir.ValType) {
+  case storage {
+    ast.StVal(vt) -> #(ir.ReadPlain, to_ir_vt(vt))
+    ast.StI8 -> #(ir.ReadPacked(8, sign_of(signed)), ir.TI32)
+    ast.StI16 -> #(ir.ReadPacked(16, sign_of(signed)), ir.TI32)
+  }
+}
+
+/// The byte width of a storage type — the stride `array.new_data`/`init_data`
+/// decode each element at (numeric elements are their raw little-endian bit
+/// pattern, so width is all the runtime needs). Reference elements never reach
+/// the data ops (validate rejects them); 4 is a harmless default.
+fn storage_byte_width(s: ast.StorageType) -> Int {
+  case s {
+    ast.StI8 -> 1
+    ast.StI16 -> 2
+    ast.StVal(ast.I64) | ast.StVal(ast.F64) -> 8
+    ast.StVal(ast.V128) -> 16
+    ast.StVal(_) -> 4
+  }
+}
+
+fn sign_of(signed: option.Option(Bool)) -> Bool {
+  case signed {
+    option.Some(b) -> b
+    option.None -> False
+  }
+}
+
+/// The RTTI matcher + null-acceptance flag for a `ref.test`/`ref.cast` target: a
+/// concrete target expands to the closed set of subtype indices; abstract targets
+/// map to an object-kind atom. Null is accepted iff the target ref type is nullable.
+fn gc_matcher(rt: ast.RefType, ctx: LCtx) -> #(ir.GcMatcher, Bool) {
+  let m = case rt.heap {
+    ast.HConcrete(t) -> ir.MatchConcrete(subtype_set(t, ctx.types))
+    ast.HStruct -> ir.MatchAbstract(ir.KStruct)
+    ast.HArray -> ir.MatchAbstract(ir.KArray)
+    ast.HI31 -> ir.MatchAbstract(ir.KI31)
+    ast.HEq -> ir.MatchAbstract(ir.KEq)
+    ast.HAny -> ir.MatchAbstract(ir.KAny)
+    ast.HNone -> ir.MatchAbstract(ir.KNone)
+    ast.HFunc -> ir.MatchAbstract(ir.KFunc)
+    ast.HNoFunc -> ir.MatchAbstract(ir.KNoFunc)
+    ast.HExtern -> ir.MatchAbstract(ir.KExtern)
+    ast.HNoExtern -> ir.MatchAbstract(ir.KNoExtern)
+    ast.HExn -> ir.MatchAbstract(ir.KExn)
+    ast.HNoExn -> ir.MatchAbstract(ir.KNoExn)
+  }
+  #(m, rt.nullable)
+}
+
+/// The closed set of concrete type indices `<:` `t` — the runtime match set for a
+/// concrete `ref.test`/`ref.cast` (an object whose stored type index is in this set
+/// matches). Bounded walk (chain ≤ #types) so a malformed cycle can't loop.
+fn subtype_set(t: Int, types: List(ast.DefType)) -> List(Int) {
+  let n = list.length(types)
+  types
+  |> list.index_map(fn(_dt, i) { i })
+  |> list.filter(fn(i) { gc_reaches(i, t, types, n) })
+}
+
+/// Lower `call_ref $t`: pop the funcref (top of stack) then the params, and bind
+/// the callee's results. Mirrors `lower_call_indirect`, but the target is the
+/// funcref value itself (no table dispatch) — `ir.Gc(GcCallRef, [funcref, ...params])`.
+fn lower_call_ref(
+  type_idx: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
+  let result_ir_types = list.map(sig.results, to_ir_vt)
+  let rc = list.length(sig.results)
+  use #(funcref, stack1) <- result.try(pop1(st.stack))
+  let pcount = list.length(sig.params)
+  let args = take_push_order(stack1, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let rest_stack = list.drop(stack1, pcount)
+      let #(names, c2) = fresh_n(st.counter, rc)
+      let result_vars = list.map(names, ir.Var)
+      let st2 =
+        record_types(
+          LState(
+            ..st,
+            stack: list.append(list.reverse(result_vars), rest_stack),
+            counter: c2,
+          ),
+          list.zip(names, result_ir_types),
+        )
+      use inner <- result.try(go(tail, ctx, st2))
+      Ok(wrap_let(names, ir.Gc(ir.GcCallRef(rc), [funcref, ..args]), inner))
+    }
+  }
+}
+
+/// Lower `return_call_ref $t`: a tail call through a funcref — pop the funcref
+/// (top) then the params, emit the `ir.ReturnCallRef` bottom node, and consume the
+/// (dead) tail. Mirrors `lower_return_call_indirect` without a table dispatch.
+fn lower_return_call_ref(
+  type_idx: Int,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
+  use #(funcref, stack1) <- result.try(pop1(st.stack))
+  let pcount = list.length(sig.params)
+  let args = take_push_order(stack1, pcount)
+  case list.length(args) == pcount {
+    False -> Error(StackUnderflow)
+    True -> {
+      let node = ir.ReturnCallRef(funcref, args)
+      use #(marker, rest) <- result.try(consume_dead(tail, 0))
+      Ok(end_or_else(marker, node, rest, st.counter))
+    }
+  }
+}
+
+/// Lower `br_on_null`/`br_on_non_null l`: pop the ref, branch on `ref.is_null`.
+/// `br_on_null` (on_null = True) branches on the null case carrying the stack sans
+/// the ref, and falls through keeping the (now non-null) ref; `br_on_non_null`
+/// swaps which side branches and which keeps the ref.
+fn lower_br_on_null(
+  l: Int,
+  on_null: Bool,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(ref, stack1) <- result.try(pop1(st.stack))
+  let #(cond_name, c2) = fresh(st.counter)
+  use cur <- result.try(current_frame(st))
+  let st_without = LState(..st, stack: stack1, counter: c2)
+  let st_with = LState(..st, stack: [ref, ..stack1], counter: c2)
+  case on_null {
+    True -> {
+      use transfer <- result.try(build_transfer(l, st_without))
+      use inner <- result.try(go(tail, ctx, st_with))
+      Ok(finish_br_cond(cond_name, ref, cur, transfer, inner, True))
+    }
+    False -> {
+      use transfer <- result.try(build_transfer(l, st_with))
+      use inner <- result.try(go(tail, ctx, st_without))
+      Ok(finish_br_cond(cond_name, ref, cur, transfer, inner, False))
+    }
+  }
+}
+
+/// Lower `br_on_cast`/`br_on_cast_fail l _ rt2`: pop the ref, branch on
+/// `ref.test rt2`. Both sides keep the ref on the stack (the spec fall-through /
+/// branch both carry a ref); `br_on_cast` branches when the test succeeds,
+/// `br_on_cast_fail` (is_fail = True) when it fails.
+fn lower_br_on_cast(
+  l: Int,
+  rt2: ast.RefType,
+  is_fail: Bool,
+  tail: List(ast.Instr),
+  ctx: LCtx,
+  st: LState,
+) -> Result(GoResult, LowerError) {
+  use #(ref, stack1) <- result.try(pop1(st.stack))
+  let #(cond_name, c2) = fresh(st.counter)
+  use cur <- result.try(current_frame(st))
+  let #(matcher, null_ok) = gc_matcher(rt2, ctx)
+  let st_with = LState(..st, stack: [ref, ..stack1], counter: c2)
+  use transfer <- result.try(build_transfer(l, st_with))
+  use inner <- result.try(go(tail, ctx, st_with))
+  let mk = fn(e) {
+    case is_fail {
+      False -> ir.If(ir.Var(cond_name), cur.result_types, transfer, e)
+      True -> ir.If(ir.Var(cond_name), cur.result_types, e, transfer)
+    }
+  }
+  let gr = case inner {
+    GEnd(e, rest, c) -> GEnd(mk(e), rest, c)
+    GElse(e, rest, c) -> GElse(mk(e), rest, c)
+  }
+  Ok(wrap_let([cond_name], ir.Gc(ir.GcRefTest(matcher, null_ok), [ref]), gr))
+}
+
+/// Assemble a branch-cast `If`: bind `cond = ref.is_null(ref)`, then choose which
+/// arm branches. `branch_when_null` puts the transfer in the then-arm (br_on_null)
+/// or the else-arm (br_on_non_null).
+fn finish_br_cond(
+  cond_name: String,
+  ref: ir.Value,
+  cur: LFrame,
+  transfer: ir.Expr,
+  inner: GoResult,
+  branch_when_null: Bool,
+) -> GoResult {
+  let mk = fn(e) {
+    case branch_when_null {
+      True -> ir.If(ir.Var(cond_name), cur.result_types, transfer, e)
+      False -> ir.If(ir.Var(cond_name), cur.result_types, e, transfer)
+    }
+  }
+  let gr = case inner {
+    GEnd(e, rest, c) -> GEnd(mk(e), rest, c)
+    GElse(e, rest, c) -> GElse(mk(e), rest, c)
+  }
+  wrap_let([cond_name], ir.RefIsNull(ref), gr)
+}
+
+fn gc_reaches(i: Int, t: Int, types: List(ast.DefType), fuel: Int) -> Bool {
+  case i == t {
+    True -> True
+    False ->
+      case fuel <= 0 {
+        True -> False
+        False ->
+          case ast.def_type_at(types, i) {
+            Ok(ast.DefType(supertype: option.Some(s), ..)) ->
+              gc_reaches(s, t, types, fuel - 1)
+            _ -> False
+          }
+      }
+  }
+}
+
 /// A defensive null funcref operand, the reference-typed counterpart of `z/0` (used where
 /// a bulk/table op's unreachable arm needs a reference value).
 fn zref() -> ir.Value {
@@ -1253,7 +1809,11 @@ fn lower_call_indirect(
   ctx: LCtx,
   st: LState,
 ) -> Result(GoResult, LowerError) {
-  use sig <- result.try(nth_err(ctx.types, type_idx, UnknownTypeIndex(type_idx)))
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
   let result_ir_types = list.map(sig.results, to_ir_vt)
   let ir_ty = ir.FuncType(list.map(sig.params, to_ir_vt), result_ir_types)
   use #(index, stack1) <- result.try(pop1(st.stack))
@@ -1493,7 +2053,11 @@ fn lower_return_call_indirect(
   ctx: LCtx,
   st: LState,
 ) -> Result(GoResult, LowerError) {
-  use sig <- result.try(nth_err(ctx.types, type_idx, UnknownTypeIndex(type_idx)))
+  use sig <- result.try(func_type_err(
+    ctx.types,
+    type_idx,
+    UnknownTypeIndex(type_idx),
+  ))
   let ir_ty =
     ir.FuncType(list.map(sig.params, to_ir_vt), list.map(sig.results, to_ir_vt))
   use #(index, stack1) <- result.try(pop1(st.stack))
@@ -2869,7 +3433,7 @@ fn blocktype_io(
     ast.BlockEmpty -> Ok(#([], []))
     ast.BlockVal(t) -> Ok(#([], [to_ir_vt(t)]))
     ast.BlockTypeIdx(i) ->
-      case nth_err(ctx.types, i, UnknownTypeIndex(i)) {
+      case func_type_err(ctx.types, i, UnknownTypeIndex(i)) {
         Ok(ast.FuncType(params, results)) ->
           Ok(#(list.map(params, to_ir_vt), list.map(results, to_ir_vt)))
         Error(e) -> Error(e)
@@ -2894,6 +3458,8 @@ fn to_ir_vt(t: ast.ValType) -> ir.ValType {
     ast.FuncRef -> ir.TFuncRef
     ast.ExternRef -> ir.TExternRef
     ast.ExnRef -> ir.TExnRef
+    // A GC-proposal reference is a boxed BEAM term (an arena handle, or null).
+    ast.Ref(_) -> ir.TTerm
   }
 }
 
@@ -2929,7 +3495,10 @@ fn zero_value(t: ir.ValType) -> ir.Value {
     ir.TI64 -> ir.ConstI64(0)
     ir.TF32 -> ir.ConstF32(0)
     ir.TF64 -> ir.ConstF64(0)
-    ir.TTerm -> ir.ConstI32(0)
+    // A `TTerm` WASM local is a GC reference (only `ast.Ref` lowers to `TTerm`);
+    // its zero value is the null sentinel `{ref_null}` (shared with funcref/
+    // externref null), never an integer.
+    ir.TTerm -> ir.ConstNull(ir.FuncRef)
     // A reference-typed slot's zero value is the null reference (H1). Never arises from the
     // Phase-1..4 WASM surface (only numeric locals); P5-05 exercises reference locals.
     ir.TFuncRef -> ir.ConstNull(ir.FuncRef)
@@ -2961,6 +3530,17 @@ fn two_pow(n: Int) -> Int {
 }
 
 /// Total list indexing returning `Error(err)` (the caller's chosen `LowerError`).
+fn func_type_err(
+  types: List(ast.DefType),
+  i: Int,
+  err: LowerError,
+) -> Result(ast.FuncType, LowerError) {
+  case ast.func_type_at(types, i) {
+    Ok(ft) -> Ok(ft)
+    Error(_) -> Error(err)
+  }
+}
+
 fn nth_err(xs: List(a), i: Int, err: LowerError) -> Result(a, LowerError) {
   case xs, i {
     [x, ..], 0 -> Ok(x)
@@ -3150,7 +3730,7 @@ fn lower_tags(
   imported_tag_count: Int,
 ) -> Result(List(ir.TagDecl), LowerError) {
   list.index_map(module.tags, fn(t, i) {
-    use sig <- result.try(nth_err(
+    use sig <- result.try(func_type_err(
       module.types,
       t.type_idx,
       UnknownTypeIndex(t.type_idx),
@@ -3259,7 +3839,7 @@ fn lower_imports(
   list.try_map(module.imports, fn(imp) {
     case imp.desc {
       ast.ImportFunc(tyidx) -> {
-        use sig <- result.try(nth_err(
+        use sig <- result.try(func_type_err(
           module.types,
           tyidx,
           UnknownTypeIndex(tyidx),
@@ -3289,7 +3869,7 @@ fn lower_imports(
       // signature (the exception payload types), resolved from `types[tyidx]` and mapped to
       // IR types. Imported tags occupy the LOW tagidx range (before defined tags).
       ast.ImportTag(tyidx) -> {
-        use sig <- result.try(nth_err(
+        use sig <- result.try(func_type_err(
           module.types,
           tyidx,
           UnknownTypeIndex(tyidx),

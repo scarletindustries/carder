@@ -57,14 +57,14 @@ import gleam/list
 import twocore/ir.{
   type ConvOp, type Expr, type Function, type NumOp, Block, Break, CallClosure,
   CallDirect, CallHost, CallImport, CallIndirect, Charge, Continue, Convert,
-  DataDrop, ElemDrop, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If, Let,
-  Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad,
+  DataDrop, ElemDrop, Gc, GlobalGet, GlobalSet, IDivS, IDivU, IRemS, IRemU, If,
+  Let, Loop, MakeClosure, MapOp, MemCopy, MemFill, MemGrow, MemInit, MemLoad,
   MemLoadUnchecked, MemSize, MemStore, MemStoreUnchecked, Num, NumTerm, RefFunc,
   RefFuncImport, RefIsNull, Return, ReturnCall, ReturnCallImport,
-  ReturnCallIndirect, Simd, SimdLoad, SimdLoadLane, SimdShuffle, SimdStore,
-  SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow, TableInit,
-  TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef, Trap, TruncS,
-  TruncU, Try, Values,
+  ReturnCallIndirect, ReturnCallRef, Simd, SimdLoad, SimdLoadLane, SimdShuffle,
+  SimdStore, SimdStoreLane, Switch, TableCopy, TableFill, TableGet, TableGrow,
+  TableInit, TableSet, TableSize, TermOp, TermTag, TermTest, Throw, ThrowRef,
+  Trap, TruncS, TruncU, Try, Values,
 }
 
 /// Whether an expression is observably pure or side-effecting (F3).
@@ -160,6 +160,7 @@ pub fn is_effectful_node(e: Expr) -> Bool {
       ReturnCall(_, _)
     | ReturnCallIndirect(_, _, _, _)
     | ReturnCallImport(_, _, _)
+    | ReturnCallRef(_, _)
     | // ── Phase-7 exception handling (J5/T1): ALL THREE EH nodes are barriers. `Throw`/`ThrowRef`
       // are non-local control transfers that RAISE (like `Trap`/`Return`) — never reorder, hoist,
       // duplicate, or eliminate (they add/remove an exception, an F2 observable). `Try` establishes
@@ -181,7 +182,12 @@ pub fn is_effectful_node(e: Expr) -> Bool {
       // or hoisting it onto a path where it did not originally evaluate, adds/removes a raise (an F2
       // observable). Hence a barrier: no CSE, no DCE, no reorder. (`TermTest`/`TermTag` are PURE — the
       // `is_*` BIFs are total, never trap — so they classify `Pure` in the non-barrier arm below.) ──
-      NumTerm(_, _, _) -> True
+      NumTerm(_, _, _)
+    | // ── WasmGC (this proposal): every `Gc` op is a barrier. Each reads and/or
+      // writes the per-process GC arena (an alias-heavy mutable heap) through an
+      // `rt_gc` seam call, and several trap (`ref.cast` cast-failure, array OOB,
+      // null deref) — so, like `MemStore`/the table ops, never CSE/DCE/reorder. ──
+      Gc(_, _) -> True
     Num(op, _) -> trapping_numop(op)
     Convert(op, _) -> trapping_convop(op)
     // ── Phase-6 PURE lane-wise SIMD (S7): `Simd`/`SimdShuffle` are TOTAL and DETERMINISTIC —

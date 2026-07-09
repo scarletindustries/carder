@@ -418,6 +418,7 @@ fn has_tail_call(e: ir.Expr) -> Bool {
   case e {
     ir.ReturnCall(_, _)
     | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallRef(_, _)
     | ir.ReturnCallImport(_, _, _) -> True
     ir.Let(_, rhs, body) -> has_tail_call(rhs) || has_tail_call(body)
     ir.Block(_, _, body) -> has_tail_call(body)
@@ -636,6 +637,7 @@ fn apply_rename_subst(
     // ── Phase-6 SIMD nodes + `CallImport`: rewrite their `Value` operands (their op tag / lane
     // immediates / mem index / import slot are static). ──
     ir.Simd(op, sargs) -> ir.Simd(op, rs_values(sargs, rename, subst))
+    ir.Gc(op, gargs) -> ir.Gc(op, rs_values(gargs, rename, subst))
     ir.SimdShuffle(lanes, a, b) ->
       ir.SimdShuffle(
         lanes,
@@ -681,6 +683,11 @@ fn apply_rename_subst(
         table,
         rs_value(index, rename, subst),
         ty,
+        rs_values(cargs, rename, subst),
+      )
+    ir.ReturnCallRef(funcref, cargs) ->
+      ir.ReturnCallRef(
+        rs_value(funcref, rename, subst),
         rs_values(cargs, rename, subst),
       )
     ir.ReturnCallImport(slot, ty, cargs) ->
@@ -814,6 +821,7 @@ fn has_any_call(e: ir.Expr) -> Bool {
     | // Phase-13 (Q13-05): the tail-call nodes are calls too (a body containing one is not a leaf).
       ir.ReturnCall(_, _)
     | ir.ReturnCallIndirect(_, _, _, _)
+    | ir.ReturnCallRef(_, _)
     | ir.ReturnCallImport(_, _, _) -> True
     ir.Let(_, rhs, body) -> has_any_call(rhs) || has_any_call(body)
     ir.Block(_, _, body) -> has_any_call(body)
