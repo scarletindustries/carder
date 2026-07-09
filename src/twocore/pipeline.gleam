@@ -84,6 +84,7 @@ import twocore/runtime/instance.{type Binding}
 import twocore/runtime/link
 import twocore/runtime/porffor_abi.{type PorfValue}
 import twocore/runtime/profiles
+import twocore/runtime/rt_teavm
 
 // ─────────────────────────────── composed error type (D4) ───────────────────────────────
 
@@ -358,12 +359,22 @@ fn host_func_vector(
   list.filter_map(m.imports, fn(imp) {
     case imp {
       ir.ImportFn(capability:, name:, ty:) ->
-        Ok(
-          link.provided_func(ty, fn(args) {
-            host(capability, name, list.map(args, dyn_to_int))
-            |> list.map(to_dynamic)
-          }),
-        )
+        case rt_teavm.is_teavm_capability(capability) {
+          // A TeaVM WASM GC runtime import (teavmJso/wasm:js-string/teavmMemory/teavmDate/teavm) is
+          // REFERENCE-typed (externref/funcref/GC refs), which the numeric `host` ABI cannot carry.
+          // Resolve it to `rt_teavm`'s TERM-native handler, exactly as `link.resolve_func_provided`
+          // does — so a Java/TeaVM guest instantiates while the embedder's `host` still services the
+          // (i32-only) `dance.*`/`env`/… imports numerically.
+          True ->
+            Ok(link.provided_func(ty, rt_teavm.dispatch(capability, name)))
+          False ->
+            Ok(
+              link.provided_func(ty, fn(args) {
+                host(capability, name, list.map(args, dyn_to_int))
+                |> list.map(to_dynamic)
+              }),
+            )
+        }
       _ -> Error(Nil)
     }
   })
