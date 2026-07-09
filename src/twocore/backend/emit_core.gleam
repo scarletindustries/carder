@@ -5649,7 +5649,7 @@ fn emit_instantiate_full(
   // Gensym'd, so they never collide with each other or the seeds.
   let #(imports_param, state1) = fresh_var(state0)
   let #(imp_vars, state2) = fresh_n_vars(state1, n_imports)
-  use #(decl_term, state3) <- result.try(full_decl_term(
+  use #(decl_term, deferred_global_sets, state3) <- result.try(full_decl_term(
     module,
     ctx,
     imp_vars,
@@ -5659,7 +5659,16 @@ fn emit_instantiate_full(
   // pull their `Imp<p>` vars for the `seed_func_imports`/`set_func_imports` seed.
   let func_import_vars = list.drop(imp_vars, count_state_imports(module))
   use body <- result.try(case is_threaded(ctx) {
-    False -> full_cell_body(module, ctx, decl_term, func_import_vars, state3)
+    False ->
+      full_cell_body(
+        module,
+        ctx,
+        decl_term,
+        deferred_global_sets,
+        func_import_vars,
+        state3,
+      )
+    // `deferred_global_sets` is empty for the Threaded posture (defer is off there).
     True -> full_threaded_body(module, ctx, decl_term, func_import_vars, state3)
   })
   Ok(wrap_instantiate(n_imports, imports_param, imp_vars, body))
@@ -5695,6 +5704,7 @@ fn full_cell_body(
   module: Module,
   ctx: Ctx,
   decl_term: CExpr,
+  deferred_global_sets: List(CExpr),
   func_import_vars: List(String),
   state: EmitState,
 ) -> Result(CExpr, EmitError) {
@@ -5717,6 +5727,9 @@ fn full_cell_body(
       seed_policy_effect(ctx),
       [seed_effect],
       seed_func_imports_effect(func_import_vars, ctx),
+      // Globals whose init reads another global, set in declaration order now that the cell is
+      // seeded — BEFORE any element/data segment or `start`, which may read them.
+      deferred_global_sets,
       elem_fx,
       data_fx,
       start_fx,
@@ -5835,23 +5848,30 @@ fn full_decl_term(
   ctx: Ctx,
   imp_vars: List(String),
   state: EmitState,
-) -> Result(#(CExpr, EmitState), EmitError) {
+) -> Result(#(CExpr, List(CExpr), EmitState), EmitError) {
   use #(imp_mems, imp_tables, imp_nums, imp_refs) <- result.try(imported_slots(
     module,
     imp_vars,
   ))
   let def_mems = list.map(module.memories, fn(m) { mem_fresh_term(m, ctx) })
   let def_tables = list.map(module.tables, fn(t) { table_new_term(t, ctx) })
-  use #(def_nums, def_refs, state2) <- result.try(defined_globals(
+  // Only the Cell posture defers global-reading inits to post-seed sets; the Threaded posture builds
+  // its state record functionally (`fresh_full`) and is unchanged here.
+  use #(def_nums, def_refs, deferred, state2) <- result.try(defined_globals(
     module.globals,
     ctx,
     state,
+    !is_threaded(ctx),
   ))
   let mems = core_list(list.append(imp_mems, def_mems))
   let globals = core_list(list.append(imp_nums, def_nums))
   let tables = core_list(list.append(imp_tables, def_tables))
   let ref_globals = core_list(list.append(imp_refs, def_refs))
-  Ok(#(CTuple([CAtom("full_decl"), mems, globals, tables, ref_globals]), state2))
+  Ok(#(
+    CTuple([CAtom("full_decl"), mems, globals, tables, ref_globals]),
+    deferred,
+    state2,
+  ))
 }
 
 /// Walk `module.imports` and build the IMPORTED slot vectors for the `FullDecl` — each imported
@@ -5978,26 +5998,70 @@ fn table_new_term(t: ir.TableDecl, ctx: Ctx) -> CExpr {
   ])
 }
 
+/// Does a constant-init expression READ another global? In a constant expression the only global
+/// read is a `GlobalGet`, appearing either as the whole init or as the bound expr of a `Let` (the
+/// shape a nested GC allocation with a `global.get` operand lowers to). Such a global cannot be
+/// evaluated while BUILDING the seed decl (the instance cell is not installed yet) — it must be set
+/// after `seed_full`, once its (preceding) referents are in the cell.
+fn init_reads_global(expr: ir.Expr) -> Bool {
+  case expr {
+    ir.GlobalGet(_) -> True
+    ir.Let(_, rhs, body) -> init_reads_global(rhs) || init_reads_global(body)
+    _ -> False
+  }
+}
+
 /// Split the DEFINED globals into the numeric `{<<name>>, Bits}` pairs (const-folded raw bits,
 /// D5) and the reference `{<<name>>, Ref}` pairs (R8), threading `state` for funcref-closure
-/// gensyms. `Error(NonConstInit)` on a non-constant numeric init or an inadmissible reference
-/// init. Returns `#(numeric_pairs, reference_pairs, state)`.
+/// gensyms. When `defer` is set (the Cell posture — the only one that seeds via a self-installed
+/// cell), a boxed global whose init READS another global is instead seeded with a null placeholder
+/// and its real init returned as a ready-to-chain `ref_global_set` effect, to run in declaration
+/// order AFTER `seed_full` (spec constant expressions read only PRECEDING immutable globals, so the
+/// declaration-order sets always see their referents already installed). `Error(NonConstInit)` on a
+/// non-constant init. Returns `#(numeric_pairs, reference_pairs, deferred_set_effects, state)`.
 fn defined_globals(
   globals: List(ir.GlobalDecl),
   ctx: Ctx,
   state: EmitState,
-) -> Result(#(List(CExpr), List(CExpr), EmitState), EmitError) {
-  list.try_fold(globals, #([], [], state), fn(acc, g) {
-    let #(nums, refs, st) = acc
+  defer: Bool,
+) -> Result(#(List(CExpr), List(CExpr), List(CExpr), EmitState), EmitError) {
+  list.try_fold(globals, #([], [], [], state), fn(acc, g) {
+    let #(nums, refs, deferred, st) = acc
     let name = core_binary_string(g.name)
     case is_boxed_global_type(g.ty) {
       True -> {
         use #(refval, st2) <- result.try(render_ref_global_init(g.init, ctx, st))
-        Ok(#(nums, list.append(refs, [CTuple([name, refval])]), st2))
+        case defer && init_reads_global(g.init) {
+          True -> {
+            let set_effect =
+              seam_call(ctx.binding.state_module, "ref_global_set", [
+                name,
+                refval,
+              ])
+            Ok(#(
+              nums,
+              list.append(refs, [CTuple([name, null_ref_term()])]),
+              list.append(deferred, [set_effect]),
+              st2,
+            ))
+          }
+          False ->
+            Ok(#(
+              nums,
+              list.append(refs, [CTuple([name, refval])]),
+              deferred,
+              st2,
+            ))
+        }
       }
       False -> {
         use bits <- result.try(const_fold(g.init))
-        Ok(#(list.append(nums, [CTuple([name, CInt(bits)])]), refs, st))
+        Ok(#(
+          list.append(nums, [CTuple([name, CInt(bits)])]),
+          refs,
+          deferred,
+          st,
+        ))
       }
     }
   })

@@ -408,10 +408,11 @@ pub fn reject_extended_const_init_test() {
   |> should.equal(Error(validate.NonConstantExpr))
 }
 
-/// A `global.get` init expr has no valid referent in Phase 2 (only immutable imported
-/// globals qualify, and there are none) — rejected (`global.wast` `$z5`;
-/// extended-const proposal).
-pub fn reject_global_get_init_test() {
+/// `global.get x` in a global initializer IS a constant expression when `x` is a PRECEDING
+/// immutable global — the function-references/GC extension of constant expressions (MVP allowed
+/// only imported immutable globals). Verified valid by `wasm-tools validate`
+/// (`(module (global i32 (i32.const 1)) (global i32 (global.get 0)))`).
+pub fn accept_global_get_preceding_immutable_global_test() {
   module(
     types: [],
     tables: [],
@@ -419,6 +420,45 @@ pub fn reject_global_get_init_test() {
     globals: [
       ast.Global(ty: ast.I32, mutable: False, init: [ast.I32Const(1)]),
       ast.Global(ty: ast.I32, mutable: False, init: [ast.GlobalGet(0)]),
+    ],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.be_ok()
+}
+
+/// The bounds of that relaxation: a `global.get` of a MUTABLE global is NOT constant
+/// (`wasm-tools`: "constant expression required: global.get of mutable global"), and a FORWARD
+/// reference to a not-yet-initialized global is out of scope. Both are `NonConstantExpr`.
+pub fn reject_nonconstant_global_get_init_test() {
+  // A mutable referent is not a constant.
+  module(
+    types: [],
+    tables: [],
+    memories: [],
+    globals: [
+      ast.Global(ty: ast.I32, mutable: True, init: [ast.I32Const(1)]),
+      ast.Global(ty: ast.I32, mutable: False, init: [ast.GlobalGet(0)]),
+    ],
+    funcs: [],
+    start: None,
+    elements: [],
+    data: [],
+  )
+  |> validate.validate()
+  |> should.equal(Error(validate.NonConstantExpr))
+
+  // A forward reference (global 0 reads the later global 1) is not yet in scope.
+  module(
+    types: [],
+    tables: [],
+    memories: [],
+    globals: [
+      ast.Global(ty: ast.I32, mutable: False, init: [ast.GlobalGet(1)]),
+      ast.Global(ty: ast.I32, mutable: False, init: [ast.I32Const(1)]),
     ],
     funcs: [],
     start: None,
