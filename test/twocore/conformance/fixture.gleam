@@ -60,6 +60,29 @@ pub type V128Lane {
   LaneF64
 }
 
+/// Which WebAssembly GC heap-type a reference expectation / classification is tagged with
+/// (Phase-8 GC). These come from the wasm-tools `json-from-wast` `type` field for the GC
+/// abstract-heap-type `assert_return` patterns (`structref`/`arrayref`/`i31ref`/`eqref`/`anyref`)
+/// — TYPE-only assertions (no value): "the result is a non-null ref of this kind". The oracle
+/// judges them against the WASM GC subtype lattice (`any ⊇ eq ⊇ {struct, array, i31}`).
+///
+/// - `StructRefK` / `ArrayRefK` / `I31RefK`: a concrete kind.
+/// - `EqRefK`: any eq ref (i31/struct/array).
+/// - `AnyRefK`: any (internal) ref.
+/// - `GcHeapK`: the ACTUAL-side coarse kind for a returned `{gc, Id}` handle whose struct-vs-array
+///   discriminator is not observable in the harness process (the arena is instance-process-local,
+///   R-GC1) — matched leniently against `structref`/`arrayref` (documented, like the funcref
+///   identity leniency in `oracle`), precisely against `eqref`/`anyref`. A future engine handle
+///   retag (`{gc, struct|array, Id}`) refines `GcHeapK` into `StructRefK`/`ArrayRefK`.
+pub type GcRefKind {
+  StructRefK
+  ArrayRefK
+  I31RefK
+  EqRefK
+  AnyRefK
+  GcHeapK
+}
+
 /// A single WebAssembly value as it appears in a fixture. Integers and concrete floats
 /// hold the **raw UNSIGNED bit pattern** (the decimal-string in the JSON, parsed to an
 /// `Int`). A NaN expectation carries only a `NanKind`, never concrete bits. Reference values
@@ -93,6 +116,12 @@ pub type SpecValue {
   /// `v128_bytes_le`; a returned v128 is decoded back into this shape at the EXPECTED's lane type
   /// for lane-wise comparison (see `oracle.matches`).
   V128Val(lane: V128Lane, lanes: List(SpecValue))
+  /// A NON-NULL WebAssembly GC reference of an abstract heap kind (Phase-8 GC). As an EXPECTED it
+  /// is a TYPE-only assertion (`(ref.struct)`/`(ref.array)`/`(ref.i31)`/`(ref.eq)`/`(ref.any)` in
+  /// the spec — no concrete value); as an ACTUAL it is the harness's classification of a returned
+  /// GC term (`{i31, _}` → `I31RefK`, `{gc, Id}` → `GcHeapK`, refined to `StructRefK`/`ArrayRefK`
+  /// if the handle self-describes). A GC null is `NullRef` (the shared sentinel), never this.
+  GcRef(kind: GcRefKind)
 }
 
 /// Which on-disk form a rejected-module command references.
@@ -400,9 +429,35 @@ fn parse_spec_value(ty: String, value: String) -> SpecValue {
         "" -> FuncRefVal(None)
         _ -> FuncRefVal(Some(parse_bits(value)))
       }
-    // Any other reftype spelling (anyref / typed refs — GC proposal) is out of Phase-5 scope;
-    // model as a null placeholder so a value position never panics (such modules skip at
-    // parse / instantiate anyway).
+    // GC abstract-heap-type reference expectations (Phase-8 GC). wasm-tools `json-from-wast`
+    // encodes the `(ref.struct)`/`(ref.array)`/`(ref.i31)`/`(ref.eq)` result patterns as a bare
+    // `type` with NO value ("a non-null ref of this kind") — mapped to `GcRef(kind)` and judged by
+    // the oracle against the GC subtype lattice.
+    "structref" -> GcRef(StructRefK)
+    "arrayref" -> GcRef(ArrayRefK)
+    "i31ref" -> GcRef(I31RefK)
+    "eqref" -> GcRef(EqRefK)
+    // `anyref` carries a HOST value in the suite (`ref.host N` / `null`): a null is the shared
+    // sentinel; a non-null host any-ref is judged by kind only (`AnyRefK`) — its host identity is
+    // not cross-checked yet (documented; extern.wast is the only user).
+    "anyref" ->
+      case value {
+        "null" -> NullRef(ExternRefTag)
+        _ -> GcRef(AnyRefK)
+      }
+    // The GC null-heap-types (`(ref.null none|nofunc|noextern|noexn)` and the generic `refnull`):
+    // all denote the ONE shared null sentinel, matched by the existing null oracle arm.
+    "nullref" | "refnull" | "nullfuncref" | "nullexternref" | "nullexnref" ->
+      NullRef(FuncRefTag)
+    // `exnref` (Phase-7 EH heap type): a null exn is the shared sentinel; a non-null exn is an
+    // opaque non-null reference (identity not compared — like a funcref).
+    "exnref" ->
+      case value {
+        "null" -> NullRef(FuncRefTag)
+        _ -> FuncRefVal(None)
+      }
+    // Any other reftype spelling is out of scope; model as a null placeholder so a value position
+    // never panics (such modules skip at parse / instantiate anyway).
     _ -> NullRef(FuncRefTag)
   }
 }

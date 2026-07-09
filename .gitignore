@@ -31,6 +31,13 @@ erl_crash.dump
 !/test/twocore/conformance/fixtures/eh/
 !/test/twocore/conformance/fixtures/eh/*.json
 !/test/twocore/conformance/fixtures/eh/*.wasm
+# Phase-8 GC fixtures: the official GC `.wast` suite converted with `wasm-tools json-from-wast`
+# (wabt cannot parse GC text — issue #2530), kept in a SUBDIRECTORY so the main conformance glob
+# does not see them (the headline stays byte-identical). Committed so `gc_conformance_test` runs on
+# a fresh checkout without wasm-tools; regenerate/expand with vendor.sh's GC section.
+!/test/twocore/conformance/fixtures/gc/
+!/test/twocore/conformance/fixtures/gc/*.json
+!/test/twocore/conformance/fixtures/gc/*.wasm
 # macOS Finder metadata
 .DS_Store
 

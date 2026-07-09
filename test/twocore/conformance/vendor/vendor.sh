@@ -144,6 +144,49 @@ vendor_eh "legacy/rethrow.wast" "legacy_rethrow"
 vendor_eh "legacy/try_catch.wast"    "legacy_try_catch"    "--enable-tail-call"
 vendor_eh "legacy/try_delegate.wast" "legacy_try_delegate" "--enable-tail-call"
 
+# --- GC fixtures (Phase-8) -------------------------------------------------------
+# The official WebAssembly GC `.wast` suite. wabt 1.0.41's WAT parser cannot tokenize GC
+# struct/array/i31 instructions or GC abstract heap types (an upstream gap — wabt issue #2530;
+# `--enable-gc` is a CLI facade with no parser behind it), so these are converted with
+# `wasm-tools json-from-wast` (which fully parses GC and emits a wast2json-compatible `.json` +
+# `.wasm` set). Output lands in `fixtures/gc/` — a SUBDIRECTORY the main `conformance_test`
+# top-level `.json` glob does not see, so the Phase-1..6 headline stays byte-identical; the GC
+# suite is driven separately by `gc_conformance_test`. NOTE: wasm-tools has no `spectest-interp`
+# equivalent for GC, so (unlike the wabt lanes) the baked expected values are NOT re-validated at
+# vendor time — they are the pinned testsuite's own spec-authoritative values. Toolchain-gated:
+# if wasm-tools is absent, the GC fixtures are skipped and `gc_conformance_test` degrades to a
+# graceful "no fixtures" categorized skip (never a false green).
+gc_dir="$fixtures_dir/gc"
+if command -v wasm-tools >/dev/null 2>&1; then
+  echo "vendor: GC via $(wasm-tools --version)"
+  mkdir -p "$gc_dir"
+  vendor_gc() {  # <src-basename> <out-basename>
+    local src="$clone_dir/$1.wast" out="$gc_dir/$2.json"
+    if [ ! -f "$src" ]; then echo "vendor: GC MISSING $1.wast at pin (skipped)" >&2; return; fi
+    if ( cd "$gc_dir" && wasm-tools json-from-wast "$src" -o "$out" --wasm-dir "$gc_dir" ) \
+        >"$out.convert.log" 2>&1; then
+      rm -f "$out.convert.log"
+      # Normalise `source_filename` to the BASENAME (wasm-tools embeds the absolute input path,
+      # which is machine-specific and would churn the committed fixture); the `.wasm` `filename`
+      # refs stay relative and loadable.
+      tmp="$(mktemp)"
+      sed 's#"source_filename":"[^"]*/#"source_filename":"#' "$out" > "$tmp" && mv "$tmp" "$out"
+      echo "vendor: GC OK   $2"
+    else
+      echo "vendor: GC SKIP $1 (wasm-tools json-from-wast could not convert at pin)" >&2
+      rm -f "$out"
+    fi
+  }
+  for gc in struct array array_copy array_fill array_init_data array_init_elem \
+            array_new_data array_new_elem binary-gc br_on_cast br_on_cast_fail \
+            extern i31 local_init ref_cast ref_eq ref_func ref_null ref_test \
+            type-canon type-equivalence type-rec type-subtyping; do
+    vendor_gc "$gc" "$gc"
+  done
+else
+  echo "vendor: wasm-tools not found — GC fixtures SKIPPED (gc_conformance_test categorized-skips)" >&2
+fi
+
 echo "vendor: converted +validated:$converted"
 [ -n "$skipped" ] && echo "vendor: skipped (un-convertible at pin):$skipped"
 if [ "$fail" != "0" ]; then echo "vendor: one or more CONVERTIBLE fixtures failed validation" >&2; exit 1; fi

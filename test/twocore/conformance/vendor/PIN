@@ -10,6 +10,12 @@ TESTSUITE_SHA=193e551ff22663995b1ac95dc62344133669e14b
 # wabt (provides wat2wasm / wast2json / spectest-interp).
 WABT_VERSION=1.0.41
 
+# wasm-tools — the GC-capable converter (Phase-8). wabt 1.0.41's WAT parser cannot tokenize GC
+# struct/array/i31 instructions (upstream gap, wabt issue #2530), so the official GC `.wast` suite
+# is converted with `wasm-tools json-from-wast` instead (it fully parses GC). Used only for the
+# `fixtures/gc/` lane, driven separately by `gc_conformance_test`; the main allowlist stays on wabt.
+WASM_TOOLS_VERSION=1.253.0
+
 # wasmtime — Tier-B reference engine (authored / random inputs only).
 # Verified invoke syntax for this version (flags + function BEFORE the module,
 # call arguments AFTER it):  wasmtime run --invoke <fn> <module.wasm> <arg> <arg> ...
