@@ -47,3 +47,18 @@ pub fn embed_compiles_sdk_guests_test() {
   let assert Ok(channel) = ffi.read_file("test/twocore/teavm/channel_java.wasm")
   let assert Ok(_) = embed.compile(channel)
 }
+
+/// The SDK guests also INSTANTIATE — which seeds their ~450 static GC globals. One global's init
+/// reads a preceding immutable global to build a `struct.new`; that read is only valid once the
+/// instance cell exists, so the seed must install such globals in declaration order AFTER the cell
+/// (not while building the seed decl). Instantiation succeeding is the regression guard for that
+/// ordered seeding (a stub host suffices — neither guest touches a `dance.*` import at start).
+pub fn embed_instantiates_sdk_guests_test() {
+  let host = fn(_capability, _name, _args) { [] }
+  let assert Ok(counter) = ffi.read_file("test/twocore/teavm/counter_java.wasm")
+  let assert Ok(counter_c) = embed.compile(counter)
+  let assert Ok(_) = embed.instantiate(counter_c, host)
+  let assert Ok(channel) = ffi.read_file("test/twocore/teavm/channel_java.wasm")
+  let assert Ok(channel_c) = embed.compile(channel)
+  let assert Ok(_) = embed.instantiate(channel_c, host)
+}
