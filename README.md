@@ -53,7 +53,7 @@ the main thing right now is getting good WASM conformance, then focus on finding
 
 <p align="center">
   <img src="docs/wasm-conformance.svg" width="640"
-       alt="WebAssembly spec-suite conformance: 15,747 passing, 411 out of scope, 0 failing">
+       alt="WebAssembly spec-suite conformance: 47,734 passing, 683 out of scope, 0 failing; plus the official WebAssembly GC suite driven separately (15 files green, 0 fail)">
 </p>
 
 ## contributing

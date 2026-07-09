@@ -229,6 +229,7 @@ pub fn decode_add_fixture_test() {
     Ok(
       ast.Module(
         imported_func_count: 0,
+        rec_groups: [],
         types: list.map(
           [ast.FuncType(params: [ast.I32, ast.I32], results: [ast.I32])],
           ast.func_def,

@@ -486,6 +486,8 @@ pub fn raw_of(v: SpecValue) -> Int {
     F32Nan(_) | F64Nan(_) -> 0
     // Reference values carry no raw bits (the acceptance corpus is numeric); 0 keeps it total.
     fixture.NullRef(_) | fixture.ExternRefVal(_) | fixture.FuncRefVal(_) -> 0
+    // A GC ref carries no raw bits either (this corpus is numeric); 0 keeps it total.
+    fixture.GcRef(_) -> 0
     // A v128 is compared lane-wise, never as a scalar; this differential corpus is numeric.
     fixture.V128Val(_, _) -> 0
   }

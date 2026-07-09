@@ -1489,6 +1489,9 @@ fn phase_b(
     types: list.map(st.types, fn(ft) {
       ast.DefType(comp: ast.CtFunc(ft), supertype: option.None, final: True)
     }),
+    // The WAT parser only produces func types (no rec groups / GC), so every type
+    // is its own singleton group — the non-GC default is `[]`.
+    rec_groups: [],
     imports: list.reverse(st.imports),
     tables: list.reverse(st.tables),
     memories: list.reverse(st.memories),

@@ -41,8 +41,9 @@ import twocore/backend/build_beam
 import twocore/backend/emit_core
 import twocore/conformance/ffi
 import twocore/conformance/fixture.{
-  type SpecValue, ExternRefTag, ExternRefVal, F32Bits, F32Nan, F64Bits, F64Nan,
-  FuncRefTag, FuncRefVal, I32Val, I64Val, LaneI8, NullRef, V128Val,
+  type SpecValue, ArrayRefK, ExternRefTag, ExternRefVal, F32Bits, F32Nan,
+  F64Bits, F64Nan, FuncRefTag, FuncRefVal, GcHeapK, GcRef, I31RefK, I32Val,
+  I64Val, LaneI8, NullRef, StructRefK, V128Val,
 }
 import twocore/conformance/runner.{
   type Driver, type ImportEnv, type Instance, type InvokeResult, ImportEnv,
@@ -456,7 +457,11 @@ fn use_term_abi(args: List(SpecValue), results: List(ir.ValType)) -> Bool {
   let term_result =
     list.any(results, fn(ty) {
       case ty {
-        ir.TFuncRef | ir.TExternRef | ir.TV128 -> True
+        // `ir.TTerm` is a GC heap reference result (Phase-8 GC — every GC ref lowers to `TTerm`).
+        // Route it through the term ABI so the returned `{gc, Id}`/`{i31, _}` term is classified,
+        // not coerced to a garbage int on the numeric path. GC refs do not appear in the main
+        // (non-GC) allowlist suite, so this is inert for the headline (verified by re-run).
+        ir.TFuncRef | ir.TExternRef | ir.TV128 | ir.TTerm -> True
         _ -> False
       }
     })
@@ -483,6 +488,9 @@ fn spec_to_raw(v: SpecValue) -> Int {
     I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
     F32Nan(_) | F64Nan(_) -> 0
     NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> 0
+    // A GC ref never appears as a numeric argument (the suite passes GC refs only as host
+    // anyref/externref, and never on the integer path); defensive 0.
+    GcRef(_) -> 0
     // A v128 argument never reaches the integer path (it forces the term ABI, S14).
     V128Val(_, _) -> 0
   }
@@ -500,6 +508,9 @@ fn spec_to_term(v: SpecValue) -> Dynamic {
     NullRef(_) -> rt_ref.null_ref()
     ExternRefVal(id) -> rt_ref.extern_of(id)
     FuncRefVal(_) -> rt_ref.null_ref()
+    // A GC ref never occurs as a script argument (wast2json/wasm-tools never pass a struct/array/i31
+    // ref as an invoke arg); map to null defensively so the arg path stays total.
+    GcRef(_) -> rt_ref.null_ref()
     // A v128 argument IS its 16 raw little-endian bytes (S14): pack the lanes into the 128-bit
     // image, emit the 16-byte binary the generated code consumes as a `<<_:128>>` operand.
     V128Val(lane, lanes) ->
@@ -536,7 +547,9 @@ fn tag_term(ty: ir.ValType, term: Dynamic) -> SpecValue {
     ir.TI64 -> I64Val(term_to_int(term))
     ir.TF32 -> F32Bits(term_to_int(term))
     ir.TF64 -> F64Bits(term_to_int(term))
-    ir.TTerm -> I32Val(term_to_int(term))
+    // A GC heap reference result (Phase-8 GC): classify the returned term into a GC-kind
+    // `SpecValue` for the oracle's lattice comparison, instead of the old i32 coercion.
+    ir.TTerm -> tag_gc(term)
     ir.TFuncRef -> tag_ref(term, FuncRefTag)
     ir.TExternRef -> tag_ref(term, ExternRefTag)
     // A `v128` result is the 16 raw little-endian bytes the generated code returned (S14). Read the
@@ -578,6 +591,24 @@ fn tag_ref(term: Dynamic, t: fixture.RefTypeTag) -> SpecValue {
     // keeping conformance byte-identical). Tag it as an opaque non-null reference for now.
     rt_ref.ExnRef -> FuncRefVal(None)
     rt_ref.FuncRef -> FuncRefVal(None)
+  }
+}
+
+/// Classify a returned GC heap reference term (Phase-8 GC) into a `SpecValue` for the oracle. Uses
+/// the structural harness FFI `ffi.gc_classify` (never dereferences the instance-process arena,
+/// R-GC1): a null → `NullRef`, an `i31` → `GcRef(I31RefK)` (precise, self-describing), a `{gc, Id}`
+/// heap handle → `GcRef(GcHeapK)` (coarse — struct-vs-array not observable across the process copy;
+/// refined to `StructRefK`/`ArrayRefK` if the handle self-describes), a host `extern`/any-ref →
+/// `ExternRefVal` by identity, else an opaque non-null funcref/exn. Total.
+fn tag_gc(term: Dynamic) -> SpecValue {
+  case ffi.gc_classify(term) {
+    "null" -> NullRef(FuncRefTag)
+    "i31" -> GcRef(I31RefK)
+    "gc_struct" -> GcRef(StructRefK)
+    "gc_array" -> GcRef(ArrayRefK)
+    "gc_heap" -> GcRef(GcHeapK)
+    "extern" -> ExternRefVal(term_to_int(ffi.extern_payload(term)))
+    _ -> FuncRefVal(None)
   }
 }
 

@@ -23,8 +23,9 @@
 
 import gleam/int
 import twocore/conformance/fixture.{
-  type NanKind, type SpecValue, Arithmetic, Canonical, ExternRefVal, F32Bits,
-  F32Nan, F64Bits, F64Nan, FuncRefVal, I32Val, I64Val, NullRef, V128Val,
+  type NanKind, type SpecValue, AnyRefK, Arithmetic, ArrayRefK, Canonical,
+  EqRefK, ExternRefVal, F32Bits, F32Nan, F64Bits, F64Nan, FuncRefVal, GcHeapK,
+  GcRef, I31RefK, I32Val, I64Val, NullRef, StructRefK, V128Val,
 }
 
 // IEEE-754 binary32 field masks (sign|exp[8]|payload[23]).
@@ -84,6 +85,20 @@ pub fn matches(actual: SpecValue, expected: SpecValue) -> Bool {
         FuncRefVal(_) -> True
         _ -> False
       }
+    // GC abstract-heap-type comparison (Phase-8 GC), per the WASM GC subtype lattice
+    // (<https://webassembly.github.io/spec/core/valid/types.html#subtyping>):
+    // `any ⊇ eq ⊇ {struct, array, i31}`; `none`/null is bottom. The EXPECTED is a kind pattern; the
+    // ACTUAL is the harness's classification of the returned GC term. A returned `{gc, Id}` handle
+    // classifies coarsely to `GcHeapK` (struct-vs-array is not observable in the harness process —
+    // the arena is instance-process-local, R-GC1), so `structref`/`arrayref` accept `GcHeapK`
+    // leniently (documented — the static export type guarantees the kind; mirrors the funcref
+    // identity leniency above); `eqref`/`anyref` accept it by the lattice regardless. A null actual
+    // never satisfies a NON-null GC kind (that is `NullRef`, matched above).
+    GcRef(exp_kind) ->
+      case actual {
+        GcRef(act_kind) -> gc_kind_matches(exp_kind, act_kind)
+        _ -> False
+      }
     // v128 comparison (P6-10 / M3), per the spec vector value model
     // (<https://webassembly.github.io/spec/core/syntax/values.html#vectors>) + vector-instruction
     // semantics. A `v128` is correct iff EVERY lane is correct at the EXPECTED's lane
@@ -129,18 +144,45 @@ fn raw_bits(v: SpecValue) -> Int {
     I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
     F32Nan(_) | F64Nan(_) -> 0
     // Reference values carry no numeric bits (they are compared as references, never as bits).
-    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> 0
+    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) | GcRef(_) -> 0
     // A v128 is compared lane-wise (see `matches`), never as a single scalar bit pattern.
     V128Val(_, _) -> 0
   }
 }
 
-/// True iff `v` is a reference value (null / externref / funcref) — the disjointness guard so a
-/// numeric expectation never matches a reference actual.
+/// True iff `v` is a reference value (null / externref / funcref / GC heap ref) — the disjointness
+/// guard so a numeric expectation never matches a reference actual.
 fn is_ref(v: SpecValue) -> Bool {
   case v {
-    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) -> True
+    NullRef(_) | ExternRefVal(_) | FuncRefVal(_) | GcRef(_) -> True
     _ -> False
+  }
+}
+
+/// Judge a returned GC ref's classified kind (`actual`) against a spec kind pattern (`expected`),
+/// per the WASM GC subtype lattice `any ⊇ eq ⊇ {struct, array, i31}`.
+///
+/// `GcHeapK` is the coarse actual for a `{gc, Id}` handle (struct-vs-array not observable in the
+/// harness process, R-GC1): it satisfies `structref`/`arrayref` leniently and `eqref`/`anyref` by
+/// the lattice. `I31RefK` is precise (i31 self-describes). This is total over `GcRefKind`.
+fn gc_kind_matches(
+  expected: fixture.GcRefKind,
+  actual: fixture.GcRefKind,
+) -> Bool {
+  case expected, actual {
+    // any ref satisfies `anyref`.
+    AnyRefK, _ -> True
+    // eqref: i31/struct/array (and the coarse gc-heap), never a bare `AnyRefK` host ref.
+    EqRefK, I31RefK
+    | EqRefK, StructRefK
+    | EqRefK, ArrayRefK
+    | EqRefK, GcHeapK
+    -> True
+    // Concrete kinds: exact, or the coarse gc-heap actual (documented leniency).
+    StructRefK, StructRefK | StructRefK, GcHeapK -> True
+    ArrayRefK, ArrayRefK | ArrayRefK, GcHeapK -> True
+    I31RefK, I31RefK -> True
+    _, _ -> False
   }
 }
 

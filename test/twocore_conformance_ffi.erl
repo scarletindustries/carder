@@ -10,8 +10,8 @@
 -export([catch_apply/3, read_file/1, parse_json/1, list_dir/1, run/2,
          find_executable/1, unique_int/0,
          start_instance/1, start_instance_with/2, call_instance/3,
-         result_list/2, extern_payload/1, stop_instance/1, gc_and_memory/1,
-         spy_reset/0, spy_mark/0, spy_called/0]).
+         result_list/2, extern_payload/1, gc_classify/1, stop_instance/1,
+         gc_and_memory/1, spy_reset/0, spy_mark/0, spy_called/0]).
 
 %% Force a garbage collection on process Pid, then report its total memory in bytes
 %% (heap + stack + message queue + pdict). Used by the constant-space store-loop test to
@@ -139,6 +139,21 @@ result_list(Arity, V) ->
 %% classify says ExternRef, so the match always succeeds; the fallback keeps it total.
 extern_payload({ref_extern, T}) -> T;
 extern_payload(_) -> 0.
+
+%% Classify a returned GC reference term into a coarse kind string (Phase-8 GC), for the
+%% conformance oracle. Structural only — it NEVER dereferences the instance's arena (that lives in
+%% the instance's own process dictionary; a returned `{gc, Id}` handle is a dangling id here,
+%% R-GC1), so a bare 2-tuple `{gc, Id}` classifies coarsely as `<<"gc_heap">>`. A future engine
+%% handle retag to `{gc, struct|array, Id}` self-describes across the process copy and is matched
+%% here first (`gc_struct`/`gc_array`) so this reads precise kinds with no further change.
+gc_classify({ref_null})          -> <<"null">>;
+gc_classify({i31, _})            -> <<"i31">>;
+gc_classify({gc, struct, _})     -> <<"gc_struct">>;
+gc_classify({gc, array, _})      -> <<"gc_array">>;
+gc_classify({gc, _})             -> <<"gc_heap">>;
+gc_classify({ref_extern, _})     -> <<"extern">>;
+gc_classify({ref_exn, _})        -> <<"exn">>;
+gc_classify(_)                   -> <<"func">>.
 
 %% Ask the instance process to exit (its pdict cell is GC'd with it).
 stop_instance(Pid) ->

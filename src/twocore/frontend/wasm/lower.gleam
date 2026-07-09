@@ -95,6 +95,7 @@ import gleam/result
 import gleam/set
 import gleam/string
 import twocore/frontend/wasm/ast
+import twocore/frontend/wasm/canon as canon_mod
 import twocore/frontend/wasm/validate.{type TypedModule}
 import twocore/ir
 
@@ -162,6 +163,10 @@ pub type LowerError {
 type LCtx {
   LCtx(
     types: List(ast.DefType),
+    /// The iso-recursive canonical id of every type by index (`canon.canon_ids`),
+    /// so the compile-time `ref.test`/`ref.cast` subtype set matches concrete types
+    /// by structural identity, not declared index (mirrors the validator).
+    canon: List(Int),
     func_types: List(ast.FuncType),
     imported: Int,
     local_types: List(ir.ValType),
@@ -406,6 +411,7 @@ fn lower_func(
   let ctx =
     LCtx(
       types: module.types,
+      canon: canon_mod.canon_ids(module.types, module.rec_groups),
       func_types: typed.func_types,
       imported: typed.imported_func_count,
       local_types: local_types,
@@ -1592,7 +1598,7 @@ fn sign_of(signed: option.Option(Bool)) -> Bool {
 /// map to an object-kind atom. Null is accepted iff the target ref type is nullable.
 fn gc_matcher(rt: ast.RefType, ctx: LCtx) -> #(ir.GcMatcher, Bool) {
   let m = case rt.heap {
-    ast.HConcrete(t) -> ir.MatchConcrete(subtype_set(t, ctx.types))
+    ast.HConcrete(t) -> ir.MatchConcrete(subtype_set(t, ctx.types, ctx.canon))
     ast.HStruct -> ir.MatchAbstract(ir.KStruct)
     ast.HArray -> ir.MatchAbstract(ir.KArray)
     ast.HI31 -> ir.MatchAbstract(ir.KI31)
@@ -1612,11 +1618,15 @@ fn gc_matcher(rt: ast.RefType, ctx: LCtx) -> #(ir.GcMatcher, Bool) {
 /// The closed set of concrete type indices `<:` `t` — the runtime match set for a
 /// concrete `ref.test`/`ref.cast` (an object whose stored type index is in this set
 /// matches). Bounded walk (chain ≤ #types) so a malformed cycle can't loop.
-fn subtype_set(t: Int, types: List(ast.DefType)) -> List(Int) {
+fn subtype_set(
+  t: Int,
+  types: List(ast.DefType),
+  canon: List(Int),
+) -> List(Int) {
   let n = list.length(types)
   types
   |> list.index_map(fn(_dt, i) { i })
-  |> list.filter(fn(i) { gc_reaches(i, t, types, n) })
+  |> list.filter(fn(i) { gc_reaches(i, t, types, canon, n) })
 }
 
 /// Lower `call_ref $t`: pop the funcref (top of stack) then the params, and bind
@@ -1772,8 +1782,19 @@ fn finish_br_cond(
   wrap_let([cond_name], ir.RefIsNull(ref), gr)
 }
 
-fn gc_reaches(i: Int, t: Int, types: List(ast.DefType), fuel: Int) -> Bool {
-  case i == t {
+/// Does concrete type `i` reach `t` up its declared supertype chain, comparing by
+/// **iso-recursive canonical id** (`canon[i'] == canon[t]`) rather than declared
+/// index — so a `ref.test`/`ref.cast` to `$t` matches every structurally-equivalent
+/// concrete type, across rec groups (mirrors the validator's `supertype_reaches`).
+/// Bounded by `fuel` (chain length ≤ #types) so a malformed cycle can't loop.
+fn gc_reaches(
+  i: Int,
+  t: Int,
+  types: List(ast.DefType),
+  canon: List(Int),
+  fuel: Int,
+) -> Bool {
+  case gc_canon_eq(canon, i, t) {
     True -> True
     False ->
       case fuel <= 0 {
@@ -1781,8 +1802,37 @@ fn gc_reaches(i: Int, t: Int, types: List(ast.DefType), fuel: Int) -> Bool {
         False ->
           case ast.def_type_at(types, i) {
             Ok(ast.DefType(supertype: option.Some(s), ..)) ->
-              gc_reaches(s, t, types, fuel - 1)
+              gc_reaches(s, t, types, canon, fuel - 1)
             _ -> False
+          }
+      }
+  }
+}
+
+/// `True` iff type indices `i` and `j` have the same canonical id, falling back to
+/// declared-index equality when either index is out of range of `canon`.
+fn gc_canon_eq(canon: List(Int), i: Int, j: Int) -> Bool {
+  case i == j {
+    True -> True
+    False ->
+      case nth_canon(canon, i), nth_canon(canon, j) {
+        Ok(ci), Ok(cj) -> ci == cj
+        _, _ -> False
+      }
+  }
+}
+
+/// Total list indexing for the canonical-id list.
+fn nth_canon(xs: List(Int), i: Int) -> Result(Int, Nil) {
+  case i < 0 {
+    True -> Error(Nil)
+    False ->
+      case xs {
+        [] -> Error(Nil)
+        [x, ..rest] ->
+          case i {
+            0 -> Ok(x)
+            _ -> nth_canon(rest, i - 1)
           }
       }
   }
@@ -3689,6 +3739,7 @@ fn lower_globals(
       g.init,
       imported_func_count,
       func_types,
+      module.types,
     ))
     Ok(ir.GlobalDecl(
       gname(imported_global_count + i),
@@ -3763,13 +3814,19 @@ fn lower_elements(
   func_types: List(ast.FuncType),
 ) -> Result(List(ir.ElementSegment), LowerError) {
   list.try_map(module.elements, fn(e) {
-    use init <- result.try(lower_elem_init(e.init, imported, func_types))
+    use init <- result.try(lower_elem_init(
+      e.init,
+      imported,
+      func_types,
+      module.types,
+    ))
     use mode <- result.try(case e.mode {
       ast.ElemActive(table, offset_expr) -> {
         use offset <- result.try(lower_const_expr(
           offset_expr,
           imported,
           func_types,
+          module.types,
         ))
         Ok(ir.ElemActive(tname(table), offset))
       }
@@ -3790,12 +3847,15 @@ fn lower_elem_init(
   init: ast.ElemInit,
   imported: Int,
   func_types: List(ast.FuncType),
+  types: List(ast.DefType),
 ) -> Result(List(ir.Expr), LowerError) {
   case init {
     ast.ElemFuncs(funcs) ->
       list.try_map(funcs, fn(idx) { lower_ref_func(idx, imported, func_types) })
     ast.ElemExprs(exprs) ->
-      list.try_map(exprs, fn(e) { lower_const_expr(e, imported, func_types) })
+      list.try_map(exprs, fn(e) {
+        lower_const_expr(e, imported, func_types, types)
+      })
   }
 }
 
@@ -3818,6 +3878,7 @@ fn lower_data(
           offset_expr,
           imported,
           func_types,
+          module.types,
         ))
         Ok(ir.DataSegment(ir.DataActive(mem, offset), d.bytes))
       }
@@ -3952,6 +4013,7 @@ fn lower_const_expr(
   instrs: List(ast.Instr),
   imported: Int,
   func_types: List(ast.FuncType),
+  types: List(ast.DefType),
 ) -> Result(ir.Expr, LowerError) {
   let stripped = case list.reverse(instrs) {
     [ast.End, ..rest] -> list.reverse(rest)
@@ -3968,7 +4030,161 @@ fn lower_const_expr(
     [ast.RefFunc(x)] -> lower_ref_func(x, imported, func_types)
     [ast.RefNull(rt)] -> Ok(ir.Values([ir.ConstNull(to_ir_reftype(rt))]))
     [ast.GlobalGet(i)] -> Ok(ir.GlobalGet(gname(i)))
-    _ -> Error(NonConstInitExpr("non-constant init expression"))
+    // GC constant-expression SEQUENCES (`ref.i31`, `struct.new[_default]`,
+    // `array.new[_default|_fixed]`, which NEST): lower to an ANF `Let`-chain of `ir.Gc`
+    // allocations evaluated in-process at instantiate time. Validation already guaranteed
+    // constancy + arity; this is the constructive counterpart. Non-GC modules never reach
+    // here (their inits hit the single-instruction arms above), so IR is byte-identical.
+    _ -> lower_const_seq(stripped, imported, func_types, types)
+  }
+}
+
+/// Lower a GC constant-expression SEQUENCE to an `ir.Expr` (an ANF `Let`-chain ending in the
+/// produced value). Mirrors the body's operand construction (`ir.Gc` args bottom-first): each
+/// allocation / `ref.func` / `global.get` binds a fresh name and pushes its `Var`; constants
+/// push their `Value` directly. The single leftover stack value is the init's result.
+/// `Error(NonConstInitExpr(_))` on a non-constant instruction (validation already rejected these,
+/// so this is a defensive backstop).
+fn lower_const_seq(
+  instrs: List(ast.Instr),
+  imported: Int,
+  func_types: List(ast.FuncType),
+  types: List(ast.DefType),
+) -> Result(ir.Expr, LowerError) {
+  use #(stack, binds, _c) <- result.try(
+    list.try_fold(instrs, #([], [], 0), fn(acc, instr) {
+      let #(stack, binds, counter) = acc
+      case instr {
+        ast.I32Const(v) ->
+          Ok(#([ir.ConstI32(unsigned_bits(v, 32)), ..stack], binds, counter))
+        ast.I64Const(v) ->
+          Ok(#([ir.ConstI64(unsigned_bits(v, 64)), ..stack], binds, counter))
+        ast.F32Const(b) -> Ok(#([ir.ConstF32(b), ..stack], binds, counter))
+        ast.F64Const(b) -> Ok(#([ir.ConstF64(b), ..stack], binds, counter))
+        ast.V128Const(b) -> Ok(#([ir.ConstV128(b), ..stack], binds, counter))
+        ast.RefNull(rt) ->
+          Ok(#([ir.ConstNull(to_ir_reftype(rt)), ..stack], binds, counter))
+        ast.RefNullHt(_) ->
+          Ok(#([ir.ConstNull(ir.FuncRef), ..stack], binds, counter))
+        ast.RefFunc(x) -> {
+          use e <- result.try(lower_ref_func(x, imported, func_types))
+          Ok(bind_seq(e, stack, binds, counter))
+        }
+        ast.GlobalGet(i) ->
+          Ok(bind_seq(ir.GlobalGet(gname(i)), stack, binds, counter))
+        ast.RefI31 ->
+          pop_bind(1, stack, binds, counter, fn(a) { ir.Gc(ir.GcRefI31, a) })
+        ast.StructNew(t) -> {
+          use fs <- result.try(struct_fields_at(types, t))
+          pop_bind(list.length(fs), stack, binds, counter, fn(a) {
+            ir.Gc(ir.GcStructNew(t), a)
+          })
+        }
+        ast.StructNewDefault(t) -> {
+          use fs <- result.try(struct_fields_at(types, t))
+          Ok(bind_seq(
+            ir.Gc(
+              ir.GcStructNew(t),
+              list.map(fs, fn(fd) { default_storage_value(fd.storage) }),
+            ),
+            stack,
+            binds,
+            counter,
+          ))
+        }
+        // GC array.new args are [elem, count] (bottom-first); the stack top→down is count,elem,
+        // so `pop_bind` (reverse of the top n) yields exactly [elem, count].
+        ast.ArrayNew(t) ->
+          pop_bind(2, stack, binds, counter, fn(a) {
+            ir.Gc(ir.GcArrayNew(t), a)
+          })
+        ast.ArrayNewDefault(t) -> {
+          use fd <- result.try(array_field_at(types, t))
+          let d = default_storage_value(fd.storage)
+          pop_bind(1, stack, binds, counter, fn(a) {
+            ir.Gc(ir.GcArrayNew(t), [d, ..a])
+          })
+        }
+        ast.ArrayNewFixed(t, n) ->
+          pop_bind(n, stack, binds, counter, fn(a) {
+            ir.Gc(ir.GcArrayNewFixed(t), a)
+          })
+        ast.AnyConvertExtern ->
+          pop_bind(1, stack, binds, counter, fn(a) {
+            ir.Gc(ir.GcAnyConvertExtern, a)
+          })
+        ast.ExternConvertAny ->
+          pop_bind(1, stack, binds, counter, fn(a) {
+            ir.Gc(ir.GcExternConvertAny, a)
+          })
+        _ -> Error(NonConstInitExpr("non-constant init expression"))
+      }
+    }),
+  )
+  case stack {
+    [final] ->
+      Ok(
+        list.fold(binds, ir.Values([final]), fn(inner, b) {
+          let #(ns, rhs) = b
+          ir.Let(ns, rhs, inner)
+        }),
+      )
+    _ -> Error(NonConstInitExpr("const expr did not yield exactly one value"))
+  }
+}
+
+/// Bind an `Expr` result to a fresh SSA name: record the `#(names, rhs)` binding and push the
+/// name's `Var` onto the value stack. The binding list is prepended (most-recent first); the
+/// caller folds it so the FIRST binding is outermost (correct evaluation order).
+fn bind_seq(
+  rhs: ir.Expr,
+  stack: List(ir.Value),
+  binds: List(#(List(String), ir.Expr)),
+  counter: Int,
+) -> #(List(ir.Value), List(#(List(String), ir.Expr)), Int) {
+  let #(name, c2) = fresh(counter)
+  #([ir.Var(name), ..stack], [#([name], rhs), ..binds], c2)
+}
+
+/// Pop `n` operand values (bottom-first) off the const-seq stack, build the allocation `Expr`
+/// from them, and bind it. `Error(StackUnderflow)` on too few operands (validation guarantees
+/// arity, so this is defensive).
+fn pop_bind(
+  n: Int,
+  stack: List(ir.Value),
+  binds: List(#(List(String), ir.Expr)),
+  counter: Int,
+  build: fn(List(ir.Value)) -> ir.Expr,
+) -> Result(#(List(ir.Value), List(#(List(String), ir.Expr)), Int), LowerError) {
+  case list.length(stack) >= n {
+    False -> Error(StackUnderflow)
+    True -> {
+      let args = list.reverse(list.take(stack, n))
+      let rest = list.drop(stack, n)
+      Ok(bind_seq(build(args), rest, binds, counter))
+    }
+  }
+}
+
+/// The struct field types at type index `t` (for const-expr `struct.new`).
+fn struct_fields_at(
+  types: List(ast.DefType),
+  t: Int,
+) -> Result(List(ast.FieldType), LowerError) {
+  case ast.def_type_at(types, t) {
+    Ok(ast.DefType(comp: ast.CtStruct(fs), ..)) -> Ok(fs)
+    _ -> Error(UnknownTypeIndex(t))
+  }
+}
+
+/// The array element field type at type index `t` (for const-expr `array.new*`).
+fn array_field_at(
+  types: List(ast.DefType),
+  t: Int,
+) -> Result(ast.FieldType, LowerError) {
+  case ast.def_type_at(types, t) {
+    Ok(ast.DefType(comp: ast.CtArray(fd), ..)) -> Ok(fd)
+    _ -> Error(UnknownTypeIndex(t))
   }
 }
 

@@ -103,6 +103,15 @@ pub fn call_instance_terms(
 @external(erlang, "twocore_conformance_ffi", "extern_payload")
 pub fn extern_payload(ref: Dynamic) -> Dynamic
 
+/// Classify a returned GC reference term into a coarse kind string (Phase-8 GC), for the
+/// conformance oracle. Structural, harness-side (never dereferences the instance-process arena):
+///   `{ref_null}` → `"null"`, `{i31, _}` → `"i31"`, `{gc, struct, _}` → `"gc_struct"`,
+///   `{gc, array, _}` → `"gc_array"`, `{gc, _}` → `"gc_heap"` (coarse — struct-vs-array not
+///   observable across the process copy, R-GC1), `{ref_extern, _}` → `"extern"`,
+///   `{ref_exn, _}` → `"exn"`, anything else → `"func"`. Total.
+@external(erlang, "twocore_conformance_ffi", "gc_classify")
+pub fn gc_classify(term: Dynamic) -> String
+
 /// Unpack an invoke result `package` into a flat list of its `arity` values (R17 multi-value
 /// run-ABI). `arity == 0` → `[]` (the unit placeholder is dropped); `arity == 1` → `[package]`;
 /// `arity >= 2` → the N-tuple destructured with `tuple_to_list`. Each element is a raw numeric
