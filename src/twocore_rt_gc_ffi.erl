@@ -66,19 +66,19 @@ struct_new(TypeIdx, Fields) ->
     {gc, Id}.
 
 %% struct.get $t $f (plain, non-packed field).
-struct_get({ref_null}, _Field) -> null_trap();
+struct_get({ref_null}, _Field) -> null_struct_trap();
 struct_get({gc, Id}, Field) ->
     {struct, _T, Fs} = get({gc_obj, Id}),
     element(Field + 1, Fs).
 
 %% struct.get_s / struct.get_u $t $f (packed field → i32).
-struct_get_packed({ref_null}, _F, _B, _S) -> null_trap();
+struct_get_packed({ref_null}, _F, _B, _S) -> null_struct_trap();
 struct_get_packed({gc, Id}, Field, Bits, Signed) ->
     {struct, _T, Fs} = get({gc_obj, Id}),
     unpack(element(Field + 1, Fs), Bits, Signed).
 
 %% struct.set $t $f.
-struct_set({ref_null}, _F, _V) -> null_trap();
+struct_set({ref_null}, _F, _V) -> null_struct_trap();
 struct_set({gc, Id}, Field, Val) ->
     {struct, T, Fs} = get({gc_obj, Id}),
     put({gc_obj, Id}, {struct, T, setelement(Field + 1, Fs, Val)}),
@@ -98,31 +98,31 @@ array_new_fixed(TypeIdx, Elems) ->
     put({gc_obj, Id}, {array, TypeIdx, list_to_tuple(Elems)}),
     {gc, Id}.
 
-array_get({ref_null}, _Idx) -> null_trap();
+array_get({ref_null}, _Idx) -> null_array_trap();
 array_get({gc, Id}, Idx) ->
     {array, _T, Es} = get({gc_obj, Id}),
     check_bounds(Idx, tuple_size(Es)),
     element(Idx + 1, Es).
 
-array_get_packed({ref_null}, _I, _B, _S) -> null_trap();
+array_get_packed({ref_null}, _I, _B, _S) -> null_array_trap();
 array_get_packed({gc, Id}, Idx, Bits, Signed) ->
     {array, _T, Es} = get({gc_obj, Id}),
     check_bounds(Idx, tuple_size(Es)),
     unpack(element(Idx + 1, Es), Bits, Signed).
 
-array_set({ref_null}, _I, _V) -> null_trap();
+array_set({ref_null}, _I, _V) -> null_array_trap();
 array_set({gc, Id}, Idx, Val) ->
     {array, T, Es} = get({gc_obj, Id}),
     check_bounds(Idx, tuple_size(Es)),
     put({gc_obj, Id}, {array, T, setelement(Idx + 1, Es, Val)}),
     ok.
 
-array_len({ref_null}) -> null_trap();
+array_len({ref_null}) -> null_array_trap();
 array_len({gc, Id}) ->
     {array, _T, Es} = get({gc_obj, Id}),
     tuple_size(Es).
 
-array_fill({ref_null}, _I, _V, _C) -> null_trap();
+array_fill({ref_null}, _I, _V, _C) -> null_array_trap();
 array_fill({gc, Id}, Idx, Val, Count) ->
     {array, T, Es} = get({gc_obj, Id}),
     check_range(Idx, Count, tuple_size(Es)),
@@ -131,8 +131,8 @@ array_fill({gc, Id}, Idx, Val, Count) ->
 
 %% array.copy dst-ref dst-idx src-ref src-idx count. The source slice is read into
 %% a list first, so an overlapping same-array copy behaves as if via a temporary.
-array_copy({ref_null}, _Di, _Src, _Si, _C) -> null_trap();
-array_copy(_Dst, _Di, {ref_null}, _Si, _C) -> null_trap();
+array_copy({ref_null}, _Di, _Src, _Si, _C) -> null_array_trap();
+array_copy(_Dst, _Di, {ref_null}, _Si, _C) -> null_array_trap();
 array_copy({gc, Did}, Di, {gc, Sid}, Si, Count) ->
     {array, DT, DEs} = get({gc_obj, Did}),
     {array, _ST, SEs} = get({gc_obj, Sid}),
@@ -148,11 +148,11 @@ array_copy({gc, Did}, Di, {gc, Sid}, Si, Count) ->
 ref_i31(N) -> {i31, N band 16#7FFFFFFF}.
 
 %% i31.get_s : sign-extend from bit 30 to the 32-bit unsigned pattern.
-i31_get_s({ref_null}) -> null_trap();
+i31_get_s({ref_null}) -> null_i31_trap();
 i31_get_s({i31, V}) -> sign_extend(V, 31).
 
 %% i31.get_u : the 31-bit value (already a valid non-negative i32).
-i31_get_u({ref_null}) -> null_trap();
+i31_get_u({ref_null}) -> null_i31_trap();
 i31_get_u({i31, V}) -> V.
 
 %% ───────────────────────────── casts / equality ───────────────────────────
@@ -240,7 +240,8 @@ pkg_to_list(Pkg, _) -> tuple_to_list(Pkg).
 array_new_data(TypeIdx, Bytes, Offset, Count, Width) ->
     case Offset >= 0 andalso Count >= 0
         andalso Offset + Count * Width =< byte_size(Bytes) of
-        false -> oob_trap();
+        %% A data-segment span over-run is spec "out of bounds memory access".
+        false -> mem_oob_trap();
         true ->
             new_array(TypeIdx, decode_data_elems(Bytes, Offset, Count, Width))
     end.
@@ -248,42 +249,39 @@ array_new_data(TypeIdx, Bytes, Offset, Count, Width) ->
 %% array.init_data $t $d : copy `Count` elements from data segment `Bytes` (at byte
 %% `SrcOff`) into the array at index `DstIdx`. OOB on either range; null-traps.
 array_init_data({ref_null}, _DstIdx, _Bytes, _SrcOff, _Count, _Width) ->
-    null_trap();
+    null_array_trap();
 array_init_data({gc, Id}, DstIdx, Bytes, SrcOff, Count, Width) ->
     {array, T, Es} = get({gc_obj, Id}),
-    case DstIdx >= 0 andalso Count >= 0 andalso SrcOff >= 0
-        andalso DstIdx + Count =< tuple_size(Es)
-        andalso SrcOff + Count * Width =< byte_size(Bytes) of
-        false -> oob_trap();
-        true ->
-            Vals = decode_data_elems(Bytes, SrcOff, Count, Width),
-            put({gc_obj, Id}, {array, T, write_slice(Es, DstIdx, Vals)}),
-            ok
-    end.
+    %% The ARRAY (destination) range is checked FIRST, then the DATA (source) span —
+    %% a both-overflow case reports the array trap (spec ordering, per array_init_data.wast).
+    check_range(DstIdx, Count, tuple_size(Es)),
+    check_data_range(SrcOff, Count, Width, byte_size(Bytes)),
+    Vals = decode_data_elems(Bytes, SrcOff, Count, Width),
+    put({gc_obj, Id}, {array, T, write_slice(Es, DstIdx, Vals)}),
+    ok.
 
 %% array.new_elem $t $e : a new array of `Count` references taken from the (drop-
 %% gated) element segment value list `Refs` starting at index `Offset`.
 array_new_elem(TypeIdx, Refs, Offset, Count) ->
     case Offset >= 0 andalso Count >= 0 andalso Offset + Count =< length(Refs) of
-        false -> oob_trap();
+        %% An element-segment span over-run is spec "out of bounds table access".
+        false -> table_oob_trap();
         true -> new_array(TypeIdx, lists:sublist(Refs, Offset + 1, Count))
     end.
 
 %% array.init_elem $t $e : copy `Count` references from element segment `Refs` (at
 %% index `SrcOff`) into the array at index `DstIdx`. OOB on either range; null-traps.
 array_init_elem({ref_null}, _DstIdx, _Refs, _SrcOff, _Count) ->
-    null_trap();
+    null_array_trap();
 array_init_elem({gc, Id}, DstIdx, Refs, SrcOff, Count) ->
     {array, T, Es} = get({gc_obj, Id}),
-    case DstIdx >= 0 andalso Count >= 0 andalso SrcOff >= 0
-        andalso DstIdx + Count =< tuple_size(Es)
-        andalso SrcOff + Count =< length(Refs) of
-        false -> oob_trap();
-        true ->
-            Vals = lists:sublist(Refs, SrcOff + 1, Count),
-            put({gc_obj, Id}, {array, T, write_slice(Es, DstIdx, Vals)}),
-            ok
-    end.
+    %% ARRAY (destination) range first, then the ELEMENT (source) span — a both-overflow
+    %% case reports the array trap (spec ordering, per array_init_elem.wast).
+    check_range(DstIdx, Count, tuple_size(Es)),
+    check_elem_range(SrcOff, Count, length(Refs)),
+    Vals = lists:sublist(Refs, SrcOff + 1, Count),
+    put({gc_obj, Id}, {array, T, write_slice(Es, DstIdx, Vals)}),
+    ok.
 
 %% Decode `N` little-endian unsigned integers of `W` bytes each from `Bytes` at
 %% byte `Off` (bounds already checked by the caller).
@@ -357,11 +355,32 @@ write_slice(Es, Di, Slice) ->
     Res.
 
 check_bounds(Idx, Size) when Idx >= 0, Idx < Size -> ok;
-check_bounds(_Idx, _Size) -> oob_trap().
+check_bounds(_Idx, _Size) -> array_oob_trap().
 
 check_range(Idx, Count, Size) when Idx >= 0, Count >= 0, Idx + Count =< Size -> ok;
-check_range(_Idx, _Count, _Size) -> oob_trap().
+check_range(_Idx, _Count, _Size) -> array_oob_trap().
 
-null_trap() -> erlang:error({wasm_trap, null_reference}).
-cast_trap() -> erlang:error({wasm_trap, cast_failure}).
-oob_trap() -> erlang:error({wasm_trap, array_out_of_bounds}).
+%% Data-segment byte-span bounds (array.new_data / array.init_data): over-running the
+%% DATA segment is spec "out of bounds memory access".
+check_data_range(Off, Count, Width, ByteSize)
+    when Off >= 0, Count >= 0, Off + Count * Width =< ByteSize -> ok;
+check_data_range(_, _, _, _) -> mem_oob_trap().
+
+%% Element-segment span bounds (array.new_elem / array.init_elem): over-running the
+%% ELEMENT segment is spec "out of bounds table access".
+check_elem_range(Off, Count, Len)
+    when Off >= 0, Count >= 0, Off + Count =< Len -> ok;
+check_elem_range(_, _, _) -> table_oob_trap().
+
+%% Per-space trap helpers. The spec trap MESSAGE differs by which reference kind / segment
+%% space faulted, so each raises a distinct atom (mapped to its spec phrase in the
+%% conformance runner's `spec_phrase_of`). Only the message differs — the trap semantics
+%% (a genuine WASM trap) are unchanged, and these atoms are reachable ONLY from GC code.
+null_trap()        -> erlang:error({wasm_trap, null_reference}).
+null_struct_trap() -> erlang:error({wasm_trap, null_structure_reference}).
+null_array_trap()  -> erlang:error({wasm_trap, null_array_reference}).
+null_i31_trap()    -> erlang:error({wasm_trap, null_i31_reference}).
+cast_trap()        -> erlang:error({wasm_trap, cast_failure}).
+array_oob_trap()   -> erlang:error({wasm_trap, array_out_of_bounds}).
+mem_oob_trap()     -> erlang:error({wasm_trap, memory_out_of_bounds}).
+table_oob_trap()   -> erlang:error({wasm_trap, table_out_of_bounds}).

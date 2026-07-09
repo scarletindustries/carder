@@ -909,6 +909,18 @@ fn spec_phrase_of(reason: String) -> Result(String, Nil) {
     #("indirect_call_type_mismatch", "indirect call type mismatch"),
     #("uninitialized_element", "uninitialized element"),
     #("undefined_element", "undefined element"),
+    // Phase-8 GC trap phrases. `array.new_data`/`new_elem` reuse the already-mapped
+    // memory_/table_out_of_bounds atoms (a data/element-segment span over-run); the array-index
+    // space is its own `array_out_of_bounds`. The null-dereference message is space-specific
+    // (structure/array/i31), with the bare `null_reference` for `ref.as_non_null`. No atom here is
+    // a substring of another (the specific null_* kinds do NOT contain the bare `null_reference`),
+    // so first-match ordering is safe.
+    #("array_out_of_bounds", "out of bounds array access"),
+    #("null_structure_reference", "null structure reference"),
+    #("null_array_reference", "null array reference"),
+    #("null_i31_reference", "null i31 reference"),
+    #("null_reference", "null reference"),
+    #("cast_failure", "cast failure"),
     #("unreachable", "unreachable"),
   ]
   list.find_map(kinds, fn(kv) {
