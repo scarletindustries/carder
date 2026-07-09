@@ -146,7 +146,9 @@ pub fn mangle_injective(closure_modules: List(String)) -> Bool {
 /// (`rt_ref`/`link`/`rt_simd`/`rt_exn`). `porffor_abi` is reached transitively (via `rt_host`) and so
 /// is a member of `frozen_runtime_closure/0` but NOT a root.
 ///
-/// Returns the 15 fully-mangled `twocore@runtime@*` module atom strings, sorted.
+/// Returns the 16 fully-mangled `twocore@runtime@*` module atom strings, sorted. `rt_teavm` (the
+/// TeaVM WASM GC host runtime, experimental) is reachable because `link.resolve_func_provided`
+/// routes TeaVM host imports to it.
 pub fn frozen_runtime_roots() -> List(String) {
   sorted([
     "twocore@runtime@link", "twocore@runtime@rt_exn", "twocore@runtime@rt_host",
@@ -155,7 +157,8 @@ pub fn frozen_runtime_roots() -> List(String) {
     "twocore@runtime@rt_ref", "twocore@runtime@rt_simd",
     "twocore@runtime@rt_state", "twocore@runtime@rt_stdlib",
     "twocore@runtime@rt_table", "twocore@runtime@rt_table_atomics",
-    "twocore@runtime@rt_table_ets", "twocore@runtime@rt_trap",
+    "twocore@runtime@rt_table_ets", "twocore@runtime@rt_teavm",
+    "twocore@runtime@rt_trap",
   ])
 }
 

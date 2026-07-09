@@ -136,18 +136,19 @@ pub fn surviving_remotes_subset_of_ambient_test() {
 // Closure snapshot shape (R8/R15) — counts + adversarial exclusions.
 // ---------------------------------------------------------------------------
 
-/// The frozen closure snapshot has the expected shape: 16 runtime + 12 gleam + 7 FFI = 35 in-closure
-/// modules, all duplicate-free, and the roots (15) are the runtime closure minus `porffor_abi` (the
-/// only transitively-reached runtime member).
+/// The frozen closure snapshot has the expected shape: 17 runtime + 12 gleam + 7 FFI = 36 in-closure
+/// modules, all duplicate-free, and the roots (16) are the runtime closure minus `porffor_abi` (the
+/// only transitively-reached runtime member). (`rt_teavm`, the experimental TeaVM WASM GC host
+/// runtime reached from `link`, added the 17th runtime member.)
 pub fn frozen_closure_shape_test() {
-  assert list.length(m.frozen_runtime_closure()) == 16
+  assert list.length(m.frozen_runtime_closure()) == 17
   assert list.length(m.frozen_gleam_closure()) == 12
   assert list.length(m.frozen_ffi_erl()) == 7
-  assert list.length(m.frozen_closure_modules()) == 35
+  assert list.length(m.frozen_closure_modules()) == 36
   assert no_duplicates(m.frozen_closure_modules()) == True
 
   let roots = m.frozen_runtime_roots()
-  assert list.length(roots) == 15
+  assert list.length(roots) == 16
   assert subset_of(roots, m.frozen_runtime_closure()) == True
   // the sole non-root runtime member is porffor_abi (reached via rt_host).
   let extra =
