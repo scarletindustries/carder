@@ -52,6 +52,7 @@ import twocore/ir.{
 import twocore/runtime/rt_host
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_table
+import twocore/runtime/rt_teavm
 
 /// Identity coercion of a `List(Dynamic)` to the `List(Int)` shape `rt_host.call_host`
 /// consumes — sound because a host function argument is a raw numeric bit pattern (D5), which
@@ -541,28 +542,36 @@ fn resolve_func_provided(
         Error(Nil) -> Error(UnknownImport(capability, name))
       }
     _ ->
-      case is_registered(capability, providers) {
-        // A genuine host capability (env, wasi, …): call-site-gated, not link-checked.
-        False -> Ok(ProvidedFunc(ty, host_func_closure(capability, name)))
-        True ->
-          case lookup_registered(capability, name, providers) {
-            Ok(ProvidedFunc(sig, closure)) ->
-              case sig == ty {
-                True -> Ok(ProvidedFunc(sig, closure))
-                False ->
+      // TeaVM WASM GC host imports (experimental) are REFERENCE-typed (externref/funcref/GC refs),
+      // which the numeric `host_func_closure`/`call_host` ABI cannot carry. Resolve them to a
+      // TERM-native `ProvidedFunc` closure in `rt_teavm` (the same `List(Dynamic)` closure ABI the
+      // register-seam uses). Not link-checked, not `HostPolicy`-gated — its fate is the handler.
+      case rt_teavm.is_teavm_capability(capability) {
+        True -> Ok(ProvidedFunc(ty, rt_teavm.dispatch(capability, name)))
+        False ->
+          case is_registered(capability, providers) {
+            // A genuine host capability (env, wasi, …): call-site-gated, not link-checked.
+            False -> Ok(ProvidedFunc(ty, host_func_closure(capability, name)))
+            True ->
+              case lookup_registered(capability, name, providers) {
+                Ok(ProvidedFunc(sig, closure)) ->
+                  case sig == ty {
+                    True -> Ok(ProvidedFunc(sig, closure))
+                    False ->
+                      Error(IncompatibleImportType(
+                        capability,
+                        name,
+                        "function signature",
+                      ))
+                  }
+                Ok(_) ->
                   Error(IncompatibleImportType(
                     capability,
                     name,
-                    "function signature",
+                    "expected a function",
                   ))
+                Error(Nil) -> Error(UnknownImport(capability, name))
               }
-            Ok(_) ->
-              Error(IncompatibleImportType(
-                capability,
-                name,
-                "expected a function",
-              ))
-            Error(Nil) -> Error(UnknownImport(capability, name))
           }
       }
   }
@@ -620,11 +629,36 @@ fn find_provided(
 ) -> Result(Provided, ImportError) {
   let found = case module {
     "spectest" -> spectest_export(name)
+    // TeaVM WASM GC state imports (experimental): the imported linear `memory` (`env.memory`) and
+    // the two `teavmMemory` layout globals. Built-in like `spectest`, consulted before providers.
+    "env" | "teavmMemory" -> teavm_export(name)
     _ -> lookup_registered(module, name, providers)
   }
   case found {
     Ok(p) -> Ok(p)
     Error(Nil) -> Error(UnknownImport(module, name))
+  }
+}
+
+/// The TeaVM WASM GC runtime's imported STATE externvals (experimental) — the imported linear
+/// `memory` (`env.memory`, 33 pages min / 32768 max, `Idx32`) plus the two `teavmMemory` globals
+/// that tell TeaVM where its linear-memory malloc heap begins (`heapOffset` — 216, aligned past the
+/// module's ~211 B of static data) and its ceiling (`maxSize`). Mirrors `spectest_export`: a fresh
+/// `rt_mem` memory the importing binding links, filled by the module's own active data segment at
+/// instantiate. A literal `case` — no ambient authority (D3a). `Error(Nil)` for an unknown name.
+fn teavm_export(name: String) -> Result(Provided, Nil) {
+  case name {
+    "memory" ->
+      Ok(ProvidedMemory(
+        value: rt_mem.fresh(33, Some(32_768), spectest_mem_safe_cap),
+        min_pages: 33,
+        max_pages: Some(32_768),
+        idx_type: Idx32,
+      ))
+    "heapOffset" -> Ok(ProvidedGlobal(value: 216, ty: TI32, mutable: False))
+    "maxSize" ->
+      Ok(ProvidedGlobal(value: 2_147_483_647, ty: TI32, mutable: False))
+    _ -> Error(Nil)
   }
 }
 
