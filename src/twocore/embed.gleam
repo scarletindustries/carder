@@ -21,18 +21,38 @@
 //// obligation, mirroring `rt_host.HostHandler`). It may call `mem_read`/`mem_write` on the
 //// pointers it is passed; a bad guest pointer is a bounds-checked `Error`, never a node crash.
 
+import gleam/erlang/atom
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import twocore/backend/build_beam
 import twocore/ir
 import twocore/pipeline
 import twocore/runtime/profiles
 import twocore/runtime/rt_mem
 
-/// A compiled guest: its loadable `.beam` bytes plus the IR module whose `imports` order drives
-/// the function-import wiring at instantiate. Produced by `compile`, consumed by `instantiate`.
+/// Target sub-module count when a guest is large enough to split (see `chunk.split_module`). Splitting
+/// a big guest into this many independently-compiled BEAM modules bounds the `compile:forms` peak to
+/// ~1/N of the whole-module cost, while keeping the loaded-module count modest.
+const chunk_target = 8
+
+/// Only split a guest with at least this many top-level Core functions. A smaller guest compiles as a
+/// SINGLE module — byte-identical to the pre-chunking output — so the vast majority of guests are
+/// untouched and only the large ones (which are the ones that OOM) pay the multi-module path.
+const min_split_defs = 64
+
+/// A compiled guest: the loadable `.beam` bytes of its ENTRY module, the IR module whose `imports`
+/// order drives the function-import wiring at instantiate, and any HELPER chunk modules a large guest
+/// was split into. Produced by `compile`, consumed by `instantiate`.
+///
+/// - `beam`: the entry module's `.beam` (loads under `module.name`) — the module `instantiate` runs.
+/// - `module`: the guest's IR (import metadata + the entry atom `module.name`).
+/// - `extra`: `#(module_atom, beam)` for each additional chunk a large guest was split into (empty
+///   for a small guest compiled as one module). `instantiate` loads these alongside `beam` so the
+///   entry's cross-chunk `call`s resolve; they are pure code with no state of their own.
 pub type Compiled {
-  Compiled(beam: BitArray, module: ir.Module)
+  Compiled(beam: BitArray, module: ir.Module, extra: List(#(String, BitArray)))
 }
 
 /// A live guest instance — an opaque handle to its owning BEAM process (one-instance-one-process
@@ -121,13 +141,25 @@ fn compile_with_name(
         None -> m0
       }
       on_progress(20, "generating")
-      case pipeline.ir_to_core(m, profiles.safe()) {
+      // Emit + split into N balanced chunks (a large guest), or a single chunk (a small one). The
+      // chunks are compiled SEQUENTIALLY, bounding peak compile memory to ~the largest chunk.
+      case
+        pipeline.source_to_chunks(
+          m,
+          profiles.safe(),
+          chunk_target,
+          min_split_defs,
+        )
+      {
         Error(e) -> Error(pipeline.describe(e))
-        Ok(core) -> {
+        Ok(chunks) -> {
           on_progress(45, "compiling")
-          case pipeline.core_to_beam(core, m.name) {
+          case pipeline.chunks_to_beams(chunks) {
             Error(e) -> Error(pipeline.describe(e))
-            Ok(beam) -> Ok(Compiled(beam:, module: m))
+            // Chunk 0 (name == `m.name`) is the entry module; the rest are helper modules.
+            Ok([#(_entry_name, primary), ..extra]) ->
+              Ok(Compiled(beam: primary, module: m, extra: extra))
+            Ok([]) -> Error("codegen produced no output modules")
           }
         }
       }
@@ -146,9 +178,32 @@ pub fn instantiate(
   compiled: Compiled,
   host: fn(String, String, List(Int)) -> List(Int),
 ) -> Result(Instance, String) {
-  let Compiled(beam:, module:) = compiled
-  pipeline.instantiate_with_host(beam, module, host)
-  |> result.map(Instance)
+  let Compiled(beam:, module:, extra:) = compiled
+  // Load the helper chunk modules FIRST (pure code, no per-instance state) so the entry module's
+  // cross-chunk `call`s resolve, then start the entry instance in its own process.
+  case load_helpers(extra) {
+    Error(reason) -> Error(reason)
+    Ok(Nil) ->
+      pipeline.instantiate_with_host(beam, module, host)
+      |> result.map(Instance)
+  }
+}
+
+/// Load each helper chunk module into the node. They share the flat BEAM module namespace, but each
+/// was compiled with a distinct `<entry>_c<i>` atom (baked into its `.core` header and every
+/// intra/inter-chunk reference), so a load never clobbers the entry or a sibling. Idempotent-safe
+/// (re-loading the same atom replaces it with identical code). Returns `Error(reason)` on the first
+/// load rejection — fail-closed, since a missing helper would crash the entry's cross-chunk `call`
+/// at runtime. Total.
+fn load_helpers(extra: List(#(String, BitArray))) -> Result(Nil, String) {
+  list.try_fold(extra, Nil, fn(_acc, nb) {
+    let #(name, beam) = nb
+    case build_beam.load_module(atom.create(name), "twocore_embed", beam) {
+      Ok(_) -> Ok(Nil)
+      Error(reason) ->
+        Error("load helper chunk " <> name <> " failed: " <> reason)
+    }
+  })
 }
 
 /// **Invoke** an exported function on a live instance, routed into its owning process (so it

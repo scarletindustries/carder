@@ -70,6 +70,8 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import twocore/backend/build_beam
+import twocore/backend/chunk
+import twocore/backend/core_erlang.{type CModule}
 import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/frontend/wasm/ast
@@ -630,6 +632,53 @@ pub fn core_to_beam(
   }
 }
 
+/// Lower + optimize + emit + **split** an IR module into N balanced Core sub-modules (chunk 0 first).
+///
+/// Same three stages as `ir_to_lowered_core` up to `emit_core.emit_module`, then `chunk.split_module`
+/// partitions the whole-module `CModule` so the downstream `compile:forms` peak is bounded to
+/// O(largest chunk) instead of O(whole module). `target <= 1` or a module with fewer than
+/// `min_split_defs` defs returns a SINGLE chunk (the whole module), whose printed `.core` is
+/// byte-identical to the unchunked path.
+///
+/// - `m`: the IR module. `binding`: the build-time binding. `target`: desired chunk count.
+///   `min_split_defs`: don't split a module smaller than this (keeps small guests untouched).
+/// - Return: `Ok([CModule])` (chunk order), or `Error(IrLowerFailed/EmitFailed)`. Total.
+pub fn source_to_chunks(
+  m: ir.Module,
+  binding: Binding,
+  target: Int,
+  min_split_defs: Int,
+) -> Result(List(CModule), PipelineError) {
+  case lower_ir(m, binding) {
+    Error(e) -> Error(e)
+    Ok(lowered) -> {
+      let optimized = optimize_ir(lowered, binding)
+      case emit_core.emit_module(optimized, binding) {
+        Error(e) -> Error(EmitFailed(e))
+        Ok(cmod) -> Ok(chunk.split_module(cmod, target, min_split_defs))
+      }
+    }
+  }
+}
+
+/// Compile chunk `CModule`s to loadable `.beam`s, **sequentially** — this is what bounds the peak
+/// (each chunk's compile transients are reclaimed before the next starts).
+///
+/// - `chunks`: from `source_to_chunks` (chunk 0 first).
+/// - Return: `Ok([#(module_atom, beam)])` in chunk order — chunk 0's atom is the guest's run-ABI
+///   module name; the rest are its `_c<i>` helper modules that must be loaded alongside it. Or the
+///   first chunk's `Error(BuildFailed(_))`. Total — never panics.
+pub fn chunks_to_beams(
+  chunks: List(CModule),
+) -> Result(List(#(String, BitArray)), PipelineError) {
+  list.try_map(chunks, fn(c) {
+    case core_to_beam(core_printer.print_module(c), c.name) {
+      Error(e) -> Error(e)
+      Ok(beam) -> Ok(#(c.name, beam))
+    }
+  })
+}
+
 /// Parse `.ir` text into an `ir.Module` (unit 02's parser). A convenience wrapper used by
 /// the CLI's `.ir`-consuming subcommands; the `ir.parser.ParseError` is NOT a pipeline
 /// stage error (it parses the inter-stage textual form), so it is surfaced as its own type.
@@ -691,6 +740,62 @@ pub fn run_source(
                   Ok(result)
                 }
               }
+          }
+      }
+  }
+}
+
+/// Like `run_source`, but compiles the guest as N balanced CHUNKS (see `source_to_chunks`), loads
+/// every chunk beam, then instantiates + invokes the entry (chunk 0). Used to prove chunked
+/// compilation is behaviour-identical to the whole-module path (a chunked guest must return
+/// byte-identical results / traps), and it is the shape the memory-bounded server path uses.
+///
+/// - `wasm`/`binding`/`export`/`args`: as `run_source`. `target`/`min_split_defs`: chunk controls
+///   (a small `min_split_defs` forces a split even on a small guest, for testing).
+/// - Return: identical to `run_source` (`Ok(Returned/Trapped/…)` or the first compile `Error`). The
+///   helper chunks are inter-module `call` targets of the entry, so they are loaded FIRST; a helper
+///   that fails to load surfaces as an instantiation error. Total — never panics.
+pub fn run_source_chunked(
+  wasm: BitArray,
+  binding: Binding,
+  export: String,
+  args: List(Int),
+  target: Int,
+  min_split_defs: Int,
+) -> Result(RunResult, PipelineError) {
+  case source_to_ir(wasm) {
+    Error(e) -> Error(e)
+    Ok(m) ->
+      case source_to_chunks(m, binding, target, min_split_defs) {
+        Error(e) -> Error(e)
+        Ok(chunks) ->
+          case chunks_to_beams(chunks) {
+            Error(e) -> Error(e)
+            // Unreachable: `source_to_chunks` always yields at least one chunk.
+            Ok([]) ->
+              Error(
+                BuildFailed(
+                  build_beam.CompileFailed([
+                    "chunking produced no output modules",
+                  ]),
+                ),
+              )
+            Ok([#(name, beam), ..extras]) -> {
+              // Load the helper chunks first so the entry's cross-chunk `call`s resolve.
+              list.each(extras, fn(nb) {
+                let _ =
+                  build_beam.load_module(atom.create(nb.0), "twocore_cli", nb.1)
+                Nil
+              })
+              case instantiate(beam, name) {
+                Error(reason) -> Ok(classify_run_error(reason))
+                Ok(proc) -> {
+                  let result = invoke_instance(proc, export, args)
+                  stop_instance(proc)
+                  Ok(result)
+                }
+              }
+            }
           }
       }
   }
