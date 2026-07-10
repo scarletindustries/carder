@@ -42,8 +42,21 @@
 %% returned Module atom is taken from the `.core` `module` header, not any
 %% filename. On failure every diagnostic from whichever stage failed is
 %% returned as a flat list of human-readable "<loc>: <message>" binaries.
+%%
+%% PERF (compile memory): `core_printer` pretty-prints with an indent that GROWS
+%% per nesting level, and a large guest (a TeaVM/Java module) lowers to functions
+%% nested hundreds of `let`/`letrec` levels deep — so a ~277 KB wasm becomes ~85 MB
+%% of `.core`, of which ~94% is leading whitespace. That is catastrophic HERE
+%% (only): `unicode:characters_to_list/1` turns the 85 MB binary into an ~1.4 GB
+%% char list, and `core_scan` chews the lot, blowing the compile up to ~12 GiB and
+%% OOM-killing a memory-capped node. The whitespace is INSIGNIFICANT to the scanner
+%% (tokens stay separated by the newlines we keep), so we strip each line's leading
+%% indentation before scanning — dropping the text ~15x and peak compile memory
+%% ~11x (measured: 11.74 GiB -> ~1.0 GiB) with a byte-identical `.beam`. The
+%% pretty-printed text `core_printer` returns is untouched (tests/debug still read
+%% it); only this compile path sees the compact form.
 compile_core(CoreBin) when is_binary(CoreBin) ->
-    Str = unicode:characters_to_list(CoreBin),
+    Str = unicode:characters_to_list(strip_indent(CoreBin)),
     case core_scan:string(Str) of
         {ok, Toks, _End} ->
             case core_parse:parse(Toks) of
@@ -57,6 +70,18 @@ compile_core(CoreBin) when is_binary(CoreBin) ->
             end;
         {error, EI, _End} -> {error, [fmt_one(EI)]}
     end.
+
+%% Strip each line's LEADING indentation (spaces/tabs) while keeping the newlines
+%% that separate tokens — semantics-preserving for the Core scanner. Sub-binaries
+%% from `binary:split` are cheap references into `CoreBin`; the rejoined result is
+%% the ~6 MB of real content (vs ~85 MB of mostly-whitespace input).
+strip_indent(CoreBin) ->
+    Lines = binary:split(CoreBin, <<"\n">>, [global]),
+    iolist_to_binary(lists:join(<<"\n">>, [trim_leading(L) || L <- Lines])).
+
+trim_leading(<<$\s, Rest/binary>>) -> trim_leading(Rest);
+trim_leading(<<$\t, Rest/binary>>) -> trim_leading(Rest);
+trim_leading(Line) -> Line.
 
 %% Flatten the compiler's per-file nested error list into one flat list of
 %% rendered binary lines. `fmt_one` already returns a single binary, so we wrap
