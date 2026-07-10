@@ -10,6 +10,7 @@ import gleam/erlang/process
 import gleeunit/should
 import simplifile
 import twocore/embed
+import twocore/ir
 
 /// An embedder host function is called for a guest import AND can marshal over the guest's
 /// linear memory. The `poke` fixture writes "ABC" to memory then calls `dance.poke(0, 3)`; the
@@ -73,4 +74,26 @@ pub fn artifact_round_trip_reinstantiates_test() {
 pub fn artifact_malformed_is_error_test() {
   embed.from_artifact(<<"not a real artifact">>)
   |> should.be_error
+}
+
+/// Fabricate the 3-field `{compiled, Beam, Module}` artifact an OLDER compiler produced (before the
+/// `extra` helper-chunk field), bypassing `to_artifact`.
+@external(erlang, "twocore_embed_compat_ffi", "legacy_artifact")
+fn legacy_artifact(beam: BitArray, module: ir.Module) -> BitArray
+
+/// Back-compat: a durable artifact cached by a PRE-chunking compiler must still load + boot after a
+/// compiler upgrade. `from_artifact` upgrades the legacy 3-field shape to the current 4-field record
+/// (no helper chunks), and the reloaded guest instantiates + runs unchanged.
+pub fn legacy_artifact_upgrades_and_instantiates_test() {
+  let assert Ok(wasm) =
+    simplifile.read_bits("test/twocore/conformance/corpus/add.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+
+  let legacy = legacy_artifact(compiled.beam, compiled.module)
+  let assert Ok(upgraded) = embed.from_artifact(legacy)
+
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(instance) = embed.instantiate(upgraded, no_host)
+  embed.invoke(instance, "add", [3, 5]) |> should.equal(Ok([8]))
+  embed.stop(instance)
 }

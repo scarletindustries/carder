@@ -22,5 +22,16 @@
 -export([from_binary/1]).
 
 from_binary(Bin) ->
-    try {ok, binary_to_term(Bin)}
+    try upgrade(binary_to_term(Bin))
     catch _:_ -> {error, <<"malformed 2core artifact">>} end.
+
+%% Back-compat for the `extra` (helper-chunk) field added to the `Compiled` record. An artifact
+%% serialized BEFORE that field existed is the 3-element tuple `{compiled, Beam, Module}`; the
+%% current record is the 4-element `{compiled, Beam, Module, Extra}`. A node running the newer
+%% compiler must still boot a deployment whose artifact was cached by the OLDER compiler (the cache
+%% is durable and survives a worker upgrade), so rewrite the legacy shape to the current one with an
+%% empty helper-chunk list — a pre-chunking guest simply has no helper modules. Any already-current
+%% (4-tuple) or otherwise-shaped term passes through untouched; a genuinely-malformed blob still
+%% fails closed via the catch in `from_binary/1` (and the downstream `instantiate` shape check).
+upgrade({compiled, Beam, Module}) -> {ok, {compiled, Beam, Module, []}};
+upgrade(Term) -> {ok, Term}.
