@@ -2019,7 +2019,17 @@ fn apply_cont(
         False -> Error(ArityMismatch(list.length(names), list.length(vals)))
         True -> {
           use #(body_c, state2) <- result.try(emit(body, next, sc, state, ctx))
-          Ok(#(CLet(names, value_list(vals), body_c), state2))
+          case names {
+            // A zero-value bind is `let <> = <> in body`: the RHS `value_list([])` is the
+            // empty value list `<>` — a pure literal with no side effects — so the `let` is a
+            // vacuous no-op. Emit `body` directly. On a large guest (e.g. the TeaVM gateway)
+            // this drops ~10k such lets (~10% of the emitted Core text), shrinking the
+            // emit/scan/parse cost and wall-time. It does NOT change the resulting `.beam`
+            // (`sys_core_fold` inside `compile:forms` already elides these), so the
+            // compile:forms peak is unchanged; this is a text/transient/time win only.
+            [] -> Ok(#(body_c, state2))
+            _ -> Ok(#(CLet(names, value_list(vals), body_c), state2))
+          }
         }
       }
   }

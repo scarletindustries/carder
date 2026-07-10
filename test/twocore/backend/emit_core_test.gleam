@@ -1181,7 +1181,8 @@ pub fn threaded_store_rebinds_record_test() {
   assert st_arg == st
   assert s == s2
   // the zero-result function returns `{'ok', St2}` — the rebound record, NOT the incoming St.
-  let assert CLet([], CValues([]), CTuple([CAtom("ok"), CVar(ret)])) = tail
+  // (The zero-value `let <> = <>` that used to wrap this tail is now elided at emit time.)
+  let assert CTuple([CAtom("ok"), CVar(ret)]) = tail
   assert ret == newst
 }
 
@@ -1303,6 +1304,8 @@ pub fn threaded_global_set_rebinds_record_test() {
     )
   let assert FunDef(FName("set", 2), CFun([st, "v"], body)) =
     threaded_def(st_module(set), "set")
+  // The trailing `{'ok', St2}` is yielded directly — the vacuous zero-value `let <> = <>` that
+  // used to wrap it (from the empty-result `Values([])`) is now elided at emit time.
   let assert CLet(
     [newst],
     CCall(
@@ -1310,7 +1313,7 @@ pub fn threaded_global_set_rebinds_record_test() {
       CAtom("t_global_set"),
       [CVar(st_arg), CBinary(_), CVar("v")],
     ),
-    CLet([], CValues([]), CTuple([CAtom("ok"), CVar(ret)])),
+    CTuple([CAtom("ok"), CVar(ret)]),
   ) = body
   assert st_arg == st
   assert ret == newst
@@ -1459,13 +1462,13 @@ pub fn threaded_loop_is_constant_space_template_test() {
   // the loop is entered with the function's LEADING record param.
   assert st_entry == st
   // the back-edge is a TAIL apply of the loop head, prepending the LIVE (rebound) record. The
-  // store's `let St2 = <case>` rebinds the record; the `Let([], …, Continue)` interposes only a
-  // trivial zero-value `let <> = <>` (identical to the cell path), then the `apply` is in TAIL
-  // position — no `case`/wrapping between it and the loop head, so the loop is constant space.
+  // store's `let St2 = <case>` rebinds the record; the zero-value `Let([], …, Continue)` that used
+  // to interpose a trivial `let <> = <>` is now elided, so the back-edge `apply` sits DIRECTLY in
+  // tail position — no `case`/wrapping between it and the loop head, so the loop is constant space.
   let assert CLet(
     [st2],
     _store_case,
-    CLet([], CValues([]), CApply(FName(back, 2), [CVar(st2b), CVar("i")])),
+    CApply(FName(back, 2), [CVar(st2b), CVar("i")]),
   ) = lbody
   assert back == lname
   assert st2b == st2
