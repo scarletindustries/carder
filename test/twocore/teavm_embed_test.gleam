@@ -6,6 +6,7 @@
 ////   - memtest.wasm — org.teavm.interop.Address raw linear-memory r/w → 49 (the IMPORTED memory works)
 //// A stub `host` (never called — neither fixture imports a non-teavm function) stands in for the embedder.
 
+import gleam/erlang/process
 import gleam/io
 import gleam/string
 import twocore/conformance/ffi
@@ -72,6 +73,22 @@ pub fn default_compile_collides_teavm_modules_test() {
   let assert Ok(channel_c) = embed.compile(channel)
   // Two different modules, ONE atom — the collision.
   assert counter_c.module.name == channel_c.module.name
+}
+
+/// `compile_progress` reports each compiler phase (percent, label) in order, so an embedder can
+/// drive a build progress bar. Same result as `compile_named` (progress is a side channel).
+pub fn compile_progress_reports_phases_test() {
+  let assert Ok(bytes) = ffi.read_file("test/twocore/teavm/compute.wasm")
+  let events = process.new_subject()
+  let assert Ok(compiled) =
+    embed.compile_progress(bytes, "twocore@wasm@progress", fn(pct, phase) {
+      process.send(events, #(pct, phase))
+    })
+  assert compiled.module.name == "twocore@wasm@progress"
+  // Phases are entered in order with a monotonically rising completed-percent.
+  assert process.receive(events, 200) == Ok(#(0, "analyzing"))
+  assert process.receive(events, 200) == Ok(#(20, "generating"))
+  assert process.receive(events, 200) == Ok(#(45, "compiling"))
 }
 
 /// `compile_named` with distinct atoms lets two guests COEXIST in one node, each resolving to its OWN

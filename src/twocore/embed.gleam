@@ -61,7 +61,12 @@ pub type InvokeResult =
 /// first. An embedder deploying MULTIPLE guests to one node (e.g. a Dance app with several WASM
 /// modules) must give each a distinct atom via `compile_named`.
 pub fn compile(wasm: BitArray) -> Result(Compiled, String) {
-  compile_with_name(wasm, None)
+  compile_with_name(wasm, None, no_progress)
+}
+
+/// The no-op progress callback for `compile`/`compile_named` (callers that don't want progress).
+fn no_progress(_percent: Int, _phase: String) -> Nil {
+  Nil
 }
 
 /// **Compile** WASM guest bytes like `compile`, but OVERRIDE the generated BEAM module atom with
@@ -75,17 +80,39 @@ pub fn compile(wasm: BitArray) -> Result(Compiled, String) {
 /// - Returns `Ok(Compiled)` whose `module.name` is `name`, or `Error(text)` (same failure modes as
 ///   `compile`; an atom-invalid `name` surfaces as a codegen `Error` from `core_to_beam`). Total.
 pub fn compile_named(wasm: BitArray, name: String) -> Result(Compiled, String) {
-  compile_with_name(wasm, Some(name))
+  compile_with_name(wasm, Some(name), no_progress)
 }
 
-/// Shared compile path for `compile`/`compile_named`. When `name_override` is `Some`, the IR
-/// module's `name` (set by `lower` to `twocore@wasm@<firstexport>`) is replaced BEFORE `ir_to_core`
-/// so `emit_core` (which reads the emitted-module atom solely from `ir.Module.name`, and every
-/// downstream stage after `lower` has no wasm to re-derive it from) threads the override everywhere.
+/// Like `compile_named`, but reports coarse build PROGRESS through `on_progress(percent, phase)` as
+/// it enters each compiler phase — so an embedder (e.g. Dance) can drive a build progress bar.
+///
+/// - `percent` is the work COMPLETED before the phase begins: `0` → analyze (decode/validate/lower),
+///   `20` → generate (IR → Core Erlang), `45` → compile (Core Erlang → BEAM). The last is the long
+///   pole (~half the wall time) and has no internal sub-progress, so the bar dwells at `45` during
+///   it; the embedder owns the tail (its own caching → `100`).
+/// - `phase` is a short EMBEDDER-FACING label ("analyzing"/"generating"/"compiling"); compiler
+///   internals stay internal.
+/// - The callback runs IN the compiling process — keep it cheap and node-safe (a crash there fails
+///   the compile). Returns exactly as `compile_named`.
+pub fn compile_progress(
+  wasm: BitArray,
+  name: String,
+  on_progress: fn(Int, String) -> Nil,
+) -> Result(Compiled, String) {
+  compile_with_name(wasm, Some(name), on_progress)
+}
+
+/// Shared compile path for `compile`/`compile_named`/`compile_progress`. When `name_override` is
+/// `Some`, the IR module's `name` (set by `lower` to `twocore@wasm@<firstexport>`) is replaced
+/// BEFORE `ir_to_core` so `emit_core` (which reads the emitted-module atom solely from
+/// `ir.Module.name`, and every downstream stage after `lower` has no wasm to re-derive it from)
+/// threads the override everywhere. `on_progress` is invoked as each phase is ENTERED.
 fn compile_with_name(
   wasm: BitArray,
   name_override: Option(String),
+  on_progress: fn(Int, String) -> Nil,
 ) -> Result(Compiled, String) {
+  on_progress(0, "analyzing")
   case pipeline.source_to_ir(wasm) {
     Error(e) -> Error(pipeline.describe(e))
     Ok(m0) -> {
@@ -93,13 +120,16 @@ fn compile_with_name(
         Some(name) -> ir.Module(..m0, name: name)
         None -> m0
       }
+      on_progress(20, "generating")
       case pipeline.ir_to_core(m, profiles.safe()) {
         Error(e) -> Error(pipeline.describe(e))
-        Ok(core) ->
+        Ok(core) -> {
+          on_progress(45, "compiling")
           case pipeline.core_to_beam(core, m.name) {
             Error(e) -> Error(pipeline.describe(e))
             Ok(beam) -> Ok(Compiled(beam:, module: m))
           }
+        }
       }
     }
   }
