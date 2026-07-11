@@ -22,6 +22,7 @@
 //// pointers it is passed; a bad guest pointer is a bounds-checked `Error`, never a node crash.
 
 import gleam/erlang/atom
+import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -234,6 +235,33 @@ pub fn invoke(
 pub fn stop(instance: Instance) -> Nil {
   let Instance(proc:) = instance
   pipeline.stop_instance(proc)
+}
+
+/// The Pid of the instance's owning process — the process that holds its linear memory,
+/// globals and tables (one-instance-one-process isolation). An embedder uses this to
+/// attribute the guest's real resource usage EXTERNALLY via `erlang:process_info`
+/// (reductions, process memory, mailbox) without messaging the guest — e.g. a periodic
+/// telemetry snapshot that must not stall behind an in-flight invoke. Total.
+///
+/// The Pid is only meaningful while the instance is live; after `stop` (or a guest
+/// crash) it names a dead process and `process_info` returns `undefined`.
+pub fn guest_pid(instance: Instance) -> Pid {
+  let Instance(proc:) = instance
+  pipeline.instance_pid(proc)
+}
+
+/// The guest's current linear-memory (memory 0) footprint, in BYTES — `memory.size`
+/// pages × 64 KiB — read inside the guest's own process so it reflects the true
+/// allocation (the dominant footprint of a WASM interpreter guest, which a host-side
+/// `process_info` under-counts because a Paged memory is an off-heap binary).
+///
+/// - Returns the byte size, or `0` for a guest that declares no memory.
+/// - This RPCs the guest process, so it serialises behind any in-flight invoke; use it
+///   for an on-demand probe (e.g. a dashboard "measure" request), NOT a hot loop. For a
+///   non-blocking periodic snapshot use `guest_pid` + `process_info` instead. Total.
+pub fn mem_size(instance: Instance) -> Int {
+  let Instance(proc:) = instance
+  pipeline.mem_size_instance(proc) * 65_536
 }
 
 /// Read `len` bytes at `ptr` from the CURRENT instance's linear memory (memory 0). Call ONLY

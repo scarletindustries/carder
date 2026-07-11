@@ -12,7 +12,7 @@
 -module(twocore_cli_ffi).
 -export([catch_apply/3, start_instance/1, start_instance_with/2,
          call_instance/3, stop_instance/1, module_name/1, bench_instance/4,
-         porffor_output/1]).
+         porffor_output/1, mem_size/1]).
 
 %% Apply Mod:Fun(Args) on the loaded generated module. On a normal return yield
 %% `{ok, V}` (a Gleam `Ok(Int)`) where V is the result rendered as an integer (the raw
@@ -158,6 +158,25 @@ stop_instance(Pid) ->
     Pid ! stop,
     nil.
 
+%% Ask the instance process to report memory 0's size (64 KiB pages), read IN that
+%% process so it reflects the guest's real linear-memory footprint (the Cell mem cell
+%% / Threaded state record are both process-local). A memory-less guest reports 0.
+%% Backs embed:mem_size / pipeline:mem_size_instance.
+mem_size(Pid) ->
+    %% Monitor so a DEAD guest yields 0 instead of blocking forever (the guest is
+    %% spawned unlinked/unmonitored, so a bare `receive` would wait on a reply that
+    %% never comes). A LIVE-but-busy guest still serialises behind its in-flight
+    %% invoke — correct, and the sole driver (the dance actor) is itself blocked
+    %% during an invoke, so it cannot race a mem_size against one.
+    Ref = monitor(process, Pid),
+    Pid ! {mem_size, self(), Ref},
+    receive
+        {mem_size_reply, Ref, Pages} ->
+            demonitor(Ref, [flush]),
+            Pages;
+        {'DOWN', Ref, process, Pid, _} -> 0
+    end.
+
 instance_loop(Module) ->
     receive
         {invoke, Fun, Args, From, Ref} ->
@@ -187,6 +206,14 @@ instance_loop(Module) ->
             Bin = try 'twocore@runtime@rt_host':porffor_output()
                   catch _:_ -> <<>> end,
             From ! {porffor_output_reply, Ref, Bin},
+            instance_loop(Module);
+        {mem_size, From, Ref} ->
+            %% Report memory 0's size in 64 KiB pages, read IN this process (the Cell
+            %% memory lives in this process's dictionary). A memory-less guest → 0.
+            %% D3a: the rt_mem module reference is build-fixed, never data-derived.
+            Pages = try 'twocore@runtime@rt_mem':size()
+                    catch _:_ -> 0 end,
+            From ! {mem_size_reply, Ref, Pages},
             instance_loop(Module);
         stop ->
             ok
@@ -246,6 +273,13 @@ threaded_loop(Module, St) ->
             Bin = try 'twocore@runtime@rt_host':porffor_output()
                   catch _:_ -> <<>> end,
             From ! {porffor_output_reply, Ref, Bin},
+            threaded_loop(Module, St);
+        {mem_size, From, Ref} ->
+            %% Threaded twin of the Cell `mem_size`: memory 0 lives in the `St`
+            %% record, so read its page count via rt_mem:t_size/1. Memory-less → 0.
+            Pages = try 'twocore@runtime@rt_mem':t_size(St)
+                    catch _:_ -> 0 end,
+            From ! {mem_size_reply, Ref, Pages},
             threaded_loop(Module, St);
         stop ->
             ok
