@@ -80,7 +80,7 @@ fn emitted_core_arity(exports: List(FName), name: String) -> Int {
 /// TablePaged) — the accepted Phase-12 posture.
 fn threaded_binding() -> instance.Binding {
   let assert Ok(b) =
-    twocore.resolve_binding(profiles.safe(), True, None, None, None)
+    twocore.resolve_binding(profiles.safe(), True, False, None, None, None)
   b
 }
 
@@ -127,7 +127,7 @@ pub fn default_off_byte_identical_test() {
   let assert Ok(bytes) = simplifile.read_bits(wasm)
   let assert Ok(m) = pipeline.source_to_ir(bytes)
   let assert Ok(binding) =
-    twocore.resolve_binding(profiles.safe(), False, None, None, None)
+    twocore.resolve_binding(profiles.safe(), False, False, None, None, None)
   let assert Ok(core) = pipeline.ir_to_core(m, binding)
   let assert Ok(oracle_beam) = pipeline.core_to_beam(core, m.name)
 

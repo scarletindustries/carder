@@ -93,7 +93,8 @@ fn clz_fn() -> ir.Function {
   )
 }
 
-/// `add(a, b) = i32.add(a, b)` — a binary numeric op routing to `rt_num:i32_add`.
+/// `add(a, b) = i32.add(a, b)` — a binary numeric op. `i32.add` is INLINED as a BEAM guard
+/// BIF (`band('+'(a, b), 2^32−1)`), so it leaves NO `rt_num:i32_add` seam in the merge.
 fn add_fn() -> ir.Function {
   ir.Function(
     name: "add",
@@ -103,6 +104,24 @@ fn add_fn() -> ir.Function {
     body: ir.Let(
       ["r"],
       ir.Num(ir.IAdd(ir.W32), [ir.Var("p0"), ir.Var("p1")]),
+      ir.Return([ir.Var("r")]),
+    ),
+  )
+}
+
+/// `rotl(a, b) = i32.rotl(a, b)` — a binary numeric op that STAYS on the `rt_num` seam
+/// (rotate is not inlined), so it emits a `call 'twocore@runtime@rt_num':'i32_rotl'(a, b)` and
+/// therefore appears in the merge as the mangled def `rt_num__i32_rotl/2`. Used as a genuinely
+/// seam-reaching function for the DCE / mangling assertions now that `i32.add` is inlined away.
+fn rotl_fn() -> ir.Function {
+  ir.Function(
+    name: "rotl",
+    params: [ir.Local("p0", ir.TI32), ir.Local("p1", ir.TI32)],
+    result: [ir.TI32],
+    locals: [],
+    body: ir.Let(
+      ["r"],
+      ir.Num(ir.IRotl(ir.W32), [ir.Var("p0"), ir.Var("p1")]),
       ir.Return([ir.Var("r")]),
     ),
   )
@@ -286,15 +305,16 @@ pub fn fun_capture_is_first_class_test() {
 // ════════════════════ 4. DCE soundness ════════════════════
 
 /// DCE soundness: a closure function NOT reachable from the roots is ABSENT from
-/// the merged output. The numerics module uses only `i32.clz`/`i32.add`, so an
-/// unrelated `rt_num` export (e.g. `f64_sqrt`) must NOT appear as a merged def.
+/// the merged output. The numerics module uses only `i32.clz`/`i32.rotl` (both still on the
+/// `rt_num` seam — `i32.add` is inlined and would leave no seam to observe), so an unrelated
+/// `rt_num` export (e.g. `f64_sqrt`) must NOT appear as a merged def.
 pub fn dce_drops_unreachable_test() {
   let name = "twocore@link@dce"
-  let core = gen_core(num_module(name, [clz_fn(), add_fn()]))
+  let core = gen_core(num_module(name, [clz_fn(), rotl_fn()]))
   let assert Ok(#(_, text)) = beam_link.link_to_core(core, name, ambient())
-  // i32_clz + i32_add ARE reached (defs present).
+  // i32_clz + i32_rotl ARE reached (defs present).
   assert string.contains(text, "'twocore@runtime@rt_num__i32_clz'/1 =")
-  assert string.contains(text, "'twocore@runtime@rt_num__i32_add'/2 =")
+  assert string.contains(text, "'twocore@runtime@rt_num__i32_rotl'/2 =")
   // an unreferenced runtime function is DCE'd out.
   assert !string.contains(text, "'twocore@runtime@rt_num__f64_sqrt'/1 =")
 }
@@ -386,10 +406,11 @@ pub fn fail_closed_missing_module_test() {
 /// asserts the merged module actually defines the distinctly-mangled names.
 pub fn mangle_disambiguates_same_named_functions_test() {
   let name = "twocore@link@mangle"
-  let core = gen_core(num_module(name, [clz_fn(), add_fn()]))
+  let core = gen_core(num_module(name, [clz_fn(), rotl_fn()]))
   let assert Ok(#(_, text)) = beam_link.link_to_core(core, name, ambient())
-  // the runtime `i32_add` is mangled with its full module atom — never bare.
-  assert string.contains(text, "'twocore@runtime@rt_num__i32_add'/2 =")
+  // the runtime `i32_rotl` (a still-seamed op) is mangled with its full module atom — never
+  // bare. (`i32.add` is inlined and leaves no seam to observe here.)
+  assert string.contains(text, "'twocore@runtime@rt_num__i32_rotl'/2 =")
 }
 
 /// R12 fail-closed: a DISCOVERED closure module whose atom itself contains the

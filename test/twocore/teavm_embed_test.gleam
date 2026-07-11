@@ -6,6 +6,7 @@
 ////   - memtest.wasm — org.teavm.interop.Address raw linear-memory r/w → 49 (the IMPORTED memory works)
 //// A stub `host` (never called — neither fixture imports a non-teavm function) stands in for the embedder.
 
+import gleam/erlang/process
 import gleam/io
 import gleam/string
 import twocore/conformance/ffi
@@ -46,6 +47,66 @@ pub fn embed_compiles_sdk_guests_test() {
   let assert Ok(_) = embed.compile(counter)
   let assert Ok(channel) = ffi.read_file("test/twocore/teavm/channel_java.wasm")
   let assert Ok(_) = embed.compile(channel)
+}
+
+/// `compile_named` bakes the requested atom in AND preserves semantics — including the `call_ref`
+/// virtual dispatch `compute()` performs (→ 46). The emitted `module.name` is the override verbatim.
+pub fn compile_named_preserves_semantics_test() {
+  let assert Ok(bytes) = ffi.read_file("test/twocore/teavm/compute.wasm")
+  let assert Ok(compiled) =
+    embed.compile_named(bytes, "twocore@wasm@renamed_compute")
+  assert compiled.module.name == "twocore@wasm@renamed_compute"
+  let host = fn(_capability, _name, _args) { [] }
+  let assert Ok(instance) = embed.instantiate(compiled, host)
+  // Same result as the default-named compile (call_ref dispatch resolves against the override).
+  assert embed.invoke(instance, "compute", []) == Ok([46])
+}
+
+/// DOCUMENTS THE BUG `compile_named` exists to fix: two DISTINCT TeaVM guests compile to the SAME
+/// BEAM atom under the default `compile`, because the atom is `twocore@wasm@<first export>` and every
+/// TeaVM module exports `teavm.stringToJs` first. Loading both into one node would have the second
+/// silently overwrite the first — so a multi-WASM-module Dance app MUST use `compile_named`.
+pub fn default_compile_collides_teavm_modules_test() {
+  let assert Ok(counter) = ffi.read_file("test/twocore/teavm/counter_java.wasm")
+  let assert Ok(counter_c) = embed.compile(counter)
+  let assert Ok(channel) = ffi.read_file("test/twocore/teavm/channel_java.wasm")
+  let assert Ok(channel_c) = embed.compile(channel)
+  // Two different modules, ONE atom — the collision.
+  assert counter_c.module.name == channel_c.module.name
+}
+
+/// `compile_progress` reports each compiler phase (percent, label) in order, so an embedder can
+/// drive a build progress bar. Same result as `compile_named` (progress is a side channel).
+pub fn compile_progress_reports_phases_test() {
+  let assert Ok(bytes) = ffi.read_file("test/twocore/teavm/compute.wasm")
+  let events = process.new_subject()
+  let assert Ok(compiled) =
+    embed.compile_progress(bytes, "twocore@wasm@progress", fn(pct, phase) {
+      process.send(events, #(pct, phase))
+    })
+  assert compiled.module.name == "twocore@wasm@progress"
+  // Phases are entered in order with a monotonically rising completed-percent.
+  assert process.receive(events, 200) == Ok(#(0, "analyzing"))
+  assert process.receive(events, 200) == Ok(#(20, "generating"))
+  assert process.receive(events, 200) == Ok(#(45, "compiling"))
+}
+
+/// `compile_named` with distinct atoms lets two guests COEXIST in one node, each resolving to its OWN
+/// code. `compute` (→46) and `memtest` (→49) are loaded together under distinct atoms, then BOTH are
+/// invoked: if they shared an atom the second load would overwrite the first and one export would
+/// vanish / return the other's result. Distinct atoms → each keeps its own behaviour.
+pub fn compile_named_distinct_atoms_coexist_test() {
+  let host = fn(_capability, _name, _args) { [] }
+  let assert Ok(compute) = ffi.read_file("test/twocore/teavm/compute.wasm")
+  let assert Ok(memtest) = ffi.read_file("test/twocore/teavm/memtest.wasm")
+  let assert Ok(a) = embed.compile_named(compute, "twocore@wasm@coexist_a")
+  let assert Ok(b) = embed.compile_named(memtest, "twocore@wasm@coexist_b")
+  assert a.module.name != b.module.name
+  // Load BOTH, THEN invoke both — each must still see its own code.
+  let assert Ok(ia) = embed.instantiate(a, host)
+  let assert Ok(ib) = embed.instantiate(b, host)
+  assert embed.invoke(ia, "compute", []) == Ok([46])
+  assert embed.invoke(ib, "memtest", []) == Ok([49])
 }
 
 /// The SDK guests also INSTANTIATE — which seeds their ~450 static GC globals. One global's init

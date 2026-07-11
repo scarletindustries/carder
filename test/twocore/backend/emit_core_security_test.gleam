@@ -110,10 +110,29 @@ fn children(e: CExpr) -> List(CExpr) {
   }
 }
 
-/// Every `call` in `m` targets a fixed runtime module atom (drawn from `binding`) and a
-/// literal function atom.
+/// The FIXED pure-BIF whitelist. The inline-numeric optimization (`emit_core.inline_num_op`)
+/// lowers the hot, provably-exact integer ops to BEAM guard BIFs emitted as
+/// `call 'erlang':'<bif>'(…)` instead of an `rt_num` seam call. Every BIF here is PURE
+/// (effect-free arithmetic / bitwise / comparison) and is selected by a FIXED LITERAL atom in
+/// the emitter — NEVER derived from program/attacker data — so it carries NO ambient authority
+/// and stays D3a-clean. Admitting `erlang` for exactly these atoms is the ONE intentional,
+/// tightly-scoped loosening of the twocore-only module homogeneity (S5), justified by the
+/// hot-integer-op inlining. Anything outside this set on the `erlang` module would be a
+/// violation.
+fn pure_bif_whitelist() -> Set(String) {
+  set.from_list([
+    "band", "bor", "bxor", "bsl", "bsr", "+", "-", "*", "<", ">", "=<", ">=",
+    "=:=", "=/=",
+  ])
+}
+
+/// Every `call` in `m` targets a fixed runtime module atom (drawn from `binding`) and a literal
+/// function atom — EXCEPT the inlined hot-integer ops, which emit `call 'erlang':'<bif>'(…)`
+/// where the function atom is drawn from `pure_bif_whitelist()` (a pure guard BIF chosen by a
+/// fixed literal atom, no ambient authority — see `pure_bif_whitelist`).
 fn assert_calls_are_runtime(m: CModule, binding: instance.Binding) {
   let allowed = runtime_modules(binding)
+  let pure_bifs = pure_bif_whitelist()
   let calls =
     list.flat_map(m.defs, fn(d) {
       let FunDef(_, v) = d
@@ -121,11 +140,18 @@ fn assert_calls_are_runtime(m: CModule, binding: instance.Binding) {
     })
   list.each(calls, fn(pair) {
     let #(mod, fun) = pair
-    // module position: a literal atom that is one of the binding's runtime modules.
+    // module position: a literal atom.
     let assert CAtom(mod_name) = mod
-    assert set.contains(allowed, mod_name) == True
     // function position: a literal atom (never program-chosen/computed).
-    let assert CAtom(_) = fun
+    let assert CAtom(fun_name) = fun
+    let ok = case mod_name {
+      // an inlined hot-integer op: `call 'erlang':'<bif>'(…)` is admitted ONLY when the function
+      // atom is one of the FIXED pure guard BIFs (no ambient authority, D3a-clean).
+      "erlang" -> set.contains(pure_bifs, fun_name)
+      // every other `call` targets one of the binding's fixed twocore runtime modules (S5).
+      _ -> set.contains(allowed, mod_name)
+    }
+    assert ok == True
   })
 }
 

@@ -110,16 +110,23 @@ fn add_fn() -> ir.Function {
   )
 }
 
-/// `Let(names, rhs, body)` → `let <names> = <rhs> in <body>`; `Num(IAdd(W32))` routes
-/// through `num_module:i32_add`; tail `Return([r])` is the bare value (a 1-value list).
+/// `Let(names, rhs, body)` → `let <names> = <rhs> in <body>`; the hot `Num(IAdd(W32))` is
+/// INLINED as a BEAM guard BIF `band('erlang':'+'(p0, p1), 2^32−1)` — no `rt_num` seam call
+/// (the Erlang compiler folds it to a `gc_bif`, and `band(_, 2^32−1)` is the width wrap,
+/// bit-identical to `rt_num.norm`). Tail `Return([r])` is the bare value (a 1-value list).
 pub fn let_num_return_test() {
-  let b = binding()
   let assert CLet(
     ["r"],
-    CCall(CAtom(num), CAtom("i32_add"), [CVar("p0"), CVar("p1")]),
+    CCall(
+      CAtom("erlang"),
+      CAtom("band"),
+      [
+        CCall(CAtom("erlang"), CAtom("+"), [CVar("p0"), CVar("p1")]),
+        CInt(4_294_967_295),
+      ],
+    ),
     CVar("r"),
   ) = body_of(module_with(add_fn()), "add")
-  assert num == b.num_module
 }
 
 // ───────────────────────────── If → case on i32 ─────────────────────────────
@@ -201,10 +208,20 @@ pub fn loop_is_tail_recursive_letrec_test() {
   // The body's `continue` is a tail self-apply of the same head → constant space.
   assert applies_to(lbody, lname)
   // The body computes the loop condition, then `case`s on it: `<0>` (false) breaks with the
-  // bare accumulator (no join point, since the exit is in tail position / KReturn).
+  // bare accumulator (no join point, since the exit is in tail position / KReturn). The
+  // condition is the INLINED `i64.le_u` — a raw unsigned BEAM `=<` compare reified to an i32
+  // truth value (`bool_bif_to_i32`), no `rt_num` seam. Its 1/0 internals are pinned in the
+  // numeric tests; here we only assert it IS the unsigned-`=<` shape and focus on the
+  // loop/case/continue skeleton.
   let assert CLet(
     ["cond"],
-    CCall(_, CAtom("i64_le_u"), _),
+    CCase(
+      CCall(CAtom("erlang"), CAtom("=<"), _),
+      [
+        CClause([PAtom("true")], CAtom("true"), CInt(1)),
+        CClause([PAtom("false")], CAtom("true"), CInt(0)),
+      ],
+    ),
     CCase(
       CVar("cond"),
       [
@@ -595,29 +612,17 @@ pub fn mem_grow_is_bare_call_test() {
   assert mem == b.mem_module
 }
 
-/// `MemLoad(MemAccess(bytes,signed), addr, off, result)` → a trapping `Result`: a `case`
-/// over `call '<mem_module>':'load'(Bytes, Signed, ResultWidth, Addr, Off)` raising on
-/// `{error,_}`. `i32.load8_s` walks to `Signed='true'` + `ResultWidth=32`.
+/// `MemLoad(MemAccess(bytes,signed), addr, off, result)` under the Cell (`NoState`) strategy (lever
+/// 2) → a BARE `call '<mem_module>':'load_raising'(Bytes, Signed, ResultWidth, Addr, Off)` that
+/// returns the value directly and raises `MemoryOutOfBounds` INTERNALLY — so it binds straight
+/// through the continuation (here the function return), with NO `{ok,X}|{error,E}` tuple + emit-side
+/// `case … raise` unwrap. `i32.load8_s` walks to `Signed='true'` + `ResultWidth=32`.
 pub fn mem_load_is_trapping_case_test() {
   let b = binding()
-  let assert CLet(
-    [r],
-    CCase(
-      CCall(
-        CAtom(mem),
-        CAtom("load"),
-        [CInt(1), CAtom("true"), CInt(32), CVar("a"), CInt(8)],
-      ),
-      [
-        CClause([PTuple([PAtom("ok"), PVar(x)])], CAtom("true"), CVar(x2)),
-        CClause(
-          [PTuple([PAtom("error"), PVar(e)])],
-          CAtom("true"),
-          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
-        ),
-      ],
-    ),
-    CVar(r2),
+  let assert CCall(
+    CAtom(mem),
+    CAtom("load_raising"),
+    [CInt(1), CAtom("true"), CInt(32), CVar("a"), CInt(8)],
   ) =
     body_of(
       op_module(
@@ -629,16 +634,13 @@ pub fn mem_load_is_trapping_case_test() {
       "f",
     )
   assert mem == b.mem_module
-  assert trap == b.trap_module
-  assert x == x2
-  assert e == e2
-  assert r == r2
 }
 
 /// `i64.load8_s` differs from `i32.load8_s` ONLY in the emitted `ResultWidth` (64 vs 32) —
-/// same `bytes`+`signed` — confirming `result` disambiguates the sign-extension width (E2).
+/// same `bytes`+`signed` — confirming `result` disambiguates the sign-extension width (E2). Both
+/// lower to the bare `load_raising` seam call (lever 2), the width being the 3rd argument.
 pub fn mem_load_result_width_disambiguates_test() {
-  let assert CLet(_, CCase(CCall(_, _, [_, _, CInt(w32), ..]), _), _) =
+  let assert CCall(_, CAtom("load_raising"), [_, _, CInt(w32), ..]) =
     body_of(
       op_module(
         "f",
@@ -648,7 +650,7 @@ pub fn mem_load_result_width_disambiguates_test() {
       ),
       "f",
     )
-  let assert CLet(_, CCase(CCall(_, _, [_, _, CInt(w64), ..]), _), _) =
+  let assert CCall(_, CAtom("load_raising"), [_, _, CInt(w64), ..]) =
     body_of(
       op_module(
         "f",
@@ -662,28 +664,19 @@ pub fn mem_load_result_width_disambiguates_test() {
   assert w64 == 64
 }
 
-/// `MemStore` → a ZERO-RESULT ordered effect: `let <_> = <case over
-/// call '<mem_module>':'store'(Bytes, Addr, Val, Off)> in <rest>`, the `case` reduced to a
-/// single discardable value (`{ok,_}`→`'ok'`, `{error,E}`→`raise`). The store sequences
-/// before the rest (non-DCE) with eval order addr → value → store.
+/// `MemStore` under the Cell (`NoState`) strategy (lever 2) → a ZERO-RESULT ordered effect:
+/// `let <_> = call '<mem_module>':'store_raising'(Bytes, Addr, Val, Off) in <rest>`. The bare
+/// `store_raising` call IS the effect — it returns `Nil` and raises `MemoryOutOfBounds` INTERNALLY,
+/// so there is NO `{ok,_}|{error,E}` tuple + emit-side `case … raise` reduction. It sequences before
+/// the rest (non-DCE) with eval order addr → value → store.
 pub fn mem_store_is_ordered_effect_test() {
   let b = binding()
   let assert CLet(
     [_g],
-    CCase(
-      CCall(
-        CAtom(mem),
-        CAtom("store"),
-        [CInt(4), CVar("a"), CVar("v"), CInt(0)],
-      ),
-      [
-        CClause([PTuple([PAtom("ok"), PVar(_)])], CAtom("true"), CAtom("ok")),
-        CClause(
-          [PTuple([PAtom("error"), PVar(e)])],
-          CAtom("true"),
-          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
-        ),
-      ],
+    CCall(
+      CAtom(mem),
+      CAtom("store_raising"),
+      [CInt(4), CVar("a"), CVar("v"), CInt(0)],
     ),
     CAtom("ok"),
   ) =
@@ -697,8 +690,6 @@ pub fn mem_store_is_ordered_effect_test() {
       "f",
     )
   assert mem == b.mem_module
-  assert trap == b.trap_module
-  assert e == e2
 }
 
 /// `GlobalGet(name)` → a bare `call '<state_module>':'global_get'(NameBin)` where `NameBin`
@@ -1181,7 +1172,8 @@ pub fn threaded_store_rebinds_record_test() {
   assert st_arg == st
   assert s == s2
   // the zero-result function returns `{'ok', St2}` — the rebound record, NOT the incoming St.
-  let assert CLet([], CValues([]), CTuple([CAtom("ok"), CVar(ret)])) = tail
+  // (The zero-value `let <> = <>` that used to wrap this tail is now elided at emit time.)
+  let assert CTuple([CAtom("ok"), CVar(ret)]) = tail
   assert ret == newst
 }
 
@@ -1303,6 +1295,8 @@ pub fn threaded_global_set_rebinds_record_test() {
     )
   let assert FunDef(FName("set", 2), CFun([st, "v"], body)) =
     threaded_def(st_module(set), "set")
+  // The trailing `{'ok', St2}` is yielded directly — the vacuous zero-value `let <> = <>` that
+  // used to wrap it (from the empty-result `Values([])`) is now elided at emit time.
   let assert CLet(
     [newst],
     CCall(
@@ -1310,7 +1304,7 @@ pub fn threaded_global_set_rebinds_record_test() {
       CAtom("t_global_set"),
       [CVar(st_arg), CBinary(_), CVar("v")],
     ),
-    CLet([], CValues([]), CTuple([CAtom("ok"), CVar(ret)])),
+    CTuple([CAtom("ok"), CVar(ret)]),
   ) = body
   assert st_arg == st
   assert ret == newst
@@ -1370,21 +1364,28 @@ pub fn threaded_call_indirect_binds_results_and_rebinds_test() {
 }
 
 /// A PURE function under `Threaded` keeps its Phase-1 `'g'/n` shape (no `St`, no return
-/// tuple) — byte-identical to `Cell`. So pure numeric leaves pay NOTHING (§B.1, §D).
+/// tuple) — byte-identical to `Cell`. So pure numeric leaves pay NOTHING (§B.1, §D). The
+/// `i32.add` leaf is the INLINED BIF `band('erlang':'+'(p0, p1), 2^32−1)` (no `rt_num` seam);
+/// what this test pins is the FunDef/CFun shape — NO leading `St` param, bare `r` return.
 pub fn threaded_pure_function_keeps_phase1_shape_test() {
-  let b = threaded_binding()
   let assert FunDef(
     FName("add", 2),
     CFun(
       ["p0", "p1"],
       CLet(
         ["r"],
-        CCall(CAtom(num), CAtom("i32_add"), [CVar("p0"), CVar("p1")]),
+        CCall(
+          CAtom("erlang"),
+          CAtom("band"),
+          [
+            CCall(CAtom("erlang"), CAtom("+"), [CVar("p0"), CVar("p1")]),
+            CInt(4_294_967_295),
+          ],
+        ),
         CVar("r"),
       ),
     ),
   ) = threaded_def(module_with(add_fn()), "add")
-  assert num == b.num_module
 }
 
 /// A tail `CallDirect` to a STATE-REACHING callee stays a TAIL CALL: `apply 'g'/(n+1)(St, x)`
@@ -1459,13 +1460,13 @@ pub fn threaded_loop_is_constant_space_template_test() {
   // the loop is entered with the function's LEADING record param.
   assert st_entry == st
   // the back-edge is a TAIL apply of the loop head, prepending the LIVE (rebound) record. The
-  // store's `let St2 = <case>` rebinds the record; the `Let([], …, Continue)` interposes only a
-  // trivial zero-value `let <> = <>` (identical to the cell path), then the `apply` is in TAIL
-  // position — no `case`/wrapping between it and the loop head, so the loop is constant space.
+  // store's `let St2 = <case>` rebinds the record; the zero-value `Let([], …, Continue)` that used
+  // to interpose a trivial `let <> = <>` is now elided, so the back-edge `apply` sits DIRECTLY in
+  // tail position — no `case`/wrapping between it and the loop head, so the loop is constant space.
   let assert CLet(
     [st2],
     _store_case,
-    CLet([], CValues([]), CApply(FName(back, 2), [CVar(st2b), CVar("i")])),
+    CApply(FName(back, 2), [CVar(st2b), CVar("i")]),
   ) = lbody
   assert back == lname
   assert st2b == st2
@@ -1788,9 +1789,10 @@ pub fn table_grow_test() {
     )
 }
 
-/// The memory-index ROUTING (H3/H7): `MemLoad(0, …)` emits the byte-identical Phase-4 `rt_mem:load`
-/// (NO index arg); `MemLoad(1, …)` emits `rt_mem:load_at(1, …)` (a leading memidx). A single-memory
-/// index-0 module is unchanged from Phase-4.
+/// The memory-index ROUTING (H3/H7) under the Cell (`NoState`) strategy (lever 2): `MemLoad(0, …)`
+/// emits the bare `rt_mem:load_raising` (NO index arg); `MemLoad(1, …)` emits
+/// `rt_mem:load_at_raising(1, …)` (a leading memidx). Both are bare seam calls raising
+/// `MemoryOutOfBounds` internally — no `{ok,X}|{error,E}` unwrap `case`.
 pub fn mem_load_index_routing_test() {
   // index 0 → the un-indexed head.
   let load0 = ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32)
@@ -1798,13 +1800,10 @@ pub fn mem_load_index_routing_test() {
     _,
     CFun(
       _,
-      CLet(
-        [_],
-        CCase(
-          CCall(CAtom(_), CAtom("load"), [CInt(4), _, _, CVar("p0"), CInt(0)]),
-          _,
-        ),
-        _,
+      CCall(
+        CAtom(_),
+        CAtom("load_raising"),
+        [CInt(4), _, _, CVar("p0"), CInt(0)],
       ),
     ),
   ) = p5_fdef(load0, [ir.TI32], binding())
@@ -1814,17 +1813,10 @@ pub fn mem_load_index_routing_test() {
     _,
     CFun(
       _,
-      CLet(
-        [_],
-        CCase(
-          CCall(
-            CAtom(_),
-            CAtom("load_at"),
-            [CInt(1), CInt(4), _, _, CVar("p0"), CInt(0)],
-          ),
-          _,
-        ),
-        _,
+      CCall(
+        CAtom(_),
+        CAtom("load_at_raising"),
+        [CInt(1), CInt(4), _, _, CVar("p0"), CInt(0)],
       ),
     ),
   ) = p5_fdef(load1, [ir.TI32], binding())

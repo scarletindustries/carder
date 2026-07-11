@@ -45,6 +45,26 @@ import twocore/backend/core_erlang.{
 /// so this only affects readability of the emitted text, never its validity.
 const indent_unit = "    "
 
+/// Maximum accumulated indentation, in bytes. Indentation is for HUMAN readability
+/// only (the scanner ignores it), but a large guest lowers to functions nested
+/// HUNDREDS of `let`/`letrec` deep — so unbounded per-level indentation makes the
+/// emitted `.core` almost entirely leading spaces (a ~277 KB guest → ~85 MB, ~94%
+/// whitespace), ballooning emit memory + time. We cap the depth: shallow code (the
+/// common case, and every printer test) indents normally; pathologically deep
+/// nesting stops accumulating here. The compile path also strips leading
+/// indentation before scanning (`twocore_codegen_ffi`), so this is belt-and-braces
+/// for the emit side.
+const max_indent = 48
+
+/// `ind` deepened by one `indent_unit`, capped at `max_indent` bytes so deeply
+/// nested constructs stop growing the per-line indentation.
+fn deepen(ind: String) -> String {
+  case string.byte_size(ind) >= max_indent {
+    True -> ind
+    False -> ind <> indent_unit
+  }
+}
+
 // ───────────────────────────── small helpers ─────────────────────────────
 
 /// Shorthand: a `StringTree` from a literal string.
@@ -116,19 +136,20 @@ fn print_def(def: FunDef) -> StringTree {
 /// Print a definition whose LHS line begins at indentation `ind` (used both for
 /// top-level defs, `ind = ""`, and for `letrec` defs at a nested indent).
 fn print_def_at(def: FunDef, ind: String) -> StringTree {
+  let inner = deepen(ind)
   string_tree.concat([
     st(ind),
     print_fname(def.name),
     st(" =\n"),
-    st(ind <> indent_unit),
-    print_expr(def.value, ind <> indent_unit),
+    st(inner),
+    print_expr(def.value, inner),
   ])
 }
 
 // ─────────────────────────── expression printer ───────────────────────────
 
 /// Print an expression. `ind` is the indentation prefix for any *continuation*
-/// lines this expression emits; nested constructs use `ind <> indent_unit`.
+/// lines this expression emits; nested constructs use `deepen(ind)` (capped).
 /// Inline literals/calls ignore `ind`. Total; handles every `CExpr` constructor.
 fn print_expr(e: CExpr, ind: String) -> StringTree {
   case e {
@@ -220,7 +241,7 @@ fn print_expr(e: CExpr, ind: String) -> StringTree {
 /// ```
 /// The `of`/`catch` variable lists are ALWAYS value-list-wrapped `<…>` (matching the
 /// `arg`/raise arity, exactly like a `case` clause pattern). `ind` is the `try` keyword's
-/// own indentation; `arg`/`body`/`handler` continue at `ind <> indent_unit`.
+/// own indentation; `arg`/`body`/`handler` continue at `deepen(ind)` (capped).
 fn print_try(
   arg: CExpr,
   body_vars: List(String),
@@ -229,7 +250,7 @@ fn print_try(
   handler: CExpr,
   ind: String,
 ) -> StringTree {
-  let inner = ind <> indent_unit
+  let inner = deepen(ind)
   string_tree.concat([
     st("try\n"),
     st(inner),
@@ -260,7 +281,7 @@ fn print_var_list(vars: List(String)) -> StringTree {
 
 /// Print `fun (V1, V2) -> Body`, with the body on its own indented line.
 fn print_fun(vars: List(String), body: CExpr, ind: String) -> StringTree {
-  let inner = ind <> indent_unit
+  let inner = deepen(ind)
   string_tree.concat([
     st("fun ("),
     list.map(vars, fn(v) { st(legalize_var(v)) }) |> string_tree.join(", "),
@@ -279,7 +300,7 @@ fn print_let(
   body: CExpr,
   ind: String,
 ) -> StringTree {
-  let inner = ind <> indent_unit
+  let inner = deepen(ind)
   let binder = case vars {
     [single] -> st(legalize_var(single))
     _ ->
@@ -302,7 +323,7 @@ fn print_let(
 
 /// Print `letrec Defs… in Body`.
 fn print_letrec(defs: List(FunDef), body: CExpr, ind: String) -> StringTree {
-  let inner = ind <> indent_unit
+  let inner = deepen(ind)
   let defs_tree =
     list.map(defs, fn(d) { print_def_at(d, inner) }) |> string_tree.join("\n")
   string_tree.concat([
@@ -315,7 +336,7 @@ fn print_letrec(defs: List(FunDef), body: CExpr, ind: String) -> StringTree {
 
 /// Print `case Arg of Clauses… end`, with `end` aligned to the `case`.
 fn print_case(arg: CExpr, clauses: List(CClause), ind: String) -> StringTree {
-  let inner = ind <> indent_unit
+  let inner = deepen(ind)
   let cls =
     list.map(clauses, fn(c) { print_clause(c, inner) })
     |> string_tree.join("\n")
@@ -335,7 +356,7 @@ fn print_case(arg: CExpr, clauses: List(CClause), ind: String) -> StringTree {
 /// ALWAYS printed (`CAtom("true")` ⇒ `when 'true'`) — both are mandatory in Core
 /// Erlang (fact 6). `ind` is the clause's own indentation.
 fn print_clause(c: CClause, ind: String) -> StringTree {
-  let inner = ind <> indent_unit
+  let inner = deepen(ind)
   string_tree.concat([
     st(ind),
     st("<"),

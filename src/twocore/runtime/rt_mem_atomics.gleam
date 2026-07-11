@@ -55,6 +55,7 @@ import twocore/ir.{type TrapReason, MemoryOutOfBounds}
 import twocore/runtime/rt_mem
 import twocore/runtime/rt_meter
 import twocore/runtime/rt_state.{type InstanceState}
+import twocore/runtime/rt_trap
 
 // ───────────────────────────── constants ─────────────────────────────
 
@@ -509,6 +510,54 @@ pub fn store(
   }
 }
 
+/// BARE-RAISING cell load (lever 2) — `load` MINUS the `Result` wrapper: returns the loaded bit
+/// pattern DIRECTLY and, on an out-of-bounds access, raises the trap INTERNALLY via
+/// `rt_trap.raise(MemoryOutOfBounds)`. Same bounds/decode contract as `a_load` (an UNSIGNED load
+/// returns the raw `gather` directly — no decode); byte-identical trap reason and value. The seam
+/// `emit_core`'s NoState path calls so a checked atomics load lowers to a single bare `call`.
+///
+/// - `bytes`/`signed`/`result_width`/`addr`/`offset`: see `load`.
+/// - Returns the loaded value. Diverges (raises `MemoryOutOfBounds`) iff `ea < 0` or
+///   `ea + bytes > byte_len`.
+pub fn load_raising(
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  let a = current_atomics()
+  let ea = addr + offset
+  case in_bounds(a, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True -> {
+      let raw = gather(a, ea, bytes)
+      case signed {
+        True -> decode_signed(raw, bytes, result_width)
+        False -> raw
+      }
+    }
+  }
+}
+
+/// BARE-RAISING cell store (lever 2) — `store` MINUS the `Result` wrapper: scatters `value`'s low
+/// `bytes` bytes into the mutable `ref` IN PLACE (no `mem_put`) and returns `Nil`, or on an
+/// out-of-bounds access raises the trap INTERNALLY via `rt_trap.raise(MemoryOutOfBounds)` BEFORE any
+/// byte is written (all-or-nothing — zero mutation). The bare call IS the ordered effect
+/// `emit_core`'s NoState path sequences.
+///
+/// - `bytes`/`addr`/`value`/`offset`: see `store`.
+/// - Returns `Nil` on success. Diverges (raises `MemoryOutOfBounds`, ZERO mutation) iff `ea < 0` or
+///   `ea + bytes > byte_len`.
+pub fn store_raising(bytes: Int, addr: Int, value: Int, offset: Int) -> Nil {
+  let a = current_atomics()
+  let ea = addr + offset
+  case in_bounds(a, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True -> scatter(a, ea, value, bytes)
+  }
+}
+
 /// UNCHECKED cell load (Phase-10, N5) — `load` MINUS the bounds check/`Result`. See
 /// `a_load_unchecked` (BEAM-safe on OOB).
 pub fn load_unchecked(
@@ -743,6 +792,50 @@ pub fn store_at(
   case a_store(current_atomics_at(mem_idx), bytes, addr, value, offset) {
     Ok(_a) -> Ok(Nil)
     Error(reason) -> Error(reason)
+  }
+}
+
+/// BARE-RAISING `load` from memory `mem_idx` — the index-routed twin of `load_raising`. Returns the
+/// loaded bit pattern directly; raises `MemoryOutOfBounds` internally on OOB. `load_at_raising(0,…)`
+/// is byte-identical to `load_raising(…)`. See `load_raising`.
+pub fn load_at_raising(
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  let a = current_atomics_at(mem_idx)
+  let ea = addr + offset
+  case in_bounds(a, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True -> {
+      let raw = gather(a, ea, bytes)
+      case signed {
+        True -> decode_signed(raw, bytes, result_width)
+        False -> raw
+      }
+    }
+  }
+}
+
+/// BARE-RAISING `store` into memory `mem_idx` — the index-routed twin of `store_raising`. Scatters
+/// into the mutable `ref` IN PLACE (no `mem_put`) and returns `Nil`; on OOB raises
+/// `MemoryOutOfBounds` internally BEFORE any write (zero mutation). `store_at_raising(0,…)` is
+/// byte-identical to `store_raising(…)`. See `store_raising`.
+pub fn store_at_raising(
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Nil {
+  let a = current_atomics_at(mem_idx)
+  let ea = addr + offset
+  case in_bounds(a, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True -> scatter(a, ea, value, bytes)
   }
 }
 

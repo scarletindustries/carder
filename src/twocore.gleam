@@ -31,6 +31,12 @@
 ////   - `--portable` / `--ceiling` — a composed deployment profile (base).
 ////   - `--unsafe` — the Phase-3 Unsafe policy (base).
 ////   - `--threaded` — `state_strategy: Threaded` (the record-threading run-ABI).
+////   - `--trust-memory` — `trust_memory: True` (lever 3): route ALL memory-0 loads/stores through
+////     the bounds-check-free seam for a trusted guest — paged/atomics only; OOB yields a wrong
+////     value instead of trapping. Composable with any base.
+////   - `--inline-joins` — `inline_joins: True` (lever 6): inline single-use, non-recursive `letrec`
+////     join funs (a pure semantics-preserving Core rewrite that shrinks the emitted Core/`.beam`
+////     for a large guest). Composable with any base; already on under `--engine`.
 ////   - `--tier paged|atomics|nif` — the linear-memory trust tier (`nif` is Unsafe-only).
 ////   - `--table-tier paged|ets|atomics` — the funcref-table trust tier.
 ////   - `--cap PAGES` — a bounded linear-memory page cap (required to engage `atomics`/`ceiling`).
@@ -166,6 +172,7 @@ type BaseSel {
   BaseUnsafe
   BasePortable
   BaseCeiling
+  BaseEngine
 }
 
 /// A parsed axis-flag set: the CLI's requested profile/strategy/tier selection (§B). Each
@@ -185,6 +192,8 @@ type Axes {
   Axes(
     base: BaseSel,
     threaded: Bool,
+    trust_memory: Bool,
+    inline_joins: Bool,
     mem: Option(MemTier),
     table: Option(TableTier),
     cap: Option(Int),
@@ -198,7 +207,7 @@ type Axes {
 /// (order-independent among the flags; the positionals keep their given order). Total.
 ///
 /// Recognised flags: `--portable`/`--ceiling`/`--unsafe` (mutually-exclusive base — at most
-/// one), `--threaded`, `--link`, `--tier <t>`, `--table-tier <t>`, `--cap <pages>`,
+/// one), `--threaded`, `--trust-memory`, `--link`, `--tier <t>`, `--table-tier <t>`, `--cap <pages>`,
 /// `--bindings <langs>` (P12-05), `--out <dir>` (P12-05). A `--tier`/`--table-tier`/`--cap`/
 /// `--bindings`/`--out` with no following value, an unknown `--flag`, an unrecognised tier or
 /// language token, a non-integer cap, a second base/`--bindings`/`--out` flag all yield
@@ -213,7 +222,7 @@ fn split_axis_flags(
 ) -> Result(#(Axes, List(String)), String) {
   do_split_axis_flags(
     tokens,
-    Axes(BaseSafe, False, None, None, None, False, [], None),
+    Axes(BaseSafe, False, False, False, None, None, None, False, [], None),
     [],
   )
 }
@@ -245,8 +254,18 @@ fn do_split_axis_flags(
         _,
         positionals,
       ))
+    ["--engine", ..rest] ->
+      result.try(set_base(acc, BaseEngine), do_split_axis_flags(
+        rest,
+        _,
+        positionals,
+      ))
     ["--threaded", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, threaded: True), positionals)
+    ["--trust-memory", ..rest] ->
+      do_split_axis_flags(rest, Axes(..acc, trust_memory: True), positionals)
+    ["--inline-joins", ..rest] ->
+      do_split_axis_flags(rest, Axes(..acc, inline_joins: True), positionals)
     ["--link", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, link: True), positionals)
     ["--bindings", v, ..rest] ->
@@ -290,7 +309,7 @@ fn do_split_axis_flags(
 fn set_base(acc: Axes, base: BaseSel) -> Result(Axes, String) {
   case acc.base {
     BaseSafe -> Ok(Axes(..acc, base: base))
-    _ -> Error("at most one of --portable / --ceiling / --unsafe")
+    _ -> Error("at most one of --portable / --ceiling / --engine / --unsafe")
   }
 }
 
@@ -331,6 +350,7 @@ fn base_binding(sel: BaseSel) -> Binding {
     BaseUnsafe -> profiles.unsafe()
     BasePortable -> profiles.portable()
     BaseCeiling -> profiles.ceiling()
+    BaseEngine -> profiles.engine()
   }
 }
 
@@ -351,6 +371,9 @@ fn base_binding(sel: BaseSel) -> Binding {
 ///
 /// - `base`: the profile chosen by `--portable`/`--ceiling`/`--unsafe`/(default `safe()`).
 /// - `threaded`: `True` iff `--threaded` was given → `state_strategy: Threaded`.
+/// - `trust_memory`: `True` iff `--trust-memory` was given → `trust_memory: True` (lever 3, the
+///   opt-in unchecked-linear-memory toggle). Orthogonal to the base profile and to every other
+///   axis — composable with any of them; honored only on a BEAM-memory-safe tier at emit time.
 /// - `mem`/`table`: the parsed `--tier`/`--table-tier` selections (`None` = keep the base's).
 /// - `cap`: the parsed `--cap` page cap (`None` = keep the base's `safe_max_pages`).
 /// - Returns `Ok(binding)` — a coherent, `resolve_tiers`-coupled, `link`-validated `Binding` —
@@ -360,6 +383,7 @@ fn base_binding(sel: BaseSel) -> Binding {
 pub fn resolve_binding(
   base: Binding,
   threaded: Bool,
+  trust_memory: Bool,
   mem: Option(MemTier),
   table: Option(TableTier),
   cap: Option(Int),
@@ -368,9 +392,13 @@ pub fn resolve_binding(
     True -> Binding(..base, state_strategy: Threaded)
     False -> base
   }
+  let b_trust = case trust_memory {
+    True -> Binding(..b0, trust_memory: True)
+    False -> b0
+  }
   let b1 = case mem {
-    Some(t) -> Binding(..b0, mem_tier: t)
-    None -> b0
+    Some(t) -> Binding(..b_trust, mem_tier: t)
+    None -> b_trust
   }
   let b2 = case table {
     Some(t) -> Binding(..b1, table_tier: t)
@@ -427,10 +455,18 @@ fn with_binding(
   use binding <- result.try(resolve_binding(
     base_binding(axes.base),
     axes.threaded,
+    axes.trust_memory,
     axes.mem,
     axes.table,
     axes.cap,
   ))
+  // `--inline-joins` (lever 6) is applied AFTER the fail-closed `link/1` validation in
+  // `resolve_binding`: it is a pure compile-time codegen toggle, orthogonal to every policy/tier
+  // axis the gate guards, so setting it here cannot change the validated posture.
+  let binding = case axes.inline_joins {
+    True -> Binding(..binding, inline_joins: True)
+    False -> binding
+  }
   k(binding, axes, positionals)
 }
 
@@ -736,7 +772,7 @@ fn legacy_to_beam_wasm(
   link: Bool,
 ) -> Result(String, String) {
   use bytes <- result.try(read_bits(input))
-  case pipeline.source_to_ir(bytes) {
+  case pipeline.source_to_ir_with(bytes, binding.narrow_carried) {
     Error(e) -> Error(pipeline.describe(e))
     Ok(m) ->
       case link {
@@ -791,7 +827,8 @@ fn folder_to_beam_wasm(
 ) -> Result(String, String) {
   use bytes <- result.try(read_bits(input))
   use m <- result.try(
-    pipeline.source_to_ir(bytes) |> result.map_error(pipeline.describe),
+    pipeline.source_to_ir_with(bytes, binding.narrow_carried)
+    |> result.map_error(pipeline.describe),
   )
   // R17: lower + optimize ONCE; the returned `lowered` module is exactly what the `.core` (hence the
   // `.beam`) is generated from, and it is what `emit_bindings` runs `describe` over.
@@ -975,8 +1012,14 @@ fn usage() -> String {
       "  gleam run -- exec     [-n N] <in.beam> <export> <args…>  invoke a prebuilt .beam (bench, no compile)",
       "",
       "  [axes] — profile / strategy / tier selection (default: Safe / Cell / Paged, fail-closed):",
-      "    base (one of):  --unsafe | --portable | --ceiling",
+      "    base (one of):  --unsafe | --portable | --ceiling | --engine",
+      "    --engine        Safe + Atomics memory/table + Cell (fast node-safe trusted-engine profile)",
       "    --threaded                state_strategy: Threaded (the record-threading run-ABI)",
+      "    --trust-memory            skip bounds checks on ALL memory-0 loads/stores for a trusted",
+      "                              guest (paged/atomics only; OOB → wrong value, not a trap)",
+      "    --inline-joins            inline single-use, non-recursive letrec join funs (lever 6):",
+      "                              smaller emitted Core/.beam for a large guest; on by default under",
+      "                              --engine (a pure semantics-preserving Core rewrite)",
       "    --tier paged|atomics|nif  linear-memory trust tier (nif is Unsafe-only)",
       "    --table-tier paged|ets|atomics   funcref-table trust tier",
       "    --cap PAGES               bounded page cap (required to engage atomics / --ceiling)",

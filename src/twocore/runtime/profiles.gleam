@@ -480,6 +480,37 @@ pub fn ceiling() -> Binding {
   compose(unsafe(), Cell, Atomics, TableAtomics)
 }
 
+/// The **trusted-engine** performance profile (lever 4): the **Safe** policy over the node-safe
+/// tier-O `Atomics` memory + `TableAtomics` table (O(1) mutable, NO native code, cannot crash the
+/// node) with the `Cell` state strategy — the fastest posture for a large trusted guest (a JS
+/// engine like QuickJS, or SQLite) that fits the atomics reservation cap, WITHOUT the Unsafe
+/// posture `ceiling()` takes (so BIF/host/meter policy stay fail-closed). Because `Atomics`
+/// requires a BOUNDED reservation cap (`validate_binding` → `AtomicsCapRequired`), the max-pages is
+/// capped at the atomics ceiling here. A write-heavy interpreter runs several × faster on Atomics
+/// than the default `Paged` tier (measured); pair with `--trust-memory` for a further win on a
+/// guest that never legitimately OOB-traps.
+///
+/// Node-safe (`mode: Safe`) — NOT an Unsafe opt-out, so the fail-closed enumeration is unperturbed
+/// (`unsafe()`/`ceiling()` remain the only `mode: Unsafe` constructors). Total.
+pub fn engine() -> Binding {
+  Binding(
+    ..compose(safe(), Cell, Atomics, TableAtomics),
+    safe_max_pages: rt_mem_atomics.atomics_reserve_cap_pages,
+    // `inline_joins: True` (lever 6) — a large trusted engine (QuickJS) lowers to a deep nest of
+    // single-use `letrec` join funs; inlining them (a pure Core rewrite) shrinks the emitted Core
+    // + `.beam` and the per-block fun-alloc/local-call overhead.
+    inline_joins: True,
+    // `narrow_carried: True` (lever 5) — a large trusted engine's dispatch loop threads ~40+ mutable
+    // locals through every nested block/loop; the frontend liveness pass drops the ones provably dead
+    // at each construct's exit, shrinking the lowered IR and the emitted Core.
+    narrow_carried: True,
+    // `lazy_mask: True` (lever 8) — a large trusted engine emits many wrap-masked arithmetic ops
+    // (lever 1's `band(op, 2^n-1)`); the sound redundant-mask peephole collapses a subsumed
+    // `band(band(X, M2), M1)` (M2's bits ⊆ M1's) to a single `band(X, M2)`.
+    lazy_mask: True,
+  )
+}
+
 // ───────────────────────────── Phase-4: the fail-closed link gate + the sole seam (§D) ─────────────────────────────
 
 /// The linker's fail-closed link errors (G6, P5, P6).

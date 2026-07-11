@@ -59,6 +59,7 @@ import twocore/runtime/rt_mem
 import twocore/runtime/rt_mem_atomics
 import twocore/runtime/rt_meter
 import twocore/runtime/rt_state.{type InstanceState}
+import twocore/runtime/rt_trap
 
 // ───────────────────────────── the frozen NIF ABI (@external into the shim) ─────────────────────────────
 //
@@ -307,6 +308,46 @@ pub fn store(
   }
 }
 
+/// BARE-RAISING cell load (lever 2) — `load` MINUS the `Result` wrapper: returns the loaded bit
+/// pattern DIRECTLY and, on an out-of-bounds access, raises the trap INTERNALLY via
+/// `rt_trap.raise`. This removes the emit-side `{ok,V}|{error,E}` unwrap; the nif's internal tuple
+/// (unwrapped here) is acceptable for the Unsafe-only nif tier. Native: `nif_load`, unwrapped.
+/// Fallback: `rt_mem.load_raising` (byte-identical). See `load`.
+pub fn load_raising(
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  case nif_available() {
+    True ->
+      case
+        nif_load(rt_state.mem_at(0), bytes, signed, result_width, addr + offset)
+      {
+        Ok(v) -> v
+        Error(r) -> rt_trap.raise(r)
+      }
+    False -> rt_mem.load_raising(bytes, signed, result_width, addr, offset)
+  }
+}
+
+/// BARE-RAISING cell store (lever 2) — `store` MINUS the `Result` wrapper: mutates the cell resource
+/// IN PLACE (native) and returns `Nil`, or on an out-of-bounds access raises the trap INTERNALLY via
+/// `rt_trap.raise` (trap-before-write, zero mutation). The bare call IS the ordered effect
+/// `emit_core`'s NoState path sequences. Native: `nif_store`, unwrapped. Fallback:
+/// `rt_mem.store_raising`. See `store`.
+pub fn store_raising(bytes: Int, addr: Int, value: Int, offset: Int) -> Nil {
+  case nif_available() {
+    True ->
+      case nif_store(rt_state.mem_at(0), bytes, addr + offset, value) {
+        Ok(_) -> Nil
+        Error(r) -> rt_trap.raise(r)
+      }
+    False -> rt_mem.store_raising(bytes, addr, value, offset)
+  }
+}
+
 /// The current size of this process's memory, in 64 KiB pages (`memory.size`). Total; read-only.
 /// Native: `nif_size`. Fallback: `rt_mem.size`.
 pub fn size() -> Int {
@@ -514,6 +555,55 @@ pub fn store_at(
   case nif_available() {
     True -> nif_store(rt_state.mem_at(mem_idx), bytes, addr + offset, value)
     False -> rt_mem.store_at(mem_idx, bytes, addr, value, offset)
+  }
+}
+
+/// BARE-RAISING `load` from memory `mem_idx` — the index-routed twin of `load_raising`. Native:
+/// `nif_load` on slot `mem_idx`, unwrapped (raises on OOB). Fallback: `rt_mem.load_at_raising`.
+pub fn load_at_raising(
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  case nif_available() {
+    True ->
+      case
+        nif_load(
+          rt_state.mem_at(mem_idx),
+          bytes,
+          signed,
+          result_width,
+          addr + offset,
+        )
+      {
+        Ok(v) -> v
+        Error(r) -> rt_trap.raise(r)
+      }
+    False ->
+      rt_mem.load_at_raising(mem_idx, bytes, signed, result_width, addr, offset)
+  }
+}
+
+/// BARE-RAISING `store` into memory `mem_idx` — the index-routed twin of `store_raising`. Native:
+/// `nif_store` in place, unwrapped (raises on OOB, zero mutation). Fallback:
+/// `rt_mem.store_at_raising`.
+pub fn store_at_raising(
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Nil {
+  case nif_available() {
+    True ->
+      case nif_store(rt_state.mem_at(mem_idx), bytes, addr + offset, value) {
+        Ok(_) -> Nil
+        Error(r) -> rt_trap.raise(r)
+      }
+    False -> rt_mem.store_at_raising(mem_idx, bytes, addr, value, offset)
   }
 }
 

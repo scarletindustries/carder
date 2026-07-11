@@ -269,6 +269,70 @@ pub type Binding {
     bif_gate: BifGate,
     stdlib: StdlibMode,
     host_policy: HostPolicy,
+    /// Opt-in UNCHECKED linear-memory trust (lever 3), a per-build performance toggle for a
+    /// TRUSTED, self-contained guest (e.g. a JS engine) that never legitimately OOB-traps. When
+    /// `True`, EVERY memory-0 load/store routes through the bounds-check-free `*_unchecked` seam
+    /// instead of the checked/raising path — a large win on memory-heavy code — but ONLY on a
+    /// BEAM-memory-SAFE tier (`Paged` or `Atomics`), where an out-of-bounds access is CONTAINED to
+    /// a wrong value (an absent paged chunk reads zero; `atomics:get` is ERTS-bounds-checked). It is
+    /// NEVER honored on `Nif` (tier-N): a raw C deref past the buffer could crash the node, so
+    /// tier-N stays on the checked/raising path even when `trust_memory` is `True`.
+    ///
+    /// The documented, explicit tradeoff: under this mode an out-of-bounds access on a safe tier
+    /// yields a WRONG VALUE instead of a `MemoryOutOfBounds` trap (spec-incorrect but node-safe).
+    /// Default `False` (fail-closed) — the checked path is BYTE-IDENTICAL to a build without this
+    /// field; engaging it requires explicitly naming `--trust-memory`. Orthogonal to the safety
+    /// profile (composable with any base) and to `mem_tier` (it gates ON the tier, never swaps it).
+    trust_memory: Bool,
+    /// Opt-in Core-Erlang JOIN-INLINING pass (lever 6), a per-build compile-time toggle for a
+    /// large guest whose lowered control flow is a deep nest of single-use `letrec` join
+    /// functions. 2core lowers every wasm block/if/switch continuation to a
+    /// `letrec 'J'/n = fun(P…) -> Fbody in Inner` entered by `apply 'J'/n(A…)`; a fall-through-only
+    /// block yields a join reached from EXACTLY ONE exit, so the fun allocation + local call is pure
+    /// overhead. When `True`, `emit_core` beta-reduces every NON-RECURSIVE, applied-EXACTLY-ONCE join
+    /// away (splicing its body at the sole call site), shrinking the emitted Core and the resulting
+    /// `.beam` (QuickJS's interpreter lowers to ~1096 such nested joins, ~280 deep). It is a
+    /// SEMANTICS-PRESERVING transform (a standard single-use inline over fresh-SSA params — no
+    /// capture, loops/multi-exit joins are left intact), NOT a policy or tier lever.
+    ///
+    /// Default `False` (fail-closed): the DEFAULT emitted Core is BYTE-IDENTICAL to a build without
+    /// this field (the pass does not run), so the conformance/golden corpus is trivially unperturbed.
+    /// Engaged only by NAMING `--inline-joins` or a profile that sets it (`engine()`).
+    /// Orthogonal to the safety profile and every tier axis (composable with any base).
+    inline_joins: Bool,
+    /// Opt-in FRONTEND liveness narrowing of the join/loop carried-local set (lever 5), a per-build
+    /// compile-time toggle for a large guest whose hot control flow threads many mutable locals
+    /// (e.g. a JS engine's opcode-dispatch loop, ~40+ locals per executed opcode). 2core threads
+    /// EVERY local `set`/`tee`'d anywhere inside a wasm `block`/`loop`/`if` out of that construct as
+    /// an extra result / loop parameter — a gross over-approximation, since most such locals are
+    /// DEAD at the construct's exit. When `True`, the frontend runs a SOUND structured backward
+    /// liveness pass and drops a carried local ONLY where it can PROVE the local is dead at the exit
+    /// (no read on any path from the branch target before the next write); a loop additionally keeps
+    /// any local live at its back-edge (read on a later iteration). Shrinks the emitted Core and the
+    /// per-block threading overhead. On ANY uncertainty (a function using exception handling or a
+    /// GC-typed branch, an out-of-range branch, a malformed body) it KEEPS the full over-approximated
+    /// set — the analysis can only ever REMOVE a provably-dead local, never a live one.
+    ///
+    /// Default `False` (fail-closed): the DEFAULT emitted Core is BYTE-IDENTICAL to a build without
+    /// this field (the frontend narrowing does not run), so the conformance/golden corpus is trivially
+    /// unperturbed. Engaged only by a profile that sets it (`engine()`). A pure frontend-lowering
+    /// transform — orthogonal to the safety profile and every tier axis (composable with any base).
+    narrow_carried: Bool,
+    /// Opt-in Core-Erlang REDUNDANT-MASK elimination pass (lever 8), a per-build compile-time toggle.
+    /// Lever 1 emits `erlang:band(op, 2^n-1)` on every wrapping arithmetic op, so a chain of masks
+    /// can arise where an outer `band` is subsumed by an inner one — e.g. consecutive constant
+    /// `i32.and`s (`x & 0xFF & 0xFFFF`) or a re-normalized value. When `True`, `emit_core` runs a
+    /// SOUND bottom-up Core peephole rewriting `band(band(X, M2), M1)` → `band(X, M2)` whenever `M1`
+    /// and `M2` are integer literals with `M2 band M1 == M2` (M2's bits ⊆ M1's bits — the outer mask
+    /// cannot clear a bit the inner already cleared, so it is redundant for ANY integer X, positive
+    /// or negative). It preserves the value operand exactly (never drops or duplicates a subterm), so
+    /// it is a pure semantics-preserving transform, NOT a policy or tier lever. Distinct from a
+    /// risky interval-analysis "lazy masking" (deliberately NOT attempted).
+    ///
+    /// Default `False` (fail-closed): the DEFAULT emitted Core is BYTE-IDENTICAL to a build without
+    /// this field (the pass does not run) — a safe no-op when the pattern is absent. Engaged only by a
+    /// profile that sets it (`engine()`). Orthogonal to the safety profile and every tier axis.
+    lazy_mask: Bool,
     // ── Phase-4 trust-tier axes (G1/G2) ─────────────────────────────────────
     state_strategy: StateStrategy,
     mem_tier: MemTier,
@@ -316,6 +380,21 @@ pub fn safe_default() -> Binding {
     bif_gate: BifAllowlist,
     stdlib: StdlibOwn,
     host_policy: HostDenyAll,
+    // Lever 3 opt-in, OFF by default (fail-closed): the checked/raising memory path stays
+    // byte-identical to a build without this field. Set `True` only by naming `--trust-memory`.
+    trust_memory: False,
+    // Lever 6 opt-in, OFF by default (fail-closed): the join-inlining pass does not run, so the
+    // emitted Core is byte-identical to a build without this field. Set `True` only by naming
+    // `--inline-joins` or via `profiles.engine()`.
+    inline_joins: False,
+    // Lever 5 opt-in, OFF by default (fail-closed): the frontend liveness narrowing does not run, so
+    // the lowered IR (hence the emitted Core) is byte-identical to a build without this field. Set
+    // `True` only via `profiles.engine()`.
+    narrow_carried: False,
+    // Lever 8 opt-in, OFF by default (fail-closed): the redundant-mask peephole does not run, so the
+    // emitted Core is byte-identical to a build without this field. Set `True` only via
+    // `profiles.engine()`.
+    lazy_mask: False,
     // ── Phase-4 trust-tier posture (G1/G2). The maximally node-safe default (D4): the
     // tier-O `Cell` state strategy + the tier-P `Paged`/`TablePaged` backends — byte-identical
     // to Phase-2/3. Leaving it (tier-P `portable` / tier-N `ceiling`) requires NAMING a profile

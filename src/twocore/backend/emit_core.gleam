@@ -84,7 +84,7 @@ import gleam/string
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase,
-  CClause, CCons, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CClause, CCons, CFloat, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
   CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/ir.{
@@ -108,8 +108,8 @@ import twocore/ir.{
   UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
-  type Binding, type HostPolicy, Atomics, HostDenyAll, HostOpen, HostWhitelist,
-  MeterFuel, MeterOff, Nif, Paged, Threaded,
+  type Binding, type HostPolicy, type MemTier, Atomics, HostDenyAll, HostOpen,
+  HostWhitelist, MeterFuel, MeterOff, Nif, Paged, Threaded,
 }
 import twocore/runtime/profiles
 
@@ -405,12 +405,28 @@ pub fn emit_module(
     True -> 1
     False -> 0
   }
-  Ok(core_erlang.CModule(
-    name: module.name,
-    exports: list.append(export_names, [FName("instantiate", inst_arity)]),
-    attributes: [],
-    defs: list.append(list.append(defs, wrappers), [inst_def]),
-  ))
+  let cmod =
+    core_erlang.CModule(
+      name: module.name,
+      exports: list.append(export_names, [FName("instantiate", inst_arity)]),
+      attributes: [],
+      defs: list.append(list.append(defs, wrappers), [inst_def]),
+    )
+  // Lever 6 (opt-in, default OFF): beta-reduce single-use, non-recursive `letrec` join funs.
+  // Gated on `binding.inline_joins` so the DEFAULT emitted Core is byte-identical (the pass is a
+  // pure `CModule -> CModule` rewrite; when the flag is off it is never applied).
+  let cmod2 = case binding.inline_joins {
+    True -> inline_join_funs(cmod)
+    False -> cmod
+  }
+  // Lever 8 (opt-in, default OFF): eliminate a redundant outer `band` mask subsumed by an inner
+  // one. Gated on `binding.lazy_mask`, applied AFTER inlining (so a mask chain revealed by a
+  // spliced join is also collapsed); a pure `CModule -> CModule` rewrite, byte-identical when off.
+  let cmod3 = case binding.lazy_mask {
+    True -> elim_redundant_masks(cmod2)
+    False -> cmod2
+  }
+  Ok(cmod3)
 }
 
 /// Build the Core export list and any forwarding wrappers from the IR exports.
@@ -1628,10 +1644,18 @@ fn emit_mem_grow(
   }
 }
 
-/// `t.load` (trapping, read-only). `NoState`: `case '<mem>':'load'(Bytes,Signed,W,Addr,Off)`.
-/// `Threading(cur)`: `case '<mem>':'t_load'(St, Bytes,Signed,W,Addr,Off)`. Both reduce the
-/// trapping `Result(Int, _)` to one value (`emit_trapping_result`); the record is read-only,
-/// so `cur` is threaded on unchanged (the surrounding `sc` is preserved).
+/// `t.load` (trapping, read-only).
+///
+/// `NoState` (Cell / lever 2): call the BARE-RAISING seam `'<mem>':'load_raising'(Bytes,Signed,W,
+/// Addr,Off)` (or `'load_at_raising'` for `mem != 0`), which returns the loaded value DIRECTLY and
+/// raises `MemoryOutOfBounds` INTERNALLY on OOB — so the value binds straight through `apply_cont`
+/// (like `emit_mem_load_unchecked`), with NO per-op `{ok,X}|{error,E}` tuple + emit-side
+/// `case … raise` unwrap. The trap reason is identical to the old `load`; this is a runtime win and
+/// roughly halves the emitted Core for a load.
+///
+/// `Threading(cur)`: UNCHANGED — `case '<mem>':'t_load'(St,…)` reduced to one value via
+/// `emit_trapping_result` (the threaded seams still return `Result`, and the record is read-only so
+/// `cur` is threaded on unchanged, preserving `sc`).
 fn emit_mem_load(
   mem: Int,
   op: ir.MemAccess,
@@ -1650,29 +1674,56 @@ fn emit_mem_load(
     emit_value(addr),
     CInt(offset),
   ]
-  let call = case mem, sc {
-    0, NoState -> seam_call(ctx.binding.mem_module, "load", tail)
-    0, Threading(cur) ->
-      seam_call(ctx.binding.mem_module, "t_load", [CVar(cur), ..tail])
-    _, NoState ->
-      seam_call(ctx.binding.mem_module, "load_at", [CInt(mem), ..tail])
-    _, Threading(cur) ->
-      seam_call(ctx.binding.mem_module, "t_load_at", [
-        CVar(cur),
-        CInt(mem),
-        ..tail
-      ])
+  case sc {
+    NoState -> {
+      // Lever 3: on a memory-0 access under `trust_memory` and a BEAM-memory-SAFE tier, route the
+      // BARE `load_unchecked` seam (same shape `emit_mem_load_unchecked` uses) instead of the
+      // checked `load_raising`. `Nif`, `trust_memory` off, or `mem != 0` keep the current path.
+      let call = case
+        mem == 0
+        && ctx.binding.trust_memory
+        && trust_memory_unchecked_tier(ctx.binding.mem_tier),
+        mem
+      {
+        True, _ -> seam_call(ctx.binding.mem_module, "load_unchecked", tail)
+        False, 0 -> seam_call(ctx.binding.mem_module, "load_raising", tail)
+        False, _ ->
+          seam_call(ctx.binding.mem_module, "load_at_raising", [
+            CInt(mem),
+            ..tail
+          ])
+      }
+      apply_cont(cont, [call], sc, state, ctx)
+    }
+    Threading(cur) -> {
+      let call = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "t_load", [CVar(cur), ..tail])
+        _ ->
+          seam_call(ctx.binding.mem_module, "t_load_at", [
+            CVar(cur),
+            CInt(mem),
+            ..tail
+          ])
+      }
+      emit_trapping_result(call, cont, sc, state, ctx)
+    }
   }
-  emit_trapping_result(call, cont, sc, state, ctx)
 }
 
 /// `t.store` (trapping, ZERO-RESULT ordered effect). `op.signed` is irrelevant for stores
 /// (`storeN` writes the low N bytes); eval order is addr → value → store (left-to-right `call`
-/// args). `NoState`: reduce `{ok,_}`/`{error,E}` to a discardable `'ok'`/`raise` and sequence.
-/// `Threading(cur)`: `St2 = case '<mem>':'t_store'(St,…) of {ok,S}->S; {error,R}->raise` —
-/// REBIND the record to `St2` (`t_store` returns the updated record); continue under
-/// `Threading(St2)` disposing zero values. This makes store-before-load a visible dataflow
-/// edge through `St` (stronger than the cell `let`-discard barrier, §G).
+/// args).
+///
+/// `NoState` (Cell / lever 2): the BARE-RAISING seam `'<mem>':'store_raising'(Bytes,Addr,Value,Off)`
+/// (or `'store_at_raising'` for `mem != 0`) returns `Nil` and raises `MemoryOutOfBounds` INTERNALLY
+/// on OOB — so the call ITSELF is the ordered effect, sequenced+discarded by `emit_zero_effect` with
+/// NO per-op `{ok,_}|{error,E}` tuple + emit-side `case … raise` reduction. Trap-before-write and
+/// the trap reason are identical to the old `store`; this halves the emitted Core for a store.
+///
+/// `Threading(cur)`: UNCHANGED — `St2 = case '<mem>':'t_store'(St,…) of {ok,S}->S; {error,R}->raise`
+/// REBINDS the record to `St2` (`t_store` returns the updated record); continue under
+/// `Threading(St2)` disposing zero values. This makes store-before-load a visible dataflow edge
+/// through `St` (stronger than the cell `let`-discard barrier, §G).
 fn emit_mem_store(
   mem: Int,
   op: ir.MemAccess,
@@ -1692,12 +1743,24 @@ fn emit_mem_store(
   ]
   case sc {
     NoState -> {
-      let call = case mem {
-        0 -> seam_call(ctx.binding.mem_module, "store", tail)
-        _ -> seam_call(ctx.binding.mem_module, "store_at", [CInt(mem), ..tail])
+      // Lever 3: mirror `emit_mem_load` — a memory-0 store under `trust_memory` on a
+      // BEAM-memory-SAFE tier routes the BARE `store_unchecked` seam (disposed via
+      // `emit_zero_effect`, same shape `emit_mem_store_unchecked` uses); otherwise unchanged.
+      let effect = case
+        mem == 0
+        && ctx.binding.trust_memory
+        && trust_memory_unchecked_tier(ctx.binding.mem_tier),
+        mem
+      {
+        True, _ -> seam_call(ctx.binding.mem_module, "store_unchecked", tail)
+        False, 0 -> seam_call(ctx.binding.mem_module, "store_raising", tail)
+        False, _ ->
+          seam_call(ctx.binding.mem_module, "store_at_raising", [
+            CInt(mem),
+            ..tail
+          ])
       }
-      let #(effect, state2) = trapping_effect(call, ctx, state)
-      emit_zero_effect(effect, cont, sc, state2, ctx)
+      emit_zero_effect(effect, cont, sc, state, ctx)
     }
     Threading(cur) -> {
       let call = case mem {
@@ -1818,6 +1881,24 @@ fn mem_supports_unchecked(mem_module: String) -> Bool {
   mem_module == profiles.mem_module_for(Paged)
   || mem_module == profiles.mem_module_for(Atomics)
   || mem_module == profiles.mem_module_for(Nif)
+}
+
+/// May `trust_memory` (lever 3) route a memory-0 access through the bounds-check-free
+/// `*_unchecked` seam on `mem_tier`? True ONLY for the BEAM-memory-SAFE tiers where an
+/// out-of-bounds access is CONTAINED to a wrong value: `Paged` (an absent sparse chunk reads
+/// zero) and `Atomics` (`atomics:get` is ERTS-bounds-checked). NEVER `Nif` (tier-N): eliding the
+/// bounds compare there would let a raw C deref past the buffer crash the node, so tier-N stays on
+/// the checked/raising path even under `trust_memory` (§SAFETY).
+///
+/// This is the ONE emit-site that consults the tier ENUM for `trust_memory` — a node-safety gate
+/// (which tiers are safe to skip the check on), NOT a module-swap decision (G5), so branching the
+/// enum here is warranted. Distinct from `mem_supports_unchecked`, which whitelists BCE-proven
+/// unchecked nodes on ALL three tiers (Nif INCLUDED, since there the elision is guarded by a proof).
+fn trust_memory_unchecked_tier(mem_tier: MemTier) -> Bool {
+  case mem_tier {
+    Paged | Atomics -> True
+    Nif -> False
+  }
 }
 
 /// `global.get` (read-only). Routes by global TYPE (via `ctx.ref_global_names`, which holds the
@@ -2019,7 +2100,17 @@ fn apply_cont(
         False -> Error(ArityMismatch(list.length(names), list.length(vals)))
         True -> {
           use #(body_c, state2) <- result.try(emit(body, next, sc, state, ctx))
-          Ok(#(CLet(names, value_list(vals), body_c), state2))
+          case names {
+            // A zero-value bind is `let <> = <> in body`: the RHS `value_list([])` is the
+            // empty value list `<>` — a pure literal with no side effects — so the `let` is a
+            // vacuous no-op. Emit `body` directly. On a large guest (e.g. the TeaVM gateway)
+            // this drops ~10k such lets (~10% of the emitted Core text), shrinking the
+            // emit/scan/parse cost and wall-time. It does NOT change the resulting `.beam`
+            // (`sys_core_fold` inside `compile:forms` already elides these), so the
+            // compile:forms peak is unchanged; this is a text/transient/time win only.
+            [] -> Ok(#(body_c, state2))
+            _ -> Ok(#(CLet(names, value_list(vals), body_c), state2))
+          }
         }
       }
   }
@@ -2186,13 +2277,451 @@ fn wrap_join(maybe_def: Option(FunDef), inner: CExpr) -> CExpr {
   }
 }
 
+// ─────────────────────────────── lever 6: single-use join inlining ───────────────────────────────
+
+/// Beta-reduce single-use, non-recursive `letrec` join functions across every def of `mod` (lever 6
+/// — opt-in, run by `emit_module` only when `binding.inline_joins == True`).
+///
+/// 2core lowers each wasm block/if/switch continuation to a single-def
+/// `letrec 'J'/n = fun(P1..Pn) -> Fbody in Inner`, entered by `apply 'J'/n(A1..An)` (`wrap_join` +
+/// `materialize`). A join reached from EXACTLY ONE exit (a fall-through-only block) pays a fun
+/// allocation + local call for nothing. This pass replaces that sole `apply 'J'/n(A1..An)` with
+/// `let <P1..Pn> = <A1..An> in Fbody` and DROPS the `letrec`, leaving only `Inner`.
+///
+/// SOUNDNESS — a def is inlined IFF ALL hold (else the node is left byte-identical):
+/// - SINGLE DEF: the letrec binds exactly one def (2core emits exactly one for joins/loops/try).
+/// - NON-RECURSIVE: `Fbody` never applies `'J'/n`. A loop's back-edge (`Continue`) self-applies its
+///   `'L'` head, so loops are recognised recursive and left intact.
+/// - SINGLE-USE: `'J'/n` is applied EXACTLY ONCE across the whole enclosing function body. In this
+///   AST an `FName` can ONLY appear as a `CApply` target (there is no first-class funref-to-`FName`
+///   node — a closure applies a `CVar`/inline `fun` via `CApplyExpr`), so "applied once" is the
+///   COMPLETE single-use condition: no other reference kind can leak the name.
+/// - NOT TRY-PINNED: the def is not applied as a `CTry` `arg`. `emit_try` deliberately hoists its
+///   protected body into a nullary local fun so the try `Arg` stays a single `apply`; inlining it
+///   back would re-expose the `ambiguous_catch_try_state` BEAM-validator rejection the hoist
+///   prevents, so any def applied as a `CTry.arg` is PINNED (never inlined).
+///
+/// Join params are fresh SSA names (`fresh_var`/`fresh_fn`), so the spliced body cannot capture, and
+/// every free variable of `Fbody` is bound ABOVE the letrec — hence still in scope at the sole use
+/// site (which lies inside `Inner`, i.e. inside that same enclosing scope). This is the standard
+/// soundness of inlining a non-recursive single-use local function.
+///
+/// COMPLEXITY: two LINEAR passes over each def body — (1) `scan_joins` counts applies + detects
+/// self-recursion and try-pinning in one traversal; (2) `inline_expr` rewrites top-down, splicing
+/// each inlinable def's body from an environment keyed by its unique `FName`. Every node is visited
+/// once (the precomputed counts stay valid because inlining removes only the def + its single apply,
+/// never perturbing any OTHER name's count), so a deep nest (~280) of joins collapses in ONE pass —
+/// no quadratic re-traversal.
+pub fn inline_join_funs(mod: CModule) -> CModule {
+  core_erlang.CModule(..mod, defs: list.map(mod.defs, inline_join_def))
+}
+
+/// Run the join-inlining pass over one top-level `FunDef`'s body. A non-`CFun` value (which never
+/// occurs for an emitted def — every def RHS is a `CFun`, §core_erlang) is returned unchanged.
+fn inline_join_def(def: FunDef) -> FunDef {
+  case def.value {
+    CFun(vars, body) -> {
+      let info =
+        scan_joins(body, set.new(), JoinInfo(dict.new(), set.new(), set.new()))
+      FunDef(..def, value: CFun(vars, inline_expr(body, info, dict.new())))
+    }
+    _ -> def
+  }
+}
+
+/// The per-body facts the inliner needs, gathered in ONE traversal (`scan_joins`):
+/// - `counts`: for each applied `FName`, how many `apply` sites reference it in the whole body.
+/// - `recursive`: the `FName`s applied WITHIN their own def's body (a loop back-edge) — never inline.
+/// - `pinned`: the `FName`s applied as a `CTry` `arg` (the hoisted try-body funs) — never inline.
+type JoinInfo {
+  JoinInfo(counts: Dict(FName, Int), recursive: Set(FName), pinned: Set(FName))
+}
+
+/// Whether the def `fname` (bound by a single-def letrec) may be inlined: applied exactly once, not
+/// self-recursive, and not try-pinned. All three are read from the precomputed `JoinInfo`.
+fn join_inlinable(fname: FName, info: JoinInfo) -> Bool {
+  dict.get(info.counts, fname) == Ok(1)
+  && !set.contains(info.recursive, fname)
+  && !set.contains(info.pinned, fname)
+}
+
+/// One linear traversal gathering `JoinInfo` for a function body. `scope` is the set of enclosing
+/// `letrec` def names whose BODY we are currently inside — an `apply` of a name in `scope` marks it
+/// recursive. `acc` is the accumulator threaded through.
+fn scan_joins(expr: CExpr, scope: Set(FName), acc: JoinInfo) -> JoinInfo {
+  case expr {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> acc
+    CCons(h, t) -> scan_joins(t, scope, scan_joins(h, scope, acc))
+    CTuple(es) -> list.fold(es, acc, fn(a, e) { scan_joins(e, scope, a) })
+    CBinary(segs) ->
+      list.fold(segs, acc, fn(a, s) {
+        scan_joins(s.size, scope, scan_joins(s.value, scope, a))
+      })
+    CValues(vs) -> list.fold(vs, acc, fn(a, e) { scan_joins(e, scope, a) })
+    CFun(_, b) -> scan_joins(b, scope, acc)
+    CLet(_, arg, body) -> scan_joins(body, scope, scan_joins(arg, scope, acc))
+    CLetrec(defs, inner) -> {
+      // Each def name is in scope for EVERY def body (letrec defs are mutually recursive) but NOT
+      // for `inner` (a use in `inner` is the legitimate call, not a recursive back-edge).
+      let names = set.from_list(list.map(defs, fn(d) { d.name }))
+      let body_scope = set.union(scope, names)
+      let acc2 =
+        list.fold(defs, acc, fn(a, d) { scan_joins(def_body(d), body_scope, a) })
+      scan_joins(inner, scope, acc2)
+    }
+    CCase(arg, clauses) ->
+      list.fold(clauses, scan_joins(arg, scope, acc), fn(a, cl) {
+        scan_joins(cl.body, scope, scan_joins(cl.guard, scope, a))
+      })
+    CApply(fname, args) -> {
+      let n = case dict.get(acc.counts, fname) {
+        Ok(c) -> c + 1
+        Error(_) -> 1
+      }
+      let recursive = case set.contains(scope, fname) {
+        True -> set.insert(acc.recursive, fname)
+        False -> acc.recursive
+      }
+      let acc1 =
+        JoinInfo(..acc, counts: dict.insert(acc.counts, fname, n), recursive:)
+      list.fold(args, acc1, fn(a, e) { scan_joins(e, scope, a) })
+    }
+    CApplyExpr(op, args) ->
+      list.fold(args, scan_joins(op, scope, acc), fn(a, e) {
+        scan_joins(e, scope, a)
+      })
+    CCall(m, f, args) ->
+      list.fold(args, scan_joins(f, scope, scan_joins(m, scope, acc)), fn(a, e) {
+        scan_joins(e, scope, a)
+      })
+    CPrimop(_, args) ->
+      list.fold(args, acc, fn(a, e) { scan_joins(e, scope, a) })
+    CTry(arg, _, body, _, handler) -> {
+      // PIN a def applied directly as the try `Arg` (the hoisted try-body): it must stay a single
+      // `apply` (see `inline_join_funs`).
+      let acc1 = case arg {
+        CApply(fname, _) ->
+          JoinInfo(..acc, pinned: set.insert(acc.pinned, fname))
+        _ -> acc
+      }
+      scan_joins(
+        handler,
+        scope,
+        scan_joins(body, scope, scan_joins(arg, scope, acc1)),
+      )
+    }
+  }
+}
+
+/// The body expression of a `FunDef` — the `CFun` body when the RHS is a `fun` (always, for an
+/// emitted def), else the RHS itself (keeps `scan_joins` total on a non-`CFun` RHS).
+fn def_body(d: FunDef) -> CExpr {
+  case d.value {
+    CFun(_, b) -> b
+    other -> other
+  }
+}
+
+/// Top-down rewrite that inlines each eligible join. `env` maps an inlinable def's `FName` to its
+/// `#(params, transformed_body)`; when the sole `apply` of that name is reached it is replaced by
+/// `let <params> = <args> in body`. `env` only holds names decided inlinable at an enclosing letrec,
+/// so a lookup hit is ALWAYS that def's unique call site.
+fn inline_expr(
+  expr: CExpr,
+  info: JoinInfo,
+  env: Dict(FName, #(List(String), CExpr)),
+) -> CExpr {
+  case expr {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CCons(h, t) -> CCons(inline_expr(h, info, env), inline_expr(t, info, env))
+    CTuple(es) -> CTuple(list.map(es, fn(e) { inline_expr(e, info, env) }))
+    CBinary(segs) ->
+      CBinary(
+        list.map(segs, fn(s) {
+          CBitSeg(
+            ..s,
+            value: inline_expr(s.value, info, env),
+            size: inline_expr(s.size, info, env),
+          )
+        }),
+      )
+    CValues(vs) -> CValues(list.map(vs, fn(e) { inline_expr(e, info, env) }))
+    CFun(vars, b) -> CFun(vars, inline_expr(b, info, env))
+    CLet(vars, arg, body) ->
+      CLet(vars, inline_expr(arg, info, env), inline_expr(body, info, env))
+    CLetrec([FunDef(fname, CFun(params, fbody))], inner) ->
+      case join_inlinable(fname, info) {
+        True -> {
+          // Transform the body once (its own nested joins collapse), stash it, then rewrite `inner`
+          // with the def in scope — the single `apply fname(..)` there splices it in. The letrec is
+          // DROPPED (nothing else references `fname`).
+          let fbody2 = inline_expr(fbody, info, env)
+          let env2 = dict.insert(env, fname, #(params, fbody2))
+          inline_expr(inner, info, env2)
+        }
+        False ->
+          CLetrec(
+            [FunDef(fname, CFun(params, inline_expr(fbody, info, env)))],
+            inline_expr(inner, info, env),
+          )
+      }
+    CLetrec(defs, inner) ->
+      // Not the single-def-join shape — leave the letrec, but recurse into every def body + inner.
+      CLetrec(
+        list.map(defs, fn(d) {
+          case d.value {
+            CFun(vs, b) -> FunDef(d.name, CFun(vs, inline_expr(b, info, env)))
+            other -> FunDef(d.name, inline_expr(other, info, env))
+          }
+        }),
+        inline_expr(inner, info, env),
+      )
+    CCase(arg, clauses) ->
+      CCase(
+        inline_expr(arg, info, env),
+        list.map(clauses, fn(cl) {
+          CClause(
+            cl.pats,
+            inline_expr(cl.guard, info, env),
+            inline_expr(cl.body, info, env),
+          )
+        }),
+      )
+    CApply(fname, args) -> {
+      let args2 = list.map(args, fn(e) { inline_expr(e, info, env) })
+      case dict.get(env, fname) {
+        Ok(#(params, fbody2)) -> bind_join_args(params, args2, fbody2)
+        Error(_) -> CApply(fname, args2)
+      }
+    }
+    CApplyExpr(op, args) ->
+      CApplyExpr(
+        inline_expr(op, info, env),
+        list.map(args, fn(e) { inline_expr(e, info, env) }),
+      )
+    CCall(m, f, args) ->
+      CCall(
+        inline_expr(m, info, env),
+        inline_expr(f, info, env),
+        list.map(args, fn(e) { inline_expr(e, info, env) }),
+      )
+    CPrimop(name, args) ->
+      CPrimop(name, list.map(args, fn(e) { inline_expr(e, info, env) }))
+    CTry(arg, bv, body, ev, handler) ->
+      CTry(
+        inline_expr(arg, info, env),
+        bv,
+        inline_expr(body, info, env),
+        ev,
+        inline_expr(handler, info, env),
+      )
+  }
+}
+
+/// Bind a join's `params` to the call-site `args` and run its `body` — the beta-reduction that
+/// replaces `apply 'J'/n(args)` when inlined. Mirrors `apply_cont`'s `KBind`: `[]` params splice
+/// `body` directly (the vacuous zero-value `let <> = <> in body`), otherwise
+/// `let <params> = <value_list(args)> in body`. `len(params) == len(args)` always — a join's arity
+/// equals its param count, and `emit_core` applies it with exactly that many args.
+fn bind_join_args(
+  params: List(String),
+  args: List(CExpr),
+  body: CExpr,
+) -> CExpr {
+  case params {
+    [] -> body
+    _ -> CLet(params, value_list(args), body)
+  }
+}
+
+// ─────────────────────────── Lever 8: redundant-mask elimination (opt-in) ───────────────────────────
+
+/// Eliminate a redundant OUTER bitwise-AND mask throughout every function body of `mod` (lever 8,
+/// opt-in via `binding.lazy_mask`; a pure `CModule -> CModule` rewrite that is a safe no-op when the
+/// pattern is absent). When the flag is off this is never applied, so the default Core is unchanged.
+///
+/// Lever 1 emits `call 'erlang':'band'(op, 2^n-1)` on every WRAPPING arithmetic op, so a chain
+/// `band(band(X, M2), M1)` can arise — e.g. consecutive constant `i32.and`s (`x & 0xFF & 0xFFFF`),
+/// or a re-normalized value flowing into another masked op. This rewrites `band(band(X, M2), M1)` →
+/// `band(X, M2)` whenever `M1` and `M2` are INTEGER LITERALS with `M2 band M1 == M2` — i.e. M2's set
+/// bits are a SUBSET of M1's, so the outer `band M1` cannot clear any bit that `band M2` left set
+/// and is redundant.
+///
+/// **Soundness for ALL integers X (including negative).** With a non-negative finite mask M2,
+/// `X band M2` is a NON-NEGATIVE value whose set bits ⊆ M2's bits; if M2's bits ⊆ M1's bits then
+/// `(X band M2) band M1 == X band M2`. Every mask 2core emits here — `2^n-1`, the shift counts
+/// `31`/`63`, and wasm-const operands (stored as unsigned bit patterns) — is non-negative, so the
+/// identity holds regardless of X's runtime sign. The value operand X is preserved VERBATIM (never
+/// dropped or duplicated), and no operand is evaluated a different number of times, so the transform
+/// is semantics-preserving. Distinct from a risky interval-analysis "lazy masking" (NOT attempted).
+pub fn elim_redundant_masks(mod: CModule) -> CModule {
+  core_erlang.CModule(..mod, defs: list.map(mod.defs, mask_def))
+}
+
+/// Run the mask peephole over one top-level (or `letrec`) `FunDef`'s body. A non-`CFun` RHS (which
+/// never occurs for an emitted def, §core_erlang) is returned unchanged.
+fn mask_def(def: FunDef) -> FunDef {
+  case def.value {
+    CFun(vars, body) -> FunDef(..def, value: CFun(vars, mask_expr(body)))
+    _ -> def
+  }
+}
+
+/// Bottom-up rewrite: rewrite every child first, then apply the local redundant-mask reduction at a
+/// `band` node. Because a node's children are collapsed BEFORE the node itself is examined, a whole
+/// `band` chain reaches a fixpoint in ONE pass — each level sees its already-collapsed child, and a
+/// produced `band(X, M2)` is never itself further reducible (its inner mask, if any, was resolved
+/// against M2 when the child was rewritten).
+fn mask_expr(expr: CExpr) -> CExpr {
+  case expr {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CCons(h, t) -> CCons(mask_expr(h), mask_expr(t))
+    CTuple(es) -> CTuple(list.map(es, mask_expr))
+    CBinary(segs) ->
+      CBinary(
+        list.map(segs, fn(s) {
+          CBitSeg(..s, value: mask_expr(s.value), size: mask_expr(s.size))
+        }),
+      )
+    CValues(vs) -> CValues(list.map(vs, mask_expr))
+    CFun(vars, b) -> CFun(vars, mask_expr(b))
+    CLet(vars, arg, body) -> CLet(vars, mask_expr(arg), mask_expr(body))
+    CLetrec(defs, inner) -> CLetrec(list.map(defs, mask_def), mask_expr(inner))
+    CCase(arg, clauses) ->
+      CCase(
+        mask_expr(arg),
+        list.map(clauses, fn(cl) {
+          CClause(cl.pats, mask_expr(cl.guard), mask_expr(cl.body))
+        }),
+      )
+    CApply(fname, args) -> CApply(fname, list.map(args, mask_expr))
+    CApplyExpr(op, args) -> CApplyExpr(mask_expr(op), list.map(args, mask_expr))
+    // `band` is the only reducible node — apply the local rule to the rewritten `call`.
+    CCall(m, f, args) ->
+      reduce_mask(CCall(mask_expr(m), mask_expr(f), list.map(args, mask_expr)))
+    CPrimop(name, args) -> CPrimop(name, list.map(args, mask_expr))
+    CTry(arg, bv, body, ev, handler) ->
+      CTry(mask_expr(arg), bv, mask_expr(body), ev, mask_expr(handler))
+  }
+}
+
+/// Apply ONE redundant-mask reduction at a `band` node whose children are already rewritten:
+/// `band(band(X, M2), M1)` → `band(X, M2)` when `M1`, `M2` are integer literals and `M2 band M1 ==
+/// M2` (M2's bits ⊆ M1's). Returns `node` unchanged when it is not a reducible masked-band-of-
+/// masked-band (the common case — a safe no-op).
+fn reduce_mask(node: CExpr) -> CExpr {
+  case as_masked(node) {
+    Some(#(inner, m1)) ->
+      case as_masked(inner) {
+        Some(#(x, m2)) ->
+          case int.bitwise_and(m2, m1) == m2 {
+            True -> band_lit(x, m2)
+            False -> node
+          }
+        None -> node
+      }
+    None -> node
+  }
+}
+
+/// Recognize a bitwise-AND against a SINGLE integer-literal mask: `band(V, CInt(M))` or the
+/// commuted `band(CInt(M), V)`. Returns `Some(#(V, M))` — the value operand and the literal mask —
+/// or `None` for a non-`band`, a wrong arity, or a `band` with zero or two literal operands (no
+/// single value/mask split). `band` is commutative, so either operand order is accepted; a
+/// `band(CInt, CInt)` (a constant — nothing to preserve) yields `None`.
+fn as_masked(node: CExpr) -> Option(#(CExpr, Int)) {
+  case node {
+    CCall(CAtom("erlang"), CAtom("band"), [CInt(m), v]) ->
+      case v {
+        CInt(_) -> None
+        _ -> Some(#(v, m))
+      }
+    CCall(CAtom("erlang"), CAtom("band"), [v, CInt(m)]) ->
+      case v {
+        CInt(_) -> None
+        _ -> Some(#(v, m))
+      }
+    _ -> None
+  }
+}
+
+/// Build the reduced single-mask node `call 'erlang':'band'(x, M)`.
+fn band_lit(x: CExpr, mask: Int) -> CExpr {
+  CCall(CAtom("erlang"), CAtom("band"), [x, CInt(mask)])
+}
+
 // ─────────────────────────────── numeric ops (the chokepoint) ───────────────────────────────
+
+/// A BEAM guard-BIF call `call 'erlang':'<name>'(args…)`. The Erlang compiler folds these
+/// (`+`/`band`/`bsl`/`<`/…) to inline `bif`/`gc_bif` instructions, so no function call remains.
+fn bif(name: String, args: List(CExpr)) -> CExpr {
+  CCall(CAtom("erlang"), CAtom(name), args)
+}
+
+/// The unsigned mask `2^n − 1` bounding an n-bit value (the two's-complement wrap bound).
+fn width_mask(w: IntWidth) -> Int {
+  case w {
+    W32 -> 4_294_967_295
+    W64 -> 18_446_744_073_709_551_615
+  }
+}
+
+/// `band(expr, 2^n−1)` — normalize an arithmetic result to the width's unsigned range.
+/// Bit-identical to `rt_num.norm` (`norm(x,n) == band(x, 2^n−1)` for ANY Erlang integer,
+/// positive or negative — the low n bits of the two's-complement representation).
+fn mask_to_width(w: IntWidth, expr: CExpr) -> CExpr {
+  bif("band", [expr, CInt(width_mask(w))])
+}
+
+/// The shift/rotate count `b band (n−1)` — matches `rt_num.shift_count`.
+fn shift_count_expr(w: IntWidth, b: CExpr) -> CExpr {
+  let mask = case w {
+    W32 -> 31
+    W64 -> 63
+  }
+  bif("band", [b, CInt(mask)])
+}
+
+/// Try to lower a non-trapping integer `NumOp` to an INLINE BEAM guard BIF instead of an
+/// `rt_num` seam call, so a `rt_num:i32_add` local function call becomes a folded `+`/`band`
+/// instruction (per-op function-call overhead is a large fraction of a wasm-lowered guest's
+/// runtime). Returns `Ok(expr)` for the provably-exact inlinable ops, `Error(Nil)` for
+/// everything else (signed compares/shifts, rotate, clz/ctz/popcnt, div/rem, float,
+/// conversions) — those stay on the `rt_num` seam. `args` are the already-emitted operands.
+///
+/// Bit-exactness (rt_num.gleam is the oracle): `norm(x,n) == band(x, 2^n−1)` so add/sub/mul
+/// and `shl` reduce to a masked BIF; `and`/`or`/`xor` and `shr_u` are already in-range so need
+/// no mask; `eqz`/`eq`/`ne` and the UNSIGNED comparisons (`lt_u`/`gt_u`/`le_u`/`ge_u`) are raw
+/// BEAM comparisons on the stored unsigned bit patterns. SIGNED compares/shifts need a
+/// `signed(a,n)` reinterpret first, so they deliberately stay on the seam.
+fn inline_num_op(op: NumOp, args: List(CExpr)) -> Result(CExpr, Nil) {
+  case op, args {
+    IAnd(_), [a, b] -> Ok(bif("band", [a, b]))
+    IOr(_), [a, b] -> Ok(bif("bor", [a, b]))
+    IXor(_), [a, b] -> Ok(bif("bxor", [a, b]))
+    IAdd(w), [a, b] -> Ok(mask_to_width(w, bif("+", [a, b])))
+    ISub(w), [a, b] -> Ok(mask_to_width(w, bif("-", [a, b])))
+    IMul(w), [a, b] -> Ok(mask_to_width(w, bif("*", [a, b])))
+    IShl(w), [a, b] ->
+      Ok(mask_to_width(w, bif("bsl", [a, shift_count_expr(w, b)])))
+    IShrU(w), [a, b] -> Ok(bif("bsr", [a, shift_count_expr(w, b)]))
+    IEqz(_), [a] -> Ok(bool_bif_to_i32("=:=", [a, CInt(0)]))
+    IEq(_), [a, b] -> Ok(bool_bif_to_i32("=:=", [a, b]))
+    INe(_), [a, b] -> Ok(bool_bif_to_i32("=/=", [a, b]))
+    ILtU(_), [a, b] -> Ok(bool_bif_to_i32("<", [a, b]))
+    IGtU(_), [a, b] -> Ok(bool_bif_to_i32(">", [a, b]))
+    ILeU(_), [a, b] -> Ok(bool_bif_to_i32("=<", [a, b]))
+    IGeU(_), [a, b] -> Ok(bool_bif_to_i32(">=", [a, b]))
+    _, _ -> Error(Nil)
+  }
+}
 
 /// Lower a `Num` op through `binding.num_module` (the numeric chokepoint).
 ///
-/// Non-trapping ops emit `call '<num>':'<fn>'(args…)` and pass the single result to
-/// `cont`. The four trapping ops (`div`/`rem`, signed and unsigned) return
-/// `Result(Int, TrapReason)` = `{ok,X}`/`{error,R}`; they emit the verified
+/// The hot, provably-exact non-trapping integer ops are INLINED as BEAM BIFs (`inline_num_op`)
+/// — valid only because `num_module` is the standard `rt_num` (its single definition site). The
+/// rest emit `call '<num>':'<fn>'(args…)`. The four trapping ops (`div`/`rem`, signed and
+/// unsigned) return `Result(Int, TrapReason)` = `{ok,X}`/`{error,R}`; they emit the verified
 /// `case`-and-`raise` shape, continuing with `X` on `{ok,X}` and raising `R` via
 /// `binding.trap_module` on `{error,R}`.
 fn emit_num(
@@ -2203,15 +2732,19 @@ fn emit_num(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let call =
-    seam_call(
-      ctx.binding.num_module,
-      num_op_name(op),
-      list.map(args, emit_value),
-    )
-  case is_trapping(op) {
-    False -> apply_cont(cont, [call], sc, state, ctx)
-    True -> emit_trapping_result(call, cont, sc, state, ctx)
+  let cargs = list.map(args, emit_value)
+  case
+    ctx.binding.num_module == "twocore@runtime@rt_num",
+    inline_num_op(op, cargs)
+  {
+    True, Ok(inlined) -> apply_cont(cont, [inlined], sc, state, ctx)
+    _, _ -> {
+      let call = seam_call(ctx.binding.num_module, num_op_name(op), cargs)
+      case is_trapping(op) {
+        False -> apply_cont(cont, [call], sc, state, ctx)
+        True -> emit_trapping_result(call, cont, sc, state, ctx)
+      }
+    }
   }
 }
 
@@ -5078,11 +5611,20 @@ fn emit_charge(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(wild, state2) = fresh_var(state)
-  use #(body_c, state3) <- result.try(emit(body, cont, sc, state2, ctx))
-  let charge_call =
-    CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
-  Ok(#(CLet([wild], charge_call, body_c), state3))
+  case body {
+    // Batch consecutive `Charge` regions into ONE `meter:charge` with the summed cost (lever 9).
+    // Both charges already run before `inner`, so pre-charging their sum deducts the same fuel and
+    // traps at the SAME program point (before `inner`) — one fewer seam call on the hot path.
+    Charge(cost2, inner) ->
+      emit_charge(cost + cost2, inner, cont, sc, state, ctx)
+    _ -> {
+      let #(wild, state2) = fresh_var(state)
+      use #(body_c, state3) <- result.try(emit(body, cont, sc, state2, ctx))
+      let charge_call =
+        CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
+      Ok(#(CLet([wild], charge_call, body_c), state3))
+    }
+  }
 }
 
 // ─────────────────────────── Phase-7 exception handling (§J/T1/T5/T7) ───────────────────────────
