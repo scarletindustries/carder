@@ -4175,6 +4175,7 @@ fn resolve_js(op: String) -> Option(String) {
     "shl" -> Some("shl")
     "shr" -> Some("shr")
     "ushr" -> Some("ushr")
+    "pow" -> Some("pow")
     // truthiness / coercion
     "truthy" -> Some("truthy")
     "to_number" -> Some("to_number")

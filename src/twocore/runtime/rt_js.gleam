@@ -162,6 +162,12 @@ pub fn shr(a: Dynamic, b: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "ushr")
 pub fn ushr(a: Dynamic, b: Dynamic) -> Dynamic
 
+/// JS `**` — `Number::exponentiate(ToNumber(a), ToNumber(b))`. Handles the spec
+/// special cases (`x ** ±0` → 1 even for NaN base; NaN/±Infinity operands; a negative
+/// base with a non-integer exponent → NaN); finite integer/integer stays exact.
+@external(erlang, "twocore_rt_js_ffi", "pow")
+pub fn pow(a: Dynamic, b: Dynamic) -> Dynamic
+
 /// JS ToString → a binary. Strings pass through; integral floats < 1e21 print integer-style
 /// (`String(5.0)` is `"5"`); other floats print shortest-round-trip (`[short]` — exponent
 /// FORMATTING diverges from Number::toString at the extremes, FFI header note); sentinels are

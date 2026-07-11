@@ -60,7 +60,7 @@
     add/2, sub/2, mul/2, neg/1, divide/2, modulo/2,
     lt/2, le/2, gt/2, ge/2, strict_eq/2, eq/2,
     truthy/1, to_number/1, to_string/1, type_of/1,
-    bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2,
+    bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
     empty_list/0, console_log/1, not_callable/1
@@ -416,6 +416,91 @@ shl(A, B) -> wrap_int32(js_to_int32(A) bsl (js_to_uint32(B) band 31)).
 shr(A, B) -> js_to_int32(A) bsr (js_to_uint32(B) band 31).
 %% `>>>` is a zero-fill (logical) shift on the UNSIGNED uint32; result stays uint32.
 ushr(A, B) -> js_to_uint32(A) bsr (js_to_uint32(B) band 31).
+
+%% ── exponentiation ───────────────────────────────────────────────────────
+%% JS `**` (Number::exponentiate). Operands coerce via ToNumber; the many
+%% spec special cases (±0 exponent → 1, NaN, the infinities, negative base
+%% with a non-integer exponent → NaN) are handled explicitly, and the finite
+%% integer/integer case stays exact (native BEAM integer power).
+pow(A, B) ->
+    out(npow(coerce_num(A), coerce_num(B))).
+
+npow(_Base, Exp) when Exp == 0 -> 1;
+npow(nan, _) -> nan;
+npow(_, nan) -> nan;
+npow(Base, inf) -> npow_exp_pinf(Base);
+npow(Base, neg_inf) -> npow_exp_ninf(Base);
+npow(inf, Exp) when Exp > 0 -> inf;
+npow(inf, _) -> 0;
+npow(neg_inf, Exp) when Exp > 0 ->
+    case is_odd_int(Exp) of
+        true -> neg_inf;
+        false -> inf
+    end;
+npow(neg_inf, _) -> 0;
+npow(Base, Exp) when is_integer(Base), is_integer(Exp), Exp >= 0 ->
+    int_pow(Base, Exp);
+npow(Base, Exp) ->
+    case Base < 0 andalso not is_int_valued(Exp) of
+        true -> nan;
+        false ->
+            try math:pow(js_to_float(Base), js_to_float(Exp)) catch
+                error:badarith ->
+                    case Base < 0 andalso is_odd_int(Exp) of
+                        true -> neg_inf;
+                        false -> inf
+                    end
+            end
+    end.
+
+%% x ** (+Infinity): |x|>1 → +Inf, |x|=1 → NaN, |x|<1 → +0.
+npow_exp_pinf(inf) -> inf;
+npow_exp_pinf(neg_inf) -> inf;
+npow_exp_pinf(Base) ->
+    A = abs_num(Base),
+    if
+        A > 1 -> inf;
+        A == 1 -> nan;
+        true -> 0
+    end.
+
+%% x ** (-Infinity): |x|>1 → +0, |x|=1 → NaN, |x|<1 → +Inf.
+npow_exp_ninf(inf) -> 0;
+npow_exp_ninf(neg_inf) -> 0;
+npow_exp_ninf(Base) ->
+    A = abs_num(Base),
+    if
+        A > 1 -> 0;
+        A == 1 -> nan;
+        true -> inf
+    end.
+
+abs_num(N) when N < 0 -> -N;
+abs_num(N) -> N.
+
+js_to_float(N) when is_integer(N) -> float(N);
+js_to_float(N) -> N.
+
+is_int_valued(N) when is_integer(N) -> true;
+is_int_valued(N) when is_float(N) -> N == trunc(N);
+is_int_valued(_) -> false.
+
+is_odd_int(N) ->
+    case is_int_valued(N) of
+        true -> trunc(N) rem 2 =/= 0;
+        false -> false
+    end.
+
+%% Exact integer exponentiation by squaring (Exp >= 0).
+int_pow(B, E) -> int_pow(B, E, 1).
+int_pow(_, 0, Acc) -> Acc;
+int_pow(B, E, Acc) ->
+    Acc2 =
+        case E band 1 of
+            1 -> Acc * B;
+            _ -> Acc
+        end,
+    int_pow(B * B, E bsr 1, Acc2).
 
 %% JS ToString → a binary. Strings pass through; integral floats < 1e21 print
 %% integer-style (String(5.0) = "5"); other floats use [short] (shortest

@@ -351,6 +351,22 @@ pub fn bitwise_compound_test() {
   to_float(call(s, "f", [])) |> should.equal(32.0)
 }
 
+// ── exponentiation ───────────────────────────────────────────────────────────
+
+pub fn exponentiation_test() {
+  num("2 ** 10") |> should.equal(1024.0)
+  num("2 ** 0") |> should.equal(1.0)
+  num("2 ** -1") |> should.equal(0.5)
+  num("9 ** 0.5") |> should.equal(3.0)
+  // right-associative: 2 ** 3 ** 2 == 2 ** 9 == 512
+  num("2 ** 3 ** 2") |> should.equal(512.0)
+  let m = compile("function f() { let x = 3; x **= 2; return x; }")
+  to_float(call(m, "f", [])) |> should.equal(9.0)
+  // Negative base with a non-integer exponent is NaN (NaN !== NaN).
+  let n = compile("function f() { let r = (-8) ** (1 / 3); return r !== r; }")
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

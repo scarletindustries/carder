@@ -21,9 +21,9 @@
 //// flow threads mutated variables as loop-carried params / phi-merged `If` results.
 ////
 //// Not yet (a clean `Unsupported` error / panic): first-class functions & closures,
-//// arrays, classes, `try/catch/throw`, `switch`, `for-in/of`, `**`, regex, and
-//// `continue` inside a `do/while`. Scope is one flat function scope per JS function
-//// (block-scoped `let` is treated as function-scoped).
+//// arrays, classes, `try/catch/throw`, `switch`, `for-in/of`, regex, and `continue`
+//// inside a `do/while`. Scope is one flat function scope per JS function (block-scoped
+//// `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -823,6 +823,9 @@ fn lower_binary(
     ast.RightShift -> Ok(bind_after(pre, ir.CallHost("js", "shr", [l, r]), ctr))
     ast.UnsignedRightShift ->
       Ok(bind_after(pre, ir.CallHost("js", "ushr", [l, r]), ctr))
+    // `**` — always rt_js (Number::exponentiate).
+    ast.Exponentiation ->
+      Ok(bind_after(pre, ir.CallHost("js", "pow", [l, r]), ctr))
     // comparisons in value position → a JS boolean term.
     _ ->
       case compare_op(op) {
@@ -1167,6 +1170,8 @@ fn apply_compound(
       Ok(bind_after(pre, ir.CallHost("js", "shr", [l, r]), ctr))
     ast.UnsignedRightShiftAssign ->
       Ok(bind_after(pre, ir.CallHost("js", "ushr", [l, r]), ctr))
+    ast.ExponentiationAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "pow", [l, r]), ctr))
     _ -> Error(Unsupported("compound assignment operator"))
   }
 }
@@ -1198,6 +1203,8 @@ fn desugar_compound(
       Ok(ast.BinaryExpression(sp, ast.RightShift, left, right))
     ast.UnsignedRightShiftAssign ->
       Ok(ast.BinaryExpression(sp, ast.UnsignedRightShift, left, right))
+    ast.ExponentiationAssign ->
+      Ok(ast.BinaryExpression(sp, ast.Exponentiation, left, right))
     _ -> Error(Unsupported("compound assignment operator"))
   }
 }
