@@ -144,6 +144,18 @@ fn numeric_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
   }
 }
 
+/// Native-float-term path (the hypothesis): a JS number literal → a NATIVE BEAM
+/// `float()` term (the new `ir.ConstFloatTerm`), so `NumTerm`'s `erlang:'+'` does
+/// native double arithmetic — no per-op bit box/unbox. Real doubles, and (if the
+/// hypothesis holds) as fast as the integer-term path.
+fn native_float_backend() -> Backend {
+  Backend(ty: ir.TTerm, lit: native_float_lit, binop: term_binop)
+}
+
+fn native_float_lit(v: Float, ctr: Int) -> #(List(Bind), ir.Value, Int) {
+  #([], ir.ConstFloatTerm(v), ctr)
+}
+
 // ── The lowering: arc AST → 2core IR ────────────────────────────────────────
 
 /// Fold ordered bindings into nested `Let`s around `body` (first binding outermost).
@@ -508,6 +520,11 @@ pub fn sum_loop_compiles_and_runs_test() {
   let #(fmod, f_f) = jit(numeric_backend(), "sumn", src)
   let assert Ok(fr) = catch_apply_dyn(fmod, f_f, [to_dynamic(float_bits(10.0))])
   f64_from_bits(fr) |> should.equal(45.0)
+
+  // Native-float term path: a real BEAM float() result, via NumTerm on native doubles.
+  let #(nmod, n_f) = jit(native_float_backend(), "sumnfc", src)
+  let assert Ok(nr) = catch_apply_dyn(nmod, n_f, [to_dynamic(10.0)])
+  term_to_float(nr) |> should.equal(45.0)
 }
 
 /// BENCHMARK: AOT-compiled `sum(n)` vs arc's bytecode VM on the same JS. Compiles
@@ -523,8 +540,10 @@ pub fn sum_vs_arc_benchmark_test() {
 
   let #(imod, i_f) = jit(term_backend(), "sumi", src)
   let #(fmod, f_f) = jit(numeric_backend(), "sumf", src)
+  let #(nmod, n_f) = jit(native_float_backend(), "sumnf", src)
   let int_arg = [to_dynamic(n)]
   let f64_arg = [to_dynamic(float_bits(nf))]
+  let nf_arg = [to_dynamic(nf)]
 
   let eng = engine.new()
   let arc_src =
@@ -535,32 +554,40 @@ pub fn sum_vs_arc_benchmark_test() {
   // Warm up.
   let _ = catch_apply_dyn(imod, i_f, int_arg)
   let _ = catch_apply_dyn(fmod, f_f, f64_arg)
+  let _ = catch_apply_dyn(nmod, n_f, nf_arg)
   let _ = arc_eval(eng, arc_src)
 
   let reps = 5
   let int_us = best_us(reps, fn() { catch_apply_dyn(imod, i_f, int_arg) })
   let f64_us = best_us(reps, fn() { catch_apply_dyn(fmod, f_f, f64_arg) })
+  let nf_us = best_us(reps, fn() { catch_apply_dyn(nmod, n_f, nf_arg) })
   let arc_us = best_us(reps, fn() { arc_eval(eng, arc_src) })
 
   // Correctness gate: every path computes the same value.
   let assert Ok(ir_) = catch_apply_dyn(imod, i_f, int_arg)
   let assert Ok(fr) = catch_apply_dyn(fmod, f_f, f64_arg)
+  let assert Ok(nr) = catch_apply_dyn(nmod, n_f, nf_arg)
   term_to_float(ir_) |> should.equal(expected)
   f64_from_bits(fr) |> should.equal(expected)
+  term_to_float(nr) |> should.equal(expected)
   arc_eval(eng, arc_src) |> should.equal(expected)
 
   io.println("")
   io.println("── JS→2core-IR vs arc (sum 0..999999, best of 5) ──")
-  io.println("  2core int-term  : " <> int.to_string(int_us) <> " us")
+  io.println("  2core int-term    : " <> int.to_string(int_us) <> " us")
+  io.println("  2core f64 (raw-bit): " <> int.to_string(f64_us) <> " us")
   io.println(
-    "  2core f64       : "
-    <> int.to_string(f64_us)
-    <> " us  (real IEEE-754 doubles, arc's semantics)",
+    "  2core native-float: "
+    <> int.to_string(nf_us)
+    <> " us  (real BEAM float() terms — the hypothesis)",
   )
-  io.println("  arc bytecode VM : " <> int.to_string(arc_us) <> " us")
-  io.println("  speedup int : " <> ratio(arc_us, int_us) <> "x")
+  io.println("  arc bytecode VM   : " <> int.to_string(arc_us) <> " us")
+  io.println("  speedup int          : " <> ratio(arc_us, int_us) <> "x")
+  io.println("  speedup f64 (raw-bit): " <> ratio(arc_us, f64_us) <> "x")
   io.println(
-    "  speedup f64 : " <> ratio(arc_us, f64_us) <> "x   <- apples-to-apples",
+    "  speedup native-float : "
+    <> ratio(arc_us, nf_us)
+    <> "x   <- apples-to-apples doubles",
   )
 }
 
