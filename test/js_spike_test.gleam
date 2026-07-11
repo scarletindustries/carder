@@ -82,11 +82,13 @@ type Bind =
 
 /// A lowering target: the IR value type carrying a JS number, how a number literal
 /// becomes a `Value` (possibly with `Let` bindings), and how a binary op lowers.
+/// `binop` threads the fresh-name counter (the dynamic backend needs fresh guard
+/// names) and returns the op expression + the advanced counter.
 type Backend {
   Backend(
     ty: ir.ValType,
     lit: fn(Float, Int) -> #(List(Bind), ir.Value, Int),
-    binop: fn(ast.BinaryOp, ir.Value, ir.Value) -> ir.Expr,
+    binop: fn(ast.BinaryOp, ir.Value, ir.Value, Int) -> #(ir.Expr, Int),
   )
 }
 
@@ -105,8 +107,13 @@ fn term_lit(v: Float, ctr: Int) -> #(List(Bind), ir.Value, Int) {
   #([#(name, boxed)], ir.Var(name), ctr)
 }
 
-fn term_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
-  case op {
+fn term_binop(
+  op: ast.BinaryOp,
+  l: ir.Value,
+  r: ir.Value,
+  ctr: Int,
+) -> #(ir.Expr, Int) {
+  let e = case op {
     ast.Add -> ir.NumTerm(ir.NAdd, l, r)
     ast.Subtract -> ir.NumTerm(ir.NSub, l, r)
     ast.Multiply -> ir.NumTerm(ir.NMul, l, r)
@@ -117,6 +124,7 @@ fn term_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
     ast.StrictEqual -> ir.NumTerm(ir.NEq, l, r)
     _ -> panic as "js-spike: unsupported binary operator"
   }
+  #(e, ctr)
 }
 
 /// Numeric f64 path: every JS number → an unboxed IEEE-754 double (`TF64`, a raw
@@ -130,8 +138,13 @@ fn numeric_lit(v: Float, ctr: Int) -> #(List(Bind), ir.Value, Int) {
   #([], ir.ConstF64(float_bits(v)), ctr)
 }
 
-fn numeric_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
-  case op {
+fn numeric_binop(
+  op: ast.BinaryOp,
+  l: ir.Value,
+  r: ir.Value,
+  ctr: Int,
+) -> #(ir.Expr, Int) {
+  let e = case op {
     ast.Add -> ir.Num(ir.FAdd(ir.FW64), [l, r])
     ast.Subtract -> ir.Num(ir.FSub(ir.FW64), [l, r])
     ast.Multiply -> ir.Num(ir.FMul(ir.FW64), [l, r])
@@ -142,6 +155,7 @@ fn numeric_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
     ast.StrictEqual -> ir.Num(ir.FEq(ir.FW64), [l, r])
     _ -> panic as "js-spike: unsupported binary operator"
   }
+  #(e, ctr)
 }
 
 /// Native-float-term path (the hypothesis): a JS number literal → a NATIVE BEAM
@@ -154,6 +168,67 @@ fn native_float_backend() -> Backend {
 
 fn native_float_lit(v: Float, ctr: Int) -> #(List(Bind), ir.Value, Int) {
   #([], ir.ConstFloatTerm(v), ctr)
+}
+
+/// Dynamic path — polymorphic JS. Each `+`/`-`/`*` compiles to a GUARDED dispatch:
+/// `if IsNumber(a) && IsNumber(b) then NumTerm(fast native arithmetic) else
+/// CallHost("js", op, [a, b])` — the `rt_js` cold path with REAL JS semantics
+/// (string concat, coercion, NaN/Infinity). Number literals are native BEAM floats
+/// (so the both-number path is the native-float fast path); the guard is a cheap
+/// `erlang:is_number` BIF. Comparisons stay on the numeric fast path (a loop
+/// condition is numeric, and both arms of a guarded compare would be i32).
+fn dynamic_backend() -> Backend {
+  Backend(ty: ir.TTerm, lit: native_float_lit, binop: dynamic_binop)
+}
+
+fn dynamic_binop(
+  op: ast.BinaryOp,
+  l: ir.Value,
+  r: ir.Value,
+  ctr: Int,
+) -> #(ir.Expr, Int) {
+  case op {
+    // `+`/`-`/`*` are polymorphic in JS (`+` also concatenates): guard them.
+    ast.Add | ast.Subtract | ast.Multiply -> {
+      let #(ga, ctr) = fresh(ctr)
+      let #(gb, ctr) = fresh(ctr)
+      let #(fast, ctr) = term_binop(op, l, r, ctr)
+      let slow = ir.CallHost("js", js_op_name(op), [l, r])
+      let guarded =
+        ir.Let(
+          [ga],
+          ir.TermTest(ir.IsNumber, l),
+          ir.Let(
+            [gb],
+            ir.TermTest(ir.IsNumber, r),
+            ir.If(
+              cond: ir.Var(ga),
+              result: [ir.TTerm],
+              then_branch: ir.If(
+                cond: ir.Var(gb),
+                result: [ir.TTerm],
+                then_branch: fast,
+                else_branch: slow,
+              ),
+              else_branch: slow,
+            ),
+          ),
+        )
+      #(guarded, ctr)
+    }
+    // Comparisons: the numeric fast path (→ i32 truth for the loop `If`).
+    _ -> term_binop(op, l, r, ctr)
+  }
+}
+
+/// The `rt_js` cold-path op name for a guarded arithmetic operator.
+fn js_op_name(op: ast.BinaryOp) -> String {
+  case op {
+    ast.Add -> "add"
+    ast.Subtract -> "sub"
+    ast.Multiply -> "mul"
+    _ -> panic as "js-spike: no rt_js op for this operator"
+  }
 }
 
 // ── The lowering: arc AST → 2core IR ────────────────────────────────────────
@@ -186,8 +261,9 @@ fn lower_expr(
     ast.BinaryExpression(operator: op, left: l, right: r, ..) -> {
       let #(bl, vl, ctr) = lower_expr(be, l, env, ctr)
       let #(br, vr, ctr) = lower_expr(be, r, env, ctr)
+      let #(op_expr, ctr) = be.binop(op, vl, vr, ctr)
       let #(name, ctr) = fresh(ctr)
-      let binds = list.flatten([bl, br, [#(name, be.binop(op, vl, vr))]])
+      let binds = list.flatten([bl, br, [#(name, op_expr)]])
       #(binds, ir.Var(name), ctr)
     }
     _ -> panic as "js-spike: unsupported expression"
@@ -527,6 +603,28 @@ pub fn sum_loop_compiles_and_runs_test() {
   term_to_float(nr) |> should.equal(45.0)
 }
 
+/// POLYMORPHISM: the dynamic backend compiles ONE `a + b` that dispatches at
+/// runtime — the native fast path for numbers, and the `rt_js` cold path (REAL JS
+/// semantics: concat, coercion) for strings / mixed operands. Proves 2core compiles
+/// dynamic JS, not just monomorphic numeric kernels.
+pub fn dynamic_polymorphism_test() {
+  let #(mod, f) =
+    jit(dynamic_backend(), "poly", "function poly(a, b) { return a + b; }")
+
+  // both numbers → guard true → native NumTerm(NAdd) fast path.
+  let assert Ok(nn) =
+    catch_apply_dyn(mod, f, [to_dynamic(2.0), to_dynamic(3.0)])
+  term_to_float(nn) |> should.equal(5.0)
+
+  // both strings → guard false → rt_js cold path → real JS string concat.
+  catch_apply_dyn(mod, f, [to_dynamic(<<"a">>), to_dynamic(<<"b">>)])
+  |> should.equal(Ok(to_dynamic(<<"ab">>)))
+
+  // number + string → cold path → rt_js coercion (`2 + "x"` → `"2x"`).
+  catch_apply_dyn(mod, f, [to_dynamic(2.0), to_dynamic(<<"x">>)])
+  |> should.equal(Ok(to_dynamic(<<"2x">>)))
+}
+
 /// BENCHMARK: AOT-compiled `sum(n)` vs arc's bytecode VM on the same JS. Compiles
 /// TWO paths — integer-term and numeric f64 (arc's own double semantics) — so the
 /// f64 row is a clean apples-to-apples compiled-vs-interpreted comparison. Asserts
@@ -541,9 +639,11 @@ pub fn sum_vs_arc_benchmark_test() {
   let #(imod, i_f) = jit(term_backend(), "sumi", src)
   let #(fmod, f_f) = jit(numeric_backend(), "sumf", src)
   let #(nmod, n_f) = jit(native_float_backend(), "sumnf", src)
+  let #(dmod, d_f) = jit(dynamic_backend(), "sumd", src)
   let int_arg = [to_dynamic(n)]
   let f64_arg = [to_dynamic(float_bits(nf))]
   let nf_arg = [to_dynamic(nf)]
+  let dyn_arg = [to_dynamic(nf)]
 
   let eng = engine.new()
   let arc_src =
@@ -555,40 +655,46 @@ pub fn sum_vs_arc_benchmark_test() {
   let _ = catch_apply_dyn(imod, i_f, int_arg)
   let _ = catch_apply_dyn(fmod, f_f, f64_arg)
   let _ = catch_apply_dyn(nmod, n_f, nf_arg)
+  let _ = catch_apply_dyn(dmod, d_f, dyn_arg)
   let _ = arc_eval(eng, arc_src)
 
-  let reps = 5
+  let reps = 25
   let int_us = best_us(reps, fn() { catch_apply_dyn(imod, i_f, int_arg) })
   let f64_us = best_us(reps, fn() { catch_apply_dyn(fmod, f_f, f64_arg) })
   let nf_us = best_us(reps, fn() { catch_apply_dyn(nmod, n_f, nf_arg) })
+  let dyn_us = best_us(reps, fn() { catch_apply_dyn(dmod, d_f, dyn_arg) })
   let arc_us = best_us(reps, fn() { arc_eval(eng, arc_src) })
 
   // Correctness gate: every path computes the same value.
   let assert Ok(ir_) = catch_apply_dyn(imod, i_f, int_arg)
   let assert Ok(fr) = catch_apply_dyn(fmod, f_f, f64_arg)
   let assert Ok(nr) = catch_apply_dyn(nmod, n_f, nf_arg)
+  let assert Ok(dr) = catch_apply_dyn(dmod, d_f, dyn_arg)
   term_to_float(ir_) |> should.equal(expected)
   f64_from_bits(fr) |> should.equal(expected)
   term_to_float(nr) |> should.equal(expected)
+  term_to_float(dr) |> should.equal(expected)
   arc_eval(eng, arc_src) |> should.equal(expected)
 
   io.println("")
-  io.println("── JS→2core-IR vs arc (sum 0..999999, best of 5) ──")
-  io.println("  2core int-term    : " <> int.to_string(int_us) <> " us")
+  io.println("── JS→2core-IR vs arc (sum 0..999999, best of 25) ──")
+  io.println("  2core int-term     : " <> int.to_string(int_us) <> " us")
   io.println("  2core f64 (raw-bit): " <> int.to_string(f64_us) <> " us")
+  io.println("  2core native-float : " <> int.to_string(nf_us) <> " us")
   io.println(
-    "  2core native-float: "
-    <> int.to_string(nf_us)
-    <> " us  (real BEAM float() terms — the hypothesis)",
+    "  2core DYNAMIC      : "
+    <> int.to_string(dyn_us)
+    <> " us  (polymorphic: IsNumber guard → native, else rt_js)",
   )
-  io.println("  arc bytecode VM   : " <> int.to_string(arc_us) <> " us")
+  io.println("  arc bytecode VM    : " <> int.to_string(arc_us) <> " us")
   io.println("  speedup int          : " <> ratio(arc_us, int_us) <> "x")
-  io.println("  speedup f64 (raw-bit): " <> ratio(arc_us, f64_us) <> "x")
+  io.println("  speedup native-float : " <> ratio(arc_us, nf_us) <> "x")
   io.println(
-    "  speedup native-float : "
-    <> ratio(arc_us, nf_us)
-    <> "x   <- apples-to-apples doubles",
+    "  speedup DYNAMIC      : "
+    <> ratio(arc_us, dyn_us)
+    <> "x   <- polymorphic JS vs arc",
   )
+  io.println("  guard overhead (dyn/native) : " <> ratio(dyn_us, nf_us) <> "x")
 }
 
 /// Run `f` `reps` times, returning the fastest wall time in microseconds.
