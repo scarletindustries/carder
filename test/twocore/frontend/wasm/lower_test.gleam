@@ -25,6 +25,7 @@ import twocore/frontend/wasm/ast
 import twocore/frontend/wasm/decode
 import twocore/frontend/wasm/lower
 import twocore/frontend/wasm/validate
+import twocore/frontend/wasm/wat
 import twocore/ir
 import twocore/ir/parser
 import twocore/ir/printer
@@ -1591,6 +1592,207 @@ pub fn imported_call_test() {
   has(fn(e) { e == ir.CallDirect("f2", [ir.Var("p0")]) })
   |> should.equal(True)
 }
+
+// ─────────────── lever 5: liveness narrowing of the carried-local set ───────────────
+//
+// Objective (spec) property: the frontend threads a block/loop/if's mutated locals out as extra
+// results / loop params. WASM semantics say a local NOT read on any path after the exit (before its
+// next write) is dead there — its outgoing value is unobservable. Under `narrow_carried`, such a
+// local must NOT be carried; a local read after the exit MUST be. And an end-to-end run under
+// narrowing must return the SPEC-CORRECT result (the analysis only removes provably-dead locals).
+
+/// Parse WAT → validate → frontend-lower, with liveness narrowing on/off. Each stage must succeed
+/// (these are valid fixtures); a failure is a genuine test failure.
+fn lower_wat(source: String, narrow: Bool) -> ir.Module {
+  let assert Ok(m) = wat.parse_module(source)
+  let assert Ok(tm) = validate.validate(m)
+  let assert Ok(irm) = lower.lower_with(tm, narrow)
+  irm
+}
+
+/// The single defined function of a one-function fixture (the frontend names it by funcidx, e.g.
+/// `"f0"`, not by its export name).
+fn single_func(irm: ir.Module) -> ir.Function {
+  let assert [f] = irm.functions
+  f
+}
+
+/// Every `ir.Loop`'s param list in `f`'s body (structural inspection of loop-carried vars).
+fn loop_params(f: ir.Function) -> List(List(ir.LoopParam)) {
+  list.filter_map(all_exprs(f.body), fn(e) {
+    case e {
+      ir.Loop(_, params, _, _) -> Ok(params)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// Every `ir.Block`'s result-type list in `f`'s body. A block has no stack results in these fixtures
+/// (empty blocktype), so its result list length == its carried-local count.
+fn block_results(f: ir.Function) -> List(List(ir.ValType)) {
+  list.filter_map(all_exprs(f.body), fn(e) {
+    case e {
+      ir.Block(_, result, _) -> Ok(result)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+// `(func (export "f") (param i32) (result i32) (local $dead i32) (local $live i32)
+//    (block (local.set $dead (i32.const 7)) (local.set $live (i32.const 9)))
+//    (local.get $live))`
+// $dead and $live are BOTH set inside the block; only $live is read after it. So the block's
+// carried locals are {$dead, $live} without narrowing, {$live} with narrowing.
+const narrow_join_wat: String = "
+  (module
+    (func (export \"f\") (param i32) (result i32)
+      (local $dead i32) (local $live i32)
+      (block
+        (local.set $dead (i32.const 7))
+        (local.set $live (i32.const 9)))
+      (local.get $live)))"
+
+/// Objective: a local set inside a `block` but DEAD after it (never read before its next write) is
+/// NOT threaded out under narrowing, while one read after the block IS. The block yields no stack
+/// value, so its `ir.Block` result-list length equals its carried-local count: 2 without narrowing
+/// (both `$dead` and `$live`), exactly 1 with it (only `$live`).
+pub fn narrow_drops_dead_join_local_test() {
+  let f_wide = single_func(lower_wat(narrow_join_wat, False))
+  let f_narrow = single_func(lower_wat(narrow_join_wat, True))
+  // Default (no narrowing): the block carries BOTH mutated locals — the over-approximation.
+  let assert [wide] = block_results(f_wide)
+  list.length(wide) |> should.equal(2)
+  // Narrowed: only the local live at the exit (`$live`) survives; `$dead` is dropped.
+  let assert [narrow] = block_results(f_narrow)
+  list.length(narrow) |> should.equal(1)
+}
+
+// `(func (export "sumloop") (param $n i32) (result i32)
+//    (local $i i32) (local $acc i32) (local $tmp i32)
+//    (block $break (loop $cont
+//      (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+//      (local.set $tmp (i32.mul (local.get $i) (i32.const 2)))
+//      (local.set $acc (i32.add (local.get $acc) (local.get $tmp)))
+//      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+//      (br $cont)))
+//    (local.get $acc)))`
+// $tmp is written then read WITHIN one iteration — dead at the back-edge (rewritten before read
+// each pass) and never read after the loop; $i and $acc are read on the next iteration / after.
+const narrow_loop_wat: String = "
+  (module
+    (func (export \"sumloop\") (param $n i32) (result i32)
+      (local $i i32) (local $acc i32) (local $tmp i32)
+      (block $break
+        (loop $cont
+          (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+          (local.set $tmp (i32.mul (local.get $i) (i32.const 2)))
+          (local.set $acc (i32.add (local.get $acc) (local.get $tmp)))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $cont)))
+      (local.get $acc)))"
+
+/// Objective: a loop temp written-then-read within a single iteration (`$tmp`) is dead at BOTH the
+/// back-edge and the exit, so narrowing drops it from the loop parameters — while `$i`/`$acc`, live
+/// across iterations / after the loop, are kept. Without narrowing all three locals are loop params.
+pub fn narrow_drops_dead_loop_local_test() {
+  let assert [wide] =
+    loop_params(single_func(lower_wat(narrow_loop_wat, False)))
+  // Default: the loop carries all three mutated locals ($i, $acc, $tmp).
+  list.length(wide) |> should.equal(3)
+  let assert [narrow] =
+    loop_params(single_func(lower_wat(narrow_loop_wat, True)))
+  // Narrowed: $tmp — dead at the back-edge AND the exit — is dropped; $i and $acc remain.
+  list.length(narrow) |> should.equal(2)
+}
+
+/// Objective: narrowing is BEHAVIOUR-PRESERVING. Compile+run `sumloop` (which mutates $i/$acc/$tmp
+/// per iteration) with narrowing ON and OFF; both return the SPEC-CORRECT result. `sumloop(n)` sums
+/// `i*2` for `i` in `[0, n)` = `n*(n-1)`: `sumloop(5)=20`, `sumloop(10)=90`, `sumloop(0)=0`.
+pub fn narrow_preserves_loop_semantics_e2e_test() {
+  list.each([False, True], fn(narrow) {
+    let mod = load(lower_wat(narrow_loop_wat, narrow))
+    catch_apply(mod, atom.create("sumloop"), [5]) |> should.equal(Ok(20))
+    catch_apply(mod, atom.create("sumloop"), [10]) |> should.equal(Ok(90))
+    catch_apply(mod, atom.create("sumloop"), [0]) |> should.equal(Ok(0))
+  })
+}
+
+/// Objective: narrowing NEVER perturbs the DEFAULT lowering — `lower/1` (narrowing off) is
+/// byte-identical to `lower_with(_, False)`, and the existing `sum_to` fixture lowers identically
+/// either way (its only carried locals, `$i`/`$acc`, are both live). This pins the fail-closed
+/// default the conformance corpus relies on.
+pub fn narrow_off_is_default_test() {
+  // The public `lower/1` is exactly `lower_with(_, False)`.
+  let assert Ok(tm) =
+    validate.validate({
+      let assert Ok(m) = decode.decode(sum_to_wasm)
+      m
+    })
+  lower.lower(tm) |> should.equal(lower.lower_with(tm, False))
+  // A loop whose carried locals are all live is unchanged BY narrowing (nothing to drop).
+  let default = single_func(build(sum_to_wasm))
+  let narrowed = single_func(lower_wat(sum_to_wat, True))
+  loop_params(default)
+  |> list.map(list.length)
+  |> should.equal(loop_params(narrowed) |> list.map(list.length))
+}
+
+// `(func (export "carry") (param $n i32) (result i32)
+//    (local $i i32) (local $prev i32) (local $sum i32)
+//    (block $break (loop $cont
+//      (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+//      (local.set $sum (i32.add (local.get $sum) (local.get $prev)))   ;; reads $prev at the TOP
+//      (local.set $prev (local.get $i))                                ;; writes $prev for NEXT iter
+//      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+//      (br $cont)))
+//    (local.get $sum)))`
+// $prev is written near the END of the body and read at the START of the NEXT iteration, so it is
+// LIVE at the back-edge and MUST be kept as a loop param — a wrongly-dropped $prev would read 0
+// every pass. This pins the loop back-edge soundness the fixpoint captures.
+const carry_wat: String = "
+  (module
+    (func (export \"carry\") (param $n i32) (result i32)
+      (local $i i32) (local $prev i32) (local $sum i32)
+      (block $break
+        (loop $cont
+          (br_if $break (i32.ge_s (local.get $i) (local.get $n)))
+          (local.set $sum (i32.add (local.get $sum) (local.get $prev)))
+          (local.set $prev (local.get $i))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $cont)))
+      (local.get $sum)))"
+
+/// Objective: a local written late in a loop body and read at the TOP of the next iteration is live
+/// at the back-edge — narrowing MUST keep it (the fixpoint's raison d'être). Structurally `$prev`
+/// stays a loop param (all three locals kept), and end-to-end the result is spec-correct under
+/// narrowing: `carry(n) = sum of prev_i = (n-2)(n-1)/2` for `n>=2` — `carry(5)=6`, `carry(10)=36`.
+/// A dropped `$prev` would return 0.
+pub fn narrow_keeps_backedge_live_local_test() {
+  // $i, $prev, $sum are all live (at the back-edge or after) — nothing is dropped.
+  let assert [params] = loop_params(single_func(lower_wat(carry_wat, True)))
+  list.length(params) |> should.equal(3)
+  // And the run is spec-correct under narrowing (and identically without it).
+  list.each([False, True], fn(narrow) {
+    let mod = load(lower_wat(carry_wat, narrow))
+    catch_apply(mod, atom.create("carry"), [5]) |> should.equal(Ok(6))
+    catch_apply(mod, atom.create("carry"), [10]) |> should.equal(Ok(36))
+    catch_apply(mod, atom.create("carry"), [1]) |> should.equal(Ok(0))
+  })
+}
+
+// `sum_to` as WAT (matches the `sum_to_wasm` byte fixture): both carried locals ($i, $acc) are live.
+const sum_to_wat: String = "
+  (module
+    (func (export \"sum_to\") (param $n i32) (result i32)
+      (local $i i32) (local $acc i32)
+      (local.set $i (i32.const 1))
+      (block $break
+        (loop $cont
+          (br_if $break (i32.gt_s (local.get $i) (local.get $n)))
+          (local.set $acc (i32.add (local.get $acc) (local.get $i)))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $cont)))
+      (local.get $acc)))"
 
 // ───────────────────────────── fixtures ─────────────────────────────
 

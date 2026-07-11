@@ -500,6 +500,10 @@ pub fn engine() -> Binding {
     // single-use `letrec` join funs; inlining them (a pure Core rewrite) shrinks the emitted Core
     // + `.beam` and the per-block fun-alloc/local-call overhead.
     inline_joins: True,
+    // `narrow_carried: True` (lever 5) — a large trusted engine's dispatch loop threads ~40+ mutable
+    // locals through every nested block/loop; the frontend liveness pass drops the ones provably dead
+    // at each construct's exit, shrinking the lowered IR and the emitted Core.
+    narrow_carried: True,
   )
 }
 

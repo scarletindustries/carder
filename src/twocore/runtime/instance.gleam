@@ -300,6 +300,24 @@ pub type Binding {
     /// Engaged only by NAMING `--inline-joins` or a profile that sets it (`engine()`).
     /// Orthogonal to the safety profile and every tier axis (composable with any base).
     inline_joins: Bool,
+    /// Opt-in FRONTEND liveness narrowing of the join/loop carried-local set (lever 5), a per-build
+    /// compile-time toggle for a large guest whose hot control flow threads many mutable locals
+    /// (e.g. a JS engine's opcode-dispatch loop, ~40+ locals per executed opcode). 2core threads
+    /// EVERY local `set`/`tee`'d anywhere inside a wasm `block`/`loop`/`if` out of that construct as
+    /// an extra result / loop parameter — a gross over-approximation, since most such locals are
+    /// DEAD at the construct's exit. When `True`, the frontend runs a SOUND structured backward
+    /// liveness pass and drops a carried local ONLY where it can PROVE the local is dead at the exit
+    /// (no read on any path from the branch target before the next write); a loop additionally keeps
+    /// any local live at its back-edge (read on a later iteration). Shrinks the emitted Core and the
+    /// per-block threading overhead. On ANY uncertainty (a function using exception handling or a
+    /// GC-typed branch, an out-of-range branch, a malformed body) it KEEPS the full over-approximated
+    /// set — the analysis can only ever REMOVE a provably-dead local, never a live one.
+    ///
+    /// Default `False` (fail-closed): the DEFAULT emitted Core is BYTE-IDENTICAL to a build without
+    /// this field (the frontend narrowing does not run), so the conformance/golden corpus is trivially
+    /// unperturbed. Engaged only by a profile that sets it (`engine()`). A pure frontend-lowering
+    /// transform — orthogonal to the safety profile and every tier axis (composable with any base).
+    narrow_carried: Bool,
     // ── Phase-4 trust-tier axes (G1/G2) ─────────────────────────────────────
     state_strategy: StateStrategy,
     mem_tier: MemTier,
@@ -354,6 +372,10 @@ pub fn safe_default() -> Binding {
     // emitted Core is byte-identical to a build without this field. Set `True` only by naming
     // `--inline-joins` or via `profiles.engine()`.
     inline_joins: False,
+    // Lever 5 opt-in, OFF by default (fail-closed): the frontend liveness narrowing does not run, so
+    // the lowered IR (hence the emitted Core) is byte-identical to a build without this field. Set
+    // `True` only via `profiles.engine()`.
+    narrow_carried: False,
     // ── Phase-4 trust-tier posture (G1/G2). The maximally node-safe default (D4): the
     // tier-O `Cell` state strategy + the tier-P `Paged`/`TablePaged` backends — byte-identical
     // to Phase-2/3. Leaving it (tier-P `portable` / tier-N `ceiling`) requires NAMING a profile

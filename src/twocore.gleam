@@ -772,7 +772,7 @@ fn legacy_to_beam_wasm(
   link: Bool,
 ) -> Result(String, String) {
   use bytes <- result.try(read_bits(input))
-  case pipeline.source_to_ir(bytes) {
+  case pipeline.source_to_ir_with(bytes, binding.narrow_carried) {
     Error(e) -> Error(pipeline.describe(e))
     Ok(m) ->
       case link {
@@ -827,7 +827,8 @@ fn folder_to_beam_wasm(
 ) -> Result(String, String) {
   use bytes <- result.try(read_bits(input))
   use m <- result.try(
-    pipeline.source_to_ir(bytes) |> result.map_error(pipeline.describe),
+    pipeline.source_to_ir_with(bytes, binding.narrow_carried)
+    |> result.map_error(pipeline.describe),
   )
   // R17: lower + optimize ONCE; the returned `lowered` module is exactly what the `.core` (hence the
   // `.beam`) is generated from, and it is what `emit_bindings` runs `describe` over.

@@ -511,13 +511,25 @@ fn ffi_bench_instance(
 /// - Return: `Ok(ir.Module)` or the first failing stage's `Error(PipelineError)`. No policy
 ///   pass or codegen is run here (use `ir_to_core` for those). Total — never panics.
 pub fn source_to_ir(wasm: BitArray) -> Result(ir.Module, PipelineError) {
+  source_to_ir_with(wasm, False)
+}
+
+/// As `source_to_ir`, but `narrow_carried` selects the frontend liveness narrowing (lever 5). Pass
+/// `binding.narrow_carried` from a binding-carrying compile path (e.g. `run_source`); `False` (the
+/// `source_to_ir/1` default) reproduces the byte-identical no-narrowing lowering. The narrowing only
+/// ever removes a carried local it can PROVE dead at its construct's exit, so `True` is behaviour-
+/// preserving.
+pub fn source_to_ir_with(
+  wasm: BitArray,
+  narrow_carried: Bool,
+) -> Result(ir.Module, PipelineError) {
   case decode.decode(wasm) {
     Error(e) -> Error(DecodeFailed(e))
     Ok(m) ->
       case validate.validate(m) {
         Error(e) -> Error(ValidateFailed(e))
         Ok(tm) ->
-          case lower.lower(tm) {
+          case lower.lower_with(tm, narrow_carried) {
             Error(e) -> Error(FrontendLowerFailed(e))
             Ok(irmod) -> Ok(irmod)
           }
@@ -721,7 +733,7 @@ pub fn run_source(
   export: String,
   args: List(Int),
 ) -> Result(RunResult, PipelineError) {
-  case source_to_ir(wasm) {
+  case source_to_ir_with(wasm, binding.narrow_carried) {
     Error(e) -> Error(e)
     Ok(m) ->
       case ir_to_core(m, binding) {
@@ -763,7 +775,7 @@ pub fn run_source_chunked(
   target: Int,
   min_split_defs: Int,
 ) -> Result(RunResult, PipelineError) {
-  case source_to_ir(wasm) {
+  case source_to_ir_with(wasm, binding.narrow_carried) {
     Error(e) -> Error(e)
     Ok(m) ->
       case source_to_chunks(m, binding, target, min_split_defs) {

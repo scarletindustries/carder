@@ -174,6 +174,24 @@ type LCtx {
     table_types: List(ir.RefType),
     tag_types: List(List(ir.ValType)),
     catch_refs: List(String),
+    /// (Lever 5) `True` iff frontend liveness narrowing is enabled FOR THIS FUNCTION — the build
+    /// flag AND the function being analysable (no exception-handling / GC-typed-branch instruction,
+    /// which the backward liveness pass does not model and so bails on). When `False`, every
+    /// block/loop/if threads its FULL `scan_modified` carried set (byte-identical to a no-narrowing
+    /// build).
+    narrow_carried: Bool,
+    /// (Lever 5) `{0..local_count-1}` — the conservative "all locals" set the backward liveness pass
+    /// falls back to on any uncertainty (an out-of-range branch depth, a body that runs off its end),
+    /// so an unknown live-set can never DROP a local. Empty when `narrow_carried` is `False`.
+    all_locals: set.Set(Int),
+    /// (Lever 5) The branch-target and fall-through live-local sets of each ENCLOSING control frame,
+    /// innermost at the head, parallel to `LState.frames`. Entry `#(br_live, ft_live)`: `br_live` =
+    /// the locals live where a `br` to that frame lands (a `block`/`if`'s merge, a `loop`'s head =
+    /// its back-edge live set); `ft_live` = the locals live at that frame's fall-through exit. The
+    /// backward liveness pass indexes `br_live` by branch depth and reads the head `ft_live` at a
+    /// frame-closing `end`. Only meaningful (and only maintained in lockstep with `frames`) while
+    /// `narrow_carried` is `True`; a stale value is never read otherwise.
+    label_lives: List(#(set.Set(Int), set.Set(Int))),
   )
 }
 
@@ -257,10 +275,28 @@ type GoResult {
 /// Returns `Ok(ir.Module)`, or `Error(LowerError)` — fail-closed, never a panic — for an
 /// out-of-scope construct (`Unsupported`) or a non-constant-literal init/offset expression
 /// (`NonConstInitExpr`).
+///
+/// Frontend liveness narrowing (lever 5) is OFF: every block/loop/if threads its full
+/// `scan_modified` carried-local set, so the output is byte-identical to a no-narrowing build.
+/// Use `lower_with(typed, True)` to enable narrowing.
 pub fn lower(typed: TypedModule) -> Result(ir.Module, LowerError) {
+  lower_with(typed, False)
+}
+
+/// As `lower/1`, but `narrow_carried` selects whether the frontend runs the SOUND liveness pass
+/// (lever 5) that drops each block/loop/if carried local it can PROVE is dead at the construct's
+/// exit (a loop additionally keeps any local live at its back-edge). `False` reproduces `lower/1`
+/// exactly (byte-identical). `True` only ever REMOVES a provably-dead carried local — never a live
+/// one — and bails to the full set for any function using exception handling or a GC-typed branch.
+pub fn lower_with(
+  typed: TypedModule,
+  narrow_carried: Bool,
+) -> Result(ir.Module, LowerError) {
   let module = typed.module
   use functions <- result.try(
-    list.index_map(module.funcs, fn(f, i) { lower_func(f, i, typed) })
+    list.index_map(module.funcs, fn(f, i) {
+      lower_func(f, i, typed, narrow_carried)
+    })
     |> result.all,
   )
   // Exports of all four kinds. Functions → `f<funcidx>`; state exports carry the IR name
@@ -351,6 +387,7 @@ fn lower_func(
   f: ast.Func,
   defined_idx: Int,
   typed: TypedModule,
+  narrow_carried: Bool,
 ) -> Result(ir.Function, LowerError) {
   let module = typed.module
   let funcidx = typed.imported_func_count + defined_idx
@@ -422,6 +459,18 @@ fn lower_func(
       // legacy catch handler is active at function entry, so `catch_refs` starts empty.
       tag_types: list.map(typed.tag_types, fn(ts) { list.map(ts, to_ir_vt) }),
       catch_refs: [],
+      // Lever 5: narrow this function's carried sets by liveness only if the build asked for it AND
+      // the body is analysable (no EH / GC-typed branch the pass would have to model). Otherwise the
+      // pass never runs and the full over-approximated carried set is threaded (byte-identical).
+      narrow_carried: narrow_carried && is_narrowable(f.body),
+      all_locals: case narrow_carried {
+        True -> set_range(list.length(local_types))
+        False -> set.new()
+      },
+      // The function frame's branch/fall-through live sets: a `return` and a fall-through off the
+      // body end both exit the function, where NO local is live (results are stack values). One
+      // entry, parallel to `st0.frames = [func_frame]`.
+      label_lives: [#(set.new(), set.new())],
     )
   let st0 =
     LState(
@@ -2420,7 +2469,11 @@ fn lower_block(
   use #(in_ir, out_ir) <- result.try(blocktype_io(bt, ctx))
   let in_n = list.length(in_ir)
   let out_n = list.length(out_ir)
-  let carried = scan_modified(tail, 0, set.new())
+  // Lever 5: a `block`'s carried locals are its extra RESULTS (the merge after it); narrow to the
+  // ones live at that exit. `br 0` to the block and the fall-through both land at the same merge, so
+  // the narrowed set is sound for every exit.
+  let #(carried, body_ctx) =
+    narrow_join_carried(scan_modified(tail, 0, set.new()), tail, ctx)
   use carried_ts <- result.try(carried_types(carried, ctx.local_types))
   let result_types = list.append(out_ir, carried_ts)
 
@@ -2444,7 +2497,7 @@ fn lower_block(
       frames: [frame, ..st.frames],
       var_types: st.var_types,
     )
-  use body_res <- result.try(go(tail, ctx, child))
+  use body_res <- result.try(go(tail, body_ctx, child))
   use #(body_expr, rest, c2) <- result.try(expect_end(body_res))
   finish_construct(
     ir.Block(label, result_types, body_expr),
@@ -2471,7 +2524,12 @@ fn lower_loop(
   use #(in_ir, out_ir) <- result.try(blocktype_io(bt, ctx))
   let in_n = list.length(in_ir)
   let out_n = list.length(out_ir)
-  let carried = scan_modified(tail, 0, set.new())
+  // Lever 5: a `loop`'s carried locals become loop PARAMETERS — threaded both out on exit AND back
+  // on every `br 0` (Continue) into the next iteration. So a carried local must be kept if it is
+  // live at the loop's exit OR at its back-edge (read on a later iteration); `narrow_loop_carried`
+  // drops only the ones dead on BOTH.
+  let #(carried, body_ctx) =
+    narrow_loop_carried(scan_modified(tail, 0, set.new()), tail, ctx)
   use carried_ts <- result.try(carried_types(carried, ctx.local_types))
   use carried_inits <- result.try(get_locals(st, carried))
 
@@ -2517,7 +2575,7 @@ fn lower_loop(
       frames: [frame, ..st.frames],
       var_types: child_var_types,
     )
-  use body_res <- result.try(go(tail, ctx, child))
+  use body_res <- result.try(go(tail, body_ctx, child))
   use #(body_expr, rest, c3) <- result.try(expect_end(body_res))
   finish_construct(
     ir.Loop(label, loop_params, result_types, body_expr),
@@ -2545,7 +2603,10 @@ fn lower_if(
   use #(in_ir, out_ir) <- result.try(blocktype_io(bt, ctx))
   let in_n = list.length(in_ir)
   let out_n = list.length(out_ir)
-  let carried = scan_modified(tail, 0, set.new())
+  // Lever 5: an `if`'s carried locals are its extra RESULTS (the merge after the whole `if`), like a
+  // `block` — narrow to the ones live at that exit (both arms + any `br 0` land at the same merge).
+  let #(carried, body_ctx) =
+    narrow_join_carried(scan_modified(tail, 0, set.new()), tail, ctx)
   use carried_ts <- result.try(carried_types(carried, ctx.local_types))
   let result_types = list.append(out_ir, carried_ts)
 
@@ -2570,7 +2631,7 @@ fn lower_if(
       frames: [frame, ..st.frames],
       var_types: st.var_types,
     )
-  use then_res <- result.try(go(tail, ctx, child_then))
+  use then_res <- result.try(go(tail, body_ctx, child_then))
   case then_res {
     GElse(then_expr, after_else, c2) -> {
       let child_else =
@@ -2581,7 +2642,7 @@ fn lower_if(
           frames: [frame, ..st.frames],
           var_types: st.var_types,
         )
-      use else_res <- result.try(go(after_else, ctx, child_else))
+      use else_res <- result.try(go(after_else, body_ctx, child_else))
       use #(else_expr, rest, c3) <- result.try(expect_end(else_res))
       finish_if(
         label,
@@ -3472,6 +3533,324 @@ fn scan_modified(
 /// A set of ints as an ascending list.
 fn set_to_sorted(s: set.Set(Int)) -> List(Int) {
   set.to_list(s) |> list.sort(int.compare)
+}
+
+// ───────────────────── lever 5: liveness narrowing of the carried-local set ─────────────────────
+//
+// `scan_modified` over-approximates a block/loop/if's carried locals as EVERY local set/tee'd
+// inside it. Under `narrow_carried` we intersect that with the locals actually LIVE at the
+// construct's exit, computed by a SOUND structured backward liveness pass (`live_of`). The pass may
+// only ever REMOVE a local it can prove dead — on any uncertainty it keeps the local. Enabled only
+// for functions with no exception-handling / GC-typed branch (`is_narrowable`), whose control flow
+// the pass models exactly; every other function threads the full `scan_modified` set unchanged.
+
+/// `True` iff `instrs` (a whole function body) contains NO instruction the backward liveness pass
+/// declines to model: exception handling (`throw`/`throw_ref`/`rethrow`/`try*`/legacy catch/delegate)
+/// or a GC-typed branch (`br_on_null`/`br_on_non_null`/`br_on_cast`/`br_on_cast_fail`). Their control
+/// flow (a throw reaching a handler that may read locals; a ref-typed conditional edge) is outside the
+/// pass's model, so a body containing any of them is NOT narrowed — it threads the full over-
+/// approximated carried set (sound). Every other instruction either touches no local and falls through
+/// (transparent to local liveness) or is one of the modeled control instructions (`live_of`).
+fn is_narrowable(instrs: List(ast.Instr)) -> Bool {
+  case instrs {
+    [] -> True
+    [i, ..t] ->
+      case i {
+        ast.Throw(_)
+        | ast.ThrowRef
+        | ast.Rethrow(_)
+        | ast.TryLegacy(_)
+        | ast.TryTable(_, _)
+        | ast.LegacyCatch(_)
+        | ast.LegacyCatchAll
+        | ast.LegacyDelegate(_)
+        | ast.BrOnNull(_)
+        | ast.BrOnNonNull(_)
+        | ast.BrOnCast(_, _, _)
+        | ast.BrOnCastFail(_, _, _) -> False
+        _ -> is_narrowable(t)
+      }
+  }
+}
+
+/// The set `{0, 1, …, n-1}` — the conservative "all locals" fallback.
+fn set_range(n: Int) -> set.Set(Int) {
+  set_range_go(0, n, set.new())
+}
+
+fn set_range_go(i: Int, n: Int, acc: set.Set(Int)) -> set.Set(Int) {
+  case i < n {
+    True -> set_range_go(i + 1, n, set.insert(acc, i))
+    False -> acc
+  }
+}
+
+/// Narrow a `block`/`if`'s carried locals to those live at its exit, and produce the child `LCtx`
+/// (with this construct's frame pushed onto `label_lives`) for lowering its body. A block/if's
+/// carried locals are its extra RESULTS: every exit (fall-through or a `br` to it) lands at the SAME
+/// merge — the code immediately after the construct — so `live_out` (that merge's live-in) is the
+/// exit live set for all of them. Returns `#(narrowed_carried, body_ctx)`. When `narrow_carried` is
+/// off, returns the full set and the unchanged ctx (byte-identical to a no-narrowing build).
+///
+/// `full_carried` is `scan_modified`'s over-approximation (ascending); the result preserves order and
+/// is always a SUBSET, so downstream threading is unaffected apart from dropping provably-dead locals.
+fn narrow_join_carried(
+  full_carried: List(Int),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+) -> #(List(Int), LCtx) {
+  case ctx.narrow_carried {
+    False -> #(full_carried, ctx)
+    True -> {
+      let live_out =
+        live_of(skip_construct(tail), ctx.label_lives, ctx.all_locals)
+      let narrowed =
+        list.filter(full_carried, fn(i) { set.contains(live_out, i) })
+      #(
+        narrowed,
+        LCtx(..ctx, label_lives: [#(live_out, live_out), ..ctx.label_lives]),
+      )
+    }
+  }
+}
+
+/// Narrow a `loop`'s carried locals, and produce the child `LCtx` for lowering its body. A loop's
+/// carried locals are its loop PARAMETERS: threaded OUT on exit AND back on every `br 0` (Continue)
+/// into the next iteration. So a carried local must be kept if it is live at the loop's exit
+/// (`live_out`) OR at its back-edge — the loop head (`headlive`, the loop body's live-in, computed as
+/// a least fixpoint so a value written this iteration and read the next is captured). Only a local
+/// dead at BOTH is dropped. The pushed `label_lives` entry is `#(headlive, live_out)`: a `br 0` in
+/// the body reaches the head (`headlive`), a fall-through off the body end exits the loop (`live_out`).
+fn narrow_loop_carried(
+  full_carried: List(Int),
+  tail: List(ast.Instr),
+  ctx: LCtx,
+) -> #(List(Int), LCtx) {
+  case ctx.narrow_carried {
+    False -> #(full_carried, ctx)
+    True -> {
+      let live_out =
+        live_of(skip_construct(tail), ctx.label_lives, ctx.all_locals)
+      let head = loop_headlive(tail, live_out, ctx.label_lives, ctx.all_locals)
+      let keep = set.union(live_out, head)
+      let narrowed = list.filter(full_carried, fn(i) { set.contains(keep, i) })
+      #(
+        narrowed,
+        LCtx(..ctx, label_lives: [#(head, live_out), ..ctx.label_lives]),
+      )
+    }
+  }
+}
+
+/// The set of locals LIVE at the entry of `instrs` — a suffix of ONE control frame's body, up to and
+/// including that frame's closing `end` (which the pass stops at). SOUND backward liveness: the
+/// result is always a SUPERSET of the true live set (it never under-approximates), so intersecting a
+/// carried set with it can only drop a PROVABLY-dead local.
+///
+/// - `lives`: `#(br_live, ft_live)` per enclosing frame, innermost at the head (parallel to the
+///   lowering frame stack). A `br l` lands with `lives[l].br_live` live; the current frame's
+///   fall-through `end`/`else` yields `lives[0].ft_live`.
+/// - `all_locals`: the conservative fallback returned on any uncertainty (a body that runs off its
+///   end, an out-of-range branch depth) — it contains every local, so nothing is ever dropped there.
+///
+/// Local liveness gen/kill lives entirely in `local.get` (gen), `local.set`/`local.tee` (kill); every
+/// other non-control instruction is transparent (its stack operands' reads are their producers').
+/// Unconditional transfers (`br`/`br_table`/`return`/`return_call*`/`unreachable`) make the fall-
+/// through tail unreachable, so live-in is purely the target's live set. Nested `block`/`loop`/`if`
+/// recurse: the sub-region's merge is the live-in of the code AFTER it; a `loop` back-edge (`br 0`)
+/// targets its head, resolved by `loop_headlive`. Only ever called on `is_narrowable` bodies, so no
+/// EH / GC-typed-branch instruction is reached.
+fn live_of(
+  instrs: List(ast.Instr),
+  lives: List(#(set.Set(Int), set.Set(Int))),
+  all_locals: set.Set(Int),
+) -> set.Set(Int) {
+  case instrs {
+    // Ran off the body end without a closing `end` (only on a malformed stream) — keep all.
+    [] -> all_locals
+    // Frame-closing markers: fall through to this frame's fall-through live set.
+    [ast.End, ..] -> ft_head(lives, all_locals)
+    [ast.Else, ..] -> ft_head(lives, all_locals)
+
+    // Locals — the ONLY gen (get) / kill (set/tee) sites.
+    [ast.LocalGet(i), ..t] -> set.insert(live_of(t, lives, all_locals), i)
+    [ast.LocalSet(i), ..t] -> set.delete(live_of(t, lives, all_locals), i)
+    [ast.LocalTee(i), ..t] -> set.delete(live_of(t, lives, all_locals), i)
+
+    // Unconditional transfers — the fall-through tail is unreachable, so live-in is the target's
+    // live set (∅ for a bottom-exit that leaves the function via `return`/`return_call*`/`unreachable`).
+    [ast.Br(l), ..] -> br_at(lives, l, all_locals)
+    [ast.BrTable(targets, default), ..] ->
+      list.fold(targets, br_at(lives, default, all_locals), fn(acc, tgt) {
+        set.union(acc, br_at(lives, tgt, all_locals))
+      })
+    [ast.Return, ..] -> set.new()
+    [ast.ReturnCall(_), ..] -> set.new()
+    [ast.ReturnCallIndirect(_, _), ..] -> set.new()
+    [ast.ReturnCallRef(_), ..] -> set.new()
+    [ast.Unreachable, ..] -> set.new()
+
+    // Conditional branch — either the target `l` or the fall-through continue.
+    [ast.BrIf(l), ..t] ->
+      set.union(br_at(lives, l, all_locals), live_of(t, lives, all_locals))
+
+    // Nested structured control. A `block`/`if`'s `br 0` and fall-through both land at its merge
+    // (`live_of` of the code after it); a `loop`'s `br 0` lands at its head (`loop_headlive`), its
+    // fall-through at its merge. The live-in of the whole sub-region is the live-in of its body
+    // (control enters the body once); an `if` unions its two arms.
+    [ast.Block(_), ..body] -> {
+      let merge = live_of(skip_construct(body), lives, all_locals)
+      live_of(body, [#(merge, merge), ..lives], all_locals)
+    }
+    [ast.Loop(_), ..body] -> {
+      let merge = live_of(skip_construct(body), lives, all_locals)
+      loop_headlive(body, merge, lives, all_locals)
+    }
+    [ast.If(_), ..body] -> {
+      let merge = live_of(skip_construct(body), lives, all_locals)
+      let inner = [#(merge, merge), ..lives]
+      let live_then = live_of(body, inner, all_locals)
+      let live_else = case else_part(body) {
+        option.Some(e) -> live_of(e, inner, all_locals)
+        // No `else`: the synthesised arm forwards params (no local read/write), so its live-in is
+        // the merge.
+        option.None -> merge
+      }
+      set.union(live_then, live_else)
+    }
+
+    // Every other instruction touches no local and falls through (its trap/return edge, if any,
+    // leaves nothing local live), so it is transparent to local liveness.
+    [_, ..t] -> live_of(t, lives, all_locals)
+  }
+}
+
+/// The live-in of a `loop` body accounting for its back-edge — the least fixpoint of
+/// `H = live_of(body, br0 = H, ft0 = live_out)`. Iterated from `∅` upward: each step is monotone and
+/// the result is bounded by `all_locals`, so it converges (equal size ⟹ equal set, since the
+/// iteration only grows). `body` starts at the loop's first body instruction (its closing `end`
+/// terminates `live_of` at `live_out`). On the (unreachable) fuel exhaustion, returns `all_locals`.
+fn loop_headlive(
+  body: List(ast.Instr),
+  live_out: set.Set(Int),
+  lives: List(#(set.Set(Int), set.Set(Int))),
+  all_locals: set.Set(Int),
+) -> set.Set(Int) {
+  loop_headlive_go(
+    body,
+    live_out,
+    lives,
+    all_locals,
+    set.new(),
+    set.size(all_locals) + 2,
+  )
+}
+
+fn loop_headlive_go(
+  body: List(ast.Instr),
+  live_out: set.Set(Int),
+  lives: List(#(set.Set(Int), set.Set(Int))),
+  all_locals: set.Set(Int),
+  cur: set.Set(Int),
+  fuel: Int,
+) -> set.Set(Int) {
+  case fuel <= 0 {
+    True -> all_locals
+    False -> {
+      let next = live_of(body, [#(cur, live_out), ..lives], all_locals)
+      case set.size(next) == set.size(cur) {
+        True -> next
+        False ->
+          loop_headlive_go(body, live_out, lives, all_locals, next, fuel - 1)
+      }
+    }
+  }
+}
+
+/// The instructions AFTER a construct's matching `end` (depth 0), given `instrs` starting just after
+/// its opener — i.e. the construct's continuation. `else` at depth 0 is NOT a closer (an `if`'s two
+/// arms are one region here); a legacy `delegate` closes its `try` like `end`. Mirrors
+/// `scan_modified`'s depth bookkeeping.
+fn skip_construct(instrs: List(ast.Instr)) -> List(ast.Instr) {
+  skip_construct_go(instrs, 0)
+}
+
+fn skip_construct_go(instrs: List(ast.Instr), depth: Int) -> List(ast.Instr) {
+  case instrs {
+    [] -> []
+    [ast.Block(_), ..t]
+    | [ast.Loop(_), ..t]
+    | [ast.If(_), ..t]
+    | [ast.TryLegacy(_), ..t]
+    | [ast.TryTable(_, _), ..t] -> skip_construct_go(t, depth + 1)
+    [ast.LegacyDelegate(_), ..t] | [ast.End, ..t] ->
+      case depth {
+        0 -> t
+        _ -> skip_construct_go(t, depth - 1)
+      }
+    [_, ..t] -> skip_construct_go(t, depth)
+  }
+}
+
+/// `Some(else_instrs)` if `instrs` (starting just after an `if`'s opener) has a depth-0 `else` — the
+/// instructions of the else-arm (through its `end`); `None` if the `if` closes with no `else`.
+fn else_part(instrs: List(ast.Instr)) -> Option(List(ast.Instr)) {
+  else_part_go(instrs, 0)
+}
+
+fn else_part_go(
+  instrs: List(ast.Instr),
+  depth: Int,
+) -> Option(List(ast.Instr)) {
+  case instrs {
+    [] -> None
+    [ast.Block(_), ..t]
+    | [ast.Loop(_), ..t]
+    | [ast.If(_), ..t]
+    | [ast.TryLegacy(_), ..t]
+    | [ast.TryTable(_, _), ..t] -> else_part_go(t, depth + 1)
+    [ast.LegacyDelegate(_), ..t] ->
+      case depth {
+        0 -> None
+        _ -> else_part_go(t, depth - 1)
+      }
+    [ast.Else, ..t] ->
+      case depth {
+        0 -> Some(t)
+        _ -> else_part_go(t, depth)
+      }
+    [ast.End, ..t] ->
+      case depth {
+        0 -> None
+        _ -> else_part_go(t, depth - 1)
+      }
+    [_, ..t] -> else_part_go(t, depth)
+  }
+}
+
+/// The branch-target live set for a `br` at relative depth `l` (`lives[l].br_live`); the conservative
+/// `all_locals` if `l` is out of range (only on a malformed/unvalidated stream — never drops a local).
+fn br_at(
+  lives: List(#(set.Set(Int), set.Set(Int))),
+  l: Int,
+  all_locals: set.Set(Int),
+) -> set.Set(Int) {
+  case nth_err(lives, l, StackUnderflow) {
+    Ok(#(br, _ft)) -> br
+    Error(_) -> all_locals
+  }
+}
+
+/// The current frame's fall-through live set (`lives` head's `ft_live`); `all_locals` if `lives` is
+/// empty (never, given the function frame is always present — conservative regardless).
+fn ft_head(
+  lives: List(#(set.Set(Int), set.Set(Int))),
+  all_locals: set.Set(Int),
+) -> set.Set(Int) {
+  case lives {
+    [#(_br, ft), ..] -> ft
+    [] -> all_locals
+  }
 }
 
 /// Resolve a blocktype to `#(input_types, result_types)` as IR types.
