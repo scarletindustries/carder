@@ -2198,11 +2198,76 @@ fn wrap_join(maybe_def: Option(FunDef), inner: CExpr) -> CExpr {
 
 // ─────────────────────────────── numeric ops (the chokepoint) ───────────────────────────────
 
+/// A BEAM guard-BIF call `call 'erlang':'<name>'(args…)`. The Erlang compiler folds these
+/// (`+`/`band`/`bsl`/`<`/…) to inline `bif`/`gc_bif` instructions, so no function call remains.
+fn bif(name: String, args: List(CExpr)) -> CExpr {
+  CCall(CAtom("erlang"), CAtom(name), args)
+}
+
+/// The unsigned mask `2^n − 1` bounding an n-bit value (the two's-complement wrap bound).
+fn width_mask(w: IntWidth) -> Int {
+  case w {
+    W32 -> 4_294_967_295
+    W64 -> 18_446_744_073_709_551_615
+  }
+}
+
+/// `band(expr, 2^n−1)` — normalize an arithmetic result to the width's unsigned range.
+/// Bit-identical to `rt_num.norm` (`norm(x,n) == band(x, 2^n−1)` for ANY Erlang integer,
+/// positive or negative — the low n bits of the two's-complement representation).
+fn mask_to_width(w: IntWidth, expr: CExpr) -> CExpr {
+  bif("band", [expr, CInt(width_mask(w))])
+}
+
+/// The shift/rotate count `b band (n−1)` — matches `rt_num.shift_count`.
+fn shift_count_expr(w: IntWidth, b: CExpr) -> CExpr {
+  let mask = case w {
+    W32 -> 31
+    W64 -> 63
+  }
+  bif("band", [b, CInt(mask)])
+}
+
+/// Try to lower a non-trapping integer `NumOp` to an INLINE BEAM guard BIF instead of an
+/// `rt_num` seam call, so a `rt_num:i32_add` local function call becomes a folded `+`/`band`
+/// instruction (per-op function-call overhead is a large fraction of a wasm-lowered guest's
+/// runtime). Returns `Ok(expr)` for the provably-exact inlinable ops, `Error(Nil)` for
+/// everything else (signed compares/shifts, rotate, clz/ctz/popcnt, div/rem, float,
+/// conversions) — those stay on the `rt_num` seam. `args` are the already-emitted operands.
+///
+/// Bit-exactness (rt_num.gleam is the oracle): `norm(x,n) == band(x, 2^n−1)` so add/sub/mul
+/// and `shl` reduce to a masked BIF; `and`/`or`/`xor` and `shr_u` are already in-range so need
+/// no mask; `eqz`/`eq`/`ne` and the UNSIGNED comparisons (`lt_u`/`gt_u`/`le_u`/`ge_u`) are raw
+/// BEAM comparisons on the stored unsigned bit patterns. SIGNED compares/shifts need a
+/// `signed(a,n)` reinterpret first, so they deliberately stay on the seam.
+fn inline_num_op(op: NumOp, args: List(CExpr)) -> Result(CExpr, Nil) {
+  case op, args {
+    IAnd(_), [a, b] -> Ok(bif("band", [a, b]))
+    IOr(_), [a, b] -> Ok(bif("bor", [a, b]))
+    IXor(_), [a, b] -> Ok(bif("bxor", [a, b]))
+    IAdd(w), [a, b] -> Ok(mask_to_width(w, bif("+", [a, b])))
+    ISub(w), [a, b] -> Ok(mask_to_width(w, bif("-", [a, b])))
+    IMul(w), [a, b] -> Ok(mask_to_width(w, bif("*", [a, b])))
+    IShl(w), [a, b] ->
+      Ok(mask_to_width(w, bif("bsl", [a, shift_count_expr(w, b)])))
+    IShrU(w), [a, b] -> Ok(bif("bsr", [a, shift_count_expr(w, b)]))
+    IEqz(_), [a] -> Ok(bool_bif_to_i32("=:=", [a, CInt(0)]))
+    IEq(_), [a, b] -> Ok(bool_bif_to_i32("=:=", [a, b]))
+    INe(_), [a, b] -> Ok(bool_bif_to_i32("=/=", [a, b]))
+    ILtU(_), [a, b] -> Ok(bool_bif_to_i32("<", [a, b]))
+    IGtU(_), [a, b] -> Ok(bool_bif_to_i32(">", [a, b]))
+    ILeU(_), [a, b] -> Ok(bool_bif_to_i32("=<", [a, b]))
+    IGeU(_), [a, b] -> Ok(bool_bif_to_i32(">=", [a, b]))
+    _, _ -> Error(Nil)
+  }
+}
+
 /// Lower a `Num` op through `binding.num_module` (the numeric chokepoint).
 ///
-/// Non-trapping ops emit `call '<num>':'<fn>'(args…)` and pass the single result to
-/// `cont`. The four trapping ops (`div`/`rem`, signed and unsigned) return
-/// `Result(Int, TrapReason)` = `{ok,X}`/`{error,R}`; they emit the verified
+/// The hot, provably-exact non-trapping integer ops are INLINED as BEAM BIFs (`inline_num_op`)
+/// — valid only because `num_module` is the standard `rt_num` (its single definition site). The
+/// rest emit `call '<num>':'<fn>'(args…)`. The four trapping ops (`div`/`rem`, signed and
+/// unsigned) return `Result(Int, TrapReason)` = `{ok,X}`/`{error,R}`; they emit the verified
 /// `case`-and-`raise` shape, continuing with `X` on `{ok,X}` and raising `R` via
 /// `binding.trap_module` on `{error,R}`.
 fn emit_num(
@@ -2213,15 +2278,19 @@ fn emit_num(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let call =
-    seam_call(
-      ctx.binding.num_module,
-      num_op_name(op),
-      list.map(args, emit_value),
-    )
-  case is_trapping(op) {
-    False -> apply_cont(cont, [call], sc, state, ctx)
-    True -> emit_trapping_result(call, cont, sc, state, ctx)
+  let cargs = list.map(args, emit_value)
+  case
+    ctx.binding.num_module == "twocore@runtime@rt_num",
+    inline_num_op(op, cargs)
+  {
+    True, Ok(inlined) -> apply_cont(cont, [inlined], sc, state, ctx)
+    _, _ -> {
+      let call = seam_call(ctx.binding.num_module, num_op_name(op), cargs)
+      case is_trapping(op) {
+        False -> apply_cont(cont, [call], sc, state, ctx)
+        True -> emit_trapping_result(call, cont, sc, state, ctx)
+      }
+    }
   }
 }
 

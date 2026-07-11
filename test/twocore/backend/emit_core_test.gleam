@@ -110,16 +110,23 @@ fn add_fn() -> ir.Function {
   )
 }
 
-/// `Let(names, rhs, body)` → `let <names> = <rhs> in <body>`; `Num(IAdd(W32))` routes
-/// through `num_module:i32_add`; tail `Return([r])` is the bare value (a 1-value list).
+/// `Let(names, rhs, body)` → `let <names> = <rhs> in <body>`; the hot `Num(IAdd(W32))` is
+/// INLINED as a BEAM guard BIF `band('erlang':'+'(p0, p1), 2^32−1)` — no `rt_num` seam call
+/// (the Erlang compiler folds it to a `gc_bif`, and `band(_, 2^32−1)` is the width wrap,
+/// bit-identical to `rt_num.norm`). Tail `Return([r])` is the bare value (a 1-value list).
 pub fn let_num_return_test() {
-  let b = binding()
   let assert CLet(
     ["r"],
-    CCall(CAtom(num), CAtom("i32_add"), [CVar("p0"), CVar("p1")]),
+    CCall(
+      CAtom("erlang"),
+      CAtom("band"),
+      [
+        CCall(CAtom("erlang"), CAtom("+"), [CVar("p0"), CVar("p1")]),
+        CInt(4_294_967_295),
+      ],
+    ),
     CVar("r"),
   ) = body_of(module_with(add_fn()), "add")
-  assert num == b.num_module
 }
 
 // ───────────────────────────── If → case on i32 ─────────────────────────────
@@ -201,10 +208,20 @@ pub fn loop_is_tail_recursive_letrec_test() {
   // The body's `continue` is a tail self-apply of the same head → constant space.
   assert applies_to(lbody, lname)
   // The body computes the loop condition, then `case`s on it: `<0>` (false) breaks with the
-  // bare accumulator (no join point, since the exit is in tail position / KReturn).
+  // bare accumulator (no join point, since the exit is in tail position / KReturn). The
+  // condition is the INLINED `i64.le_u` — a raw unsigned BEAM `=<` compare reified to an i32
+  // truth value (`bool_bif_to_i32`), no `rt_num` seam. Its 1/0 internals are pinned in the
+  // numeric tests; here we only assert it IS the unsigned-`=<` shape and focus on the
+  // loop/case/continue skeleton.
   let assert CLet(
     ["cond"],
-    CCall(_, CAtom("i64_le_u"), _),
+    CCase(
+      CCall(CAtom("erlang"), CAtom("=<"), _),
+      [
+        CClause([PAtom("true")], CAtom("true"), CInt(1)),
+        CClause([PAtom("false")], CAtom("true"), CInt(0)),
+      ],
+    ),
     CCase(
       CVar("cond"),
       [
@@ -1373,21 +1390,28 @@ pub fn threaded_call_indirect_binds_results_and_rebinds_test() {
 }
 
 /// A PURE function under `Threaded` keeps its Phase-1 `'g'/n` shape (no `St`, no return
-/// tuple) — byte-identical to `Cell`. So pure numeric leaves pay NOTHING (§B.1, §D).
+/// tuple) — byte-identical to `Cell`. So pure numeric leaves pay NOTHING (§B.1, §D). The
+/// `i32.add` leaf is the INLINED BIF `band('erlang':'+'(p0, p1), 2^32−1)` (no `rt_num` seam);
+/// what this test pins is the FunDef/CFun shape — NO leading `St` param, bare `r` return.
 pub fn threaded_pure_function_keeps_phase1_shape_test() {
-  let b = threaded_binding()
   let assert FunDef(
     FName("add", 2),
     CFun(
       ["p0", "p1"],
       CLet(
         ["r"],
-        CCall(CAtom(num), CAtom("i32_add"), [CVar("p0"), CVar("p1")]),
+        CCall(
+          CAtom("erlang"),
+          CAtom("band"),
+          [
+            CCall(CAtom("erlang"), CAtom("+"), [CVar("p0"), CVar("p1")]),
+            CInt(4_294_967_295),
+          ],
+        ),
         CVar("r"),
       ),
     ),
   ) = threaded_def(module_with(add_fn()), "add")
-  assert num == b.num_module
 }
 
 /// A tail `CallDirect` to a STATE-REACHING callee stays a TAIL CALL: `apply 'g'/(n+1)(St, x)`
