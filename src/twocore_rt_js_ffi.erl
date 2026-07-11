@@ -60,6 +60,7 @@
     add/2, sub/2, mul/2, neg/1, divide/2, modulo/2,
     lt/2, le/2, gt/2, ge/2, strict_eq/2, eq/2,
     truthy/1, to_number/1, to_string/1, type_of/1,
+    bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
     empty_list/0, console_log/1, not_callable/1
@@ -374,6 +375,47 @@ truthy(_) -> 1.
 %% `out` maps the internal numeric domain back to a JS term (nan → js_nan, etc.).
 to_number(A) ->
     out(coerce_num(A)).
+
+%% ── bitwise / shift ops ──────────────────────────────────────────────────
+%% JS bitwise operators coerce each operand with ToInt32 (or ToUint32 for the
+%% left of `>>>` and both shift counts), operate on 32-bit two's-complement,
+%% and yield a signed int32 — except `>>>`, whose result is an unsigned uint32.
+
+%% ToUint32: ToNumber, truncate toward zero, take the low 32 bits. Non-finite → 0.
+%% Erlang's `band 16#FFFFFFFF` gives the two's-complement low word for any integer
+%% (incl. negatives), which is exactly ToUint32 on the truncated value.
+js_to_uint32(V) ->
+    case coerce_num(V) of
+        nan -> 0;
+        inf -> 0;
+        neg_inf -> 0;
+        N when is_integer(N) -> N band 16#FFFFFFFF;
+        N when is_float(N) -> trunc(N) band 16#FFFFFFFF
+    end.
+
+%% ToInt32: reinterpret the uint32 as signed two's-complement.
+js_to_int32(V) ->
+    wrap_int32(js_to_uint32(V)).
+
+%% Reinterpret an Erlang integer's low 32 bits as a signed int32.
+wrap_int32(I) ->
+    U = I band 16#FFFFFFFF,
+    case U >= 16#80000000 of
+        true -> U - 16#100000000;
+        false -> U
+    end.
+
+bit_and(A, B) -> js_to_int32(A) band js_to_int32(B).
+bit_or(A, B) -> js_to_int32(A) bor js_to_int32(B).
+bit_xor(A, B) -> js_to_int32(A) bxor js_to_int32(B).
+%% ~a == -(ToInt32(a)) - 1, always in int32 range.
+bit_not(A) -> bnot js_to_int32(A).
+%% Shift count is ToUint32(b) & 31; the `<<` result is re-wrapped to int32.
+shl(A, B) -> wrap_int32(js_to_int32(A) bsl (js_to_uint32(B) band 31)).
+%% `>>` is a sign-propagating (arithmetic) shift on the signed int32.
+shr(A, B) -> js_to_int32(A) bsr (js_to_uint32(B) band 31).
+%% `>>>` is a zero-fill (logical) shift on the UNSIGNED uint32; result stays uint32.
+ushr(A, B) -> js_to_uint32(A) bsr (js_to_uint32(B) band 31).
 
 %% JS ToString → a binary. Strings pass through; integral floats < 1e21 print
 %% integer-style (String(5.0) = "5"); other floats use [short] (shortest

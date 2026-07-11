@@ -129,6 +129,39 @@ pub fn truthy(v: Dynamic) -> Int
 @external(erlang, "twocore_rt_js_ffi", "to_number")
 pub fn to_number(v: Dynamic) -> Dynamic
 
+// ───────────────────────── bitwise / shift (int32) ─────────────────────────
+// Each operand is coerced with ToInt32 (ToUint32 for the left of `>>>` and shift
+// counts), the op runs on 32-bit two's-complement, and the result is a signed int32
+// — except `>>>`, which yields an unsigned uint32 (so `-1 >>> 0` is 4294967295).
+
+/// JS `&` — bitwise AND on ToInt32 operands → signed int32.
+@external(erlang, "twocore_rt_js_ffi", "bit_and")
+pub fn bit_and(a: Dynamic, b: Dynamic) -> Dynamic
+
+/// JS `|` — bitwise OR on ToInt32 operands → signed int32.
+@external(erlang, "twocore_rt_js_ffi", "bit_or")
+pub fn bit_or(a: Dynamic, b: Dynamic) -> Dynamic
+
+/// JS `^` — bitwise XOR on ToInt32 operands → signed int32.
+@external(erlang, "twocore_rt_js_ffi", "bit_xor")
+pub fn bit_xor(a: Dynamic, b: Dynamic) -> Dynamic
+
+/// JS `~` — bitwise NOT of ToInt32(a) → signed int32 (`~x === -(x)-1`).
+@external(erlang, "twocore_rt_js_ffi", "bit_not")
+pub fn bit_not(a: Dynamic) -> Dynamic
+
+/// JS `<<` — left shift ToInt32(a) by `ToUint32(b) & 31`, re-wrapped to signed int32.
+@external(erlang, "twocore_rt_js_ffi", "shl")
+pub fn shl(a: Dynamic, b: Dynamic) -> Dynamic
+
+/// JS `>>` — sign-propagating right shift of ToInt32(a) by `ToUint32(b) & 31`.
+@external(erlang, "twocore_rt_js_ffi", "shr")
+pub fn shr(a: Dynamic, b: Dynamic) -> Dynamic
+
+/// JS `>>>` — zero-fill right shift of ToUint32(a) by `ToUint32(b) & 31` → uint32.
+@external(erlang, "twocore_rt_js_ffi", "ushr")
+pub fn ushr(a: Dynamic, b: Dynamic) -> Dynamic
+
 /// JS ToString → a binary. Strings pass through; integral floats < 1e21 print integer-style
 /// (`String(5.0)` is `"5"`); other floats print shortest-round-trip (`[short]` — exponent
 /// FORMATTING diverges from Number::toString at the extremes, FFI header note); sentinels are

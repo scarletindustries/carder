@@ -296,6 +296,61 @@ pub fn compound_member_single_eval_test() {
   to_float(call(m, "f", [])) |> should.equal(1015.0)
 }
 
+// ── increment / decrement / void ─────────────────────────────────────────────
+
+pub fn increment_decrement_test() {
+  // As statements: x is updated in the env.
+  let m = compile("function f() { let x = 5; x++; x++; return x; }")
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+  let d = compile("function f() { let x = 5; x--; return x; }")
+  to_float(call(d, "f", [])) |> should.equal(4.0)
+  // Prefix as a value yields the NEW value.
+  let p = compile("function f() { let x = 5; return ++x; }")
+  to_float(call(p, "f", [])) |> should.equal(6.0)
+}
+
+pub fn for_loop_increment_test() {
+  // The idiomatic `i++` for-loop update.
+  let m =
+    compile(
+      "function sum(n) { let s = 0; for (let i = 0; i < n; i++) { s += i; } return s; }",
+    )
+  to_float(call(m, "sum", [dyn(5)])) |> should.equal(10.0)
+  to_float(call(m, "sum", [dyn(100)])) |> should.equal(4950.0)
+}
+
+pub fn void_test() {
+  let m = compile("function f() { return void 5; }")
+  call(m, "f", []) |> should.equal(dyn(atom.create("undefined")))
+}
+
+// ── bitwise / shift (int32 semantics) ────────────────────────────────────────
+
+pub fn bitwise_test() {
+  num("5 & 3") |> should.equal(1.0)
+  num("5 | 2") |> should.equal(7.0)
+  num("5 ^ 1") |> should.equal(4.0)
+  num("~5") |> should.equal(-6.0)
+  // ToInt32 coercion of a string operand.
+  num("\"5\" & 3") |> should.equal(1.0)
+}
+
+pub fn shift_test() {
+  num("1 << 4") |> should.equal(16.0)
+  num("1 << 31") |> should.equal(-2_147_483_648.0)
+  num("-8 >> 1") |> should.equal(-4.0)
+  // `>>>` is a zero-fill shift on a uint32.
+  num("-1 >>> 28") |> should.equal(15.0)
+  num("-1 >>> 0") |> should.equal(4_294_967_295.0)
+}
+
+pub fn bitwise_compound_test() {
+  let m = compile("function f() { let x = 12; x &= 10; return x; }")
+  to_float(call(m, "f", [])) |> should.equal(8.0)
+  let s = compile("function f() { let x = 1; x <<= 5; return x; }")
+  to_float(call(s, "f", [])) |> should.equal(32.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

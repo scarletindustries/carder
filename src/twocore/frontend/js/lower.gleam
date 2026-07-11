@@ -14,15 +14,16 @@
 ////
 //// Supported subset (v1): top-level `function` declarations (recursion, mutual
 //// recursion, calls); number/string/boolean/null/undefined/template literals;
-//// `+ - * / %`, all comparisons, `&& || !`, unary `- ! typeof`, `?:`; `let/const/var`
-//// and `= += -= *= /= %=`; `if/else`, `while`, `do/while`, `for`, `break/continue`,
+//// `+ - * / %`, all comparisons, `&& || !`, bitwise/shift `& | ^ ~ << >> >>>`, unary
+//// `- + ! ~ typeof void`, `?:`; `let/const/var`, `= += -= *= /= %= &= |= ^= <<= >>=
+//// >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`, `break/continue`,
 //// `return`, blocks; objects `{}` with `.prop`/`[k]` get/set; `console.log`. Control
 //// flow threads mutated variables as loop-carried params / phi-merged `If` results.
 ////
 //// Not yet (a clean `Unsupported` error / panic): first-class functions & closures,
-//// arrays, classes, `try/catch/throw`, `switch`, `for-in/of`, bitwise ops, regex,
-//// `++`/`--`, and `continue` inside a `do/while`. Scope is one flat function scope per
-//// JS function (block-scoped `let` is treated as function-scoped).
+//// arrays, classes, `try/catch/throw`, `switch`, `for-in/of`, `**`, regex, and
+//// `continue` inside a `do/while`. Scope is one flat function scope per JS function
+//// (block-scoped `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -33,6 +34,9 @@
 ////     `x = y = e` chain) — e.g. `f(x = 1)`, `(x = 1) + 1`, `while ((l = next()) != null)`
 ////     — computes the right value but does not rebind its target in the env, so a later
 ////     read of that target sees the old value. Top-level and chained assignments are fine.
+////   * A POSTFIX `x++`/`x--` yields the NEW value (not the pre-increment value) when its
+////     result is used inside a larger expression. As a statement or a `for` update — where
+////     the value is discarded — it is exact.
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -323,6 +327,9 @@ fn env_after_effect(e: ast.Expression, v: ir.Value, env: Env) -> Env {
   case e {
     ast.AssignmentExpression(left: ast.Identifier(name: x, ..), right: rhs, ..) ->
       env_after_effect(rhs, v, dict.insert(env, x, v))
+    // `x++` / `++x` (and `--`): `v` is the new value, so rebind `x` to it.
+    ast.UpdateExpression(argument: ast.Identifier(name: x, ..), ..) ->
+      dict.insert(env, x, v)
     _ -> env
   }
 }
@@ -734,6 +741,8 @@ fn lower_expr(
 
     ast.AssignmentExpression(operator: op, left:, right:, ..) ->
       lower_assign(op, left, right, env, ctx, ctr)
+    ast.UpdateExpression(operator: uop, argument:, ..) ->
+      lower_update(uop, argument, env, ctr)
 
     ast.CallExpression(callee:, arguments:, ..) ->
       lower_call(callee, arguments, env, ctx, ctr)
@@ -803,6 +812,17 @@ fn lower_binary(
     // `/ %` — no native NumTerm op; always rt_js (real JS `/0`=Infinity etc.).
     ast.Divide -> Ok(bind_after(pre, ir.CallHost("js", "div", [l, r]), ctr))
     ast.Modulo -> Ok(bind_after(pre, ir.CallHost("js", "mod", [l, r]), ctr))
+    // bitwise / shift — always rt_js (JS coerces both sides to int32 first).
+    ast.BitwiseAnd ->
+      Ok(bind_after(pre, ir.CallHost("js", "bit_and", [l, r]), ctr))
+    ast.BitwiseOr ->
+      Ok(bind_after(pre, ir.CallHost("js", "bit_or", [l, r]), ctr))
+    ast.BitwiseXor ->
+      Ok(bind_after(pre, ir.CallHost("js", "bit_xor", [l, r]), ctr))
+    ast.LeftShift -> Ok(bind_after(pre, ir.CallHost("js", "shl", [l, r]), ctr))
+    ast.RightShift -> Ok(bind_after(pre, ir.CallHost("js", "shr", [l, r]), ctr))
+    ast.UnsignedRightShift ->
+      Ok(bind_after(pre, ir.CallHost("js", "ushr", [l, r]), ctr))
     // comparisons in value position → a JS boolean term.
     _ ->
       case compare_op(op) {
@@ -972,6 +992,35 @@ fn lower_logical(
   Ok(bind_after(bl, expr, ctr))
 }
 
+/// `x++` / `++x` / `x--` / `--x` on a local variable: `x` becomes `x ± 1`. Yields the
+/// NEW value; the statement layer rebinds `x` (via `env_after_effect`). The spec value
+/// of a POSTFIX update is the OLD value — a documented deviation that only shows when
+/// the result is used inside a larger expression (loop counters / update statements
+/// discard it, so those are exact). The `± 1` reuses the guarded native arithmetic path.
+fn lower_update(
+  uop: ast.UpdateOp,
+  argument: ast.Expression,
+  env: Env,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case argument {
+    ast.Identifier(name: x, ..) ->
+      case dict.get(env, x) {
+        Error(Nil) ->
+          Error(Unsupported("update of unbound identifier '" <> x <> "'"))
+        Ok(cur) -> {
+          let #(bone, one, ctr) = number_literal(1.0, ctr)
+          let #(js_op, nop) = case uop {
+            ast.Increment -> #("add", ir.NAdd)
+            ast.Decrement -> #("sub", ir.NSub)
+          }
+          Ok(guarded_arith(js_op, nop, cur, one, bone, ctr))
+        }
+      }
+    _ -> Error(Unsupported("update of a non-identifier target"))
+  }
+}
+
 fn lower_unary(
   op: ast.UnaryOp,
   argument: ast.Expression,
@@ -995,6 +1044,11 @@ fn lower_unary(
     // `neg` type-errors on non-numbers, so this needs the dedicated coercion op.)
     ast.UnaryPlus ->
       Ok(bind_after(binds, ir.CallHost("js", "to_number", [v]), ctr))
+    // `void x` evaluates x for its effects (keep `binds`) and yields `undefined`.
+    ast.Void -> Ok(#(binds, undefined(), ctr))
+    // `~x` — bitwise NOT of ToInt32(x).
+    ast.BitwiseNot ->
+      Ok(bind_after(binds, ir.CallHost("js", "bit_not", [v]), ctr))
     _ -> Error(Unsupported("unary operator"))
   }
 }
@@ -1101,6 +1155,18 @@ fn apply_compound(
       Ok(bind_after(pre, ir.CallHost("js", "div", [l, r]), ctr))
     ast.ModuloAssign ->
       Ok(bind_after(pre, ir.CallHost("js", "mod", [l, r]), ctr))
+    ast.BitwiseAndAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "bit_and", [l, r]), ctr))
+    ast.BitwiseOrAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "bit_or", [l, r]), ctr))
+    ast.BitwiseXorAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "bit_xor", [l, r]), ctr))
+    ast.LeftShiftAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "shl", [l, r]), ctr))
+    ast.RightShiftAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "shr", [l, r]), ctr))
+    ast.UnsignedRightShiftAssign ->
+      Ok(bind_after(pre, ir.CallHost("js", "ushr", [l, r]), ctr))
     _ -> Error(Unsupported("compound assignment operator"))
   }
 }
@@ -1120,6 +1186,18 @@ fn desugar_compound(
       Ok(ast.BinaryExpression(sp, ast.Multiply, left, right))
     ast.DivideAssign -> Ok(ast.BinaryExpression(sp, ast.Divide, left, right))
     ast.ModuloAssign -> Ok(ast.BinaryExpression(sp, ast.Modulo, left, right))
+    ast.BitwiseAndAssign ->
+      Ok(ast.BinaryExpression(sp, ast.BitwiseAnd, left, right))
+    ast.BitwiseOrAssign ->
+      Ok(ast.BinaryExpression(sp, ast.BitwiseOr, left, right))
+    ast.BitwiseXorAssign ->
+      Ok(ast.BinaryExpression(sp, ast.BitwiseXor, left, right))
+    ast.LeftShiftAssign ->
+      Ok(ast.BinaryExpression(sp, ast.LeftShift, left, right))
+    ast.RightShiftAssign ->
+      Ok(ast.BinaryExpression(sp, ast.RightShift, left, right))
+    ast.UnsignedRightShiftAssign ->
+      Ok(ast.BinaryExpression(sp, ast.UnsignedRightShift, left, right))
     _ -> Error(Unsupported("compound assignment operator"))
   }
 }
