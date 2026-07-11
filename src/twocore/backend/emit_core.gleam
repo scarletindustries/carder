@@ -5222,11 +5222,20 @@ fn emit_charge(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(wild, state2) = fresh_var(state)
-  use #(body_c, state3) <- result.try(emit(body, cont, sc, state2, ctx))
-  let charge_call =
-    CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
-  Ok(#(CLet([wild], charge_call, body_c), state3))
+  case body {
+    // Batch consecutive `Charge` regions into ONE `meter:charge` with the summed cost (lever 9).
+    // Both charges already run before `inner`, so pre-charging their sum deducts the same fuel and
+    // traps at the SAME program point (before `inner`) — one fewer seam call on the hot path.
+    Charge(cost2, inner) ->
+      emit_charge(cost + cost2, inner, cont, sc, state, ctx)
+    _ -> {
+      let #(wild, state2) = fresh_var(state)
+      use #(body_c, state3) <- result.try(emit(body, cont, sc, state2, ctx))
+      let charge_call =
+        CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
+      Ok(#(CLet([wild], charge_call, body_c), state3))
+    }
+  }
 }
 
 // ─────────────────────────── Phase-7 exception handling (§J/T1/T5/T7) ───────────────────────────

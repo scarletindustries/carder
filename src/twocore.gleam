@@ -169,6 +169,7 @@ type BaseSel {
   BaseUnsafe
   BasePortable
   BaseCeiling
+  BaseEngine
 }
 
 /// A parsed axis-flag set: the CLI's requested profile/strategy/tier selection (§B). Each
@@ -249,6 +250,12 @@ fn do_split_axis_flags(
         _,
         positionals,
       ))
+    ["--engine", ..rest] ->
+      result.try(set_base(acc, BaseEngine), do_split_axis_flags(
+        rest,
+        _,
+        positionals,
+      ))
     ["--threaded", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, threaded: True), positionals)
     ["--trust-memory", ..rest] ->
@@ -296,7 +303,7 @@ fn do_split_axis_flags(
 fn set_base(acc: Axes, base: BaseSel) -> Result(Axes, String) {
   case acc.base {
     BaseSafe -> Ok(Axes(..acc, base: base))
-    _ -> Error("at most one of --portable / --ceiling / --unsafe")
+    _ -> Error("at most one of --portable / --ceiling / --engine / --unsafe")
   }
 }
 
@@ -337,6 +344,7 @@ fn base_binding(sel: BaseSel) -> Binding {
     BaseUnsafe -> profiles.unsafe()
     BasePortable -> profiles.portable()
     BaseCeiling -> profiles.ceiling()
+    BaseEngine -> profiles.engine()
   }
 }
 
@@ -990,7 +998,8 @@ fn usage() -> String {
       "  gleam run -- exec     [-n N] <in.beam> <export> <args…>  invoke a prebuilt .beam (bench, no compile)",
       "",
       "  [axes] — profile / strategy / tier selection (default: Safe / Cell / Paged, fail-closed):",
-      "    base (one of):  --unsafe | --portable | --ceiling",
+      "    base (one of):  --unsafe | --portable | --ceiling | --engine",
+      "    --engine        Safe + Atomics memory/table + Cell (fast node-safe trusted-engine profile)",
       "    --threaded                state_strategy: Threaded (the record-threading run-ABI)",
       "    --trust-memory            skip bounds checks on ALL memory-0 loads/stores for a trusted",
       "                              guest (paged/atomics only; OOB → wrong value, not a trap)",
