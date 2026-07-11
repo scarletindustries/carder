@@ -163,10 +163,18 @@ stop_instance(Pid) ->
 %% / Threaded state record are both process-local). A memory-less guest reports 0.
 %% Backs embed:mem_size / pipeline:mem_size_instance.
 mem_size(Pid) ->
-    Ref = make_ref(),
+    %% Monitor so a DEAD guest yields 0 instead of blocking forever (the guest is
+    %% spawned unlinked/unmonitored, so a bare `receive` would wait on a reply that
+    %% never comes). A LIVE-but-busy guest still serialises behind its in-flight
+    %% invoke — correct, and the sole driver (the dance actor) is itself blocked
+    %% during an invoke, so it cannot race a mem_size against one.
+    Ref = monitor(process, Pid),
     Pid ! {mem_size, self(), Ref},
     receive
-        {mem_size_reply, Ref, Pages} -> Pages
+        {mem_size_reply, Ref, Pages} ->
+            demonitor(Ref, [flush]),
+            Pages;
+        {'DOWN', Ref, process, Pid, _} -> 0
     end.
 
 instance_loop(Module) ->
