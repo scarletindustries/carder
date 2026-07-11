@@ -27,6 +27,7 @@
 //// Every function is total: the type system guarantees the `Module`/`Expr`/… variants,
 //// so there is no unprintable value and nothing here panics.
 
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
@@ -519,6 +520,9 @@ fn print_value(v: Value) -> String {
     // (`parse_value`) reads both back. No WASM module produces one (K7).
     ir.ConstAtom(name) -> "atom \"" <> escape(name) <> "\""
     ir.ConstBinary(bytes) -> "binary " <> print_hexbytes(bytes)
+    // A native BEAM float term — `floatterm <n>` (the parser reads it back). Finite only (a BEAM
+    // double); no WASM module produces one (K7).
+    ir.ConstFloatTerm(value) -> "floatterm " <> float.to_string(value)
   }
 }
 

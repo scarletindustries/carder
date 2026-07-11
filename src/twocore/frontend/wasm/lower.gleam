@@ -4041,7 +4041,7 @@ fn value_type(st: LState, v: ir.Value) -> ir.ValType {
     // Phase-8 term literals (K2) are boxed BEAM terms (`TTerm`). No WASM instruction produces
     // one (K7 — additive), so these arms are unreachable on the WASM path; present only to keep
     // the `Value` match exhaustive (fail-closed, D4).
-    ir.ConstAtom(_) | ir.ConstBinary(_) -> ir.TTerm
+    ir.ConstAtom(_) | ir.ConstBinary(_) | ir.ConstFloatTerm(_) -> ir.TTerm
     ir.Var(n) -> dict.get(st.var_types, n) |> result.unwrap(ir.TI32)
   }
 }

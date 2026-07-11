@@ -493,6 +493,14 @@ pub type Value {
   /// payload). A `TTerm`-typed operand; pure (it is a `Value`). **No WASM module produces one**
   /// (K7 — additive; the WASM `validate` surface rejects it, and `lower` never emits it).
   ConstBinary(bytes: BitArray)
+  /// A literal **native BEAM float** term — a real `float()` (NOT the raw-bit `ConstF64`). This is
+  /// the term-layer counterpart a dynamic-language frontend uses for a FINITE number literal so
+  /// `NumTerm` (`erlang:'+'`/`'<'`/…) runs native double arithmetic, instead of the raw-bit numeric
+  /// layer whose every op pays a `<<f:float>>`↔`<<bits>>` round-trip. `value` MUST be finite: a BEAM
+  /// double cannot carry NaN/±Inf (see `core_erlang.CFloat`), so a frontend routes those through the
+  /// numeric layer / `rt_js`. A `TTerm`-typed operand; pure. **No WASM module produces one** (K7 —
+  /// additive; the WASM `validate` surface rejects it, and `lower` never emits it).
+  ConstFloatTerm(value: Float)
 }
 
 // ───────────────────── Expressions (yield value lists) ─────────────────────

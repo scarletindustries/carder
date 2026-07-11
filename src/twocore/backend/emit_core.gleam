@@ -5844,6 +5844,11 @@ fn emit_value(v: Value) -> CExpr {
     // same renderer a data-segment payload uses). Both pure — no runtime call.
     ir.ConstAtom(name) -> CAtom(name)
     ir.ConstBinary(bytes) -> core_binary_bytes(bytes)
+    // A native BEAM float TERM literal — the term-layer double a dynamic-language frontend emits
+    // for a FINITE number literal, so `NumTerm`/`erlang:'+'` runs native double arithmetic. THE
+    // deliberate exception to the "floats as bits, never a Core float" rule above (D5): only a
+    // frontend `ConstFloatTerm` (finite, K7-additive) reaches it; no WASM float ever does.
+    ir.ConstFloatTerm(value) -> CFloat(value)
   }
 }
 
@@ -7382,6 +7387,10 @@ fn const_value_bits(v: Value) -> Result(Int, EmitError) {
       Error(NonConstInit("atom constant in numeric constant init/offset"))
     ir.ConstBinary(_) ->
       Error(NonConstInit("binary constant in numeric constant init/offset"))
+    // A native float term is a boxed BEAM double, not a scalar bit pattern; like the other term
+    // literals it never appears in a WASM numeric const init (K7). Fail-closed.
+    ir.ConstFloatTerm(_) ->
+      Error(NonConstInit("float term constant in numeric constant init/offset"))
   }
 }
 
