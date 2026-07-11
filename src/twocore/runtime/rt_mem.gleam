@@ -73,6 +73,7 @@ import gleam/option.{type Option, None, Some}
 import twocore/ir.{type TrapReason, MemoryOutOfBounds}
 import twocore/runtime/rt_meter
 import twocore/runtime/rt_state
+import twocore/runtime/rt_trap
 
 // ───────────────────────────── constants ─────────────────────────────
 
@@ -221,6 +222,58 @@ pub fn store(
   }
 }
 
+/// BARE-RAISING cell load (lever 2) — `load` MINUS the `Result` wrapper: returns the loaded bit
+/// pattern DIRECTLY and, on an out-of-bounds access, raises the trap INTERNALLY via
+/// `rt_trap.raise(MemoryOutOfBounds)` (never returns on that path). Same bounds/decode contract as
+/// `load` (byte-identical trap reason and value), but the per-op `{ok,V}|{error,E}` tuple + the
+/// emit-side `case … raise` unwrap are gone — this is the seam `emit_core`'s NoState path calls so a
+/// checked load lowers to a single bare `call`. Reads the `Mem` from the pdict cell.
+///
+/// - `bytes`/`signed`/`result_width`/`addr`/`offset`: see `load`.
+/// - Returns the loaded value (raw bit pattern). Diverges (raises `MemoryOutOfBounds`) iff
+///   `ea + bytes > byte_len`.
+pub fn load_raising(
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  let m = current_mem()
+  let ea = addr + offset
+  case in_bounds(m, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True ->
+      case signed {
+        True -> decode_signed(read_bytes(m, ea, bytes), bytes, result_width)
+        False -> decode_unsigned(read_bytes(m, ea, bytes), bytes)
+      }
+  }
+}
+
+/// BARE-RAISING cell store (lever 2) — `store` MINUS the `Result` wrapper: writes the new `Mem` back
+/// to the pdict cell and returns `Nil`, or on an out-of-bounds access raises the trap INTERNALLY via
+/// `rt_trap.raise(MemoryOutOfBounds)` BEFORE any byte is written (all-or-nothing — zero mutation).
+/// Same trap-before-write contract as `store`, but the tuple + emit-side unwrap are gone; the bare
+/// call IS the ordered effect `emit_core`'s NoState path sequences.
+///
+/// - `bytes`/`addr`/`value`/`offset`: see `store`.
+/// - Returns `Nil` on success (having written the new `Mem`). Diverges (raises `MemoryOutOfBounds`,
+///   ZERO mutation) iff `ea + bytes > byte_len`.
+pub fn store_raising(bytes: Int, addr: Int, value: Int, offset: Int) -> Nil {
+  let m = current_mem()
+  let ea = addr + offset
+  case in_bounds(m, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True -> {
+      rt_state.mem_put(
+        mem_to_dynamic(write_bytes(m, ea, encode_le(value, bytes))),
+      )
+      Nil
+    }
+  }
+}
+
 /// UNCHECKED cell load (Phase-10, N5) — `load` MINUS the bounds check/`Result`. Reads the `Mem` from
 /// the pdict cell. Returns the raw bit pattern directly. See `mem_load_unchecked` (BEAM-safe on OOB).
 pub fn load_unchecked(
@@ -342,6 +395,54 @@ pub fn store_at(
       Ok(Nil)
     }
     Error(reason) -> Error(reason)
+  }
+}
+
+/// BARE-RAISING `load` on memory `mem_idx` — the index-routed twin of `load_raising`. Returns the
+/// loaded bit pattern directly; raises `MemoryOutOfBounds` internally on OOB. `load_at_raising(0,…)`
+/// is byte-identical to `load_raising(…)`. See `load_raising`.
+pub fn load_at_raising(
+  mem_idx: Int,
+  bytes: Int,
+  signed: Bool,
+  result_width: Int,
+  addr: Int,
+  offset: Int,
+) -> Int {
+  let m = current_mem_at(mem_idx)
+  let ea = addr + offset
+  case in_bounds(m, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True ->
+      case signed {
+        True -> decode_signed(read_bytes(m, ea, bytes), bytes, result_width)
+        False -> decode_unsigned(read_bytes(m, ea, bytes), bytes)
+      }
+  }
+}
+
+/// BARE-RAISING `store` on memory `mem_idx` — the index-routed twin of `store_raising`. On success
+/// rebinds slot `mem_idx` to the new `Mem` and returns `Nil`; on OOB raises `MemoryOutOfBounds`
+/// internally BEFORE any write (zero mutation). `store_at_raising(0,…)` is byte-identical to
+/// `store_raising(…)`. See `store_raising`.
+pub fn store_at_raising(
+  mem_idx: Int,
+  bytes: Int,
+  addr: Int,
+  value: Int,
+  offset: Int,
+) -> Nil {
+  let m = current_mem_at(mem_idx)
+  let ea = addr + offset
+  case in_bounds(m, ea, bytes) {
+    False -> rt_trap.raise(MemoryOutOfBounds)
+    True -> {
+      rt_state.with_mem_at(
+        mem_idx,
+        mem_to_dynamic(write_bytes(m, ea, encode_le(value, bytes))),
+      )
+      Nil
+    }
   }
 }
 

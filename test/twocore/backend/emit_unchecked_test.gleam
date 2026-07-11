@@ -125,11 +125,12 @@ pub fn nif_versioned_loop_emits_unchecked_fast_checked_slow_test() {
   // nodes to the nif `*_unchecked` heads; without EITHER, no `_unchecked` seam would appear).
   assert string.contains(c, "'load_unchecked'")
   assert string.contains(c, "'store_unchecked'")
-  // SLOW arm → the CHECKED nif seam (`'load'`/`'store'` are the quoted atoms of the checked calls;
-  // neither is a substring of `'load_unchecked'`/`'store_unchecked'`, so their presence proves the
-  // original checked loop survives verbatim as the guard's else-branch).
-  assert string.contains(c, "'load'")
-  assert string.contains(c, "'store'")
+  // SLOW arm → the CHECKED nif seam. Under the Cell (`NoState`) strategy (lever 2) a checked
+  // load/store lowers to the bare-raising `'load_raising'`/`'store_raising'` seam; neither is a
+  // substring of `'load_unchecked'`/`'store_unchecked'`, so their presence proves the original
+  // checked loop survives verbatim as the guard's else-branch.
+  assert string.contains(c, "'load_raising'")
+  assert string.contains(c, "'store_raising'")
   assert string.contains(c, "rt_mem_nif")
 }
 

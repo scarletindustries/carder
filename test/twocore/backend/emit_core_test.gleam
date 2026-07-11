@@ -612,29 +612,17 @@ pub fn mem_grow_is_bare_call_test() {
   assert mem == b.mem_module
 }
 
-/// `MemLoad(MemAccess(bytes,signed), addr, off, result)` → a trapping `Result`: a `case`
-/// over `call '<mem_module>':'load'(Bytes, Signed, ResultWidth, Addr, Off)` raising on
-/// `{error,_}`. `i32.load8_s` walks to `Signed='true'` + `ResultWidth=32`.
+/// `MemLoad(MemAccess(bytes,signed), addr, off, result)` under the Cell (`NoState`) strategy (lever
+/// 2) → a BARE `call '<mem_module>':'load_raising'(Bytes, Signed, ResultWidth, Addr, Off)` that
+/// returns the value directly and raises `MemoryOutOfBounds` INTERNALLY — so it binds straight
+/// through the continuation (here the function return), with NO `{ok,X}|{error,E}` tuple + emit-side
+/// `case … raise` unwrap. `i32.load8_s` walks to `Signed='true'` + `ResultWidth=32`.
 pub fn mem_load_is_trapping_case_test() {
   let b = binding()
-  let assert CLet(
-    [r],
-    CCase(
-      CCall(
-        CAtom(mem),
-        CAtom("load"),
-        [CInt(1), CAtom("true"), CInt(32), CVar("a"), CInt(8)],
-      ),
-      [
-        CClause([PTuple([PAtom("ok"), PVar(x)])], CAtom("true"), CVar(x2)),
-        CClause(
-          [PTuple([PAtom("error"), PVar(e)])],
-          CAtom("true"),
-          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
-        ),
-      ],
-    ),
-    CVar(r2),
+  let assert CCall(
+    CAtom(mem),
+    CAtom("load_raising"),
+    [CInt(1), CAtom("true"), CInt(32), CVar("a"), CInt(8)],
   ) =
     body_of(
       op_module(
@@ -646,16 +634,13 @@ pub fn mem_load_is_trapping_case_test() {
       "f",
     )
   assert mem == b.mem_module
-  assert trap == b.trap_module
-  assert x == x2
-  assert e == e2
-  assert r == r2
 }
 
 /// `i64.load8_s` differs from `i32.load8_s` ONLY in the emitted `ResultWidth` (64 vs 32) —
-/// same `bytes`+`signed` — confirming `result` disambiguates the sign-extension width (E2).
+/// same `bytes`+`signed` — confirming `result` disambiguates the sign-extension width (E2). Both
+/// lower to the bare `load_raising` seam call (lever 2), the width being the 3rd argument.
 pub fn mem_load_result_width_disambiguates_test() {
-  let assert CLet(_, CCase(CCall(_, _, [_, _, CInt(w32), ..]), _), _) =
+  let assert CCall(_, CAtom("load_raising"), [_, _, CInt(w32), ..]) =
     body_of(
       op_module(
         "f",
@@ -665,7 +650,7 @@ pub fn mem_load_result_width_disambiguates_test() {
       ),
       "f",
     )
-  let assert CLet(_, CCase(CCall(_, _, [_, _, CInt(w64), ..]), _), _) =
+  let assert CCall(_, CAtom("load_raising"), [_, _, CInt(w64), ..]) =
     body_of(
       op_module(
         "f",
@@ -679,28 +664,19 @@ pub fn mem_load_result_width_disambiguates_test() {
   assert w64 == 64
 }
 
-/// `MemStore` → a ZERO-RESULT ordered effect: `let <_> = <case over
-/// call '<mem_module>':'store'(Bytes, Addr, Val, Off)> in <rest>`, the `case` reduced to a
-/// single discardable value (`{ok,_}`→`'ok'`, `{error,E}`→`raise`). The store sequences
-/// before the rest (non-DCE) with eval order addr → value → store.
+/// `MemStore` under the Cell (`NoState`) strategy (lever 2) → a ZERO-RESULT ordered effect:
+/// `let <_> = call '<mem_module>':'store_raising'(Bytes, Addr, Val, Off) in <rest>`. The bare
+/// `store_raising` call IS the effect — it returns `Nil` and raises `MemoryOutOfBounds` INTERNALLY,
+/// so there is NO `{ok,_}|{error,E}` tuple + emit-side `case … raise` reduction. It sequences before
+/// the rest (non-DCE) with eval order addr → value → store.
 pub fn mem_store_is_ordered_effect_test() {
   let b = binding()
   let assert CLet(
     [_g],
-    CCase(
-      CCall(
-        CAtom(mem),
-        CAtom("store"),
-        [CInt(4), CVar("a"), CVar("v"), CInt(0)],
-      ),
-      [
-        CClause([PTuple([PAtom("ok"), PVar(_)])], CAtom("true"), CAtom("ok")),
-        CClause(
-          [PTuple([PAtom("error"), PVar(e)])],
-          CAtom("true"),
-          CCall(CAtom(trap), CAtom("raise"), [CVar(e2)]),
-        ),
-      ],
+    CCall(
+      CAtom(mem),
+      CAtom("store_raising"),
+      [CInt(4), CVar("a"), CVar("v"), CInt(0)],
     ),
     CAtom("ok"),
   ) =
@@ -714,8 +690,6 @@ pub fn mem_store_is_ordered_effect_test() {
       "f",
     )
   assert mem == b.mem_module
-  assert trap == b.trap_module
-  assert e == e2
 }
 
 /// `GlobalGet(name)` → a bare `call '<state_module>':'global_get'(NameBin)` where `NameBin`
@@ -1815,9 +1789,10 @@ pub fn table_grow_test() {
     )
 }
 
-/// The memory-index ROUTING (H3/H7): `MemLoad(0, …)` emits the byte-identical Phase-4 `rt_mem:load`
-/// (NO index arg); `MemLoad(1, …)` emits `rt_mem:load_at(1, …)` (a leading memidx). A single-memory
-/// index-0 module is unchanged from Phase-4.
+/// The memory-index ROUTING (H3/H7) under the Cell (`NoState`) strategy (lever 2): `MemLoad(0, …)`
+/// emits the bare `rt_mem:load_raising` (NO index arg); `MemLoad(1, …)` emits
+/// `rt_mem:load_at_raising(1, …)` (a leading memidx). Both are bare seam calls raising
+/// `MemoryOutOfBounds` internally — no `{ok,X}|{error,E}` unwrap `case`.
 pub fn mem_load_index_routing_test() {
   // index 0 → the un-indexed head.
   let load0 = ir.MemLoad(0, ir.MemAccess(4, False), ir.Var("p0"), 0, ir.TI32)
@@ -1825,13 +1800,10 @@ pub fn mem_load_index_routing_test() {
     _,
     CFun(
       _,
-      CLet(
-        [_],
-        CCase(
-          CCall(CAtom(_), CAtom("load"), [CInt(4), _, _, CVar("p0"), CInt(0)]),
-          _,
-        ),
-        _,
+      CCall(
+        CAtom(_),
+        CAtom("load_raising"),
+        [CInt(4), _, _, CVar("p0"), CInt(0)],
       ),
     ),
   ) = p5_fdef(load0, [ir.TI32], binding())
@@ -1841,17 +1813,10 @@ pub fn mem_load_index_routing_test() {
     _,
     CFun(
       _,
-      CLet(
-        [_],
-        CCase(
-          CCall(
-            CAtom(_),
-            CAtom("load_at"),
-            [CInt(1), CInt(4), _, _, CVar("p0"), CInt(0)],
-          ),
-          _,
-        ),
-        _,
+      CCall(
+        CAtom(_),
+        CAtom("load_at_raising"),
+        [CInt(1), CInt(4), _, _, CVar("p0"), CInt(0)],
       ),
     ),
   ) = p5_fdef(load1, [ir.TI32], binding())

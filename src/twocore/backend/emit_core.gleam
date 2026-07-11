@@ -1628,10 +1628,18 @@ fn emit_mem_grow(
   }
 }
 
-/// `t.load` (trapping, read-only). `NoState`: `case '<mem>':'load'(Bytes,Signed,W,Addr,Off)`.
-/// `Threading(cur)`: `case '<mem>':'t_load'(St, Bytes,Signed,W,Addr,Off)`. Both reduce the
-/// trapping `Result(Int, _)` to one value (`emit_trapping_result`); the record is read-only,
-/// so `cur` is threaded on unchanged (the surrounding `sc` is preserved).
+/// `t.load` (trapping, read-only).
+///
+/// `NoState` (Cell / lever 2): call the BARE-RAISING seam `'<mem>':'load_raising'(Bytes,Signed,W,
+/// Addr,Off)` (or `'load_at_raising'` for `mem != 0`), which returns the loaded value DIRECTLY and
+/// raises `MemoryOutOfBounds` INTERNALLY on OOB — so the value binds straight through `apply_cont`
+/// (like `emit_mem_load_unchecked`), with NO per-op `{ok,X}|{error,E}` tuple + emit-side
+/// `case … raise` unwrap. The trap reason is identical to the old `load`; this is a runtime win and
+/// roughly halves the emitted Core for a load.
+///
+/// `Threading(cur)`: UNCHANGED — `case '<mem>':'t_load'(St,…)` reduced to one value via
+/// `emit_trapping_result` (the threaded seams still return `Result`, and the record is read-only so
+/// `cur` is threaded on unchanged, preserving `sc`).
 fn emit_mem_load(
   mem: Int,
   op: ir.MemAccess,
@@ -1650,29 +1658,47 @@ fn emit_mem_load(
     emit_value(addr),
     CInt(offset),
   ]
-  let call = case mem, sc {
-    0, NoState -> seam_call(ctx.binding.mem_module, "load", tail)
-    0, Threading(cur) ->
-      seam_call(ctx.binding.mem_module, "t_load", [CVar(cur), ..tail])
-    _, NoState ->
-      seam_call(ctx.binding.mem_module, "load_at", [CInt(mem), ..tail])
-    _, Threading(cur) ->
-      seam_call(ctx.binding.mem_module, "t_load_at", [
-        CVar(cur),
-        CInt(mem),
-        ..tail
-      ])
+  case sc {
+    NoState -> {
+      let call = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "load_raising", tail)
+        _ ->
+          seam_call(ctx.binding.mem_module, "load_at_raising", [
+            CInt(mem),
+            ..tail
+          ])
+      }
+      apply_cont(cont, [call], sc, state, ctx)
+    }
+    Threading(cur) -> {
+      let call = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "t_load", [CVar(cur), ..tail])
+        _ ->
+          seam_call(ctx.binding.mem_module, "t_load_at", [
+            CVar(cur),
+            CInt(mem),
+            ..tail
+          ])
+      }
+      emit_trapping_result(call, cont, sc, state, ctx)
+    }
   }
-  emit_trapping_result(call, cont, sc, state, ctx)
 }
 
 /// `t.store` (trapping, ZERO-RESULT ordered effect). `op.signed` is irrelevant for stores
 /// (`storeN` writes the low N bytes); eval order is addr → value → store (left-to-right `call`
-/// args). `NoState`: reduce `{ok,_}`/`{error,E}` to a discardable `'ok'`/`raise` and sequence.
-/// `Threading(cur)`: `St2 = case '<mem>':'t_store'(St,…) of {ok,S}->S; {error,R}->raise` —
-/// REBIND the record to `St2` (`t_store` returns the updated record); continue under
-/// `Threading(St2)` disposing zero values. This makes store-before-load a visible dataflow
-/// edge through `St` (stronger than the cell `let`-discard barrier, §G).
+/// args).
+///
+/// `NoState` (Cell / lever 2): the BARE-RAISING seam `'<mem>':'store_raising'(Bytes,Addr,Value,Off)`
+/// (or `'store_at_raising'` for `mem != 0`) returns `Nil` and raises `MemoryOutOfBounds` INTERNALLY
+/// on OOB — so the call ITSELF is the ordered effect, sequenced+discarded by `emit_zero_effect` with
+/// NO per-op `{ok,_}|{error,E}` tuple + emit-side `case … raise` reduction. Trap-before-write and
+/// the trap reason are identical to the old `store`; this halves the emitted Core for a store.
+///
+/// `Threading(cur)`: UNCHANGED — `St2 = case '<mem>':'t_store'(St,…) of {ok,S}->S; {error,R}->raise`
+/// REBINDS the record to `St2` (`t_store` returns the updated record); continue under
+/// `Threading(St2)` disposing zero values. This makes store-before-load a visible dataflow edge
+/// through `St` (stronger than the cell `let`-discard barrier, §G).
 fn emit_mem_store(
   mem: Int,
   op: ir.MemAccess,
@@ -1692,12 +1718,15 @@ fn emit_mem_store(
   ]
   case sc {
     NoState -> {
-      let call = case mem {
-        0 -> seam_call(ctx.binding.mem_module, "store", tail)
-        _ -> seam_call(ctx.binding.mem_module, "store_at", [CInt(mem), ..tail])
+      let effect = case mem {
+        0 -> seam_call(ctx.binding.mem_module, "store_raising", tail)
+        _ ->
+          seam_call(ctx.binding.mem_module, "store_at_raising", [
+            CInt(mem),
+            ..tail
+          ])
       }
-      let #(effect, state2) = trapping_effect(call, ctx, state)
-      emit_zero_effect(effect, cont, sc, state2, ctx)
+      emit_zero_effect(effect, cont, sc, state, ctx)
     }
     Threading(cur) -> {
       let call = case mem {
