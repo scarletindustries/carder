@@ -63,6 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
+    new_array/1, array_push/2, array_pop/1, is_array/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -147,8 +148,8 @@ add(A, B) ->
 %% ToPrimitive).
 concat_operand(V) ->
     case js_type(V) of
-        object -> type_error(V);
-        function -> type_error(V);
+        %% only an internal (non-JS) repr is unrepresentable; objects/arrays/functions
+        %% take their to_string (`[object Object]` / comma-join / `function`).
         other -> type_error(V);
         _ -> to_string(V)
     end.
@@ -522,7 +523,13 @@ to_string(js_nan) -> <<"NaN">>;
 to_string(js_inf) -> <<"Infinity">>;
 to_string(js_neg_inf) -> <<"-Infinity">>;
 to_string(V) when is_function(V) -> <<"function">>;
-%% references (objects/cells) and any internal repr (tuple/map/list/…).
+%% an array renders as its comma-joined elements; other refs are objects.
+to_string(V) when is_reference(V) ->
+    case erlang:get(?CELL_KEY(V)) of
+        {js_array, Len, Map} -> array_to_string(Len, Map);
+        _ -> <<"[object Object]">>
+    end;
+%% any internal repr (tuple/map/list/…).
 to_string(_) -> <<"[object Object]">>.
 
 %% JS `typeof` → a binary. Sentinel numbers are "number"; null is famously
@@ -630,16 +637,6 @@ cell_set(Ref, _) ->
 new_object() ->
     cell_new(#{}).
 
-%% The object's backing map; a non-ref, a dead ref, or a cell holding a
-%% non-map is a type_error (an object receiver was required).
-obj_map(Obj) when is_reference(Obj) ->
-    case erlang:get(?CELL_KEY(Obj)) of
-        M when is_map(M) -> M;
-        _ -> type_error(Obj)
-    end;
-obj_map(Obj) ->
-    type_error(Obj).
-
 %% Property keys are binaries; a NUMBER key normalizes to its JS string form
 %% (5, 5.0 and "5" are the same key — to_string's integral-float rule does
 %% this). Any other key type is a type_error (no ToPropertyKey walk yet).
@@ -650,19 +647,155 @@ prop_key(K) ->
         _ -> type_error(K)
     end.
 
-%% obj[key] — the stored value, or `undefined` when absent. No prototype
-%% chain yet (v1: own properties only).
-get_prop(Obj, Key) ->
-    maps:get(prop_key(Key), obj_map(Obj), undefined).
+%% recv[key] — the stored value, or `undefined` when absent. Dispatches on the
+%% cell content: a `{js_array,…}` is an array (integer indices + `length`), a
+%% map is a plain object. No prototype chain yet (v1: own properties only).
+get_prop(Recv, Key) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, Len, Map} -> array_get(Len, Map, Key);
+        M when is_map(M) -> maps:get(prop_key(Key), M, undefined);
+        _ -> type_error(Recv)
+    end;
+get_prop(Recv, _Key) ->
+    type_error(Recv).
 
-%% obj[key] = v — stores and returns v (the value of a JS assignment).
-set_prop(Obj, Key, V) ->
-    erlang:put(?CELL_KEY(Obj), maps:put(prop_key(Key), V, obj_map(Obj))),
+%% recv[key] = v — stores and returns v (the value of a JS assignment).
+set_prop(Recv, Key, V) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, Len, Map} -> array_set(Recv, Len, Map, Key, V);
+        M when is_map(M) ->
+            erlang:put(?CELL_KEY(Recv), maps:put(prop_key(Key), V, M)),
+            V;
+        _ -> type_error(Recv)
+    end;
+set_prop(Recv, _Key, _V) ->
+    type_error(Recv).
+
+%% key in recv → 1|0 (own properties only, like get_prop).
+has_prop(Recv, Key) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, _Len, Map} -> array_has(Map, Key);
+        M when is_map(M) -> bool_int(maps:is_key(prop_key(Key), M));
+        _ -> type_error(Recv)
+    end;
+has_prop(Recv, _Key) ->
+    type_error(Recv).
+
+%% ───────────────────────── arrays ─────────────────────────
+%% A JS array is a cell holding `{js_array, Length, Map}`, where Map maps a
+%% dense-ish set of integer indices (plus any string properties) to values.
+%% `typeof` is still "object" (a cell is a reference); `Array.isArray` and the
+%% array-aware `to_string`/property ops distinguish it by the tagged content.
+
+%% [e0, e1, …] — build the array from the emitter's cons list of elements.
+new_array(List) when is_list(List) ->
+    {Len, Map} =
+        lists:foldl(
+            fun(E, {I, M}) -> {I + 1, maps:put(I, E, M)} end,
+            {0, #{}},
+            List
+        ),
+    cell_new({js_array, Len, Map});
+new_array(V) ->
+    type_error(V).
+
+%% Normalize an array property key: an integer index stays an integer, a
+%% canonical numeric string becomes that index, `length` is left as-is, and
+%% every other key is an ordinary (string) property.
+array_key(K) when is_integer(K) -> K;
+array_key(K) when is_float(K) ->
+    case K == trunc(K) of
+        true -> trunc(K);
+        false -> to_string(K)
+    end;
+array_key(<<"length">>) -> <<"length">>;
+array_key(K) when is_binary(K) ->
+    try
+        binary_to_integer(K)
+    catch
+        error:badarg -> K
+    end;
+array_key(K) -> prop_key(K).
+
+array_get(Len, _Map, <<"length">>) -> Len;
+array_get(_Len, Map, Key) -> maps:get(array_key(Key), Map, undefined).
+
+%% `arr.length = n` truncates (drops indices >= n) or extends the length.
+array_set(Recv, _Len, Map, <<"length">>, V) ->
+    NewLen = js_to_uint32(V),
+    Map2 = maps:filter(
+        fun(K, _) -> not (is_integer(K) andalso K >= NewLen) end,
+        Map
+    ),
+    erlang:put(?CELL_KEY(Recv), {js_array, NewLen, Map2}),
+    V;
+array_set(Recv, Len, Map, Key, V) ->
+    K = array_key(Key),
+    NewLen =
+        case is_integer(K) andalso K >= Len of
+            true -> K + 1;
+            false -> Len
+        end,
+    erlang:put(?CELL_KEY(Recv), {js_array, NewLen, maps:put(K, V, Map)}),
     V.
 
-%% key in obj → 1|0 (own properties only, like get_prop).
-has_prop(Obj, Key) ->
-    bool_int(maps:is_key(prop_key(Key), obj_map(Obj))).
+array_has(_Map, <<"length">>) -> 1;
+array_has(Map, Key) -> bool_int(maps:is_key(array_key(Key), Map)).
+
+%% arr.push(...vals) — append each (emitter passes a cons list); returns the
+%% new length.
+array_push(Recv, Vals) when is_reference(Recv), is_list(Vals) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, Len, Map} ->
+            {NewLen, NewMap} =
+                lists:foldl(
+                    fun(V, {I, M}) -> {I + 1, maps:put(I, V, M)} end,
+                    {Len, Map},
+                    Vals
+                ),
+            erlang:put(?CELL_KEY(Recv), {js_array, NewLen, NewMap}),
+            NewLen;
+        _ -> type_error(Recv)
+    end;
+array_push(Recv, _Vals) ->
+    type_error(Recv).
+
+%% arr.pop() — remove and return the last element (undefined when empty).
+array_pop(Recv) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, 0, _Map} ->
+            undefined;
+        {js_array, Len, Map} ->
+            I = Len - 1,
+            V = maps:get(I, Map, undefined),
+            erlang:put(?CELL_KEY(Recv), {js_array, I, maps:remove(I, Map)}),
+            V;
+        _ ->
+            type_error(Recv)
+    end;
+array_pop(Recv) ->
+    type_error(Recv).
+
+%% Array.isArray(x) → 1|0.
+is_array(Recv) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, _, _} -> 1;
+        _ -> 0
+    end;
+is_array(_) ->
+    0.
+
+%% JS Array.prototype.toString — elements joined with "," (null/undefined
+%% render as the empty string).
+array_to_string(0, _Map) ->
+    <<>>;
+array_to_string(Len, Map) ->
+    Parts = [array_elem_str(maps:get(I, Map, undefined)) || I <- lists:seq(0, Len - 1)],
+    iolist_to_binary(lists:join(<<",">>, Parts)).
+
+array_elem_str(undefined) -> <<>>;
+array_elem_str(null) -> <<>>;
+array_elem_str(V) -> to_string(V).
 
 %% ───────────────────────── lists / console / misc ─────────────────────────
 

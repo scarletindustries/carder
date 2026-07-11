@@ -17,13 +17,14 @@
 //// `+ - * / %`, all comparisons, `&& || !`, bitwise/shift `& | ^ ~ << >> >>>`, unary
 //// `- + ! ~ typeof void`, `?:`; `let/const/var`, `= += -= *= /= %= &= |= ^= <<= >>=
 //// >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`, `break/continue`,
-//// `return`, blocks; objects `{}` with `.prop`/`[k]` get/set; `console.log`. Control
-//// flow threads mutated variables as loop-carried params / phi-merged `If` results.
+//// `return`, blocks; objects `{}` with `.prop`/`[k]` get/set; arrays `[…]` with
+//// indexing, `.length`, `.push`/`.pop`; `console.log`. Control flow threads mutated
+//// variables as loop-carried params / phi-merged `If` results.
 ////
 //// Not yet (a clean `Unsupported` error / panic): first-class functions & closures,
-//// arrays, classes, `try/catch/throw`, `switch`, `for-in/of`, regex, and `continue`
-//// inside a `do/while`. Scope is one flat function scope per JS function (block-scoped
-//// `let` is treated as function-scoped).
+//// classes, `try/catch/throw`, `switch`, `for-in/of`, regex, most String/Array/Math
+//// builtins, and `continue` inside a `do/while`. Scope is one flat function scope per
+//// JS function (block-scoped `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -750,6 +751,7 @@ fn lower_expr(
       lower_member(object, property, computed, env, ctx, ctr)
     ast.ObjectExpression(properties:, ..) ->
       lower_object(properties, env, ctx, ctr)
+    ast.ArrayExpression(elements:, ..) -> lower_array(elements, env, ctx, ctr)
 
     _ -> Error(Unsupported("expression: " <> string_tag_expr(e)))
   }
@@ -1235,6 +1237,13 @@ fn lower_call(
       let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
       Ok(bind_after(binds2, ir.CallHost("js", "console_log", [listv]), ctr))
     }
+    // recv.method(args) — method dispatch (array methods for now).
+    ast.MemberExpression(
+      object:,
+      property: ast.Identifier(name: method, ..),
+      computed: False,
+      ..,
+    ) -> lower_method(object, method, arguments, env, ctx, ctr)
     // f(args) where f is a top-level function → direct call.
     ast.Identifier(name: fname, ..) ->
       case list.contains(ctx.funcs, fname) {
@@ -1264,6 +1273,54 @@ fn lower_call(
       }
     _ -> Error(Unsupported("call of a computed/other callee"))
   }
+}
+
+/// `recv.method(args)` — a method call. For v1 this dispatches the array-mutating
+/// methods (`push`, `pop`) to their `rt_js` ops; other method names are `Unsupported`
+/// (string/Array/Math builtins come later). The receiver is evaluated once.
+fn lower_method(
+  object: ast.Expression,
+  method: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bo, recv, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let pre = list.append(bo, ba)
+  case method {
+    "push" -> {
+      let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
+      Ok(bind_after(binds2, ir.CallHost("js", "array_push", [recv, listv]), ctr))
+    }
+    "pop" -> Ok(bind_after(pre, ir.CallHost("js", "array_pop", [recv]), ctr))
+    _ -> Error(Unsupported("method ." <> method <> "()"))
+  }
+}
+
+/// `[e0, e1, …]` — evaluate each element left-to-right (a hole becomes `undefined`),
+/// then construct the array from the cons list via `new_array`.
+fn lower_array(
+  elements: List(Option(ast.Expression)),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, vals, ctr) <- result_try(
+    list.try_fold(elements, #([], [], ctr), fn(acc, el) {
+      let #(binds, vals, ctr) = acc
+      case el {
+        Some(e) -> {
+          use #(b, v, ctr) <- result_try(lower_expr(e, env, ctx, ctr))
+          Ok(#(list.append(binds, b), list.append(vals, [v]), ctr))
+        }
+        None -> Ok(#(binds, list.append(vals, [undefined()]), ctr))
+      }
+    }),
+  )
+  let #(binds2, listv, ctr) = build_list(vals, binds, ctr)
+  Ok(bind_after(binds2, ir.CallHost("js", "new_array", [listv]), ctr))
 }
 
 fn lower_args(

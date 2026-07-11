@@ -4191,6 +4191,11 @@ fn resolve_js(op: String) -> Option(String) {
     "get_prop" -> Some("get_prop")
     "set_prop" -> Some("set_prop")
     "has_prop" -> Some("has_prop")
+    // arrays
+    "new_array" -> Some("new_array")
+    "array_push" -> Some("array_push")
+    "array_pop" -> Some("array_pop")
+    "is_array" -> Some("is_array")
     // lists / console / misc
     "empty_list" -> Some("empty_list")
     "console_log" -> Some("console_log")

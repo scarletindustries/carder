@@ -103,9 +103,9 @@ pub fn add_concat_test() {
   assert js.add(d(1.5), d("s")) == d("1.5s")
 }
 
-pub fn add_object_concat_type_error_test() {
-  // v1 has no ToPrimitive walk: string + object is a typed error, not "[object Object]".
-  assert_type_error("add", [d("s"), js.new_object()])
+pub fn add_object_concat_test() {
+  // JS ToPrimitive → ToString: `"s" + {}` is `"s[object Object]"`.
+  assert js.add(d("s"), js.new_object()) == d("s[object Object]")
 }
 
 // ───────────────────────────── sub / mul / neg ─────────────────────────────

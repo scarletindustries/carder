@@ -367,6 +367,64 @@ pub fn exponentiation_test() {
   call(n, "f", []) |> should.equal(dyn(True))
 }
 
+// ── arrays ───────────────────────────────────────────────────────────────────
+
+pub fn array_literal_test() {
+  let m = compile("function f() { let a = [10, 20, 30]; return a[0] + a[2]; }")
+  to_float(call(m, "f", [])) |> should.equal(40.0)
+}
+
+pub fn array_length_test() {
+  let m = compile("function f() { let a = [1, 2, 3]; return a.length; }")
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  // empty array
+  let e = compile("function f() { let a = []; return a.length; }")
+  to_float(call(e, "f", [])) |> should.equal(0.0)
+}
+
+pub fn array_index_assign_test() {
+  let m = compile("function f() { let a = [1, 2, 3]; a[1] = 99; return a[1]; }")
+  to_float(call(m, "f", [])) |> should.equal(99.0)
+  // assigning past the end grows length.
+  let g = compile("function f() { let a = []; a[2] = 5; return a.length; }")
+  to_float(call(g, "f", [])) |> should.equal(3.0)
+}
+
+pub fn array_push_pop_test() {
+  // push returns the new length.
+  let p = compile("function f() { let a = [1]; return a.push(9); }")
+  to_float(call(p, "f", [])) |> should.equal(2.0)
+  // pop returns the removed element and shrinks length.
+  let m =
+    compile(
+      "function f() { let a = [1, 2, 3]; let x = a.pop(); return x * 10 + a.length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(32.0)
+}
+
+pub fn array_build_loop_test() {
+  let m =
+    compile(
+      "function f(n) { let a = []; for (let i = 0; i < n; i++) { a.push(i * i); } let s = 0; for (let j = 0; j < a.length; j++) { s += a[j]; } return s; }",
+    )
+  // sum of squares 0..4 = 0+1+4+9+16 = 30
+  to_float(call(m, "f", [dyn(5)])) |> should.equal(30.0)
+}
+
+pub fn array_nested_test() {
+  let m = compile("function f() { let a = [[1, 2], [3, 4]]; return a[1][0]; }")
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
+pub fn array_typeof_and_string_test() {
+  // typeof [] is "object"
+  let t = compile("function f() { return typeof [1, 2]; }")
+  call(t, "f", []) |> should.equal(dyn(<<"object">>))
+  // String(array) joins with commas
+  let s = compile("function f() { let a = [1, 2, 3]; return \"\" + a; }")
+  call(s, "f", []) |> should.equal(dyn(<<"1,2,3">>))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

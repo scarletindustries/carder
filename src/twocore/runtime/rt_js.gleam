@@ -224,6 +224,27 @@ pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "has_prop")
 pub fn has_prop(obj: Dynamic, key: Dynamic) -> Int
 
+// ───────────────────────── arrays ─────────────────────────
+// A JS array is a cell holding `{js_array, Length, Map}`. `typeof` is "object";
+// `get_prop`/`set_prop`/`has_prop` above are array-aware (integer indices + `length`).
+
+/// `[e0, e1, …]` — build an array from the cons list of its elements.
+@external(erlang, "twocore_rt_js_ffi", "new_array")
+pub fn new_array(elements: Dynamic) -> Dynamic
+
+/// `arr.push(...vals)` — append each element of the cons list `vals`; returns the
+/// array's new length.
+@external(erlang, "twocore_rt_js_ffi", "array_push")
+pub fn array_push(arr: Dynamic, vals: Dynamic) -> Dynamic
+
+/// `arr.pop()` — remove and return the last element (`undefined` when empty).
+@external(erlang, "twocore_rt_js_ffi", "array_pop")
+pub fn array_pop(arr: Dynamic) -> Dynamic
+
+/// `Array.isArray(x)` → i32 `1`/`0`.
+@external(erlang, "twocore_rt_js_ffi", "is_array")
+pub fn is_array(x: Dynamic) -> Int
+
 // ───────────────────────── lists / console / misc ─────────────────────────
 
 /// The empty BEAM list `[]` (arity 0) — the nil tail an args-cons-list build starts from.
