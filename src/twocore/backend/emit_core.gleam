@@ -108,8 +108,8 @@ import twocore/ir.{
   UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
-  type Binding, type HostPolicy, Atomics, HostDenyAll, HostOpen, HostWhitelist,
-  MeterFuel, MeterOff, Nif, Paged, Threaded,
+  type Binding, type HostPolicy, type MemTier, Atomics, HostDenyAll, HostOpen,
+  HostWhitelist, MeterFuel, MeterOff, Nif, Paged, Threaded,
 }
 import twocore/runtime/profiles
 
@@ -1660,9 +1660,18 @@ fn emit_mem_load(
   ]
   case sc {
     NoState -> {
-      let call = case mem {
-        0 -> seam_call(ctx.binding.mem_module, "load_raising", tail)
-        _ ->
+      // Lever 3: on a memory-0 access under `trust_memory` and a BEAM-memory-SAFE tier, route the
+      // BARE `load_unchecked` seam (same shape `emit_mem_load_unchecked` uses) instead of the
+      // checked `load_raising`. `Nif`, `trust_memory` off, or `mem != 0` keep the current path.
+      let call = case
+        mem == 0
+        && ctx.binding.trust_memory
+        && trust_memory_unchecked_tier(ctx.binding.mem_tier),
+        mem
+      {
+        True, _ -> seam_call(ctx.binding.mem_module, "load_unchecked", tail)
+        False, 0 -> seam_call(ctx.binding.mem_module, "load_raising", tail)
+        False, _ ->
           seam_call(ctx.binding.mem_module, "load_at_raising", [
             CInt(mem),
             ..tail
@@ -1718,9 +1727,18 @@ fn emit_mem_store(
   ]
   case sc {
     NoState -> {
-      let effect = case mem {
-        0 -> seam_call(ctx.binding.mem_module, "store_raising", tail)
-        _ ->
+      // Lever 3: mirror `emit_mem_load` — a memory-0 store under `trust_memory` on a
+      // BEAM-memory-SAFE tier routes the BARE `store_unchecked` seam (disposed via
+      // `emit_zero_effect`, same shape `emit_mem_store_unchecked` uses); otherwise unchanged.
+      let effect = case
+        mem == 0
+        && ctx.binding.trust_memory
+        && trust_memory_unchecked_tier(ctx.binding.mem_tier),
+        mem
+      {
+        True, _ -> seam_call(ctx.binding.mem_module, "store_unchecked", tail)
+        False, 0 -> seam_call(ctx.binding.mem_module, "store_raising", tail)
+        False, _ ->
           seam_call(ctx.binding.mem_module, "store_at_raising", [
             CInt(mem),
             ..tail
@@ -1847,6 +1865,24 @@ fn mem_supports_unchecked(mem_module: String) -> Bool {
   mem_module == profiles.mem_module_for(Paged)
   || mem_module == profiles.mem_module_for(Atomics)
   || mem_module == profiles.mem_module_for(Nif)
+}
+
+/// May `trust_memory` (lever 3) route a memory-0 access through the bounds-check-free
+/// `*_unchecked` seam on `mem_tier`? True ONLY for the BEAM-memory-SAFE tiers where an
+/// out-of-bounds access is CONTAINED to a wrong value: `Paged` (an absent sparse chunk reads
+/// zero) and `Atomics` (`atomics:get` is ERTS-bounds-checked). NEVER `Nif` (tier-N): eliding the
+/// bounds compare there would let a raw C deref past the buffer crash the node, so tier-N stays on
+/// the checked/raising path even under `trust_memory` (§SAFETY).
+///
+/// This is the ONE emit-site that consults the tier ENUM for `trust_memory` — a node-safety gate
+/// (which tiers are safe to skip the check on), NOT a module-swap decision (G5), so branching the
+/// enum here is warranted. Distinct from `mem_supports_unchecked`, which whitelists BCE-proven
+/// unchecked nodes on ALL three tiers (Nif INCLUDED, since there the elision is guarded by a proof).
+fn trust_memory_unchecked_tier(mem_tier: MemTier) -> Bool {
+  case mem_tier {
+    Paged | Atomics -> True
+    Nif -> False
+  }
 }
 
 /// `global.get` (read-only). Routes by global TYPE (via `ctx.ref_global_names`, which holds the

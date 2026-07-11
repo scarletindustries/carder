@@ -74,6 +74,7 @@ pub fn default_off_byte_identical_test() {
     twocore.resolve_binding(
       profiles.safe(),
       False,
+      False,
       option.None,
       option.None,
       option.None,

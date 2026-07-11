@@ -264,6 +264,7 @@ pub fn resolve_binding_default_is_safe_cell_paged_test() {
     twocore.resolve_binding(
       profiles.safe(),
       False,
+      False,
       option.None,
       option.None,
       option.None,
@@ -279,6 +280,7 @@ pub fn resolve_binding_threaded_test() {
     twocore.resolve_binding(
       profiles.safe(),
       True,
+      False,
       option.None,
       option.None,
       option.None,
@@ -293,6 +295,7 @@ pub fn resolve_binding_atomics_couples_module_test() {
   let assert Ok(b) =
     twocore.resolve_binding(
       profiles.safe(),
+      False,
       False,
       option.Some(Atomics),
       option.None,
@@ -309,6 +312,7 @@ pub fn resolve_binding_composed_profiles_test() {
     twocore.resolve_binding(
       profiles.portable(),
       False,
+      False,
       option.None,
       option.None,
       option.None,
@@ -318,6 +322,7 @@ pub fn resolve_binding_composed_profiles_test() {
   let assert Ok(c) =
     twocore.resolve_binding(
       profiles.ceiling(),
+      False,
       False,
       option.None,
       option.None,
@@ -334,6 +339,7 @@ pub fn resolve_binding_safe_nif_rejected_test() {
     twocore.resolve_binding(
       profiles.safe(),
       False,
+      False,
       option.Some(Nif),
       option.None,
       option.None,
@@ -348,6 +354,7 @@ pub fn resolve_binding_unsafe_nif_accepted_test() {
   let assert Ok(b) =
     twocore.resolve_binding(
       profiles.unsafe(),
+      False,
       False,
       option.Some(Nif),
       option.None,
@@ -364,6 +371,7 @@ pub fn resolve_binding_uncapped_atomics_rejected_test() {
     twocore.resolve_binding(
       profiles.safe(),
       False,
+      False,
       option.Some(Atomics),
       option.None,
       option.None,
@@ -379,6 +387,7 @@ pub fn resolve_binding_ceiling_requires_cap_test() {
     twocore.resolve_binding(
       profiles.ceiling(),
       False,
+      False,
       option.None,
       option.None,
       option.None,
@@ -388,6 +397,7 @@ pub fn resolve_binding_ceiling_requires_cap_test() {
   let assert Ok(_) =
     twocore.resolve_binding(
       profiles.ceiling(),
+      False,
       False,
       option.None,
       option.None,

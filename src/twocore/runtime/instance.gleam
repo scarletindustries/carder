@@ -269,6 +269,21 @@ pub type Binding {
     bif_gate: BifGate,
     stdlib: StdlibMode,
     host_policy: HostPolicy,
+    /// Opt-in UNCHECKED linear-memory trust (lever 3), a per-build performance toggle for a
+    /// TRUSTED, self-contained guest (e.g. a JS engine) that never legitimately OOB-traps. When
+    /// `True`, EVERY memory-0 load/store routes through the bounds-check-free `*_unchecked` seam
+    /// instead of the checked/raising path — a large win on memory-heavy code — but ONLY on a
+    /// BEAM-memory-SAFE tier (`Paged` or `Atomics`), where an out-of-bounds access is CONTAINED to
+    /// a wrong value (an absent paged chunk reads zero; `atomics:get` is ERTS-bounds-checked). It is
+    /// NEVER honored on `Nif` (tier-N): a raw C deref past the buffer could crash the node, so
+    /// tier-N stays on the checked/raising path even when `trust_memory` is `True`.
+    ///
+    /// The documented, explicit tradeoff: under this mode an out-of-bounds access on a safe tier
+    /// yields a WRONG VALUE instead of a `MemoryOutOfBounds` trap (spec-incorrect but node-safe).
+    /// Default `False` (fail-closed) — the checked path is BYTE-IDENTICAL to a build without this
+    /// field; engaging it requires explicitly naming `--trust-memory`. Orthogonal to the safety
+    /// profile (composable with any base) and to `mem_tier` (it gates ON the tier, never swaps it).
+    trust_memory: Bool,
     // ── Phase-4 trust-tier axes (G1/G2) ─────────────────────────────────────
     state_strategy: StateStrategy,
     mem_tier: MemTier,
@@ -316,6 +331,9 @@ pub fn safe_default() -> Binding {
     bif_gate: BifAllowlist,
     stdlib: StdlibOwn,
     host_policy: HostDenyAll,
+    // Lever 3 opt-in, OFF by default (fail-closed): the checked/raising memory path stays
+    // byte-identical to a build without this field. Set `True` only by naming `--trust-memory`.
+    trust_memory: False,
     // ── Phase-4 trust-tier posture (G1/G2). The maximally node-safe default (D4): the
     // tier-O `Cell` state strategy + the tier-P `Paged`/`TablePaged` backends — byte-identical
     // to Phase-2/3. Leaving it (tier-P `portable` / tier-N `ceiling`) requires NAMING a profile
