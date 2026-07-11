@@ -84,7 +84,7 @@ import gleam/string
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase,
-  CClause, CCons, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CClause, CCons, CFloat, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
   CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/ir.{
@@ -405,12 +405,20 @@ pub fn emit_module(
     True -> 1
     False -> 0
   }
-  Ok(core_erlang.CModule(
-    name: module.name,
-    exports: list.append(export_names, [FName("instantiate", inst_arity)]),
-    attributes: [],
-    defs: list.append(list.append(defs, wrappers), [inst_def]),
-  ))
+  let cmod =
+    core_erlang.CModule(
+      name: module.name,
+      exports: list.append(export_names, [FName("instantiate", inst_arity)]),
+      attributes: [],
+      defs: list.append(list.append(defs, wrappers), [inst_def]),
+    )
+  // Lever 6 (opt-in, default OFF): beta-reduce single-use, non-recursive `letrec` join funs.
+  // Gated on `binding.inline_joins` so the DEFAULT emitted Core is byte-identical (the pass is a
+  // pure `CModule -> CModule` rewrite; when the flag is off it is never applied).
+  case binding.inline_joins {
+    True -> Ok(inline_join_funs(cmod))
+    False -> Ok(cmod)
+  }
 }
 
 /// Build the Core export list and any forwarding wrappers from the IR exports.
@@ -2258,6 +2266,263 @@ fn wrap_join(maybe_def: Option(FunDef), inner: CExpr) -> CExpr {
   case maybe_def {
     Some(def) -> CLetrec([def], inner)
     None -> inner
+  }
+}
+
+// ─────────────────────────────── lever 6: single-use join inlining ───────────────────────────────
+
+/// Beta-reduce single-use, non-recursive `letrec` join functions across every def of `mod` (lever 6
+/// — opt-in, run by `emit_module` only when `binding.inline_joins == True`).
+///
+/// 2core lowers each wasm block/if/switch continuation to a single-def
+/// `letrec 'J'/n = fun(P1..Pn) -> Fbody in Inner`, entered by `apply 'J'/n(A1..An)` (`wrap_join` +
+/// `materialize`). A join reached from EXACTLY ONE exit (a fall-through-only block) pays a fun
+/// allocation + local call for nothing. This pass replaces that sole `apply 'J'/n(A1..An)` with
+/// `let <P1..Pn> = <A1..An> in Fbody` and DROPS the `letrec`, leaving only `Inner`.
+///
+/// SOUNDNESS — a def is inlined IFF ALL hold (else the node is left byte-identical):
+/// - SINGLE DEF: the letrec binds exactly one def (2core emits exactly one for joins/loops/try).
+/// - NON-RECURSIVE: `Fbody` never applies `'J'/n`. A loop's back-edge (`Continue`) self-applies its
+///   `'L'` head, so loops are recognised recursive and left intact.
+/// - SINGLE-USE: `'J'/n` is applied EXACTLY ONCE across the whole enclosing function body. In this
+///   AST an `FName` can ONLY appear as a `CApply` target (there is no first-class funref-to-`FName`
+///   node — a closure applies a `CVar`/inline `fun` via `CApplyExpr`), so "applied once" is the
+///   COMPLETE single-use condition: no other reference kind can leak the name.
+/// - NOT TRY-PINNED: the def is not applied as a `CTry` `arg`. `emit_try` deliberately hoists its
+///   protected body into a nullary local fun so the try `Arg` stays a single `apply`; inlining it
+///   back would re-expose the `ambiguous_catch_try_state` BEAM-validator rejection the hoist
+///   prevents, so any def applied as a `CTry.arg` is PINNED (never inlined).
+///
+/// Join params are fresh SSA names (`fresh_var`/`fresh_fn`), so the spliced body cannot capture, and
+/// every free variable of `Fbody` is bound ABOVE the letrec — hence still in scope at the sole use
+/// site (which lies inside `Inner`, i.e. inside that same enclosing scope). This is the standard
+/// soundness of inlining a non-recursive single-use local function.
+///
+/// COMPLEXITY: two LINEAR passes over each def body — (1) `scan_joins` counts applies + detects
+/// self-recursion and try-pinning in one traversal; (2) `inline_expr` rewrites top-down, splicing
+/// each inlinable def's body from an environment keyed by its unique `FName`. Every node is visited
+/// once (the precomputed counts stay valid because inlining removes only the def + its single apply,
+/// never perturbing any OTHER name's count), so a deep nest (~280) of joins collapses in ONE pass —
+/// no quadratic re-traversal.
+pub fn inline_join_funs(mod: CModule) -> CModule {
+  core_erlang.CModule(..mod, defs: list.map(mod.defs, inline_join_def))
+}
+
+/// Run the join-inlining pass over one top-level `FunDef`'s body. A non-`CFun` value (which never
+/// occurs for an emitted def — every def RHS is a `CFun`, §core_erlang) is returned unchanged.
+fn inline_join_def(def: FunDef) -> FunDef {
+  case def.value {
+    CFun(vars, body) -> {
+      let info =
+        scan_joins(body, set.new(), JoinInfo(dict.new(), set.new(), set.new()))
+      FunDef(..def, value: CFun(vars, inline_expr(body, info, dict.new())))
+    }
+    _ -> def
+  }
+}
+
+/// The per-body facts the inliner needs, gathered in ONE traversal (`scan_joins`):
+/// - `counts`: for each applied `FName`, how many `apply` sites reference it in the whole body.
+/// - `recursive`: the `FName`s applied WITHIN their own def's body (a loop back-edge) — never inline.
+/// - `pinned`: the `FName`s applied as a `CTry` `arg` (the hoisted try-body funs) — never inline.
+type JoinInfo {
+  JoinInfo(counts: Dict(FName, Int), recursive: Set(FName), pinned: Set(FName))
+}
+
+/// Whether the def `fname` (bound by a single-def letrec) may be inlined: applied exactly once, not
+/// self-recursive, and not try-pinned. All three are read from the precomputed `JoinInfo`.
+fn join_inlinable(fname: FName, info: JoinInfo) -> Bool {
+  dict.get(info.counts, fname) == Ok(1)
+  && !set.contains(info.recursive, fname)
+  && !set.contains(info.pinned, fname)
+}
+
+/// One linear traversal gathering `JoinInfo` for a function body. `scope` is the set of enclosing
+/// `letrec` def names whose BODY we are currently inside — an `apply` of a name in `scope` marks it
+/// recursive. `acc` is the accumulator threaded through.
+fn scan_joins(expr: CExpr, scope: Set(FName), acc: JoinInfo) -> JoinInfo {
+  case expr {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> acc
+    CCons(h, t) -> scan_joins(t, scope, scan_joins(h, scope, acc))
+    CTuple(es) -> list.fold(es, acc, fn(a, e) { scan_joins(e, scope, a) })
+    CBinary(segs) ->
+      list.fold(segs, acc, fn(a, s) {
+        scan_joins(s.size, scope, scan_joins(s.value, scope, a))
+      })
+    CValues(vs) -> list.fold(vs, acc, fn(a, e) { scan_joins(e, scope, a) })
+    CFun(_, b) -> scan_joins(b, scope, acc)
+    CLet(_, arg, body) -> scan_joins(body, scope, scan_joins(arg, scope, acc))
+    CLetrec(defs, inner) -> {
+      // Each def name is in scope for EVERY def body (letrec defs are mutually recursive) but NOT
+      // for `inner` (a use in `inner` is the legitimate call, not a recursive back-edge).
+      let names = set.from_list(list.map(defs, fn(d) { d.name }))
+      let body_scope = set.union(scope, names)
+      let acc2 =
+        list.fold(defs, acc, fn(a, d) { scan_joins(def_body(d), body_scope, a) })
+      scan_joins(inner, scope, acc2)
+    }
+    CCase(arg, clauses) ->
+      list.fold(clauses, scan_joins(arg, scope, acc), fn(a, cl) {
+        scan_joins(cl.body, scope, scan_joins(cl.guard, scope, a))
+      })
+    CApply(fname, args) -> {
+      let n = case dict.get(acc.counts, fname) {
+        Ok(c) -> c + 1
+        Error(_) -> 1
+      }
+      let recursive = case set.contains(scope, fname) {
+        True -> set.insert(acc.recursive, fname)
+        False -> acc.recursive
+      }
+      let acc1 =
+        JoinInfo(..acc, counts: dict.insert(acc.counts, fname, n), recursive:)
+      list.fold(args, acc1, fn(a, e) { scan_joins(e, scope, a) })
+    }
+    CApplyExpr(op, args) ->
+      list.fold(args, scan_joins(op, scope, acc), fn(a, e) {
+        scan_joins(e, scope, a)
+      })
+    CCall(m, f, args) ->
+      list.fold(args, scan_joins(f, scope, scan_joins(m, scope, acc)), fn(a, e) {
+        scan_joins(e, scope, a)
+      })
+    CPrimop(_, args) ->
+      list.fold(args, acc, fn(a, e) { scan_joins(e, scope, a) })
+    CTry(arg, _, body, _, handler) -> {
+      // PIN a def applied directly as the try `Arg` (the hoisted try-body): it must stay a single
+      // `apply` (see `inline_join_funs`).
+      let acc1 = case arg {
+        CApply(fname, _) ->
+          JoinInfo(..acc, pinned: set.insert(acc.pinned, fname))
+        _ -> acc
+      }
+      scan_joins(
+        handler,
+        scope,
+        scan_joins(body, scope, scan_joins(arg, scope, acc1)),
+      )
+    }
+  }
+}
+
+/// The body expression of a `FunDef` — the `CFun` body when the RHS is a `fun` (always, for an
+/// emitted def), else the RHS itself (keeps `scan_joins` total on a non-`CFun` RHS).
+fn def_body(d: FunDef) -> CExpr {
+  case d.value {
+    CFun(_, b) -> b
+    other -> other
+  }
+}
+
+/// Top-down rewrite that inlines each eligible join. `env` maps an inlinable def's `FName` to its
+/// `#(params, transformed_body)`; when the sole `apply` of that name is reached it is replaced by
+/// `let <params> = <args> in body`. `env` only holds names decided inlinable at an enclosing letrec,
+/// so a lookup hit is ALWAYS that def's unique call site.
+fn inline_expr(
+  expr: CExpr,
+  info: JoinInfo,
+  env: Dict(FName, #(List(String), CExpr)),
+) -> CExpr {
+  case expr {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CCons(h, t) -> CCons(inline_expr(h, info, env), inline_expr(t, info, env))
+    CTuple(es) -> CTuple(list.map(es, fn(e) { inline_expr(e, info, env) }))
+    CBinary(segs) ->
+      CBinary(
+        list.map(segs, fn(s) {
+          CBitSeg(
+            ..s,
+            value: inline_expr(s.value, info, env),
+            size: inline_expr(s.size, info, env),
+          )
+        }),
+      )
+    CValues(vs) -> CValues(list.map(vs, fn(e) { inline_expr(e, info, env) }))
+    CFun(vars, b) -> CFun(vars, inline_expr(b, info, env))
+    CLet(vars, arg, body) ->
+      CLet(vars, inline_expr(arg, info, env), inline_expr(body, info, env))
+    CLetrec([FunDef(fname, CFun(params, fbody))], inner) ->
+      case join_inlinable(fname, info) {
+        True -> {
+          // Transform the body once (its own nested joins collapse), stash it, then rewrite `inner`
+          // with the def in scope — the single `apply fname(..)` there splices it in. The letrec is
+          // DROPPED (nothing else references `fname`).
+          let fbody2 = inline_expr(fbody, info, env)
+          let env2 = dict.insert(env, fname, #(params, fbody2))
+          inline_expr(inner, info, env2)
+        }
+        False ->
+          CLetrec(
+            [FunDef(fname, CFun(params, inline_expr(fbody, info, env)))],
+            inline_expr(inner, info, env),
+          )
+      }
+    CLetrec(defs, inner) ->
+      // Not the single-def-join shape — leave the letrec, but recurse into every def body + inner.
+      CLetrec(
+        list.map(defs, fn(d) {
+          case d.value {
+            CFun(vs, b) -> FunDef(d.name, CFun(vs, inline_expr(b, info, env)))
+            other -> FunDef(d.name, inline_expr(other, info, env))
+          }
+        }),
+        inline_expr(inner, info, env),
+      )
+    CCase(arg, clauses) ->
+      CCase(
+        inline_expr(arg, info, env),
+        list.map(clauses, fn(cl) {
+          CClause(
+            cl.pats,
+            inline_expr(cl.guard, info, env),
+            inline_expr(cl.body, info, env),
+          )
+        }),
+      )
+    CApply(fname, args) -> {
+      let args2 = list.map(args, fn(e) { inline_expr(e, info, env) })
+      case dict.get(env, fname) {
+        Ok(#(params, fbody2)) -> bind_join_args(params, args2, fbody2)
+        Error(_) -> CApply(fname, args2)
+      }
+    }
+    CApplyExpr(op, args) ->
+      CApplyExpr(
+        inline_expr(op, info, env),
+        list.map(args, fn(e) { inline_expr(e, info, env) }),
+      )
+    CCall(m, f, args) ->
+      CCall(
+        inline_expr(m, info, env),
+        inline_expr(f, info, env),
+        list.map(args, fn(e) { inline_expr(e, info, env) }),
+      )
+    CPrimop(name, args) ->
+      CPrimop(name, list.map(args, fn(e) { inline_expr(e, info, env) }))
+    CTry(arg, bv, body, ev, handler) ->
+      CTry(
+        inline_expr(arg, info, env),
+        bv,
+        inline_expr(body, info, env),
+        ev,
+        inline_expr(handler, info, env),
+      )
+  }
+}
+
+/// Bind a join's `params` to the call-site `args` and run its `body` — the beta-reduction that
+/// replaces `apply 'J'/n(args)` when inlined. Mirrors `apply_cont`'s `KBind`: `[]` params splice
+/// `body` directly (the vacuous zero-value `let <> = <> in body`), otherwise
+/// `let <params> = <value_list(args)> in body`. `len(params) == len(args)` always — a join's arity
+/// equals its param count, and `emit_core` applies it with exactly that many args.
+fn bind_join_args(
+  params: List(String),
+  args: List(CExpr),
+  body: CExpr,
+) -> CExpr {
+  case params {
+    [] -> body
+    _ -> CLet(params, value_list(args), body)
   }
 }
 

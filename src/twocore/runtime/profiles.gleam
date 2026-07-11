@@ -496,6 +496,10 @@ pub fn engine() -> Binding {
   Binding(
     ..compose(safe(), Cell, Atomics, TableAtomics),
     safe_max_pages: rt_mem_atomics.atomics_reserve_cap_pages,
+    // `inline_joins: True` (lever 6) — a large trusted engine (QuickJS) lowers to a deep nest of
+    // single-use `letrec` join funs; inlining them (a pure Core rewrite) shrinks the emitted Core
+    // + `.beam` and the per-block fun-alloc/local-call overhead.
+    inline_joins: True,
   )
 }
 

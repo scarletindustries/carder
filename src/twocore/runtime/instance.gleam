@@ -284,6 +284,22 @@ pub type Binding {
     /// field; engaging it requires explicitly naming `--trust-memory`. Orthogonal to the safety
     /// profile (composable with any base) and to `mem_tier` (it gates ON the tier, never swaps it).
     trust_memory: Bool,
+    /// Opt-in Core-Erlang JOIN-INLINING pass (lever 6), a per-build compile-time toggle for a
+    /// large guest whose lowered control flow is a deep nest of single-use `letrec` join
+    /// functions. 2core lowers every wasm block/if/switch continuation to a
+    /// `letrec 'J'/n = fun(P…) -> Fbody in Inner` entered by `apply 'J'/n(A…)`; a fall-through-only
+    /// block yields a join reached from EXACTLY ONE exit, so the fun allocation + local call is pure
+    /// overhead. When `True`, `emit_core` beta-reduces every NON-RECURSIVE, applied-EXACTLY-ONCE join
+    /// away (splicing its body at the sole call site), shrinking the emitted Core and the resulting
+    /// `.beam` (QuickJS's interpreter lowers to ~1096 such nested joins, ~280 deep). It is a
+    /// SEMANTICS-PRESERVING transform (a standard single-use inline over fresh-SSA params — no
+    /// capture, loops/multi-exit joins are left intact), NOT a policy or tier lever.
+    ///
+    /// Default `False` (fail-closed): the DEFAULT emitted Core is BYTE-IDENTICAL to a build without
+    /// this field (the pass does not run), so the conformance/golden corpus is trivially unperturbed.
+    /// Engaged only by NAMING `--inline-joins` or a profile that sets it (`engine()`).
+    /// Orthogonal to the safety profile and every tier axis (composable with any base).
+    inline_joins: Bool,
     // ── Phase-4 trust-tier axes (G1/G2) ─────────────────────────────────────
     state_strategy: StateStrategy,
     mem_tier: MemTier,
@@ -334,6 +350,10 @@ pub fn safe_default() -> Binding {
     // Lever 3 opt-in, OFF by default (fail-closed): the checked/raising memory path stays
     // byte-identical to a build without this field. Set `True` only by naming `--trust-memory`.
     trust_memory: False,
+    // Lever 6 opt-in, OFF by default (fail-closed): the join-inlining pass does not run, so the
+    // emitted Core is byte-identical to a build without this field. Set `True` only by naming
+    // `--inline-joins` or via `profiles.engine()`.
+    inline_joins: False,
     // ── Phase-4 trust-tier posture (G1/G2). The maximally node-safe default (D4): the
     // tier-O `Cell` state strategy + the tier-P `Paged`/`TablePaged` backends — byte-identical
     // to Phase-2/3. Leaving it (tier-P `portable` / tier-N `ceiling`) requires NAMING a profile

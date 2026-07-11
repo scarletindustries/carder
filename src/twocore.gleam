@@ -34,6 +34,9 @@
 ////   - `--trust-memory` — `trust_memory: True` (lever 3): route ALL memory-0 loads/stores through
 ////     the bounds-check-free seam for a trusted guest — paged/atomics only; OOB yields a wrong
 ////     value instead of trapping. Composable with any base.
+////   - `--inline-joins` — `inline_joins: True` (lever 6): inline single-use, non-recursive `letrec`
+////     join funs (a pure semantics-preserving Core rewrite that shrinks the emitted Core/`.beam`
+////     for a large guest). Composable with any base; already on under `--engine`.
 ////   - `--tier paged|atomics|nif` — the linear-memory trust tier (`nif` is Unsafe-only).
 ////   - `--table-tier paged|ets|atomics` — the funcref-table trust tier.
 ////   - `--cap PAGES` — a bounded linear-memory page cap (required to engage `atomics`/`ceiling`).
@@ -190,6 +193,7 @@ type Axes {
     base: BaseSel,
     threaded: Bool,
     trust_memory: Bool,
+    inline_joins: Bool,
     mem: Option(MemTier),
     table: Option(TableTier),
     cap: Option(Int),
@@ -218,7 +222,7 @@ fn split_axis_flags(
 ) -> Result(#(Axes, List(String)), String) {
   do_split_axis_flags(
     tokens,
-    Axes(BaseSafe, False, False, None, None, None, False, [], None),
+    Axes(BaseSafe, False, False, False, None, None, None, False, [], None),
     [],
   )
 }
@@ -260,6 +264,8 @@ fn do_split_axis_flags(
       do_split_axis_flags(rest, Axes(..acc, threaded: True), positionals)
     ["--trust-memory", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, trust_memory: True), positionals)
+    ["--inline-joins", ..rest] ->
+      do_split_axis_flags(rest, Axes(..acc, inline_joins: True), positionals)
     ["--link", ..rest] ->
       do_split_axis_flags(rest, Axes(..acc, link: True), positionals)
     ["--bindings", v, ..rest] ->
@@ -454,6 +460,13 @@ fn with_binding(
     axes.table,
     axes.cap,
   ))
+  // `--inline-joins` (lever 6) is applied AFTER the fail-closed `link/1` validation in
+  // `resolve_binding`: it is a pure compile-time codegen toggle, orthogonal to every policy/tier
+  // axis the gate guards, so setting it here cannot change the validated posture.
+  let binding = case axes.inline_joins {
+    True -> Binding(..binding, inline_joins: True)
+    False -> binding
+  }
   k(binding, axes, positionals)
 }
 
@@ -1003,6 +1016,9 @@ fn usage() -> String {
       "    --threaded                state_strategy: Threaded (the record-threading run-ABI)",
       "    --trust-memory            skip bounds checks on ALL memory-0 loads/stores for a trusted",
       "                              guest (paged/atomics only; OOB → wrong value, not a trap)",
+      "    --inline-joins            inline single-use, non-recursive letrec join funs (lever 6):",
+      "                              smaller emitted Core/.beam for a large guest; on by default under",
+      "                              --engine (a pure semantics-preserving Core rewrite)",
       "    --tier paged|atomics|nif  linear-memory trust tier (nif is Unsafe-only)",
       "    --table-tier paged|ets|atomics   funcref-table trust tier",
       "    --cap PAGES               bounded page cap (required to engage atomics / --ceiling)",
