@@ -17,10 +17,9 @@ gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
 argv = ">= 1.1.0 and < 2.0.0"
 simplifile = ">= 2.5.0 and < 3.0.0"
+# arc's JS parser is the front end of `twocore/frontend/js` (JS → 2core IR → BEAM).
+# Only its parser/AST is used; the lowering + backend are 2core's.
+arc = { git = "https://github.com/alii/arc.git", ref = "e1e8868f49ad17deb85a9469caf2bc100adac226" }
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
-# Experiment (experiment/js-frontend): arc's JS parser feeds a JS→2core-IR lowering
-# spike in test/. Dev-only so 2core's production dep tree stays minimal until/unless
-# the frontend is promoted to src/.
-arc = { git = "https://github.com/alii/arc.git", ref = "e1e8868f49ad17deb85a9469caf2bc100adac226" }
