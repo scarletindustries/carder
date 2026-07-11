@@ -2,13 +2,22 @@
 //// emits 2core IR, so 2core AOT-COMPILES JavaScript to native BEAM instead of
 //// interpreting it — then benchmark against arc's own bytecode VM.
 ////
-//// The lowering targets 2core's term layer: a JS number is a BEAM number term,
-//// `a + b` is `NumTerm(NAdd)` (→ `erlang:'+'`), a `for` loop is a 2core `Loop`
-//// with loop-carried params (`Continue`/`Break`), so the compiled function is a
-//// tight tail-recursive BEAM loop calling arithmetic BIFs directly — no opcode
-//// dispatch, no operand stack. Scope: one function; number literals, identifiers,
-//// `+ - * < <= > >= ===`, `let`, assignment, and a counted `for` loop. Enough for
-//// the classic compiled-vs-interpreted hot loop.
+//// The lowering (arc AST → 2core IR) is parameterised by a `Backend` so we can
+//// compile the SAME JS three ways and race them against arc:
+////   - term-int : JS numbers → BEAM integer terms, `+`→`NumTerm(NAdd)`
+////     (`erlang:'+'`). Fast + exact for JS integers, but integer semantics.
+////   - num-f64  : JS numbers → unboxed IEEE-754 doubles, `+`→`Num(FAdd)` via
+////     `rt_num` (2core's conformance-tested wasm float path). This is the
+////     apples-to-apples double-vs-double comparison with arc.
+//// (A term-layer *float* path is intentionally absent: 2core represents floats as
+//// raw bit patterns even when boxed — see emit_core `is_boxing_conv` — so a
+//// `BoxFloat` term is a bit-pattern integer that `NumTerm`'s `erlang:'+'` would
+//// add as an integer. Real doubles must go through the numeric layer.)
+////
+//// A `for` loop lowers to a 2core `Loop` with loop-carried params (`Continue`/
+//// `Break`): a tight tail-recursive BEAM loop, no opcode dispatch, no operand
+//// stack. Scope: one function; number literals, identifiers, `+ - * < <= > >=
+//// ===`, `let`, assignment, a counted `for` loop.
 
 import arc/engine
 import arc/parser
@@ -30,10 +39,10 @@ import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
 
-// ── FFI (mirrors term_ops_test.gleam) ───────────────────────────────────────
+// ── FFI (harness mirrors term_ops_test.gleam) ───────────────────────────────
 
 /// Apply `M:F(Args)` in the test VM, capturing a raise as `Error(text)`. Args and
-/// result are `Dynamic` (a compiled term function takes/returns BEAM terms).
+/// result are `Dynamic` (a compiled function takes/returns raw BEAM terms).
 @external(erlang, "twocore_emit_test_ffi", "catch_apply")
 fn catch_apply_dyn(
   module: Atom,
@@ -49,48 +58,54 @@ fn to_dynamic(x: a) -> Dynamic
 @external(erlang, "erlang", "monotonic_time")
 fn monotonic_time(unit: Atom) -> Int
 
-/// `erlang:float/1` — coerce a numeric BEAM term (int OR float) to a Float, so the
-/// compiled result (an integer term) compares to arc's float result by value.
+/// `erlang:float/1` — coerce a numeric BEAM term (int OR float) to a Float.
 @external(erlang, "erlang", "float")
 fn term_to_float(x: Dynamic) -> Float
+
+/// IEEE-754 bit pattern of `v` as an Int (a `TF64` argument / `ConstF64`).
+@external(erlang, "twocore@runtime@porffor_abi", "float_to_bits")
+fn float_bits(v: Float) -> Int
+
+/// Decode an f64 bit pattern (a `TF64` result term) back to a Float.
+@external(erlang, "twocore@runtime@porffor_abi", "f64_from_bits")
+fn f64_from_bits(bits: Dynamic) -> Float
 
 fn now_us() -> Int {
   monotonic_time(atom.create("microsecond"))
 }
 
-// ── The lowering: arc AST → 2core IR ────────────────────────────────────────
+// ── Backends: how a JS number is represented + arithmetic lowered ────────────
 
 /// A binding to emit as `Let([name], rhs, …)`, in evaluation order.
 type Bind =
   #(String, ir.Expr)
 
-/// Fold ordered bindings into nested `Let`s around `body` (first binding outermost).
-fn emit_lets(binds: List(Bind), body: ir.Expr) -> ir.Expr {
-  list.fold_right(binds, body, fn(acc, b) { ir.Let([b.0], b.1, acc) })
+/// A lowering target: the IR value type carrying a JS number, how a number literal
+/// becomes a `Value` (possibly with `Let` bindings), and how a binary op lowers.
+type Backend {
+  Backend(
+    ty: ir.ValType,
+    lit: fn(Float, Int) -> #(List(Bind), ir.Value, Int),
+    binop: fn(ast.BinaryOp, ir.Value, ir.Value) -> ir.Expr,
+  )
 }
 
-fn fresh(ctr: Int) -> #(String, Int) {
-  #("t" <> int.to_string(ctr), ctr + 1)
+/// Number-term path: an integer literal → a BEAM integer term (exact + fast); a
+/// fractional literal → a float term. Arithmetic is `NumTerm` (`erlang:'+'` …).
+fn term_backend() -> Backend {
+  Backend(ty: ir.TTerm, lit: term_lit, binop: term_binop)
 }
 
-/// A JS number literal as a BEAM number **term**: an integer term when it is
-/// integral (the common counting case — exact, and `erlang:'+'` on integers is
-/// fast), else a float term. Both are produced by boxing a raw numeric constant.
-fn box_number(v: Float) -> ir.Expr {
-  let truncated = float.truncate(v)
-  case int.to_float(truncated) == v {
-    True -> ir.Convert(ir.BoxInt(ir.W64), ir.ConstI64(truncated))
+fn term_lit(v: Float, ctr: Int) -> #(List(Bind), ir.Value, Int) {
+  let #(name, ctr) = fresh(ctr)
+  let boxed = case int.to_float(float.truncate(v)) == v {
+    True -> ir.Convert(ir.BoxInt(ir.W64), ir.ConstI64(float.truncate(v)))
     False -> ir.Convert(ir.BoxFloat(ir.FW64), ir.ConstF64(float_bits(v)))
   }
+  #([#(name, boxed)], ir.Var(name), ctr)
 }
 
-/// IEEE-754 bit pattern of `v` as an Int (for `ConstF64`).
-@external(erlang, "twocore@runtime@porffor_abi", "float_to_bits")
-fn float_bits(v: Float) -> Int
-
-/// Lower a JS binary operator on two already-atomic term operands to the native
-/// BEAM number-term op. Arithmetic yields a number term; comparisons an i32 truth.
-fn lower_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
+fn term_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
   case op {
     ast.Add -> ir.NumTerm(ir.NAdd, l, r)
     ast.Subtract -> ir.NumTerm(ir.NSub, l, r)
@@ -104,39 +119,74 @@ fn lower_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
   }
 }
 
+/// Numeric f64 path: every JS number → an unboxed IEEE-754 double (`TF64`, a raw
+/// bit pattern). A literal is a direct `ConstF64` value (no `Let`). Arithmetic is
+/// `Num(F…(FW64))` via `rt_num` — real double semantics, exactly like arc.
+fn numeric_backend() -> Backend {
+  Backend(ty: ir.TF64, lit: numeric_lit, binop: numeric_binop)
+}
+
+fn numeric_lit(v: Float, ctr: Int) -> #(List(Bind), ir.Value, Int) {
+  #([], ir.ConstF64(float_bits(v)), ctr)
+}
+
+fn numeric_binop(op: ast.BinaryOp, l: ir.Value, r: ir.Value) -> ir.Expr {
+  case op {
+    ast.Add -> ir.Num(ir.FAdd(ir.FW64), [l, r])
+    ast.Subtract -> ir.Num(ir.FSub(ir.FW64), [l, r])
+    ast.Multiply -> ir.Num(ir.FMul(ir.FW64), [l, r])
+    ast.LessThan -> ir.Num(ir.FLt(ir.FW64), [l, r])
+    ast.LessThanEqual -> ir.Num(ir.FLe(ir.FW64), [l, r])
+    ast.GreaterThan -> ir.Num(ir.FGt(ir.FW64), [l, r])
+    ast.GreaterThanEqual -> ir.Num(ir.FGe(ir.FW64), [l, r])
+    ast.StrictEqual -> ir.Num(ir.FEq(ir.FW64), [l, r])
+    _ -> panic as "js-spike: unsupported binary operator"
+  }
+}
+
+// ── The lowering: arc AST → 2core IR ────────────────────────────────────────
+
+/// Fold ordered bindings into nested `Let`s around `body` (first binding outermost).
+fn emit_lets(binds: List(Bind), body: ir.Expr) -> ir.Expr {
+  list.fold_right(binds, body, fn(acc, b) { ir.Let([b.0], b.1, acc) })
+}
+
+fn fresh(ctr: Int) -> #(String, Int) {
+  #("t" <> int.to_string(ctr), ctr + 1)
+}
+
 /// Lower a JS expression to ANF: the ordered `Let` bindings its evaluation needs,
 /// plus the atomic `Value` naming its result. `env` maps a live JS variable to the
 /// IR `Value` holding its current SSA binding.
 fn lower_expr(
+  be: Backend,
   e: ast.Expression,
   env: Dict(String, ir.Value),
   ctr: Int,
 ) -> #(List(Bind), ir.Value, Int) {
   case e {
-    ast.NumberLiteral(value: v, ..) -> {
-      let #(name, ctr) = fresh(ctr)
-      #([#(name, box_number(v))], ir.Var(name), ctr)
-    }
+    ast.NumberLiteral(value: v, ..) -> be.lit(v, ctr)
     ast.Identifier(name: x, ..) ->
       case dict.get(env, x) {
         Ok(v) -> #([], v, ctr)
         Error(_) -> panic as { "js-spike: unbound identifier '" <> x <> "'" }
       }
     ast.BinaryExpression(operator: op, left: l, right: r, ..) -> {
-      let #(bl, vl, ctr) = lower_expr(l, env, ctr)
-      let #(br, vr, ctr) = lower_expr(r, env, ctr)
+      let #(bl, vl, ctr) = lower_expr(be, l, env, ctr)
+      let #(br, vr, ctr) = lower_expr(be, r, env, ctr)
       let #(name, ctr) = fresh(ctr)
-      let binds = list.flatten([bl, br, [#(name, lower_binop(op, vl, vr))]])
+      let binds = list.flatten([bl, br, [#(name, be.binop(op, vl, vr))]])
       #(binds, ir.Var(name), ctr)
     }
     _ -> panic as "js-spike: unsupported expression"
   }
 }
 
-/// Lower a statement list (a function/loop body) to a single IR expression. Each
+/// Lower a statement list (a function body) to a single IR expression. Each
 /// `let`/assignment threads the updated `env` forward; a `for` loop and `return`
 /// build structured control. The list is expected to end in `return`.
 fn lower_stmts(
+  be: Backend,
   stmts: List(ast.Statement),
   env: Dict(String, ir.Value),
   ctr: Int,
@@ -145,13 +195,11 @@ fn lower_stmts(
     [] -> #(ir.Values([]), ctr)
     [stmt, ..rest] ->
       case stmt {
-        // `return e;` — the (fall-through) result of the enclosing function/loop.
         ast.ReturnStatement(argument: Some(e)) -> {
-          let #(binds, val, ctr) = lower_expr(e, env, ctr)
+          let #(binds, val, ctr) = lower_expr(be, e, env, ctr)
           #(emit_lets(binds, ir.Values([val])), ctr)
         }
 
-        // `let x = e;` — bind x to e's value; no IR local, just an env entry.
         ast.VariableDeclaration(
           declarations: [
             ast.VariableDeclarator(
@@ -161,12 +209,12 @@ fn lower_stmts(
           ],
           ..,
         ) -> {
-          let #(binds, val, ctr) = lower_expr(e, env, ctr)
-          let #(body, ctr) = lower_stmts(rest, dict.insert(env, x, val), ctr)
+          let #(binds, val, ctr) = lower_expr(be, e, env, ctr)
+          let #(body, ctr) =
+            lower_stmts(be, rest, dict.insert(env, x, val), ctr)
           #(emit_lets(binds, body), ctr)
         }
 
-        // `x = e;` — reassign x (updates the env binding).
         ast.ExpressionStatement(
           expression: ast.AssignmentExpression(
             operator: ast.Assign,
@@ -176,13 +224,14 @@ fn lower_stmts(
           ),
           ..,
         ) -> {
-          let #(binds, val, ctr) = lower_expr(e, env, ctr)
-          let #(body, ctr) = lower_stmts(rest, dict.insert(env, x, val), ctr)
+          let #(binds, val, ctr) = lower_expr(be, e, env, ctr)
+          let #(body, ctr) =
+            lower_stmts(be, rest, dict.insert(env, x, val), ctr)
           #(emit_lets(binds, body), ctr)
         }
 
         ast.ForStatement(init:, condition:, update:, body:) ->
-          lower_for(init, condition, update, body, rest, env, ctr)
+          lower_for(be, init, condition, update, body, rest, env, ctr)
 
         _ -> panic as "js-spike: unsupported statement"
       }
@@ -194,6 +243,7 @@ fn lower_stmts(
 /// on entry. Each becomes a `LoopParam`; `Continue` re-enters with their updated
 /// values, `Break` exits yielding them, and the code after the loop rebinds them.
 fn lower_for(
+  be: Backend,
   init: option.Option(ast.ForInit),
   condition: option.Option(ast.Expression),
   update: option.Option(ast.Expression),
@@ -202,7 +252,6 @@ fn lower_for(
   env: Dict(String, ir.Value),
   ctr: Int,
 ) -> #(ir.Expr, Int) {
-  // Loop variable + its init expression, from `for (let iv = e0; …)`.
   let assert Some(ast.ForInitDeclaration(ast.VariableDeclaration(
     declarations: [
       ast.VariableDeclarator(
@@ -216,15 +265,13 @@ fn lower_for(
   let assert Some(upd_expr) = update
   let body_stmts = block_stmts(body)
 
-  // Carried set: iv first, then body/update-assigned vars already live in env.
   let extern =
     list.append(collect_assigned(body_stmts), assigned_of(upd_expr))
     |> list.unique
     |> list.filter(fn(v) { v != iv && dict.has_key(env, v) })
   let carried = [iv, ..extern]
 
-  // Init values as atomic Values (iv's from e0; the rest from their current env).
-  let #(iv_binds, iv_init, ctr) = lower_expr(e0, env, ctr)
+  let #(iv_binds, iv_init, ctr) = lower_expr(be, e0, env, ctr)
   let inits =
     list.map(carried, fn(v) {
       case v == iv {
@@ -233,19 +280,16 @@ fn lower_for(
       }
     })
   let params =
-    list.map2(carried, inits, fn(v, initv) { ir.LoopParam(v, ir.TTerm, initv) })
+    list.map2(carried, inits, fn(v, initv) { ir.LoopParam(v, be.ty, initv) })
 
-  // Inside the loop each carried var reads its own param.
   let loop_env =
     list.fold(carried, env, fn(acc, v) { dict.insert(acc, v, ir.Var(v)) })
-  let result_tys = list.map(carried, fn(_) { ir.TTerm })
+  let result_tys = list.map(carried, fn(_) { be.ty })
 
-  // Condition → an i32 truth Value feeding the `If`.
-  let #(cond_binds, cond_val, ctr) = lower_expr(cond_expr, loop_env, ctr)
+  let #(cond_binds, cond_val, ctr) = lower_expr(be, cond_expr, loop_env, ctr)
 
-  // Loop body: run the JS body, then the update, then Continue with new carried.
-  let #(body_env, body_lets, ctr) = lower_seq(body_stmts, loop_env, ctr)
-  let #(upd_env, upd_lets, ctr) = lower_assign(upd_expr, body_env, ctr)
+  let #(body_env, body_lets, ctr) = lower_seq(be, body_stmts, loop_env, ctr)
+  let #(upd_env, upd_lets, ctr) = lower_assign(be, upd_expr, body_env, ctr)
   let next_vals = list.map(carried, fn(v) { dict_get(upd_env, v) })
   let continue_expr =
     emit_lets(
@@ -270,19 +314,19 @@ fn lower_for(
       ),
     )
 
-  // Bind the loop's carried results, rebind env, lower the rest (e.g. `return s`).
   let after = list.map(carried, fn(v) { v <> "_after" })
   let env_after =
     list.fold(list.zip(carried, after), env, fn(acc, pair) {
       dict.insert(acc, pair.0, ir.Var(pair.1))
     })
-  let #(rest_expr, ctr) = lower_stmts(rest, env_after, ctr)
+  let #(rest_expr, ctr) = lower_stmts(be, rest, env_after, ctr)
   #(emit_lets(iv_binds, ir.Let(after, loop, rest_expr)), ctr)
 }
 
-/// Lower a straight-line statement list (a loop body: `let`/assignments only, no
-/// nested control), returning the final env, the ordered bindings, and the counter.
+/// Lower a straight-line loop body (`let`/assignments only), returning the final
+/// env, the ordered bindings, and the counter.
 fn lower_seq(
+  be: Backend,
   stmts: List(ast.Statement),
   env: Dict(String, ir.Value),
   ctr: Int,
@@ -291,7 +335,7 @@ fn lower_seq(
     let #(env, binds, ctr) = acc
     case stmt {
       ast.ExpressionStatement(expression: a, ..) -> {
-        let #(env, more, ctr) = lower_assign(a, env, ctr)
+        let #(env, more, ctr) = lower_assign(be, a, env, ctr)
         #(env, list.append(binds, more), ctr)
       }
       ast.VariableDeclaration(
@@ -303,7 +347,7 @@ fn lower_seq(
         ],
         ..,
       ) -> {
-        let #(more, val, ctr) = lower_expr(e, env, ctr)
+        let #(more, val, ctr) = lower_expr(be, e, env, ctr)
         #(dict.insert(env, x, val), list.append(binds, more), ctr)
       }
       _ -> panic as "js-spike: unsupported statement in loop body"
@@ -313,6 +357,7 @@ fn lower_seq(
 
 /// Lower `x = e` — the ordered bindings for `e`, and env updated so `x` → e's value.
 fn lower_assign(
+  be: Backend,
   e: ast.Expression,
   env: Dict(String, ir.Value),
   ctr: Int,
@@ -324,14 +369,13 @@ fn lower_assign(
       right: rhs,
       ..,
     ) -> {
-      let #(binds, val, ctr) = lower_expr(rhs, env, ctr)
+      let #(binds, val, ctr) = lower_expr(be, rhs, env, ctr)
       #(dict.insert(env, x, val), binds, ctr)
     }
     _ -> panic as "js-spike: unsupported assignment"
   }
 }
 
-/// The variable names assigned by a statement list (`x = …` targets).
 fn collect_assigned(stmts: List(ast.Statement)) -> List(String) {
   list.flat_map(stmts, fn(s) {
     case s {
@@ -341,7 +385,6 @@ fn collect_assigned(stmts: List(ast.Statement)) -> List(String) {
   })
 }
 
-/// The variable assigned by an expression, if it is `x = …`.
 fn assigned_of(e: ast.Expression) -> List(String) {
   case e {
     ast.AssignmentExpression(left: ast.Identifier(name: x, ..), ..) -> [x]
@@ -363,9 +406,10 @@ fn dict_get(env: Dict(String, ir.Value), x: String) -> ir.Value {
   }
 }
 
-/// Parse one top-level `function name(params){ body }` and lower it to an IR module
-/// exporting `name` (a term function: `TTerm` params, one `TTerm` result).
-fn compile_js(src: String) -> #(ir.Module, String) {
+/// Parse one top-level `function name(params){ body }` and lower it under `be` to
+/// an IR module exporting `name`. `tag` uniquely names the emitted BEAM module
+/// (two compiles of the same function must NOT collide on `twocore@js@name`).
+fn compile_js(be: Backend, tag: String, src: String) -> #(ir.Module, String) {
   let assert Ok(#(program, _sb)) = parser.parse(src, parser.Script)
   let stmts = case program {
     ast.Script(body:) -> list.map(body, fn(w) { w.statement })
@@ -387,19 +431,19 @@ fn compile_js(src: String) -> #(ir.Module, String) {
     list.fold(param_names, dict.new(), fn(acc, n) {
       dict.insert(acc, n, ir.Var(n))
     })
-  let #(body_expr, _ctr) = lower_stmts(block_stmts(fn_body), env0, 0)
+  let #(body_expr, _ctr) = lower_stmts(be, block_stmts(fn_body), env0, 0)
 
   let func =
     ir.Function(
       name: fn_name,
-      params: list.map(param_names, fn(n) { ir.Local(n, ir.TTerm) }),
-      result: [ir.TTerm],
+      params: list.map(param_names, fn(n) { ir.Local(n, be.ty) }),
+      result: [be.ty],
       locals: [],
       body: body_expr,
     )
   let m =
     ir.Module(
-      name: "twocore@js@" <> fn_name,
+      name: "twocore@js@" <> tag,
       uses_numerics: True,
       memories: [],
       globals: [],
@@ -430,9 +474,9 @@ fn load(m: ir.Module) -> Atom {
   mod
 }
 
-/// Compile a JS function and return a callable: apply it with BEAM-term args.
-fn jit(src: String) -> #(Atom, Atom) {
-  let #(m, fn_name) = compile_js(src)
+/// Compile a JS function under a backend; return #(module_atom, fn_atom).
+fn jit(be: Backend, tag: String, src: String) -> #(Atom, Atom) {
+  let #(m, fn_name) = compile_js(be, tag, src)
   #(load(m), atom.create(fn_name))
 }
 
@@ -441,40 +485,47 @@ fn jit(src: String) -> #(Atom, Atom) {
 /// The whole pipeline on the simplest function: arc parses `add`, we lower it to
 /// `NumTerm(NAdd)`, compile to BEAM, and it computes on real BEAM number terms.
 pub fn add_compiles_and_runs_test() {
-  let #(mod, f) = jit("function add(a, b) { return a + b; }")
+  let #(mod, f) =
+    jit(term_backend(), "add", "function add(a, b) { return a + b; }")
   catch_apply_dyn(mod, f, [to_dynamic(2), to_dynamic(3)])
   |> should.equal(Ok(to_dynamic(5)))
-  // Compiled arithmetic follows BEAM number-term rules (int+float → float).
+  // Compiled arithmetic follows BEAM number-term rules (int + float → float).
   catch_apply_dyn(mod, f, [to_dynamic(2), to_dynamic(0.5)])
   |> should.equal(Ok(to_dynamic(2.5)))
 }
 
-/// The counted loop compiles and computes the right sum — proving loop-carried
-/// params, `Continue`/`Break`, and the `<`/`+` term ops end-to-end.
+/// The counted loop compiles on BOTH backends and computes the right sum — proving
+/// loop-carried params, `Continue`/`Break`, and the `<`/`+` ops end-to-end for the
+/// integer-term path AND the numeric f64 path (real doubles).
 pub fn sum_loop_compiles_and_runs_test() {
-  let #(mod, f) =
-    jit(
-      "function sum(n) { let s = 0; for (let i = 0; i < n; i = i + 1) { s = s + i; } return s; }",
-    )
-  let assert Ok(r) = catch_apply_dyn(mod, f, [to_dynamic(10)])
-  // 0+1+…+9 = 45.
-  term_to_float(r) |> should.equal(45.0)
+  let src =
+    "function sum(n) { let s = 0; for (let i = 0; i < n; i = i + 1) { s = s + i; } return s; }"
+
+  let #(imod, i_f) = jit(term_backend(), "sumt", src)
+  let assert Ok(ir_) = catch_apply_dyn(imod, i_f, [to_dynamic(10)])
+  term_to_float(ir_) |> should.equal(45.0)
+
+  let #(fmod, f_f) = jit(numeric_backend(), "sumn", src)
+  let assert Ok(fr) = catch_apply_dyn(fmod, f_f, [to_dynamic(float_bits(10.0))])
+  f64_from_bits(fr) |> should.equal(45.0)
 }
 
-/// BENCHMARK: AOT-compiled `sum(n)` (this spike) vs arc's bytecode VM on the same
-/// JS. Prints per-run microseconds and the speedup; asserts the results agree so
-/// the comparison is honest. Times execution only (compile is done once, outside).
+/// BENCHMARK: AOT-compiled `sum(n)` vs arc's bytecode VM on the same JS. Compiles
+/// TWO paths — integer-term and numeric f64 (arc's own double semantics) — so the
+/// f64 row is a clean apples-to-apples compiled-vs-interpreted comparison. Asserts
+/// every path computes the same value. Times execution only (compile done once).
 pub fn sum_vs_arc_benchmark_test() {
   let n = 1_000_000
+  let nf = int.to_float(n)
   let src =
     "function sum(n) { let s = 0; for (let i = 0; i < n; i = i + 1) { s = s + i; } return s; }"
   let expected = 499_999_500_000.0
 
-  // Compile once (excluded from timing).
-  let #(mod, f) = jit(src)
-  let arg = [to_dynamic(n)]
+  let #(imod, i_f) = jit(term_backend(), "sumi", src)
+  let #(fmod, f_f) = jit(numeric_backend(), "sumf", src)
+  let int_arg = [to_dynamic(n)]
+  let f64_arg = [to_dynamic(float_bits(nf))]
 
-  // arc: build the engine once (excluded); each run re-parses+runs the IIFE.
   let eng = engine.new()
   let arc_src =
     "(function(n){let s=0;for(let i=0;i<n;i=i+1){s=s+i;}return s;})("
@@ -482,23 +533,35 @@ pub fn sum_vs_arc_benchmark_test() {
     <> ")"
 
   // Warm up.
-  let _ = catch_apply_dyn(mod, f, arg)
+  let _ = catch_apply_dyn(imod, i_f, int_arg)
+  let _ = catch_apply_dyn(fmod, f_f, f64_arg)
   let _ = arc_eval(eng, arc_src)
 
   let reps = 5
-  let compiled_us = best_us(reps, fn() { catch_apply_dyn(mod, f, arg) })
+  let int_us = best_us(reps, fn() { catch_apply_dyn(imod, i_f, int_arg) })
+  let f64_us = best_us(reps, fn() { catch_apply_dyn(fmod, f_f, f64_arg) })
   let arc_us = best_us(reps, fn() { arc_eval(eng, arc_src) })
 
-  // Correctness gate: both compute the same value.
-  let assert Ok(r) = catch_apply_dyn(mod, f, arg)
-  term_to_float(r) |> should.equal(expected)
+  // Correctness gate: every path computes the same value.
+  let assert Ok(ir_) = catch_apply_dyn(imod, i_f, int_arg)
+  let assert Ok(fr) = catch_apply_dyn(fmod, f_f, f64_arg)
+  term_to_float(ir_) |> should.equal(expected)
+  f64_from_bits(fr) |> should.equal(expected)
   arc_eval(eng, arc_src) |> should.equal(expected)
 
   io.println("")
   io.println("── JS→2core-IR vs arc (sum 0..999999, best of 5) ──")
-  io.println("  2core (AOT→BEAM): " <> int.to_string(compiled_us) <> " us")
-  io.println("  arc  (bytecode VM): " <> int.to_string(arc_us) <> " us")
-  io.println("  speedup: " <> ratio(arc_us, compiled_us) <> "x")
+  io.println("  2core int-term  : " <> int.to_string(int_us) <> " us")
+  io.println(
+    "  2core f64       : "
+    <> int.to_string(f64_us)
+    <> " us  (real IEEE-754 doubles, arc's semantics)",
+  )
+  io.println("  arc bytecode VM : " <> int.to_string(arc_us) <> " us")
+  io.println("  speedup int : " <> ratio(arc_us, int_us) <> "x")
+  io.println(
+    "  speedup f64 : " <> ratio(arc_us, f64_us) <> "x   <- apples-to-apples",
+  )
 }
 
 /// Run `f` `reps` times, returning the fastest wall time in microseconds.
