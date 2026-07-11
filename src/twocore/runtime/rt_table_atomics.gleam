@@ -1,15 +1,17 @@
 //// `rt_table_atomics` — the tier-O, O(1)-integer-slot funcref-table backend (owner: unit
 //// P4-06). An Erlang `atomics` array of per-slot dense entry keys (`0` = null) BESIDE an
-//// immutable `#(FuncType, closure)` companion `Dict`, behind the frozen uniform `rt_table`
-//// interface (keystone §B.2). A pure module swap the linker (unit 07) resolves for
+//// immutable `#(FuncType, closure)` companion TUPLE (indexed 1-based by dense key), behind the
+//// frozen uniform `rt_table` interface (keystone §B.2). A pure module swap the linker (unit 07)
+//// resolves for
 //// `table_tier: TableAtomics`; nothing about the generated code or the `call_indirect` seam
 //// changes (G5/G7).
 ////
 //// **The honest sharp edge (§E).** BEAM `atomics` arrays hold only 64-bit integers, so the FUNS
 //// cannot live in the array. Each slot's `atomics` word holds a 1-based DENSE KEY (`0` = null,
-//// `k>0` = the key into the companion), and the companion `Dict(dense_key -> #(FuncType,
-//// closure))` is the immutable source of truth for the closure + type tag. The `atomics` layer is
-//// the O(1) sparse-slot → dense-entry index; the closure is invoked from the companion.
+//// `k>0` = the key into the companion), and the companion TUPLE (position `k` = `#(FuncType,
+//// closure)`) is the immutable source of truth for the closure + type tag — a per-call fetch is an
+//// O(1) `erlang:element(k, companion)`. The `atomics` layer is the O(1) sparse-slot → dense-entry
+//// index; the closure is invoked from the companion.
 ////
 //// **The 3-fault fail-closed dispatch is byte-identical to `TablePaged`** (§F, unchanged from
 //// P2-05, <https://webassembly.github.io/spec/core/exec/instructions.html>): the three guards
@@ -37,7 +39,7 @@
 ////
 //// **Both op families.** The **cell-backed** family and the **threaded** family both compose with
 //// this tier (§C — tier and state-strategy are orthogonal). The `atomics` array is mutated IN
-//// PLACE, but the companion `Dict` is IMMUTABLE, so a mutating op returns a handle with the GROWN
+//// PLACE, but the companion TUPLE is IMMUTABLE, so a mutating op returns a handle with the GROWN
 //// companion (the `occ` ref unchanged) — the §10 uniform-threading rule for a hybrid backend.
 ////
 //// **Forward-compat (Phase 5, §E).** The array is fixed-size at creation — exactly right for the
@@ -45,7 +47,6 @@
 //// `atomics:put`; a future `table.grow` inherits `rt_mem`'s `atomics` pre-allocation sharp edge
 //// (noted, not built here).
 
-import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/int
 import gleam/list
@@ -67,24 +68,23 @@ import twocore/runtime/rt_table.{
 /// - `occ`: an `atomics` array of `max(size, 1)` unsigned 64-bit words (1-based; slot `i` is
 ///   `atomics` index `i + 1`). Each word is `0` (**null**) or a `k>0` dense key into `entries`. A
 ///   store mutates it IN PLACE; `grow` REALLOCATES it (a bigger array, the old words copied).
-/// - `entries`: the IMMUTABLE companion `Dict(dense_key -> RefValue)` — the source of truth for a
-///   non-null reference (funcref `#(FuncType, closure)` or externref `{ref_extern, term}`, stored
-///   OPAQUELY). A mutating op REBUILDS this (structural sharing keeps it cheap). **Null is `occ =
-///   0`**, never a companion entry — so `call_indirect`'s `occ == 0 ⇒ UninitializedElement` guard
-///   stays byte-identical.
+/// - `entries`: the IMMUTABLE companion TUPLE of `RefValue`s indexed 1-based by DENSE KEY (a funcref
+///   `#(FuncType, closure)` or externref `{ref_extern, term}`, stored OPAQUELY) — the source of
+///   truth for a non-null reference. Held as an opaque `Dynamic` tuple so the per-`call_indirect`
+///   closure fetch is an O(1) `erlang:element(dense, entries)` (vs the former O(log n) `Dict` hash
+///   lookup): dense keys are CONTIGUOUS 1-based (`entries` always holds exactly `next - 1` elements,
+///   never deleted — an overwrite ORPHANS its old entry, the documented non-goal), so a `dense`
+///   index is a direct tuple-element access. A mutating op EXTENDS the tuple by APPENDING the new
+///   entry at position `next` (an immutable rebuild). **Null is `occ = 0`**, never a companion
+///   entry — so `call_indirect`'s `occ == 0 ⇒ UninitializedElement` guard stays byte-identical.
 /// - `size`: the current slot count (`table.size`). Grows via `grow`.
 /// - `max`: the EFFECTIVE maximum entry count (`min(declared_max, hard_max_slots)`), baked at
 ///   `new` time; `grow` never exceeds it.
 /// - `next`: the next dense key to assign — a monotonically increasing counter (1-based), so a
 ///   store never reuses a companion key (overwrites orphan the old entry; the documented non-goal).
+///   INVARIANT: `next - 1 == tuple_size(entries)`, so `next` is always the position an append lands.
 type AtomicsTable {
-  AtomicsTable(
-    occ: Dynamic,
-    entries: Dict(Int, RefValue),
-    size: Int,
-    max: Int,
-    next: Int,
-  )
+  AtomicsTable(occ: Dynamic, entries: Dynamic, size: Int, max: Int, next: Int)
 }
 
 // ───────────────────────────── the `atomics` FFI (reuses the unit-04 shim) ─────────────────────────────
@@ -102,6 +102,34 @@ fn atomics_get(ref: Dynamic, ix: Int) -> Int
 /// Write dense key `val` into the 1-indexed word `ix`, mutating `ref` IN PLACE.
 @external(erlang, "twocore_rt_mem_atomics_ffi", "put")
 fn atomics_put(ref: Dynamic, ix: Int, val: Int) -> Nil
+
+// ───────────────────────────── the companion TUPLE FFI (O(1) dense-key access) ─────────────────────────────
+
+/// `erlang:element/2` — the 1-based `dense`-th companion `RefValue`. O(1) tuple-element access (the
+/// point of the tuple companion): a `dense` outside `[1, tuple_size(entries)]` raises `badarg`
+/// (node-safe), upholding the SAME build invariant the former `Dict` `let assert` did — a non-zero
+/// `occ` slot's dense key ALWAYS names a present companion entry, so a violation is an internal bug.
+@external(erlang, "erlang", "element")
+fn companion_element(dense: Int, entries: Dynamic) -> RefValue
+
+/// `erlang:list_to_tuple/1` — build a companion tuple from `values` in dense-key order (`values[k]`
+/// → 1-based position `k + 1`). Used to (re)build the immutable companion when extending it, and to
+/// seed the empty companion (`[]` → `{}`).
+@external(erlang, "erlang", "list_to_tuple")
+fn list_to_companion(values: List(RefValue)) -> Dynamic
+
+/// `erlang:tuple_to_list/1` — the companion's `RefValue`s in dense-key order (`[e1, e2, …]`). Used
+/// to extend the immutable companion tuple by appending new entries.
+@external(erlang, "erlang", "tuple_to_list")
+fn companion_to_list(entries: Dynamic) -> List(RefValue)
+
+/// Extend the immutable companion tuple by `additions` (in dense-key order), returning the grown
+/// tuple. The new entries take the NEXT contiguous 1-based positions (dense keys), preserving the
+/// `next - 1 == tuple_size(entries)` invariant. O(|entries| + |additions|) — one rebuild, so a batch
+/// segment write is O(n) rather than a fold of O(n) single appends (O(n²)).
+fn companion_extend(entries: Dynamic, additions: List(RefValue)) -> Dynamic {
+  list_to_companion(list.append(companion_to_list(entries), additions))
+}
 
 // ───────────────────────────── opaque `Dynamic` coercions (identity at run time) ─────────────────────────────
 
@@ -168,7 +196,7 @@ fn ref_to_funcref_tuple(v: RefValue) -> #(FuncType, Dynamic)
 pub fn new(min: Int, max: Option(Int)) -> Dynamic {
   atomics_to_dynamic(AtomicsTable(
     occ: atomics_new(int.max(min, 1)),
-    entries: dict.new(),
+    entries: list_to_companion([]),
     size: min,
     max: effective_max(max),
     next: 1,
@@ -891,7 +919,7 @@ fn put_slot(t: AtomicsTable, index: Int, value: RefValue) -> AtomicsTable {
       atomics_put(t.occ, index + 1, dense)
       AtomicsTable(
         ..t,
-        entries: dict.insert(t.entries, dense, value),
+        entries: companion_extend(t.entries, [value]),
         next: dense + 1,
       )
     }
@@ -919,7 +947,7 @@ fn fill_run(
           occ_put_run(t.occ, start, dense, count)
           AtomicsTable(
             ..t,
-            entries: dict.insert(t.entries, dense, value),
+            entries: companion_extend(t.entries, [value]),
             next: dense + 1,
           )
         }
@@ -1006,34 +1034,42 @@ pub fn to_canon(handle: Dynamic) -> List(Option(FuncType)) {
 
 // ───────────────────────────── shared helpers ─────────────────────────────
 
-/// Fold each boxed funcref entry into the table: assign the next dense key, `atomics:put` it at the
-/// slot's 1-based `occ` index IN PLACE, and `dict.insert` the entry (as a `RefValue`) into the
-/// companion. Returns the updated `AtomicsTable` (occ mutated in place; companion + `next` grown).
-/// Callers MUST have bounds-checked the whole `[offset, offset+len)` range (all-or-nothing). Used
-/// by the funcref `init_elem` fast path.
+/// Write a batch of boxed funcref entries into the table: assign each the next contiguous dense key
+/// (`base + k` for the `k`-th entry, `base = table.next`), `atomics:put` that key at the slot's
+/// 1-based `occ` index IN PLACE, and EXTEND the immutable companion tuple by all entries in ONE
+/// rebuild (O(n), not a fold of O(n) single appends). Returns the updated `AtomicsTable` (occ
+/// mutated in place; companion + `next` grown). Callers MUST have bounds-checked the whole
+/// `[offset, offset+len)` range (all-or-nothing). Used by the funcref `init_elem` fast path.
 fn write_entries(
   table: AtomicsTable,
   offset: Int,
   entries: List(#(FuncType, Dynamic)),
 ) -> AtomicsTable {
-  list.index_fold(entries, table, fn(t, entry, k) {
-    let dense = t.next
-    atomics_put(t.occ, offset + k + 1, dense)
-    AtomicsTable(
-      ..t,
-      entries: dict.insert(t.entries, dense, funcref_tuple_to_ref(entry)),
-      next: dense + 1,
-    )
+  let base = table.next
+  // Write each slot's dense key (`base + k`) into `occ` in place — O(n) side effects only.
+  list.index_fold(entries, Nil, fn(_, _entry, k) {
+    atomics_put(table.occ, offset + k + 1, base + k)
+    Nil
   })
+  // Extend the companion by all entries at dense keys `base .. base + len - 1`, preserving the
+  // `next - 1 == tuple_size(entries)` invariant.
+  AtomicsTable(
+    ..table,
+    entries: companion_extend(
+      table.entries,
+      list.map(entries, funcref_tuple_to_ref),
+    ),
+    next: base + list.length(entries),
+  )
 }
 
-/// Read the companion reference value for a `dense` key derived from a non-null `atomics` slot.
-/// The `let assert` upholds a BUILD INVARIANT (a slot's dense key is written in the same step its
-/// companion entry is inserted, so a non-zero slot ALWAYS has a companion entry); a violation is
-/// an internal bug, not a WASM trap — it `panic`s node-safe rather than fabricating a value.
+/// Read the companion reference value for a `dense` key derived from a non-null `atomics` slot — an
+/// O(1) `erlang:element(dense, entries)` tuple access. `companion_element` upholds the BUILD
+/// INVARIANT (a slot's dense key is written in the same step its companion entry is appended, so a
+/// non-zero slot ALWAYS names a present tuple element); a violation is an internal bug, not a WASM
+/// trap — the underlying `element/2` raises `badarg` node-safe rather than fabricating a value.
 fn companion_get(table: AtomicsTable, dense: Int) -> RefValue {
-  let assert Ok(entry) = dict.get(table.entries, dense)
-  entry
+  companion_element(dense, table.entries)
 }
 
 /// The ascending slot indices `[0, 1, …, size-1]` (`[]` for `size <= 0`). Built by hand so it

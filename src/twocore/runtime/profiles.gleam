@@ -504,6 +504,10 @@ pub fn engine() -> Binding {
     // locals through every nested block/loop; the frontend liveness pass drops the ones provably dead
     // at each construct's exit, shrinking the lowered IR and the emitted Core.
     narrow_carried: True,
+    // `lazy_mask: True` (lever 8) — a large trusted engine emits many wrap-masked arithmetic ops
+    // (lever 1's `band(op, 2^n-1)`); the sound redundant-mask peephole collapses a subsumed
+    // `band(band(X, M2), M1)` (M2's bits ⊆ M1's) to a single `band(X, M2)`.
+    lazy_mask: True,
   )
 }
 

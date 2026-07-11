@@ -318,6 +318,21 @@ pub type Binding {
     /// unperturbed. Engaged only by a profile that sets it (`engine()`). A pure frontend-lowering
     /// transform — orthogonal to the safety profile and every tier axis (composable with any base).
     narrow_carried: Bool,
+    /// Opt-in Core-Erlang REDUNDANT-MASK elimination pass (lever 8), a per-build compile-time toggle.
+    /// Lever 1 emits `erlang:band(op, 2^n-1)` on every wrapping arithmetic op, so a chain of masks
+    /// can arise where an outer `band` is subsumed by an inner one — e.g. consecutive constant
+    /// `i32.and`s (`x & 0xFF & 0xFFFF`) or a re-normalized value. When `True`, `emit_core` runs a
+    /// SOUND bottom-up Core peephole rewriting `band(band(X, M2), M1)` → `band(X, M2)` whenever `M1`
+    /// and `M2` are integer literals with `M2 band M1 == M2` (M2's bits ⊆ M1's bits — the outer mask
+    /// cannot clear a bit the inner already cleared, so it is redundant for ANY integer X, positive
+    /// or negative). It preserves the value operand exactly (never drops or duplicates a subterm), so
+    /// it is a pure semantics-preserving transform, NOT a policy or tier lever. Distinct from a
+    /// risky interval-analysis "lazy masking" (deliberately NOT attempted).
+    ///
+    /// Default `False` (fail-closed): the DEFAULT emitted Core is BYTE-IDENTICAL to a build without
+    /// this field (the pass does not run) — a safe no-op when the pattern is absent. Engaged only by a
+    /// profile that sets it (`engine()`). Orthogonal to the safety profile and every tier axis.
+    lazy_mask: Bool,
     // ── Phase-4 trust-tier axes (G1/G2) ─────────────────────────────────────
     state_strategy: StateStrategy,
     mem_tier: MemTier,
@@ -376,6 +391,10 @@ pub fn safe_default() -> Binding {
     // the lowered IR (hence the emitted Core) is byte-identical to a build without this field. Set
     // `True` only via `profiles.engine()`.
     narrow_carried: False,
+    // Lever 8 opt-in, OFF by default (fail-closed): the redundant-mask peephole does not run, so the
+    // emitted Core is byte-identical to a build without this field. Set `True` only via
+    // `profiles.engine()`.
+    lazy_mask: False,
     // ── Phase-4 trust-tier posture (G1/G2). The maximally node-safe default (D4): the
     // tier-O `Cell` state strategy + the tier-P `Paged`/`TablePaged` backends — byte-identical
     // to Phase-2/3. Leaving it (tier-P `portable` / tier-N `ceiling`) requires NAMING a profile

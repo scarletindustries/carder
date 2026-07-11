@@ -27,6 +27,7 @@ import twocore/ir.{
   TableOutOfBounds, UndefinedElement, UninitializedElement,
 }
 import twocore/runtime/rt_state.{type InstanceState, StateDecl}
+import twocore/runtime/rt_table
 import twocore/runtime/rt_table_atomics as atom
 
 /// Catch a raise (pure Gleam cannot `catch`); shared fail-closed helper.
@@ -334,4 +335,42 @@ pub fn to_canon_reports_slot_image_test() {
 /// A 0-slot table's `to_canon` is the empty image (`build_indices` edge case).
 pub fn to_canon_zero_size_test() {
   atom.to_canon(atom.new(0, None)) |> should.equal([])
+}
+
+// ══════════════════════════ dense-companion representation ══════════════════════════
+
+/// The companion must map EACH distinct dense key to its OWN entry across many slots — the O(1)
+/// `element(dense, entries)` access must never cross-wire two slots. A batch `init_elem` fills
+/// slots 0..3 with four DISTINCT closures (dense keys 1..4 assigned contiguously); every slot then
+/// dispatches to its own constant. This exercises the batch companion-extend path and reads every
+/// dense key. (Correct dispatch is the spec oracle; the tuple layout is an internal detail.)
+pub fn cell_dense_companion_distinct_per_slot_test() {
+  let u_i = FuncType([], [TI32])
+  let konst = fn(n) { #(u_i, fn(_args) { to_pkg(n) }) }
+  seed_atom(4)
+  let assert Ok(Nil) =
+    atom.init_elem(0, [konst(10), konst(20), konst(30), konst(40)])
+  atom.call_indirect(0, u_i, []) |> should.equal(Ok([10]))
+  atom.call_indirect(1, u_i, []) |> should.equal(Ok([20]))
+  atom.call_indirect(2, u_i, []) |> should.equal(Ok([30]))
+  atom.call_indirect(3, u_i, []) |> should.equal(Ok([40]))
+}
+
+/// An overwrite ORPHANS the slot's old dense key (a documented non-goal: the old companion entry
+/// stays but is unreferenced) and appends a fresh entry at the next dense key. Dispatch through the
+/// overwritten slot must reach the NEW closure, and EVERY other slot must be untouched by the
+/// orphan. `set` overwrites slot 1 (orphaning its key); slot 1 now returns the new closure's value
+/// while slots 0/2/3 still return their originals.
+pub fn cell_dense_companion_overwrite_orphans_test() {
+  let u_i = FuncType([], [TI32])
+  let konst = fn(n) { #(u_i, fn(_args) { to_pkg(n) }) }
+  seed_atom(4)
+  let assert Ok(Nil) =
+    atom.init_elem(0, [konst(10), konst(20), konst(30), konst(40)])
+  let assert Ok(Nil) =
+    atom.set(0, 1, rt_table.funcref(u_i, fn(_args) { to_pkg(99) }))
+  atom.call_indirect(1, u_i, []) |> should.equal(Ok([99]))
+  atom.call_indirect(0, u_i, []) |> should.equal(Ok([10]))
+  atom.call_indirect(2, u_i, []) |> should.equal(Ok([30]))
+  atom.call_indirect(3, u_i, []) |> should.equal(Ok([40]))
 }

@@ -415,10 +415,18 @@ pub fn emit_module(
   // Lever 6 (opt-in, default OFF): beta-reduce single-use, non-recursive `letrec` join funs.
   // Gated on `binding.inline_joins` so the DEFAULT emitted Core is byte-identical (the pass is a
   // pure `CModule -> CModule` rewrite; when the flag is off it is never applied).
-  case binding.inline_joins {
-    True -> Ok(inline_join_funs(cmod))
-    False -> Ok(cmod)
+  let cmod2 = case binding.inline_joins {
+    True -> inline_join_funs(cmod)
+    False -> cmod
   }
+  // Lever 8 (opt-in, default OFF): eliminate a redundant outer `band` mask subsumed by an inner
+  // one. Gated on `binding.lazy_mask`, applied AFTER inlining (so a mask chain revealed by a
+  // spliced join is also collapsed); a pure `CModule -> CModule` rewrite, byte-identical when off.
+  let cmod3 = case binding.lazy_mask {
+    True -> elim_redundant_masks(cmod2)
+    False -> cmod2
+  }
+  Ok(cmod3)
 }
 
 /// Build the Core export list and any forwarding wrappers from the IR exports.
@@ -2524,6 +2532,122 @@ fn bind_join_args(
     [] -> body
     _ -> CLet(params, value_list(args), body)
   }
+}
+
+// ─────────────────────────── Lever 8: redundant-mask elimination (opt-in) ───────────────────────────
+
+/// Eliminate a redundant OUTER bitwise-AND mask throughout every function body of `mod` (lever 8,
+/// opt-in via `binding.lazy_mask`; a pure `CModule -> CModule` rewrite that is a safe no-op when the
+/// pattern is absent). When the flag is off this is never applied, so the default Core is unchanged.
+///
+/// Lever 1 emits `call 'erlang':'band'(op, 2^n-1)` on every WRAPPING arithmetic op, so a chain
+/// `band(band(X, M2), M1)` can arise — e.g. consecutive constant `i32.and`s (`x & 0xFF & 0xFFFF`),
+/// or a re-normalized value flowing into another masked op. This rewrites `band(band(X, M2), M1)` →
+/// `band(X, M2)` whenever `M1` and `M2` are INTEGER LITERALS with `M2 band M1 == M2` — i.e. M2's set
+/// bits are a SUBSET of M1's, so the outer `band M1` cannot clear any bit that `band M2` left set
+/// and is redundant.
+///
+/// **Soundness for ALL integers X (including negative).** With a non-negative finite mask M2,
+/// `X band M2` is a NON-NEGATIVE value whose set bits ⊆ M2's bits; if M2's bits ⊆ M1's bits then
+/// `(X band M2) band M1 == X band M2`. Every mask 2core emits here — `2^n-1`, the shift counts
+/// `31`/`63`, and wasm-const operands (stored as unsigned bit patterns) — is non-negative, so the
+/// identity holds regardless of X's runtime sign. The value operand X is preserved VERBATIM (never
+/// dropped or duplicated), and no operand is evaluated a different number of times, so the transform
+/// is semantics-preserving. Distinct from a risky interval-analysis "lazy masking" (NOT attempted).
+pub fn elim_redundant_masks(mod: CModule) -> CModule {
+  core_erlang.CModule(..mod, defs: list.map(mod.defs, mask_def))
+}
+
+/// Run the mask peephole over one top-level (or `letrec`) `FunDef`'s body. A non-`CFun` RHS (which
+/// never occurs for an emitted def, §core_erlang) is returned unchanged.
+fn mask_def(def: FunDef) -> FunDef {
+  case def.value {
+    CFun(vars, body) -> FunDef(..def, value: CFun(vars, mask_expr(body)))
+    _ -> def
+  }
+}
+
+/// Bottom-up rewrite: rewrite every child first, then apply the local redundant-mask reduction at a
+/// `band` node. Because a node's children are collapsed BEFORE the node itself is examined, a whole
+/// `band` chain reaches a fixpoint in ONE pass — each level sees its already-collapsed child, and a
+/// produced `band(X, M2)` is never itself further reducible (its inner mask, if any, was resolved
+/// against M2 when the child was rewritten).
+fn mask_expr(expr: CExpr) -> CExpr {
+  case expr {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CCons(h, t) -> CCons(mask_expr(h), mask_expr(t))
+    CTuple(es) -> CTuple(list.map(es, mask_expr))
+    CBinary(segs) ->
+      CBinary(
+        list.map(segs, fn(s) {
+          CBitSeg(..s, value: mask_expr(s.value), size: mask_expr(s.size))
+        }),
+      )
+    CValues(vs) -> CValues(list.map(vs, mask_expr))
+    CFun(vars, b) -> CFun(vars, mask_expr(b))
+    CLet(vars, arg, body) -> CLet(vars, mask_expr(arg), mask_expr(body))
+    CLetrec(defs, inner) -> CLetrec(list.map(defs, mask_def), mask_expr(inner))
+    CCase(arg, clauses) ->
+      CCase(
+        mask_expr(arg),
+        list.map(clauses, fn(cl) {
+          CClause(cl.pats, mask_expr(cl.guard), mask_expr(cl.body))
+        }),
+      )
+    CApply(fname, args) -> CApply(fname, list.map(args, mask_expr))
+    CApplyExpr(op, args) -> CApplyExpr(mask_expr(op), list.map(args, mask_expr))
+    // `band` is the only reducible node — apply the local rule to the rewritten `call`.
+    CCall(m, f, args) ->
+      reduce_mask(CCall(mask_expr(m), mask_expr(f), list.map(args, mask_expr)))
+    CPrimop(name, args) -> CPrimop(name, list.map(args, mask_expr))
+    CTry(arg, bv, body, ev, handler) ->
+      CTry(mask_expr(arg), bv, mask_expr(body), ev, mask_expr(handler))
+  }
+}
+
+/// Apply ONE redundant-mask reduction at a `band` node whose children are already rewritten:
+/// `band(band(X, M2), M1)` → `band(X, M2)` when `M1`, `M2` are integer literals and `M2 band M1 ==
+/// M2` (M2's bits ⊆ M1's). Returns `node` unchanged when it is not a reducible masked-band-of-
+/// masked-band (the common case — a safe no-op).
+fn reduce_mask(node: CExpr) -> CExpr {
+  case as_masked(node) {
+    Some(#(inner, m1)) ->
+      case as_masked(inner) {
+        Some(#(x, m2)) ->
+          case int.bitwise_and(m2, m1) == m2 {
+            True -> band_lit(x, m2)
+            False -> node
+          }
+        None -> node
+      }
+    None -> node
+  }
+}
+
+/// Recognize a bitwise-AND against a SINGLE integer-literal mask: `band(V, CInt(M))` or the
+/// commuted `band(CInt(M), V)`. Returns `Some(#(V, M))` — the value operand and the literal mask —
+/// or `None` for a non-`band`, a wrong arity, or a `band` with zero or two literal operands (no
+/// single value/mask split). `band` is commutative, so either operand order is accepted; a
+/// `band(CInt, CInt)` (a constant — nothing to preserve) yields `None`.
+fn as_masked(node: CExpr) -> Option(#(CExpr, Int)) {
+  case node {
+    CCall(CAtom("erlang"), CAtom("band"), [CInt(m), v]) ->
+      case v {
+        CInt(_) -> None
+        _ -> Some(#(v, m))
+      }
+    CCall(CAtom("erlang"), CAtom("band"), [v, CInt(m)]) ->
+      case v {
+        CInt(_) -> None
+        _ -> Some(#(v, m))
+      }
+    _ -> None
+  }
+}
+
+/// Build the reduced single-mask node `call 'erlang':'band'(x, M)`.
+fn band_lit(x: CExpr, mask: Int) -> CExpr {
+  CCall(CAtom("erlang"), CAtom("band"), [x, CInt(mask)])
 }
 
 // ─────────────────────────────── numeric ops (the chokepoint) ───────────────────────────────
