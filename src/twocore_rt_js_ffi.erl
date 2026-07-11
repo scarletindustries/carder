@@ -59,7 +59,7 @@
 -export([
     add/2, sub/2, mul/2, neg/1, divide/2, modulo/2,
     lt/2, le/2, gt/2, ge/2, strict_eq/2, eq/2,
-    truthy/1, to_string/1, type_of/1,
+    truthy/1, to_number/1, to_string/1, type_of/1,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
     empty_list/0, console_log/1, not_callable/1
@@ -368,6 +368,12 @@ truthy(V) when is_integer(V); is_float(V) ->
     end;
 truthy(<<>>) -> 0;
 truthy(_) -> 1.
+
+%% JS ToNumber (behind unary `+` and `Number(x)`). Reuses the same coercion as the
+%% relational operators — booleans/null/undefined/strings/objects per the spec — then
+%% `out` maps the internal numeric domain back to a JS term (nan → js_nan, etc.).
+to_number(A) ->
+    out(coerce_num(A)).
 
 %% JS ToString → a binary. Strings pass through; integral floats < 1e21 print
 %% integer-style (String(5.0) = "5"); other floats use [short] (shortest

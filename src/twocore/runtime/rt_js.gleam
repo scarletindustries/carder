@@ -121,6 +121,14 @@ pub fn eq(a: Dynamic, b: Dynamic) -> Int
 @external(erlang, "twocore_rt_js_ffi", "truthy")
 pub fn truthy(v: Dynamic) -> Int
 
+/// JS ToNumber — the coercion behind unary `+` and `Number(x)`. Numbers pass through;
+/// `true`→1, `false`/`null`→0, `undefined`→NaN; a string parses as a decimal/float
+/// (`" 5 "`→5, `""`→0, non-numeric→NaN; radix prefixes coerce to NaN — FFI header
+/// note); objects/functions →NaN (no ToPrimitive in v1). NaN/±Infinity are the
+/// `js_nan`/`js_inf`/`js_neg_inf` sentinels.
+@external(erlang, "twocore_rt_js_ffi", "to_number")
+pub fn to_number(v: Dynamic) -> Dynamic
+
 /// JS ToString → a binary. Strings pass through; integral floats < 1e21 print integer-style
 /// (`String(5.0)` is `"5"`); other floats print shortest-round-trip (`[short]` — exponent
 /// FORMATTING diverges from Number::toString at the extremes, FFI header note); sentinels are

@@ -4169,6 +4169,7 @@ fn resolve_js(op: String) -> Option(String) {
     "eq" -> Some("eq")
     // truthiness / coercion
     "truthy" -> Some("truthy")
+    "to_number" -> Some("to_number")
     "to_string" -> Some("to_string")
     "type_of" -> Some("type_of")
     "undefined_sentinel" -> Some("undefined_sentinel")
