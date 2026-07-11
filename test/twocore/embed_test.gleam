@@ -39,6 +39,37 @@ pub fn host_import_reads_guest_memory_test() {
   embed.stop(instance)
 }
 
+/// `mem_size` reports the guest's real linear-memory footprint in BYTES, and `guest_pid`
+/// names the live owning process. The `poke` fixture declares `(memory 1)` — one 64 KiB
+/// page — so `mem_size` is exactly 65536, and its owning process is alive until `stop`.
+/// This is the contract the `dance` metrics path relies on to attribute a WASM instance's
+/// footprint instead of reporting 0.
+pub fn mem_size_reports_guest_linear_memory_test() {
+  let assert Ok(wasm) = simplifile.read_bits("test/twocore/fixtures/poke.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(instance) = embed.instantiate(compiled, no_host)
+
+  // One declared page of linear memory → 64 KiB, read from inside the guest process.
+  embed.mem_size(instance) |> should.equal(65_536)
+  // The owning process is live while the instance is.
+  embed.guest_pid(instance) |> process.is_alive |> should.be_true
+
+  embed.stop(instance)
+}
+
+/// A guest that declares NO memory reports a `mem_size` of 0 (rather than crashing) — the
+/// memory-less path the RPC guards. Uses the canonical `add` corpus module.
+pub fn mem_size_zero_for_memoryless_guest_test() {
+  let assert Ok(wasm) =
+    simplifile.read_bits("test/twocore/conformance/corpus/add.wasm")
+  let assert Ok(compiled) = embed.compile(wasm)
+  let no_host = fn(_capability, _name, _args) { [] }
+  let assert Ok(instance) = embed.instantiate(compiled, no_host)
+  embed.mem_size(instance) |> should.equal(0)
+  embed.stop(instance)
+}
+
 /// A guest with NO imports compiles, instantiates, and invokes through the embed API — the
 /// non-import path stays intact (regression). Uses the canonical `add` corpus module.
 pub fn no_import_guest_invokes_test() {

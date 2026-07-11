@@ -302,6 +302,26 @@ pub fn stop_instance(proc: InstanceProc) -> Nil {
   ffi_stop_instance(pid)
 }
 
+/// The Pid of an instance's owned process — the process that holds its linear memory,
+/// globals and tables (one-instance-one-process). Exposed so an embedder can attribute
+/// the guest's real resource usage (`erlang:process_info` — reductions, memory, mailbox)
+/// EXTERNALLY, without messaging the guest. Total.
+pub fn instance_pid(proc: InstanceProc) -> Pid {
+  let InstanceProc(pid) = proc
+  pid
+}
+
+/// Ask an instance's owned process for memory 0's current size, in 64 KiB pages
+/// (`memory.size`), read IN that process so it reflects the guest's real linear-memory
+/// footprint (the per-instance memory cell/record is process-local). A guest with no
+/// memory reports 0. This RPCs the guest process (it serialises behind any in-flight
+/// invoke), so prefer `instance_pid` + `process_info` for a periodic external snapshot
+/// and reserve this for an on-demand probe. Total.
+pub fn mem_size_instance(proc: InstanceProc) -> Int {
+  let InstanceProc(pid) = proc
+  ffi_mem_size(pid)
+}
+
 /// **Embedder host injection** — instantiate `beam` (whose IR is `m`) with the EMBEDDER's own
 /// function-import closures, so a host BEAM program (e.g. the `dance` platform) provides the
 /// guest's `(import "cap" "name" (func …))` imports as native Gleam behaviour.
@@ -486,6 +506,12 @@ fn ffi_porffor_output(proc: Pid) -> BitArray
 /// Ask an instance's owned process to exit (cell GC'd with it).
 @external(erlang, "twocore_cli_ffi", "stop_instance")
 fn ffi_stop_instance(proc: Pid) -> Nil
+
+/// Ask an instance's owned process for memory 0's size in 64 KiB pages, read THERE (the
+/// memory cell/record is process-local). `0` for a memory-less guest. Backs
+/// `mem_size_instance`.
+@external(erlang, "twocore_cli_ffi", "mem_size")
+fn ffi_mem_size(proc: Pid) -> Int
 
 /// Read the module name baked into a `.beam` binary (so a prebuilt `.beam` can be loaded even
 /// when its filename differs from its module name). `Ok(name)` / `Error(reason)`.
