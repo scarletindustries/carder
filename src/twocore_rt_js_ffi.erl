@@ -94,7 +94,7 @@
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
     object_rest/2, object_freeze/1, object_is_frozen/1,
     object_from_entries/1,
-    json_stringify/1, json_parse/1,
+    json_stringify/3, json_parse/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -3455,14 +3455,117 @@ excluded_keys(_) ->
 
 %% ── JSON ─────────────────────────────────────────────────
 
-%% JSON.stringify(v) — a JSON binary, or `undefined` for undefined/function/other.
-json_stringify(V) ->
-    case json_enc(V) of
+%% JSON.stringify(value, replacer, space) — a JSON binary, or `undefined` when the
+%% root value serializes to nothing (undefined / a function / a symbol).
+%%
+%% `replacer` follows the spec (sec-json.stringify):
+%%   * a callable replacer is applied to every (key, value) pair and its result is
+%%     serialized in place;
+%%   * an Array replacer is a PropertyList — the ONLY keys emitted for objects, in
+%%     the array's order (String/Number entries only; duplicates and other types
+%%     ignored);
+%%   * anything else is treated as no replacer.
+%% `space` sets the indentation gap: a Number N yields min(10, floor(N)) spaces
+%% (0/negative → none); a String yields its first 10 code units; else none.
+%% Deviation: `this`-bound `toJSON`/replacer receivers and String/Number/Boolean
+%% wrapper objects are not modelled (this runtime has no such wrappers).
+json_stringify(V, Replacer, Space) ->
+    {RepFn, PropList} = json_replacer(Replacer),
+    Gap = json_gap(Space),
+    St = {RepFn, PropList, Gap},
+    %% SerializeJSONProperty(the empty String, {"": value}).
+    case json_serialize_prop(<<"">>, {root, V}, St, <<"">>) of
         skip -> undefined;
         Io -> iolist_to_binary(Io)
     end.
 
-json_enc(V) ->
+%% Split the replacer argument into {ReplacerFunction, PropertyList}. Exactly one
+%% is non-`undefined` (a callable replacer OR an Array); other values → both
+%% `undefined` (no filtering, no transform).
+json_replacer(R) when is_function(R) -> {R, undefined};
+json_replacer(R) when is_reference(R) ->
+    case erlang:get(?CELL_KEY(R)) of
+        {js_array, Len, Map} -> {undefined, json_proplist(arr_list(Len, Map))};
+        _ -> {undefined, undefined}
+    end;
+json_replacer(_) -> {undefined, undefined}.
+
+%% Build the PropertyList from an Array replacer's elements: keep String and
+%% Number entries (Numbers via ToString), skip everything else, and drop
+%% duplicates while preserving first-seen order (sec-json.stringify step 5.b).
+json_proplist(Elems) ->
+    lists:foldl(
+        fun(V, Acc) ->
+            case json_prop_item(V) of
+                undefined ->
+                    Acc;
+                Item ->
+                    case lists:member(Item, Acc) of
+                        true -> Acc;
+                        false -> Acc ++ [Item]
+                    end
+            end
+        end,
+        [],
+        Elems
+    ).
+
+json_prop_item(V) when is_binary(V) -> V;
+json_prop_item(V) when is_integer(V) -> integer_to_binary(V);
+json_prop_item(V) when is_float(V) -> to_string(V);
+json_prop_item(js_nan) -> <<"NaN">>;
+json_prop_item(js_inf) -> <<"Infinity">>;
+json_prop_item(js_neg_inf) -> <<"-Infinity">>;
+json_prop_item(_) -> undefined.
+
+%% The indentation gap for `space`. Numbers clamp to [0,10] spaces (floor toward
+%% zero); Strings contribute their first 10 code units; other types → no gap.
+json_gap(N) when is_integer(N) -> json_gap_spaces(N);
+json_gap(N) when is_float(N) -> json_gap_spaces(trunc(N));
+json_gap(js_inf) -> binary:copy(<<" ">>, 10);
+json_gap(js_neg_inf) -> <<>>;
+json_gap(js_nan) -> <<>>;
+json_gap(S) when is_binary(S) -> from_cps(lists:sublist(cps(S), 10));
+json_gap(_) -> <<>>.
+
+json_gap_spaces(N) when N >= 1 -> binary:copy(<<" ">>, min(10, N));
+json_gap_spaces(_) -> <<>>.
+
+%% SerializeJSONProperty(key, holder): read holder[key] (invoking any getter), let
+%% a callable `toJSON` and the replacer function transform it, then serialize by
+%% type. Returns an iolist, or `skip` when the value produces no JSON text.
+json_serialize_prop(Key, Holder, {RepFn, _, _} = St, Indent) ->
+    Value0 = json_get(Holder, Key),
+    Value1 = json_apply_tojson(Key, Value0),
+    Value2 =
+        case RepFn of
+            undefined -> Value1;
+            _ -> call_cb(RepFn, [Key, Value1])
+        end,
+    json_serialize_value(Value2, St, Indent).
+
+%% Get(holder, key). The root holder is the synthetic wrapper {"": value}; every
+%% other holder is a live object/array cell, so getters and deletions observed
+%% mid-serialization are honoured.
+json_get({root, V}, _Key) -> V;
+json_get(Holder, Key) -> get_prop(Holder, Key).
+
+%% If `value` is an object exposing a callable own `toJSON`, replace it with
+%% `toJSON(key)`; otherwise leave it unchanged (sec-serializejsonproperty step 2).
+json_apply_tojson(Key, V) when is_reference(V) ->
+    case erlang:get(?CELL_KEY(V)) of
+        M when is_map(M) ->
+            case resolve_get(maps:get(<<"toJSON">>, M, undefined)) of
+                Fn when is_function(Fn) -> call_cb(Fn, [Key]);
+                _ -> V
+            end;
+        _ ->
+            V
+    end;
+json_apply_tojson(_Key, V) ->
+    V.
+
+json_serialize_value(V, St, Indent) ->
     case js_type(V) of
         number -> json_num(V);
         boolean -> to_string(V);
@@ -3470,7 +3573,7 @@ json_enc(V) ->
         null -> <<"null">>;
         undefined -> skip;
         function -> skip;
-        object -> json_ref(V);
+        object -> json_serialize_cell(V, St, Indent);
         other -> skip
     end.
 
@@ -3502,40 +3605,75 @@ unicode_escape(B) ->
     Pad = binary:copy(<<"0">>, 4 - byte_size(H)),
     <<"\\u", Pad/binary, H/binary>>.
 
-json_ref(Ref) ->
+%% Serialize an object/array cell. Arrays and plain objects recurse; every other
+%% cell kind (regex, Map, Set, …) has no enumerable own properties and renders as
+%% an empty object `{}`, matching JSON.stringify on an ordinary object.
+json_serialize_cell(Ref, St, Indent) ->
     case erlang:get(?CELL_KEY(Ref)) of
-        {js_array, Len, Map} ->
-            json_arr(arr_list(Len, Map));
-        M when is_map(M) ->
-            %% resolve getters so serialization sees the produced value.
-            json_obj([{K, resolve_get(V)} || {K, V} <- maps:to_list(M)]);
-        _ ->
-            skip
+        {js_array, Len, _Map} -> json_serialize_array(Ref, Len, St, Indent);
+        M when is_map(M) -> json_serialize_object(Ref, M, St, Indent);
+        _ -> <<"{}">>
     end.
 
-json_arr(List) ->
-    Elems = [json_elem(E) || E <- List],
-    [$[, lists:join($,, Elems), $]].
+%% SerializeJSONArray: each index is serialized via SerializeJSONProperty (so the
+%% replacer/toJSON run per element); an element that produces no text becomes
+%% `null`. With a gap, elements are placed one per line indented one level deeper.
+json_serialize_array(_Ref, 0, _St, _Indent) ->
+    <<"[]">>;
+json_serialize_array(Ref, Len, {_, _, Gap} = St, Indent) ->
+    Indent2 = <<Indent/binary, Gap/binary>>,
+    Elems = [json_array_elem(Ref, I, St, Indent2) || I <- lists:seq(0, Len - 1)],
+    json_wrap($[, $], Elems, Gap, Indent, Indent2).
 
-%% array elements that don't serialize (undefined/function) become null.
-json_elem(E) ->
-    case json_enc(E) of
+json_array_elem(Ref, I, St, Indent2) ->
+    case json_serialize_prop(integer_to_binary(I), Ref, St, Indent2) of
         skip -> <<"null">>;
         Io -> Io
     end.
 
-json_obj(Pairs) ->
-    KVs =
-        lists:filtermap(
-            fun({K, Val}) ->
-                case json_enc(Val) of
-                    skip -> false;
-                    Io -> {true, [json_str(K), $:, Io]}
-                end
-            end,
-            Pairs
-        ),
-    [${, lists:join($,, KVs), $}].
+%% SerializeJSONObject. The key set is the replacer's PropertyList when present,
+%% otherwise the object's own enumerable string keys. Each key is serialized via
+%% SerializeJSONProperty (re-reading holder[key], so a getter that mutates a
+%% sibling is observed); keys producing no text are omitted.
+json_serialize_object(Ref, M, {_, PropList, Gap} = St, Indent) ->
+    Keys =
+        case PropList of
+            undefined -> [K || {K, _} <- maps:to_list(M)];
+            _ -> PropList
+        end,
+    Indent2 = <<Indent/binary, Gap/binary>>,
+    Colon =
+        case Gap of
+            <<>> -> $:;
+            _ -> <<": ">>
+        end,
+    Members = json_object_members(Ref, Keys, St, Indent2, Colon),
+    json_wrap(${, $}, Members, Gap, Indent, Indent2).
+
+json_object_members(_Ref, [], _St, _Indent2, _Colon) ->
+    [];
+json_object_members(Ref, [K | Ks], St, Indent2, Colon) ->
+    case json_serialize_prop(K, Ref, St, Indent2) of
+        skip ->
+            json_object_members(Ref, Ks, St, Indent2, Colon);
+        Io ->
+            [
+                [json_str(K), Colon, Io]
+                | json_object_members(Ref, Ks, St, Indent2, Colon)
+            ]
+    end.
+
+%% Wrap the serialized members between `Open`/`Close`. Without a gap the members
+%% are comma-joined on one line; with a gap each sits on its own line indented by
+%% `Indent2`, and the close bracket returns to `Indent`. An empty collection is
+%% always the bare `Open Close` pair.
+json_wrap(Open, Close, [], _Gap, _Indent, _Indent2) ->
+    [Open, Close];
+json_wrap(Open, Close, Members, <<>>, _Indent, _Indent2) ->
+    [Open, lists:join($,, Members), Close];
+json_wrap(Open, Close, Members, _Gap, Indent, Indent2) ->
+    Sep = [$,, $\n, Indent2],
+    [Open, $\n, Indent2, lists:join(Sep, Members), $\n, Indent, Close].
 
 %% JSON.parse(str) — parse JSON text to JS terms (numbers, binaries, true/false/null,
 %% arrays, objects). Malformed input is a type_error.

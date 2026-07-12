@@ -3041,6 +3041,65 @@ pub fn json_parse_escapes_test() {
   num("JSON.parse('\"\\\\uD83D\\\\uDE00\"').length") |> should.equal(1.0)
 }
 
+pub fn json_stringify_replacer_array_test() {
+  // An Array replacer is a PropertyList: object serialization emits ONLY those
+  // keys, in the ARRAY's order — independent of the object (sec-json.stringify
+  // SerializeJSONObject step 5). An empty array collapses any object to `{}`.
+  val("JSON.stringify({a: 1, b: 2}, [])") |> should.equal(dyn(<<"{}">>))
+  val("JSON.stringify({b: 1, a: 2, c: 3}, [\"c\", \"b\", \"a\"])")
+  |> should.equal(dyn(<<"{\"c\":3,\"b\":1,\"a\":2}">>))
+  // undefined entries are ignored; a listed key absent from the object is dropped.
+  val("JSON.stringify({key: 1, other: 2}, [undefined, \"key\"])")
+  |> should.equal(dyn(<<"{\"key\":1}">>))
+  // Number entries are coerced to their string key form.
+  val("JSON.stringify({\"1\": \"x\"}, [1])")
+  |> should.equal(dyn(<<"{\"1\":\"x\"}">>))
+}
+
+pub fn json_stringify_replacer_function_test() {
+  // A whole-value replacer returning undefined makes stringify yield undefined;
+  // per-property it omits object members and nulls array elements
+  // (sec-serializejsonproperty step 3).
+  val("JSON.stringify(1, function() {})")
+  |> should.equal(dyn(atom.create("undefined")))
+  val("JSON.stringify([1], function(k, v) { return v === 1 ? undefined : v; })")
+  |> should.equal(dyn(<<"[null]">>))
+  val(
+    "JSON.stringify({prop: 1}, function(k, v) { return v === 1 ? undefined : v; })",
+  )
+  |> should.equal(dyn(<<"{}">>))
+  // The replacer runs on the RESULT of toJSON (step 2 then step 3).
+  val(
+    "JSON.stringify({toJSON: function() { return \"toJSON\"; }}, function(k, v) { return v + \"|replacer\"; })",
+  )
+  |> should.equal(dyn(<<"\"toJSON|replacer\"">>))
+}
+
+pub fn json_stringify_tojson_test() {
+  // A callable own toJSON is invoked and its result serialized; a non-callable
+  // toJSON stays an ordinary own property (sec-serializejsonproperty step 2).
+  val("JSON.stringify({toJSON: function() { return \"hi\"; }})")
+  |> should.equal(dyn(<<"\"hi\"">>))
+  val("JSON.stringify({toJSON: null})")
+  |> should.equal(dyn(<<"{\"toJSON\":null}">>))
+  val("JSON.stringify({toJSON: false})")
+  |> should.equal(dyn(<<"{\"toJSON\":false}">>))
+}
+
+pub fn json_stringify_space_test() {
+  // A numeric space indents each nesting level by that many spaces; a string
+  // space uses the string itself as the gap; 0/empty means no whitespace and
+  // members use `"k": v` with a single space after the colon (sec-json.stringify).
+  val("JSON.stringify({a: 1}, null, 2)")
+  |> should.equal(dyn(<<"{\n  \"a\": 1\n}">>))
+  val("JSON.stringify([1, 2], null, 2)")
+  |> should.equal(dyn(<<"[\n  1,\n  2\n]">>))
+  val("JSON.stringify({a: 1}, null, \"\\t\")")
+  |> should.equal(dyn(<<"{\n\t\"a\": 1\n}">>))
+  val("JSON.stringify({a: 1}, null, 0)")
+  |> should.equal(dyn(<<"{\"a\":1}">>))
+}
+
 pub fn parse_float_forms_test() {
   num("parseFloat('1e3')") |> should.equal(1000.0)
   num("parseFloat('.5')") |> should.equal(0.5)
