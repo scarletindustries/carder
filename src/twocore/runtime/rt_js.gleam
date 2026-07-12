@@ -346,7 +346,7 @@ pub fn array_from_map(x: Dynamic, map_fn: Dynamic) -> Dynamic
 
 /// `arr.flat()` — flatten one level.
 @external(erlang, "twocore_rt_js_ffi", "array_flat")
-pub fn array_flat(arr: Dynamic) -> Dynamic
+pub fn array_flat(arr: Dynamic, depth: Dynamic) -> Dynamic
 
 /// `arr.fill(v, start, end)` — set elements in `[start, end)` to `v` in place
 /// (defaults: start 0, end length); returns the array.

@@ -1482,6 +1482,17 @@ pub fn array_from_flat_test() {
   num("[1, [2, 3], 4].flat()[2]") |> should.equal(3.0)
 }
 
+pub fn array_flat_depth_test() {
+  // flat honours a depth argument; Infinity fully flattens, and the default is 1.
+  let m =
+    compile(
+      "function f() { let a = [1, [2, [3, [4]]]]; "
+      <> "return a.flat(Infinity).join('') + '/' + a.flat(2).length + '/' + a.flat().length; }",
+    )
+  // full flatten → "1234"; depth 2 → [1,2,3,[4]] length 4; depth 1 → [1,2,[3,[4]]] length 3
+  call(m, "f", []) |> should.equal(dyn(<<"1234/4/3">>))
+}
+
 pub fn array_fill_at_test() {
   let m = compile("function f() { let a = [1, 2, 3]; a.fill(0); return a[1]; }")
   to_float(call(m, "f", [])) |> should.equal(0.0)

@@ -66,7 +66,7 @@
     new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
-    array_from/1, array_from_map/2, array_flat/1, array_fill/4, array_at/2,
+    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_at/2,
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
@@ -1308,9 +1308,42 @@ amap_from(_Fn, [], _I) -> [];
 amap_from(Fn, [E | Es], I) -> [call_cb(Fn, [E, I]) | amap_from(Fn, Es, I + 1)].
 
 %% arr.flat() — flatten one level (array elements are spread in).
-array_flat(Recv) ->
+%% arr.flat(depth) — flatten nested arrays up to `depth` levels. Depth defaults to
+%% 1; a provided value is ToIntegerOrInfinity (so flat(Infinity) fully flattens,
+%% flat(0)/flat(NaN) copies one level unchanged).
+array_flat(Recv, Depth) ->
+    D =
+        case Depth of
+            undefined ->
+                1;
+            _ ->
+                case coerce_num(Depth) of
+                    nan -> 0;
+                    inf -> inf;
+                    neg_inf -> 0;
+                    N -> max(0, trunc(as_float(N)))
+                end
+        end,
     {Len, Map} = arr_content(Recv),
-    new_array(lists:flatmap(fun flat_one/1, arr_list(Len, Map))).
+    new_array(flat_depth(arr_list(Len, Map), D)).
+
+flat_depth(List, 0) -> List;
+flat_depth(List, D) -> lists:flatmap(fun(E) -> flat_elem(E, D) end, List).
+
+flat_elem(E, D) ->
+    case is_array(E) of
+        1 ->
+            {L, M} = arr_content(E),
+            flat_depth(arr_list(L, M), dec_depth(D));
+        0 ->
+            [E]
+    end.
+
+dec_depth(inf) -> inf;
+dec_depth(D) -> D - 1.
+
+%% Flatten one level: an array contributes its elements, anything else itself.
+%% (Used by flatMap, which flattens the mapped results by exactly one level.)
 flat_one(E) ->
     case is_array(E) of
         1 ->
@@ -1319,7 +1352,6 @@ flat_one(E) ->
         0 ->
             [E]
     end.
-
 %% arr.fill(v) — set every element to v (in place); returns the array.
 %% arr.fill(value, start, end) — fill indices [start, end) with `value` and return
 %% the array. start/end are ToIntegerOrInfinity, clamped to [0, len] with negatives

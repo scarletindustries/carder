@@ -4792,7 +4792,8 @@ fn lower_instance_method(
       ))
     }
     "reverse", _ -> host("array_reverse", [])
-    "flat", _ -> host("array_flat", [])
+    "flat", [d, ..] -> host("array_flat", [d])
+    "flat", [] -> host("array_flat", [undefined()])
     "fill", [v, s, e, ..] -> host("array_fill", [v, s, e])
     "fill", [v, s] -> host("array_fill", [v, s, undefined()])
     "fill", [v] -> host("array_fill", [v, undefined(), undefined()])
