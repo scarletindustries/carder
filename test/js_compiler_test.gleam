@@ -1696,6 +1696,27 @@ pub fn from_code_point_test() {
   num("String.fromCodePoint(128512).length") |> should.equal(1.0)
 }
 
+pub fn logical_assign_test() {
+  // ||= assigns only when the current value is falsy.
+  num("(function(){ let x = 0; x ||= 5; return x; })()") |> should.equal(5.0)
+  num("(function(){ let x = 3; x ||= 5; return x; })()") |> should.equal(3.0)
+  // &&= assigns only when truthy.
+  num("(function(){ let x = 3; x &&= 7; return x; })()") |> should.equal(7.0)
+  num("(function(){ let x = 0; x &&= 7; return x; })()") |> should.equal(0.0)
+  // ??= assigns only when null/undefined — 0 is NOT nullish.
+  num("(function(){ let x = 0; x ??= 5; return x; })()") |> should.equal(0.0)
+  num("(function(){ let x; x ??= 5; return x; })()") |> should.equal(5.0)
+  // short-circuit: the rhs is not evaluated when the guard fails.
+  num("(function(){ let x = 1; let n = 0; x ||= (n = 9); return n; })()")
+  |> should.equal(0.0)
+  // member target: obj.p ??= v assigns once, then leaves the set value.
+  num("(function(){ let o = {}; o.a ??= 10; o.a ??= 20; return o.a; })()")
+  |> should.equal(10.0)
+  // member ||= writes through when the current property value is falsy.
+  num("(function(){ let o = { a: 0 }; o.a ||= 42; return o.a; })()")
+  |> should.equal(42.0)
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {

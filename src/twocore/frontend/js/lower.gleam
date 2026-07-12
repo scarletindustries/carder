@@ -19,7 +19,8 @@
 //// `+ - * / %`, all comparisons, `&& || ! ??`, bitwise/shift `& | ^ ~ << >> >>>`, unary
 //// `- + ! ~ typeof void delete`, `in`, `instanceof`, comma `,`, `?:`, optional chaining
 //// `?.`; `let/const/var`, `= += -= *= /=
-//// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
+//// %= **= &= |= ^= <<= >>= >>>=`, logical assignment `&&= ||= ??=`, and `++`/`--`;
+//// `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue` (incl. labeled `break outer`/`continue outer`),
 //// `return`, blocks; array/object destructuring (incl. nested) in `let`/`const`/`var`;
 //// objects
@@ -2143,6 +2144,21 @@ fn lower_assign(
           let pre = list.flatten([bo, bk, bv])
           Ok(bind_after(pre, ir.CallHost("js", "set_prop", [o, key, v]), ctr))
         }
+        // logical `obj.p ||= e` / `&&=` / `??=` — short-circuit: read obj.p once,
+        // and only evaluate `e` + assign when the guard says so.
+        ast.LogicalOrAssign
+        | ast.LogicalAndAssign
+        | ast.NullishCoalesceAssign ->
+          lower_member_logical_assign(
+            op,
+            o,
+            key,
+            right,
+            list.flatten([bo, bk]),
+            env,
+            ctx,
+            ctr,
+          )
         // compound `obj.p op= e` → set_prop(o, key, get_prop(o, key) op e). Order:
         // object, key, read, rhs — matching JS reference/GetValue/rhs evaluation.
         _ -> {
@@ -2170,6 +2186,49 @@ fn lower_assign(
     }
     _ -> Error(Unsupported("assignment target"))
   }
+}
+
+/// Lower a logical assignment to a member target: `obj.p ||= e` / `&&=` / `??=`.
+///
+/// `o` and `key` are the already-once-evaluated object and property key. The
+/// current value is read once (`get_prop`); the rhs `e` and the write are placed
+/// INSIDE the branch selected by the guard, so `e` runs (and the property is
+/// assigned) only when JS would: `||=` when falsy, `&&=` when truthy, `??=` when
+/// nullish. The expression's value is the property's resulting value.
+fn lower_member_logical_assign(
+  op: ast.AssignmentOp,
+  o: ir.Value,
+  key: ir.Value,
+  right: ast.Expression,
+  pre: List(Bind),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  let #(bcur, cur, ctr) =
+    bind_after(pre, ir.CallHost("js", "get_prop", [o, key]), ctr)
+  use #(be, ev, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
+  let assign_branch = emit_lets(be, ir.CallHost("js", "set_prop", [o, key, ev]))
+  let cur_branch = ir.Values([cur])
+  let #(guard_op, then_b, else_b) = case op {
+    ast.LogicalAndAssign -> #("truthy", assign_branch, cur_branch)
+    ast.NullishCoalesceAssign -> #("is_nullish", assign_branch, cur_branch)
+    // LogicalOrAssign
+    _ -> #("truthy", cur_branch, assign_branch)
+  }
+  let #(tvar, ctr) = fresh(ctr)
+  let expr =
+    ir.Let(
+      [tvar],
+      ir.CallHost("js", guard_op, [cur]),
+      ir.If(
+        cond: ir.Var(tvar),
+        result: [ir.TTerm],
+        then_branch: then_b,
+        else_branch: else_b,
+      ),
+    )
+  Ok(bind_after(bcur, expr, ctr))
 }
 
 /// Apply a compound-assignment arithmetic operator (`+= -= *= /= %=`) to two lowered
@@ -2236,7 +2295,15 @@ fn desugar_compound(
       Ok(ast.BinaryExpression(sp, ast.UnsignedRightShift, left, right))
     ast.ExponentiationAssign ->
       Ok(ast.BinaryExpression(sp, ast.Exponentiation, left, right))
-    _ -> Error(Unsupported("compound assignment operator"))
+    // Logical assignment (§13.15.2): `x ||= e` etc. For a plain variable target
+    // (no setters in this runtime) these are observationally `x = (x || e)` with
+    // the rhs short-circuited, so desugar to the short-circuiting logical form.
+    ast.LogicalOrAssign ->
+      Ok(ast.LogicalExpression(sp, ast.LogicalOr, left, right))
+    ast.LogicalAndAssign ->
+      Ok(ast.LogicalExpression(sp, ast.LogicalAnd, left, right))
+    ast.NullishCoalesceAssign ->
+      Ok(ast.LogicalExpression(sp, ast.NullishCoalescing, left, right))
   }
 }
 
