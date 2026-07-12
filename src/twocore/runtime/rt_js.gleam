@@ -578,6 +578,14 @@ pub fn str_char_at(str: Dynamic, i: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "str_char_code_at")
 pub fn str_char_code_at(str: Dynamic, i: Dynamic) -> Dynamic
 
+/// `str.codePointAt(i)` → the code point as a number, or `undefined` out of range.
+@external(erlang, "twocore_rt_js_ffi", "str_code_point_at")
+pub fn str_code_point_at(str: Dynamic, i: Dynamic) -> Dynamic
+
+/// `str.normalize(form)` — Unicode normalization (NFC default; NFD/NFKC/NFKD).
+@external(erlang, "twocore_rt_js_ffi", "str_normalize")
+pub fn str_normalize(str: Dynamic, form: Dynamic) -> Dynamic
+
 /// `str.toUpperCase()`.
 @external(erlang, "twocore_rt_js_ffi", "str_upper")
 pub fn str_upper(str: Dynamic) -> Dynamic

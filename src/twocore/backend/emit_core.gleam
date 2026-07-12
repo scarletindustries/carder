@@ -4274,6 +4274,8 @@ fn resolve_js(op: String) -> Option(String) {
     // strings
     "str_char_at" -> Some("str_char_at")
     "str_char_code_at" -> Some("str_char_code_at")
+    "str_code_point_at" -> Some("str_code_point_at")
+    "str_normalize" -> Some("str_normalize")
     "str_upper" -> Some("str_upper")
     "str_lower" -> Some("str_lower")
     "str_substring" -> Some("str_substring")

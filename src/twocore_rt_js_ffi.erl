@@ -82,7 +82,8 @@
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
-    str_char_at/2, str_char_code_at/2, str_upper/1, str_lower/1,
+    str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
+    str_upper/1, str_lower/1,
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
     str_trim_end/1, str_repeat/2, str_starts_with/2, str_ends_with/2,
     str_replace/3, str_replace_all/3,
@@ -1360,7 +1361,9 @@ do_pad(Str, N, Pad, Where) ->
     Target =
         case coerce_num(N) of
             nan -> 0;
-            _ -> trunc(as_float(coerce_num(N)))
+            neg_inf -> 0;
+            inf -> erlang:error({js_error, range_error, <<"Invalid string length">>});
+            Num -> trunc(as_float(Num))
         end,
     Cps = cps(Str),
     Cur = length(Cps),
@@ -2224,8 +2227,45 @@ str_char_code_at(Str, I) ->
             js_nan
     end.
 
+%% str.codePointAt(i) — like charCodeAt but the position is ToIntegerOrInfinity
+%% (undefined/NaN → 0, fractions truncated) and an out-of-range index yields
+%% `undefined` (not NaN). (In this code-point-indexed model a code point IS the code
+%% unit for BMP text; lone surrogates are unrepresentable — header deviation.)
+str_code_point_at(Str, I) ->
+    Idx =
+        case coerce_num(I) of
+            nan -> 0;
+            inf -> 16#7FFFFFFF;
+            neg_inf -> -1;
+            N -> trunc(as_float(N))
+        end,
+    Cps = cps(Str),
+    case Idx >= 0 andalso Idx < length(Cps) of
+        true -> lists:nth(Idx + 1, Cps);
+        false -> undefined
+    end.
+
 str_upper(Str) -> unicode:characters_to_binary(string:uppercase(Str)).
 str_lower(Str) -> unicode:characters_to_binary(string:lowercase(Str)).
+
+%% str.normalize(form) — Unicode normalization; form defaults to "NFC". An
+%% unrecognized form is a RangeError, per spec.
+str_normalize(Str, Form) ->
+    case norm_form(Form) of
+        nfc -> unicode:characters_to_nfc_binary(Str);
+        nfd -> unicode:characters_to_nfd_binary(Str);
+        nfkc -> unicode:characters_to_nfkc_binary(Str);
+        nfkd -> unicode:characters_to_nfkd_binary(Str);
+        error ->
+            erlang:error({js_error, range_error, <<"Invalid normalization form">>})
+    end.
+
+norm_form(undefined) -> nfc;
+norm_form(<<"NFC">>) -> nfc;
+norm_form(<<"NFD">>) -> nfd;
+norm_form(<<"NFKC">>) -> nfkc;
+norm_form(<<"NFKD">>) -> nfkd;
+norm_form(_) -> error.
 
 %% str.indexOf(sub) → first code-point index of `sub`, or -1 ("" → 0).
 str_index_of(Str, Sub) ->

@@ -4859,8 +4859,12 @@ fn lower_instance_method(
     // dispatch polymorphically in the runtime).
     "charAt", [i, ..] -> host("str_char_at", [i])
     "charCodeAt", [i, ..] -> host("str_char_code_at", [i])
-    // Strings count code POINTS in this model, so codePointAt == charCodeAt.
-    "codePointAt", [i, ..] -> host("str_char_code_at", [i])
+    // Like charCodeAt in this code-point model, but `undefined` (not NaN) when the
+    // index is out of range.
+    "codePointAt", [i, ..] -> host("str_code_point_at", [i])
+    "codePointAt", [] -> host("str_code_point_at", [undefined()])
+    "normalize", [form, ..] -> host("str_normalize", [form])
+    "normalize", [] -> host("str_normalize", [undefined()])
     "toUpperCase", _ -> host("str_upper", [])
     "toLowerCase", _ -> host("str_lower", [])
     "substring", [] -> host("str_substring", [undefined(), undefined()])

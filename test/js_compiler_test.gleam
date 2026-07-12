@@ -900,6 +900,38 @@ pub fn string_case_test() {
   call(l, "f", []) |> should.equal(dyn(<<"abc">>))
 }
 
+pub fn string_code_point_at_test() {
+  // codePointAt returns the code point, or undefined when out of range (unlike
+  // charCodeAt, which is NaN).
+  num("'abc'.codePointAt(0)") |> should.equal(97.0)
+  num("'abc'.codePointAt(2)") |> should.equal(99.0)
+  num("'abc'.codePointAt(3) === undefined ? 1 : 0") |> should.equal(1.0)
+  num("'abc'.codePointAt(-1) === undefined ? 1 : 0") |> should.equal(1.0)
+  // an omitted position defaults to 0.
+  num("'A'.codePointAt()") |> should.equal(65.0)
+}
+
+pub fn string_pad_infinity_test() {
+  // padStart/padEnd with -Infinity (or NaN/undefined) target leaves the string
+  // unchanged; it must not crash.
+  let m =
+    compile(
+      "function f() { return 'abc'.padStart(-Infinity, 'x') + '|' + 'abc'.padEnd(NaN, 'x') + '|' + 'abc'.padStart(5, 'x'); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"abc|abc|xxabc">>))
+}
+
+pub fn string_normalize_test() {
+  // Unicode normalization: composed vs decomposed forms of "é".
+  let m =
+    compile(
+      "function f() { let composed = '\\u00E9'; let decomposed = 'e\\u0301'; "
+      <> "return (composed.normalize('NFC') === decomposed.normalize('NFC') ? 1 : 0) * 10 + "
+      <> "(composed.normalize('NFD').length === 2 ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(11.0)
+}
+
 pub fn string_search_test() {
   num("\"hello\".indexOf(\"ll\")") |> should.equal(2.0)
   num("\"hello\".indexOf(\"z\")") |> should.equal(-1.0)
