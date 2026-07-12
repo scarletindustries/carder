@@ -1536,6 +1536,23 @@ pub fn rest_spread_forward_test() {
   to_float(call(m, "run", [])) |> should.equal(12.0)
 }
 
+// ── nested destructuring ─────────────────────────────────────────────────────
+
+pub fn nested_destructure_test() {
+  let m =
+    compile("function f() { let [[a, b], c] = [[1, 2], 3]; return a + b + c; }")
+  to_float(call(m, "f", [])) |> should.equal(6.0)
+  let o =
+    compile("function f() { let { p: { q } } = { p: { q: 7 } }; return q; }")
+  to_float(call(o, "f", [])) |> should.equal(7.0)
+  // object with a nested array value
+  let x =
+    compile(
+      "function f() { let { arr: [a, b] } = { arr: [10, 20] }; return a + b; }",
+    )
+  to_float(call(x, "f", [])) |> should.equal(30.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

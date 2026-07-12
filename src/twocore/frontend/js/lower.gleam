@@ -21,7 +21,8 @@
 //// `?.`; `let/const/var`, `= += -= *= /=
 //// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue` (incl. labeled `break outer`/`continue outer`),
-//// `return`, blocks; flat array/object destructuring in `let`/`const`/`var`; objects
+//// `return`, blocks; array/object destructuring (incl. nested) in `let`/`const`/`var`;
+//// objects
 //// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, and method shorthand; arrays `[…]`
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
 //// expressions, arrow functions, closures
@@ -51,7 +52,7 @@
 //// plain object).
 ////
 //// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
-//// members, nested/defaulted destructuring, `try`/`finally`, generators/async, tagged
+//// members, defaulted/rest destructuring, `try`/`finally`, generators/async, tagged
 //// templates, and `continue` inside a `do/while`. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
 //// function, is a v1 limitation. A derived
@@ -801,12 +802,6 @@ fn desugar_destructure(
       id: ast.IdentifierPattern(name: tmp, span: sp),
       init: Some(init),
     )
-  let bind = fn(name, access) {
-    ast.VariableDeclarator(
-      id: ast.IdentifierPattern(name: name, span: sp),
-      init: Some(access),
-    )
-  }
   case pattern {
     ast.ArrayPattern(elements:) -> {
       let indexed = list.index_map(elements, fn(el, i) { #(el, i) })
@@ -815,7 +810,13 @@ fn desugar_destructure(
           let #(el, i) = pair
           case el {
             None -> Ok(acc)
-            Some(ast.IdentifierPattern(name:, ..)) -> {
+            Some(ast.AssignmentPattern(..)) ->
+              Error(Unsupported("defaulted destructuring element"))
+            Some(ast.RestElement(..)) ->
+              Error(Unsupported("rest element in a destructuring pattern"))
+            // any binding pattern (identifier OR nested array/object) — a nested one is
+            // re-desugared by `lower_var_decls` when it processes this declarator.
+            Some(pat) -> {
               let access =
                 ast.MemberExpression(
                   span: sp,
@@ -823,10 +824,12 @@ fn desugar_destructure(
                   property: ast.NumberLiteral(span: sp, value: int.to_float(i)),
                   computed: True,
                 )
-              Ok(list.append(acc, [bind(name, access)]))
+              Ok(
+                list.append(acc, [
+                  ast.VariableDeclarator(id: pat, init: Some(access)),
+                ]),
+              )
             }
-            Some(_) ->
-              Error(Unsupported("nested/defaulted array destructuring"))
           }
         }),
       )
@@ -836,12 +839,10 @@ fn desugar_destructure(
       use decls <- result_try(
         list.try_map(properties, fn(p) {
           case p {
-            ast.PatternProperty(
-              key:,
-              value: ast.IdentifierPattern(name:, ..),
-              computed:,
-              ..,
-            ) -> {
+            ast.PatternProperty(value: ast.AssignmentPattern(..), ..) ->
+              Error(Unsupported("defaulted object destructuring"))
+            // any binding pattern for the value — a nested one re-desugars.
+            ast.PatternProperty(key:, value: valpat, computed:, ..) -> {
               let access =
                 ast.MemberExpression(
                   span: sp,
@@ -849,9 +850,10 @@ fn desugar_destructure(
                   property: key,
                   computed: computed,
                 )
-              Ok(bind(name, access))
+              Ok(ast.VariableDeclarator(id: valpat, init: Some(access)))
             }
-            _ -> Error(Unsupported("nested/rest object destructuring"))
+            ast.RestProperty(..) ->
+              Error(Unsupported("rest element in object destructuring"))
           }
         }),
       )
