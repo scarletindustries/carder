@@ -1482,6 +1482,60 @@ pub fn method_delegation_test() {
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
 
+// ── call spread ──────────────────────────────────────────────────────────────
+
+pub fn call_spread_test() {
+  num("Math.max(...[3, 1, 4, 1, 5])") |> should.equal(5.0)
+  let m =
+    compile(
+      "function add3(a, b, c) { return a + b + c; } function run() { let args = [10, 20, 30]; return add3(...args); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(60.0)
+  // mixed regular arg + spread
+  let x =
+    compile(
+      "function f(a, b, c) { return a * 100 + b * 10 + c; } function run() { return f(1, ...[2, 3]); }",
+    )
+  to_float(call(x, "run", [])) |> should.equal(123.0)
+  // spread into a closure
+  let c =
+    compile(
+      "function run() { let f = (a, b, c) => a + b + c; return f(...[1, 2, 3]); }",
+    )
+  to_float(call(c, "run", [])) |> should.equal(6.0)
+}
+
+// ── rest parameters ──────────────────────────────────────────────────────────
+
+pub fn rest_params_test() {
+  let m =
+    compile(
+      "function sum(...nums) { let t = 0; for (let n of nums) { t += n; } return t; } function run() { return sum(1, 2, 3, 4); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(10.0)
+  // a fixed param followed by rest
+  let f =
+    compile(
+      "function g(a, ...rest) { return a * 100 + rest.length; } function run() { return g(1, 2, 3, 4); }",
+    )
+  to_float(call(f, "run", [])) |> should.equal(103.0)
+  // empty rest
+  let e =
+    compile(
+      "function g(...args) { return args.length; } function run() { return g(); }",
+    )
+  to_float(call(e, "run", [])) |> should.equal(0.0)
+}
+
+pub fn rest_spread_forward_test() {
+  // collect args with rest, forward them with spread
+  let m =
+    compile(
+      "function inner(a, b) { return a + b; } function wrap(...args) { return inner(...args); } function run() { return wrap(5, 7); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(12.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

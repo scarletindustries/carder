@@ -4203,6 +4203,8 @@ fn resolve_js(op: String) -> Option(String) {
     "array_pop" -> Some("array_pop")
     "is_array" -> Some("is_array")
     "array_spread_into" -> Some("array_spread_into")
+    "apply_fn" -> Some("apply_fn")
+    "array_to_list" -> Some("array_to_list")
     "array_from" -> Some("array_from")
     "array_flat" -> Some("array_flat")
     "array_fill" -> Some("array_fill")

@@ -66,6 +66,7 @@
     new_object/0, get_prop/2, set_prop/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
+    apply_fn/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/2, num_to_fixed/2,
@@ -1311,6 +1312,17 @@ repl_scan(<<"$&", R/binary>>) -> [<<"\\0">> | repl_scan(R)];
 repl_scan(<<$$, D, R/binary>>) when D >= $0, D =< $9 -> [$\\, D | repl_scan(R)];
 repl_scan(<<C, R/binary>>) -> [C | repl_scan(R)];
 repl_scan(<<>>) -> [].
+
+%% Apply a JS function value to a runtime-length argument list (behind call spread
+%% `f(...args)`); arity-adaptive like a callback.
+apply_fn(F, Args) when is_function(F) -> call_cb(F, Args);
+apply_fn(F, _Args) -> not_callable(F).
+
+%% The array's elements as a plain Erlang list (behind call spread into a variadic
+%% sink like `console.log(...xs)` or building a spread argument list).
+array_to_list(Recv) ->
+    {Len, Map} = arr_content(Recv),
+    arr_list(Len, Map).
 
 %% Spread `...value` into `target` (in place): an array contributes its elements, a
 %% string its characters. Behind array-literal spread `[...a]`.

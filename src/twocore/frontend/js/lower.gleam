@@ -13,9 +13,9 @@
 //// guarded arithmetic).
 ////
 //// Supported subset (v1): top-level `function` declarations (recursion, mutual
-//// recursion, calls, default parameters, and under-/over-application — a missing
-//// argument arrives as `undefined`); number/string/boolean/null/undefined/template
-//// literals;
+//// recursion, calls, default + rest parameters, call spread `f(...a)`, and under-/
+//// over-application — a missing argument arrives as `undefined`); number/string/
+//// boolean/null/undefined/template literals;
 //// `+ - * / %`, all comparisons, `&& || ! ??`, bitwise/shift `& | ^ ~ << >> >>>`, unary
 //// `- + ! ~ typeof void delete`, `in`, `instanceof`, comma `,`, `?:`, optional chaining
 //// `?.`; `let/const/var`, `= += -= *= /=
@@ -51,9 +51,10 @@
 //// plain object).
 ////
 //// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
-//// members, nested/defaulted destructuring, call spread `f(...a)`, rest params,
-//// `try`/`finally`, generators/async, tagged templates, and `continue` inside a
-//// `do/while`. (A derived
+//// members, nested/defaulted destructuring, `try`/`finally`, generators/async, tagged
+//// templates, and `continue` inside a `do/while`. (Rest params and call spread apply to
+//// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
+//// function, is a v1 limitation. A derived
 //// class needs an explicit constructor that calls `super(…)`; field initializers run
 //// before `super()` rather than after — v1 ordering simplifications. A regular function
 //// EXPRESSION captures `this` lexically like an arrow. `JSON`/`Object.keys` key order
@@ -156,6 +157,9 @@ type Ctx {
   Ctx(
     funcs: List(String),
     fn_arity: Dict(String, Int),
+    // top-level functions with a rest param → their FIXED param count (a call bundles
+    // the trailing args into the rest array passed as the last parameter).
+    fn_rest: Dict(String, Int),
     classes: Dict(String, ClassInfo),
     // the superclass name while lowering a class's constructor/methods (for `super`).
     current_super: Option(String),
@@ -206,10 +210,20 @@ pub fn program(
   use lambdas <- result_try(collect_lambdas(scan, fn_names))
   let fn_arity =
     dict.from_list(list.map(decls, fn(d) { #(d.0, list.length(d.1)) }))
+  let fn_rest =
+    dict.from_list(
+      list.filter_map(decls, fn(d) {
+        case list.last(d.1) {
+          Ok(ast.RestElement(..)) -> Ok(#(d.0, list.length(d.1) - 1))
+          _ -> Error(Nil)
+        }
+      }),
+    )
   let ctx =
     Ctx(
       funcs: fn_names,
       fn_arity:,
+      fn_rest:,
       classes:,
       current_super: None,
       loop: None,
@@ -410,7 +424,11 @@ fn lower_class_method(
   body_stmts: List(ast.Statement),
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  use #(pnames, defaults) <- result_try(param_info(params))
+  use #(pnames, defaults, rest) <- result_try(param_info(params))
+  use _ <- result_try(case rest {
+    Some(_) -> Error(Unsupported("rest parameter in a class method"))
+    None -> Ok(Nil)
+  })
   let all = ["this", ..pnames]
   let env =
     list.fold(all, dict.new(), fn(acc, n) { dict.insert(acc, n, ir.Var(n)) })
@@ -532,15 +550,23 @@ fn lower_function(
   body: ast.Statement,
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  use #(pnames, defaults) <- result_try(param_info(params))
+  use #(pnames, defaults, rest) <- result_try(param_info(params))
+  // A rest param is an ordinary trailing parameter bound to an array (the caller
+  // bundles the extra args); no default prologue applies to it.
+  let all_params = case rest {
+    Some(r) -> list.append(pnames, [r])
+    None -> pnames
+  }
   let env =
-    list.fold(pnames, dict.new(), fn(acc, n) { dict.insert(acc, n, ir.Var(n)) })
+    list.fold(all_params, dict.new(), fn(acc, n) {
+      dict.insert(acc, n, ir.Var(n))
+    })
   let stmts = list.append(default_prologue(defaults), block_stmts(body))
   let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
   use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
   Ok(ir.Function(
     name: name,
-    params: list.map(pnames, fn(n) { ir.Local(n, ir.TTerm) }),
+    params: list.map(all_params, fn(n) { ir.Local(n, ir.TTerm) }),
     result: [ir.TTerm],
     locals: [],
     body: body_expr,
@@ -2198,6 +2224,100 @@ fn lower_call(
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  // Call spread `f(...args)` takes a separate runtime-application path; the common
+  // fixed-arity call is unchanged (and stays a direct `apply 'f'/n(…)`).
+  let has_spread =
+    list.any(arguments, fn(a) {
+      case a {
+        ast.SpreadElement(..) -> True
+        _ -> False
+      }
+    })
+  case has_spread {
+    True -> lower_spread_call(callee, arguments, env, ctx, ctr)
+    False -> lower_call_fixed(callee, arguments, env, ctx, ctr)
+  }
+}
+
+/// `f(...args)` / `f(a, ...rest)` — build the effective arguments as an array, flatten
+/// to a runtime list, and apply. Functions/closures go through `apply_fn`; `console.log`
+/// and variadic `Math.*` take the list directly.
+fn lower_spread_call(
+  callee: ast.Expression,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(barr, arr, ctr) <- result_try(lower_array(
+    list.map(arguments, Some),
+    env,
+    ctx,
+    ctr,
+  ))
+  let #(bl, listv, ctr) =
+    bind_after(barr, ir.CallHost("js", "array_to_list", [arr]), ctr)
+  case callee {
+    ast.MemberExpression(
+      object: ast.Identifier(name: "console", ..),
+      property: ast.Identifier(name: "log", ..),
+      ..,
+    ) -> Ok(bind_after(bl, ir.CallHost("js", "console_log", [listv]), ctr))
+    ast.MemberExpression(
+      object: ast.Identifier(name: "Math", ..),
+      property: ast.Identifier(name: method, ..),
+      ..,
+    ) ->
+      case math_arity(method) {
+        Some(MathReduce) ->
+          Ok(bind_after(
+            bl,
+            ir.CallHost("js", "math_reduce", [ir.ConstAtom(method), listv]),
+            ctr,
+          ))
+        _ -> Error(Unsupported("Math." <> method <> "(...spread)"))
+      }
+    ast.Identifier(name: fname, ..) ->
+      case list.contains(ctx.funcs, fname) {
+        True -> {
+          let arity = case dict.get(ctx.fn_arity, fname) {
+            Ok(a) -> a
+            Error(Nil) -> 0
+          }
+          let #(bc, closure, ctr) =
+            bind_after(bl, ir.MakeClosure(fname, [], arity), ctr)
+          Ok(bind_after(
+            bc,
+            ir.CallHost("js", "apply_fn", [closure, listv]),
+            ctr,
+          ))
+        }
+        False ->
+          case dict.get(env, fname) {
+            Ok(fv) ->
+              Ok(bind_after(bl, ir.CallHost("js", "apply_fn", [fv, listv]), ctr))
+            Error(Nil) ->
+              Error(Unsupported("spread call to unknown '" <> fname <> "'"))
+          }
+      }
+    _ -> {
+      use #(bc, cv, ctr) <- result_try(lower_expr(callee, env, ctx, ctr))
+      Ok(bind_after(
+        list.append(bl, bc),
+        ir.CallHost("js", "apply_fn", [cv, listv]),
+        ctr,
+      ))
+    }
+  }
+}
+
+fn lower_call_fixed(
+  callee: ast.Expression,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
   case callee {
     // console.log(...) → rt_js console_log(cons-list of args).
     ast.MemberExpression(
@@ -2260,14 +2380,34 @@ fn lower_call(
             ctx,
             ctr,
           ))
-          // BEAM funs are arity-strict; JS is not. Pad missing args with `undefined`
-          // (so defaults apply) and drop extras, matching the callee's declared arity.
-          let arity = case dict.get(ctx.fn_arity, fname) {
-            Ok(a) -> a
-            Error(Nil) -> list.length(argvals)
+          case dict.get(ctx.fn_rest, fname) {
+            // rest param: pass the fixed args (padded) + a rest array of the remainder.
+            Ok(fixed) -> {
+              let front = fit_args(list.take(argvals, fixed), fixed)
+              let #(bl, listv, ctr) =
+                build_list(list.drop(argvals, fixed), binds, ctr)
+              let #(ba, rest_arr, ctr) =
+                bind_after(bl, ir.CallHost("js", "new_array", [listv]), ctr)
+              Ok(bind_after(
+                ba,
+                ir.CallDirect(fname, list.append(front, [rest_arr])),
+                ctr,
+              ))
+            }
+            // BEAM funs are arity-strict; JS is not. Pad missing args with `undefined`
+            // (so defaults apply) and drop extras, matching the declared arity.
+            Error(Nil) -> {
+              let arity = case dict.get(ctx.fn_arity, fname) {
+                Ok(a) -> a
+                Error(Nil) -> list.length(argvals)
+              }
+              Ok(bind_after(
+                binds,
+                ir.CallDirect(fname, fit_args(argvals, arity)),
+                ctr,
+              ))
+            }
           }
-          let fitted = fit_args(argvals, arity)
-          Ok(bind_after(binds, ir.CallDirect(fname, fitted), ctr))
         }
         // f is a value (a closure in a variable) → CallClosure.
         False ->
@@ -3299,20 +3439,29 @@ fn pattern_names_lax(params: List(ast.Pattern)) -> List(String) {
   })
 }
 
-/// Parameter names plus any defaults (`function f(x, y = 5)`). Each parameter must be
-/// a plain identifier, optionally with a default; rest params and destructuring
-/// patterns are `Unsupported`.
+/// Parameter names, any defaults (`function f(x, y = 5)`), and an optional trailing
+/// rest param (`function f(a, ...rest)`). Each parameter must be a plain identifier
+/// (optionally defaulted); destructuring patterns are `Unsupported`.
 fn param_info(
   params: List(ast.Pattern),
-) -> Result(#(List(String), List(#(String, ast.Expression))), Error) {
-  list.try_fold(params, #([], []), fn(acc, p) {
-    let #(names, defaults) = acc
+) -> Result(
+  #(List(String), List(#(String, ast.Expression)), Option(String)),
+  Error,
+) {
+  list.try_fold(params, #([], [], None), fn(acc, p) {
+    let #(names, defaults, rest) = acc
     case p {
       ast.IdentifierPattern(name:, ..) ->
-        Ok(#(list.append(names, [name]), defaults))
+        Ok(#(list.append(names, [name]), defaults, rest))
       ast.AssignmentPattern(left: ast.IdentifierPattern(name:, ..), right: d) ->
-        Ok(#(list.append(names, [name]), list.append(defaults, [#(name, d)])))
-      _ -> Error(Unsupported("parameter pattern (rest/destructuring)"))
+        Ok(#(
+          list.append(names, [name]),
+          list.append(defaults, [#(name, d)]),
+          rest,
+        ))
+      ast.RestElement(argument: ast.IdentifierPattern(name:, ..)) ->
+        Ok(#(names, defaults, Some(name)))
+      _ -> Error(Unsupported("parameter pattern (destructuring)"))
     }
   })
 }
@@ -3611,7 +3760,12 @@ fn collect_lambdas(
   use #(lambdas, _) <- result_try(
     list.try_fold(raws, #(dict.new(), 0), fn(acc, raw) {
       let #(acc_lambdas, i) = acc
-      use #(pnames, defaults) <- result_try(param_info(raw.params))
+      use #(pnames, defaults, rest) <- result_try(param_info(raw.params))
+      use _ <- result_try(case rest {
+        Some(_) ->
+          Error(Unsupported("rest parameter in a function/arrow expression"))
+        None -> Ok(Nil)
+      })
       let name = "lambda$" <> int.to_string(i)
       let caps = lambda_captures(pnames, raw.body, globals)
       Ok(#(

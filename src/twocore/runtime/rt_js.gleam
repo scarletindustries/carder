@@ -275,6 +275,15 @@ pub fn is_array(x: Dynamic) -> Int
 @external(erlang, "twocore_rt_js_ffi", "array_spread_into")
 pub fn array_spread_into(target: Dynamic, value: Dynamic) -> Dynamic
 
+/// Apply a JS function value to a runtime-length argument list (behind call spread
+/// `f(...args)`); arity-adaptive.
+@external(erlang, "twocore_rt_js_ffi", "apply_fn")
+pub fn apply_fn(f: Dynamic, args: Dynamic) -> Dynamic
+
+/// The array's elements as a plain BEAM list (behind spread into a variadic sink).
+@external(erlang, "twocore_rt_js_ffi", "array_to_list")
+pub fn array_to_list(arr: Dynamic) -> Dynamic
+
 /// `Array.from(x)` — a new array from an array/string/array-like.
 @external(erlang, "twocore_rt_js_ffi", "array_from")
 pub fn array_from(x: Dynamic) -> Dynamic
