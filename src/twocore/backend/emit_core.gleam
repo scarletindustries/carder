@@ -4193,6 +4193,7 @@ fn resolve_js(op: String) -> Option(String) {
     "cell_set" -> Some("cell_set")
     // objects
     "new_object" -> Some("new_object")
+    "wrapper_new" -> Some("wrapper_new")
     "get_prop" -> Some("get_prop")
     "set_prop" -> Some("set_prop")
     "gen_make" -> Some("gen_make")

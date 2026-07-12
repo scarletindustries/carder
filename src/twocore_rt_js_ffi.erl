@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, wrapper_new/2, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2,
@@ -806,6 +806,8 @@ to_string(V) when is_reference(V) ->
         {js_array, Len, Map} -> array_to_string(Len, Map);
         {js_regex, _, Flags, Src} -> <<"/", Src/binary, "/", Flags/binary>>;
         {js_date, Ms} -> date_to_string(Ms);
+        %% a primitive wrapper stringifies as its boxed primitive (ToPrimitive → ToString).
+        {js_wrapper, _Kind, Prim} -> to_string(Prim);
         _ -> <<"[object Object]">>
     end;
 %% any internal repr (tuple/map/list/…).
@@ -934,6 +936,17 @@ cell_set(Ref, _) ->
 new_object() ->
     cell_new(#{}).
 
+%% `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive WRAPPER object:
+%% a cell holding `{js_wrapper, Kind, Prim}` where `Kind` is the atom `number`/`string`/
+%% `boolean` and `Prim` is the coerced primitive (ToNumber / ToString / ToBoolean of `X`).
+%% Being a cell (reference) it is `typeof` "object"; `valueOf` unwraps to `Prim` and
+%% `toString`/string-coercion unwraps to `to_string(Prim)` (see `date_call`, `get_prop`
+%% and `to_string`). A `string` wrapper additionally exposes `.length` and index access
+%% through `get_prop` (delegating to the string primitive).
+wrapper_new(number, X) -> cell_new({js_wrapper, number, to_number(X)});
+wrapper_new(string, X) -> cell_new({js_wrapper, string, to_string(X)});
+wrapper_new(boolean, X) -> cell_new({js_wrapper, boolean, truthy(X) =:= 1}).
+
 %% A generator object — a cell holding the compiled step closure. The frontend
 %% transforms `function* g(){…}` into a state machine (a closure over a persistent
 %% context) and hands the step function here. `.next(v)` drives one step. Once the
@@ -1045,6 +1058,12 @@ get_prop(Recv, Key) when is_reference(Recv) ->
         %% a generator object: arbitrary property reads are `undefined` (`.next`
         %% is dispatched by the compiler to gen_next, not via get_prop).
         {js_gen, _} ->
+            undefined;
+        %% a primitive wrapper: a String wrapper exposes the string primitive's
+        %% `.length` / index reads; Number/Boolean wrappers have no own data props.
+        {js_wrapper, string, Str} ->
+            string_prop(Str, Key);
+        {js_wrapper, _Kind, _Prim} ->
             undefined;
         M when is_map(M) ->
             resolve_get(maps:get(prop_key(Key), M, undefined));
@@ -1652,6 +1671,14 @@ date_parse(V) ->
 date_call(Recv, Name, Args) ->
     case cell_tag(Recv) of
         {js_date, Ms} -> date_field(Name, Ms, Args);
+        %% a primitive wrapper: `valueOf` unwraps to the boxed primitive, `toString`
+        %% to its string form; no other method exists on a wrapper in this v1 model.
+        {js_wrapper, _Kind, Prim} ->
+            case Name of
+                <<"valueOf">> -> Prim;
+                <<"toString">> -> to_string(Prim);
+                _ -> type_error(Recv)
+            end;
         _ -> delegate(Recv, Name, Args)
     end.
 
