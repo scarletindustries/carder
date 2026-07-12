@@ -3676,9 +3676,11 @@ json_wrap(Open, Close, Members, _Gap, Indent, Indent2) ->
     [Open, $\n, Indent2, lists:join(Sep, Members), $\n, Indent, Close].
 
 %% JSON.parse(str) — parse JSON text to JS terms (numbers, binaries, true/false/null,
-%% arrays, objects). Malformed input is a type_error.
+%% arrays, objects). The argument is first coerced with ToString (per
+%% sec-json.parse step 1), so a non-string is stringified before parsing.
+%% Malformed input is a type_error.
 json_parse(Str) ->
-    Bin = to_string(Str),
+    Bin = json_text(Str),
     case json_val(json_ws(Bin)) of
         {ok, V, Rest} ->
             case json_ws(Rest) of
@@ -3687,6 +3689,39 @@ json_parse(Str) ->
             end;
         error ->
             type_error(Str)
+    end.
+
+%% ToString for JSON.parse's `text` argument. Strings pass through; an object is
+%% run through ToPrimitive with the string hint (a callable own `toString`, else
+%% `valueOf`, supplies the primitive) before being stringified; everything else
+%% uses the ordinary numeric/boolean/etc. ToString.
+json_text(V) when is_binary(V) ->
+    V;
+json_text(V) when is_reference(V) ->
+    case erlang:get(?CELL_KEY(V)) of
+        M when is_map(M) ->
+            to_string(json_to_primitive(M, [<<"toString">>, <<"valueOf">>], V));
+        _ ->
+            to_string(V)
+    end;
+json_text(V) ->
+    to_string(V).
+
+%% Walk the preferred method names in order; the first that is callable and
+%% returns a non-object value wins. If none qualifies, fall back to `V` itself
+%% (which ToString renders as "[object Object]").
+json_to_primitive(_M, [], V) ->
+    V;
+json_to_primitive(M, [Name | Rest], V) ->
+    case resolve_get(maps:get(Name, M, undefined)) of
+        Fn when is_function(Fn) ->
+            R = call_cb(Fn, []),
+            case js_type(R) of
+                object -> json_to_primitive(M, Rest, V);
+                _ -> R
+            end;
+        _ ->
+            json_to_primitive(M, Rest, V)
     end.
 
 json_ws(<<C, R/binary>>) when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r ->

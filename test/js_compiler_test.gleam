@@ -3100,6 +3100,13 @@ pub fn json_stringify_space_test() {
   |> should.equal(dyn(<<"{\"a\":1}">>))
 }
 
+pub fn json_parse_tostring_coercion_test() {
+  // JSON.parse coerces its argument with ToString first; an object's own
+  // toString supplies the text to parse (sec-json.parse step 1).
+  val("JSON.parse({toString: function() { return '\"ok\"'; }})")
+  |> should.equal(dyn(<<"ok">>))
+}
+
 pub fn parse_float_forms_test() {
   num("parseFloat('1e3')") |> should.equal(1000.0)
   num("parseFloat('.5')") |> should.equal(0.5)
