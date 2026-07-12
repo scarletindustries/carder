@@ -1215,6 +1215,39 @@ pub fn class_super_method_test() {
   call(m, "f", []) |> should.equal(dyn(<<"X makes a sound!!!">>))
 }
 
+// ── more builtins (from/flat/fill/at, pad, fromCharCode, Date.now) ────────────
+
+pub fn array_from_flat_test() {
+  num("Array.from(\"abc\").length") |> should.equal(3.0)
+  num("[1, [2, 3], 4].flat().length") |> should.equal(4.0)
+  num("[1, [2, 3], 4].flat()[2]") |> should.equal(3.0)
+}
+
+pub fn array_fill_at_test() {
+  let m = compile("function f() { let a = [1, 2, 3]; a.fill(0); return a[1]; }")
+  to_float(call(m, "f", [])) |> should.equal(0.0)
+  num("[10, 20, 30].at(-1)") |> should.equal(30.0)
+}
+
+pub fn string_pad_test() {
+  let s = compile("function f() { return \"5\".padStart(3, \"0\"); }")
+  call(s, "f", []) |> should.equal(dyn(<<"005">>))
+  let e = compile("function f() { return \"5\".padEnd(3, \"0\"); }")
+  call(e, "f", []) |> should.equal(dyn(<<"500">>))
+  let a = compile("function f() { return \"abc\".at(-1); }")
+  call(a, "f", []) |> should.equal(dyn(<<"c">>))
+}
+
+pub fn string_from_char_code_test() {
+  let m = compile("function f() { return String.fromCharCode(72, 105); }")
+  call(m, "f", []) |> should.equal(dyn(<<"Hi">>))
+}
+
+pub fn date_now_test() {
+  let m = compile("function f() { return Date.now() > 0; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

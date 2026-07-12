@@ -271,6 +271,38 @@ pub fn is_array(x: Dynamic) -> Int
 @external(erlang, "twocore_rt_js_ffi", "array_spread_into")
 pub fn array_spread_into(target: Dynamic, value: Dynamic) -> Dynamic
 
+/// `Array.from(x)` — a new array from an array/string/array-like.
+@external(erlang, "twocore_rt_js_ffi", "array_from")
+pub fn array_from(x: Dynamic) -> Dynamic
+
+/// `arr.flat()` — flatten one level.
+@external(erlang, "twocore_rt_js_ffi", "array_flat")
+pub fn array_flat(arr: Dynamic) -> Dynamic
+
+/// `arr.fill(v)` — set every element to `v` in place; returns the array.
+@external(erlang, "twocore_rt_js_ffi", "array_fill")
+pub fn array_fill(arr: Dynamic, v: Dynamic) -> Dynamic
+
+/// `arr.at(i)` / `str.at(i)` — element at `i` (negative counts from the end), else
+/// `undefined`.
+@external(erlang, "twocore_rt_js_ffi", "array_at")
+pub fn array_at(recv: Dynamic, i: Dynamic) -> Dynamic
+
+/// `str.padStart(n, pad)` / `padEnd` — pad to length `n` (default pad is a space).
+@external(erlang, "twocore_rt_js_ffi", "str_pad_start")
+pub fn str_pad_start(str: Dynamic, n: Dynamic, pad: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "str_pad_end")
+pub fn str_pad_end(str: Dynamic, n: Dynamic, pad: Dynamic) -> Dynamic
+
+/// `String.fromCharCode(...codes)` — build a string from the cons list of code points.
+@external(erlang, "twocore_rt_js_ffi", "string_from_char_code")
+pub fn string_from_char_code(codes: Dynamic) -> Dynamic
+
+/// `Date.now()` — milliseconds since the Unix epoch.
+@external(erlang, "twocore_rt_js_ffi", "date_now")
+pub fn date_now() -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 

@@ -36,12 +36,13 @@
 ////
 //// Builtins: the `Math` namespace (functions + constants); array methods (push/pop/
 //// shift/unshift, map/filter/forEach/reduce/some/every/find/findIndex, indexOf/
-//// includes/join/slice/concat/reverse/sort); string `.length`, indexing, and methods
-//// (charAt/charCodeAt, toUpperCase/toLowerCase, indexOf/includes/slice/substring,
-//// split/trim/repeat/startsWith/endsWith/replace/replaceAll); the global functions
-//// `parseInt`/`parseFloat`/`isNaN`/`isFinite`/`String`/`Number`/`Boolean`; and the
-//// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
-//// `Number.isInteger`/`isNaN`/`isFinite`, and `JSON.stringify`/`JSON.parse`.
+//// includes/join/slice/concat/reverse/sort, flat/fill/at); string `.length`, indexing,
+//// and methods (charAt/charCodeAt, toUpperCase/toLowerCase, indexOf/includes/slice/
+//// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
+//// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
+//// `String`/`Number`/`Boolean`; and the statics `Array.isArray`/`of`/`from`,
+//// `Object.keys`/`values`/`entries`, `Number.isInteger`/`isNaN`/`isFinite`,
+//// `JSON.stringify`/`parse`, `String.fromCharCode`, and `Date.now`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): static/getter/setter class members,
 //// nested/defaulted destructuring, call spread `f(...a)`, rest params, regex,
@@ -2042,7 +2043,12 @@ fn lower_call(
       computed: False,
       ..,
     )
-      if ns == "Array" || ns == "Object" || ns == "Number" || ns == "JSON"
+      if ns == "Array"
+      || ns == "Object"
+      || ns == "Number"
+      || ns == "JSON"
+      || ns == "String"
+      || ns == "Date"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
     // `super.method(args)` — call the superclass's method on the current `this`.
     ast.MemberExpression(
@@ -2224,6 +2230,16 @@ fn lower_static_call(
     "Number", "parseFloat", [s, ..] -> host("parse_float", [s])
     "JSON", "stringify", [v, ..] -> host("json_stringify", [v])
     "JSON", "parse", [s, ..] -> host("json_parse", [s])
+    "Array", "from", [x, ..] -> host("array_from", [x])
+    "String", "fromCharCode", _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+      Ok(bind_after(
+        binds2,
+        ir.CallHost("js", "string_from_char_code", [listv]),
+        ctr,
+      ))
+    }
+    "Date", "now", _ -> host("date_now", [])
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }
@@ -2405,6 +2421,13 @@ fn lower_method(
       ))
     }
     "reverse", _ -> host("array_reverse", [])
+    "flat", _ -> host("array_flat", [])
+    "fill", [v, ..] -> host("array_fill", [v])
+    "at", [i, ..] -> host("array_at", [i])
+    "padStart", [n] -> host("str_pad_start", [n, ir.ConstBinary(<<" ">>)])
+    "padStart", [n, p, ..] -> host("str_pad_start", [n, p])
+    "padEnd", [n] -> host("str_pad_end", [n, ir.ConstBinary(<<" ">>)])
+    "padEnd", [n, p, ..] -> host("str_pad_end", [n, p])
     // iteration with a callback
     "map", [f, ..] -> host("array_map", [f])
     "filter", [f, ..] -> host("array_filter", [f])

@@ -65,6 +65,8 @@
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
+    array_from/1, array_flat/1, array_fill/2, array_at/2,
+    str_pad_start/3, str_pad_end/3, string_from_char_code/1, date_now/0,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
@@ -931,6 +933,108 @@ array_pop(Recv) when is_reference(Recv) ->
     end;
 array_pop(Recv) ->
     type_error(Recv).
+
+%% Array.from(x) — a new array from an array (copy), a string (its chars), or an
+%% array-like; a non-iterable yields an empty array.
+array_from(X) when is_reference(X) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_array, Len, Map} -> new_array(arr_list(Len, Map));
+        _ -> new_array([])
+    end;
+array_from(X) when is_binary(X) ->
+    new_array([from_cps([C]) || C <- cps(X)]);
+array_from(_X) ->
+    new_array([]).
+
+%% arr.flat() — flatten one level (array elements are spread in).
+array_flat(Recv) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(lists:flatmap(fun flat_one/1, arr_list(Len, Map))).
+flat_one(E) ->
+    case is_array(E) of
+        1 ->
+            {L, M} = arr_content(E),
+            arr_list(L, M);
+        0 ->
+            [E]
+    end.
+
+%% arr.fill(v) — set every element to v (in place); returns the array.
+array_fill(Recv, V) ->
+    {Len, _Map} = arr_content(Recv),
+    arr_store(Recv, lists:duplicate(Len, V)).
+
+%% arr.at(i) / str.at(i) — element at index i (negative counts from the end), else
+%% undefined.
+array_at(Recv, I) when is_binary(Recv) ->
+    Cps = cps(Recv),
+    nth_char(Cps, at_index(I, length(Cps)), undefined);
+array_at(Recv, I) ->
+    {Len, Map} = arr_content(Recv),
+    Idx = at_index(I, Len),
+    case Idx >= 0 andalso Idx < Len of
+        true -> maps:get(Idx, Map, undefined);
+        false -> undefined
+    end.
+
+at_index(I, Len) ->
+    N =
+        case coerce_num(I) of
+            nan -> 0;
+            inf -> Len;
+            neg_inf -> -1;
+            Num -> trunc(as_float(Num))
+        end,
+    case N < 0 of
+        true -> Len + N;
+        false -> N
+    end.
+
+%% str.padStart(n, pad) / padEnd — pad to length n with `pad` (default a space).
+str_pad_start(Str, N, Pad) ->
+    do_pad(Str, N, Pad, start).
+str_pad_end(Str, N, Pad) ->
+    do_pad(Str, N, Pad, 'end').
+
+do_pad(Str, N, Pad, Where) ->
+    Target =
+        case coerce_num(N) of
+            nan -> 0;
+            _ -> trunc(as_float(coerce_num(N)))
+        end,
+    Cps = cps(Str),
+    Cur = length(Cps),
+    PadStr =
+        case to_string(Pad) of
+            <<>> -> <<" ">>;
+            P -> P
+        end,
+    case Cur >= Target of
+        true ->
+            Str;
+        false ->
+            Fill = pad_fill(PadStr, Target - Cur),
+            case Where of
+                start -> <<Fill/binary, Str/binary>>;
+                'end' -> <<Str/binary, Fill/binary>>
+            end
+    end.
+
+%% Build `count` code points from repeating PadStr.
+pad_fill(PadStr, Count) ->
+    PadCps = cps(PadStr),
+    from_cps(take_cps(PadCps, PadCps, Count)).
+take_cps(_All, _Cur, 0) -> [];
+take_cps(All, [], Count) -> take_cps(All, All, Count);
+take_cps(All, [C | Rest], Count) -> [C | take_cps(All, Rest, Count - 1)].
+
+%% String.fromCharCode(...codes) — build a string from the emitter's cons list of codes.
+string_from_char_code(Codes) ->
+    from_cps([trunc(as_float(coerce_num(C))) || C <- Codes]).
+
+%% Date.now() — milliseconds since the Unix epoch.
+date_now() ->
+    erlang:system_time(millisecond).
 
 %% Spread `...value` into `target` (in place): an array contributes its elements, a
 %% string its characters. Behind array-literal spread `[...a]`.
