@@ -1789,6 +1789,37 @@ pub fn getter_no_leak_test() {
   call(n, "f", []) |> should.equal(dyn(True))
 }
 
+pub fn static_field_test() {
+  // A static field initialised at the class's position (run when `main` runs).
+  let m =
+    compile("class C { static answer = 42; } function f() { return C.answer; }")
+  call(m, "main", [])
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+  // no initializer → undefined.
+  let n = compile("class C { static x; } function f() { return typeof C.x; }")
+  call(n, "main", [])
+  call(n, "f", []) |> should.equal(dyn(<<"undefined">>))
+}
+
+pub fn static_field_mutation_test() {
+  // A static method reads and writes the class's static field.
+  let m =
+    compile(
+      "class Counter { static count = 0; static inc() { Counter.count = Counter.count + 1; return Counter.count; } } "
+      <> "function f() { return Counter.inc() + Counter.inc(); } ",
+    )
+  call(m, "main", [])
+  // inc() → 1, inc() → 2, so 1 + 2 = 3
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  // compound assignment on a static field.
+  let n =
+    compile(
+      "class S { static total = 10; } function f() { S.total += 5; return S.total; }",
+    )
+  call(n, "main", [])
+  to_float(call(n, "f", [])) |> should.equal(15.0)
+}
+
 pub fn method_overrides_accessor_test() {
   let base = "class A { get value() { return \"getter\"; } } "
   let derived =

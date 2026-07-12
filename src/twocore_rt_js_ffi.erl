@@ -63,7 +63,8 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, get_prop/2, set_prop/3, define_data/3, define_accessor/4, has_prop/2, delete_prop/2,
+    new_object/0, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    static_get/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, array_to_list/1,
@@ -814,6 +815,24 @@ cell_set(Ref, _) ->
 %% A fresh empty object: a cell holding an empty map (binary keys → values).
 new_object() ->
     cell_new(#{}).
+
+%% Static class fields live in the process dictionary keyed by a module-qualified
+%% class name (`ModuleName$Class`, unique per compiled JS module) so two modules
+%% that both declare `class C` do not share static state. `Class`/`Field` are
+%% binaries. static_set returns the assigned value; static_get returns `undefined`
+%% for an unset field.
+static_get(Class, Field) ->
+    maps:get(Field, static_map(Class), undefined).
+
+static_set(Class, Field, V) ->
+    erlang:put({js_static_class, Class}, maps:put(Field, V, static_map(Class))),
+    V.
+
+static_map(Class) ->
+    case erlang:get({js_static_class, Class}) of
+        undefined -> #{};
+        M -> M
+    end.
 
 %% Property keys are binaries; a NUMBER key normalizes to its JS string form
 %% (5, 5.0 and "5" are the same key — to_string's integral-float rule does

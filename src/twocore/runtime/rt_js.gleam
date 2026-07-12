@@ -246,6 +246,15 @@ pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "define_data")
 pub fn define_data(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 
+/// Read a static class field `Class.field` (`class` is the module-qualified name).
+/// Returns `undefined` if unset.
+@external(erlang, "twocore_rt_js_ffi", "static_get")
+pub fn static_get(class: Dynamic, field: Dynamic) -> Dynamic
+
+/// Write a static class field `Class.field = v`; returns `v`.
+@external(erlang, "twocore_rt_js_ffi", "static_set")
+pub fn static_set(class: Dynamic, field: Dynamic, v: Dynamic) -> Dynamic
+
 /// Install an accessor property: `getter`/`setter` are `this`-bound closures or
 /// `undefined`. Defines `obj.key` as a getter/setter pair; returns `undefined`.
 @external(erlang, "twocore_rt_js_ffi", "define_accessor")

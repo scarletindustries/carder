@@ -28,8 +28,9 @@
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
 //// expressions, arrow functions, closures
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
-//// & fields, static methods, instance getters/setters `get x()`/`set x(v)`
-//// (inherited and overridable), `new`, `this`, method calls, `extends`/`super`
+//// & fields, static methods, static fields (`static x = …`, read/written as
+//// `C.x`), instance getters/setters `get x()`/`set x(v)` (inherited and
+//// overridable), `new`, `this`, method calls, `extends`/`super`
 //// inheritance); `console.log`. Control flow threads mutated variables as loop-carried params /
 //// phi-merged `If`s.
 ////
@@ -58,10 +59,11 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): static-field class members and
-//// object-literal getters/setters (class getters/setters ARE supported),
-//// defaulted/rest destructuring, `try`/`finally`, generators/async,
-//// and `continue` inside a `do/while`. (Rest params and call spread apply to
+//// Not yet (a clean `Unsupported` error / panic): object-literal getters/setters
+//// (class getters/setters ARE supported), defaulted/rest destructuring,
+//// `try`/`finally`, generators/async, and `continue` inside a `do/while`. Static
+//// field initializers run when the module's `main/0` runs (like any top-level
+//// state), so `C.x` reads `undefined` until then. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
 //// function, is a v1 limitation. A derived
 //// class needs an explicit constructor that calls `super(…)`; field initializers run
@@ -182,11 +184,16 @@ type ClassInfo {
     // instance field names — a field shadows a same-named accessor (own data
     // property beats a prototype accessor), so such accessors are not installed.
     fields: List(String),
+    // static field names — a member access `C.name` reads static storage.
+    static_fields: List(String),
   )
 }
 
 type Ctx {
   Ctx(
+    // the compiled module's name — qualifies static-field storage keys so two
+    // modules that both declare `class C` don't share static state.
+    module_name: String,
     funcs: List(String),
     fn_arity: Dict(String, Int),
     // top-level functions with a rest param → their FIXED param count (a call bundles
@@ -226,9 +233,19 @@ pub fn program(
     dict.from_list(
       list.map(class_decls, fn(c) { #(c.0, class_info(c.1, c.2)) }),
     )
+  // Top-level code that runs in `main/0`: drop function declarations (lifted),
+  // and replace each class declaration with its static-field initializers at the
+  // class's textual position (so they see preceding top-level state).
   let top =
-    list.filter(stmts, fn(s) {
-      as_function_decl(s) == Error(Nil) && as_class_decl(s) == Error(Nil)
+    list.flat_map(stmts, fn(s) {
+      case as_class_decl(s) {
+        Ok(#(cname, _parent, parts)) -> static_init_stmts(cname, parts)
+        Error(Nil) ->
+          case as_function_decl(s) {
+            Ok(_) -> []
+            Error(Nil) -> [s]
+          }
+      }
     })
 
   // Pre-pass: lift every function/arrow expression (in top-level code AND inside the
@@ -253,6 +270,7 @@ pub fn program(
     )
   let ctx =
     Ctx(
+      module_name: module_name,
       funcs: fn_names,
       fn_arity:,
       fn_rest:,
@@ -316,6 +334,8 @@ type ClassParts {
     statics: List(#(String, List(ast.Pattern), ast.Statement)),
     fields: List(#(String, Option(ast.Expression))),
     accessors: List(Accessor),
+    // static fields `static name = init` (name + optional initializer).
+    static_fields: List(#(String, Option(ast.Expression))),
   )
 }
 
@@ -354,7 +374,7 @@ fn as_class_decl(
 }
 
 fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
-  list.try_fold(body, ClassParts(None, [], [], [], []), fn(acc, el) {
+  list.try_fold(body, ClassParts(None, [], [], [], [], []), fn(acc, el) {
     case el {
       ast.ClassMethod(value:, kind: ast.MethodConstructor, is_static: False, ..) -> {
         use #(params, b) <- result_try(method_fn(value))
@@ -398,6 +418,19 @@ fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
         computed: False,
       ) ->
         Ok(ClassParts(..acc, fields: list.append(acc.fields, [#(name, init)])))
+      // static field `static name = init`
+      ast.ClassField(
+        key: ast.Identifier(name:, ..),
+        value: init,
+        is_static: True,
+        computed: False,
+      ) ->
+        Ok(
+          ClassParts(
+            ..acc,
+            static_fields: list.append(acc.static_fields, [#(name, init)]),
+          ),
+        )
       // instance getter `get name() { … }`
       ast.ClassMethod(
         key: ast.Identifier(name:, ..),
@@ -430,10 +463,7 @@ fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
           ),
         )
       }
-      _ ->
-        Error(Unsupported(
-          "class element (static field/computed key/non-identifier extends)",
-        ))
+      _ -> Error(Unsupported("class element (computed key / static block)"))
     }
   })
 }
@@ -470,6 +500,60 @@ fn method_fn(
   case value {
     ast.FunctionExpression(params:, body:, ..) -> Ok(#(params, body))
     _ -> Error(Unsupported("class method value"))
+  }
+}
+
+/// The static-field initializer statements for class `cname`, run at the class's
+/// textual position in `main`: each `static name = init` becomes `cname.name =
+/// init` (an omitted initializer is `undefined`). `lower_assign` recognises a
+/// member assignment whose object is a class name and whose property is a static
+/// field, and routes it to `static_set`.
+fn static_init_stmts(cname: String, parts: ClassParts) -> List(ast.Statement) {
+  let sp = ast.Span(0, 0)
+  list.map(parts.static_fields, fn(sf) {
+    let #(name, init) = sf
+    let value = option.unwrap(init, ast.UndefinedExpression(span: sp))
+    ast.ExpressionStatement(
+      directive: None,
+      expression: ast.AssignmentExpression(
+        span: sp,
+        operator: ast.Assign,
+        left: ast.MemberExpression(
+          span: sp,
+          object: ast.Identifier(span: sp, name: cname),
+          property: ast.Identifier(span: sp, name: name),
+          computed: False,
+        ),
+        right: value,
+      ),
+    )
+  })
+}
+
+/// The module-qualified storage key for class `cname`'s static fields.
+fn static_class_key(ctx: Ctx, cname: String) -> ir.Value {
+  ir.ConstBinary(<<{ ctx.module_name <> "$" <> cname }:utf8>>)
+}
+
+/// If `object.property` names a static field of a known class, returns the class
+/// name and the field name (for `static_get`/`static_set` routing).
+fn static_field_target(
+  object: ast.Expression,
+  property: ast.Expression,
+  computed: Bool,
+  ctx: Ctx,
+) -> Option(#(String, String)) {
+  case object, property, computed {
+    ast.Identifier(name: cname, ..), ast.Identifier(name: field, ..), False ->
+      case dict.get(ctx.classes, cname) {
+        Ok(info) ->
+          case list.contains(info.static_fields, field) {
+            True -> Some(#(cname, field))
+            False -> None
+          }
+        Error(Nil) -> None
+      }
+    _, _, _ -> None
   }
 }
 
@@ -574,6 +658,7 @@ fn class_info(parent: Option(String), parts: ClassParts) -> ClassInfo {
       #(a.name, option.is_some(a.getter), option.is_some(a.setter))
     }),
     fields: list.map(parts.fields, fn(f) { f.0 }),
+    static_fields: list.map(parts.static_fields, fn(f) { f.0 }),
   )
 }
 
@@ -2320,63 +2405,128 @@ fn lower_assign(
     // `obj.p op= e` / `obj[k] op= e`. Evaluate the object and key EXACTLY ONCE so a
     // compound assignment (or a side-effecting/computed `getObj()[k()] += e`) doesn't
     // re-run them, then read/write the property through those bound values.
-    ast.MemberExpression(object:, property:, computed:, ..) -> {
-      use #(bo, o, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
-      use #(bk, key, ctr) <- result_try(member_key(
-        property,
-        computed,
-        env,
-        ctx,
-        ctr,
-      ))
-      case op {
-        // plain `obj.p = e` → set_prop(o, key, e), returns e.
-        ast.Assign -> {
-          use #(bv, v, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
-          let pre = list.flatten([bo, bk, bv])
-          Ok(bind_after(pre, ir.CallHost("js", "set_prop", [o, key, v]), ctr))
-        }
-        // logical `obj.p ||= e` / `&&=` / `??=` — short-circuit: read obj.p once,
-        // and only evaluate `e` + assign when the guard says so.
-        ast.LogicalOrAssign
-        | ast.LogicalAndAssign
-        | ast.NullishCoalesceAssign ->
-          lower_member_logical_assign(
+    ast.MemberExpression(object:, property:, computed:, ..) ->
+      // `C.staticField = e` (and compound) — write the class's static storage;
+      // otherwise the ordinary object-property path.
+      case static_field_target(object, property, computed, ctx) {
+        Some(#(cname, field)) ->
+          lower_static_assign(op, cname, field, right, env, ctx, ctr)
+        None ->
+          lower_member_assign(
             op,
-            o,
-            key,
+            object,
+            property,
+            computed,
             right,
-            list.flatten([bo, bk]),
             env,
             ctx,
             ctr,
           )
-        // compound `obj.p op= e` → set_prop(o, key, get_prop(o, key) op e). Order:
-        // object, key, read, rhs — matching JS reference/GetValue/rhs evaluation.
-        _ -> {
-          let #(bcur, cur, ctr) =
-            bind_after(
-              list.flatten([bo, bk]),
-              ir.CallHost("js", "get_prop", [o, key]),
-              ctr,
-            )
-          use #(brv, rv, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
-          use #(bres, resv, ctr) <- result_try(apply_compound(
-            op,
-            cur,
-            rv,
-            list.append(bcur, brv),
-            ctr,
-          ))
-          Ok(bind_after(
-            bres,
-            ir.CallHost("js", "set_prop", [o, key, resv]),
-            ctr,
-          ))
-        }
       }
-    }
     _ -> Error(Unsupported("assignment target"))
+  }
+}
+
+/// The ordinary object-property assignment path (`obj.p = e` / `obj.p op= e`),
+/// factored out of `lower_assign` so the static-field case can precede it.
+fn lower_member_assign(
+  op: ast.AssignmentOp,
+  object: ast.Expression,
+  property: ast.Expression,
+  computed: Bool,
+  right: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bo, o, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+  use #(bk, key, ctr) <- result_try(member_key(
+    property,
+    computed,
+    env,
+    ctx,
+    ctr,
+  ))
+  case op {
+    // plain `obj.p = e` → set_prop(o, key, e), returns e.
+    ast.Assign -> {
+      use #(bv, v, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
+      let pre = list.flatten([bo, bk, bv])
+      Ok(bind_after(pre, ir.CallHost("js", "set_prop", [o, key, v]), ctr))
+    }
+    // logical `obj.p ||= e` / `&&=` / `??=` — short-circuit: read obj.p once,
+    // and only evaluate `e` + assign when the guard says so.
+    ast.LogicalOrAssign | ast.LogicalAndAssign | ast.NullishCoalesceAssign ->
+      lower_member_logical_assign(
+        op,
+        o,
+        key,
+        right,
+        list.flatten([bo, bk]),
+        env,
+        ctx,
+        ctr,
+      )
+    // compound `obj.p op= e` → set_prop(o, key, get_prop(o, key) op e). Order:
+    // object, key, read, rhs — matching JS reference/GetValue/rhs evaluation.
+    _ -> {
+      let #(bcur, cur, ctr) =
+        bind_after(
+          list.flatten([bo, bk]),
+          ir.CallHost("js", "get_prop", [o, key]),
+          ctr,
+        )
+      use #(brv, rv, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
+      use #(bres, resv, ctr) <- result_try(apply_compound(
+        op,
+        cur,
+        rv,
+        list.append(bcur, brv),
+        ctr,
+      ))
+      Ok(bind_after(bres, ir.CallHost("js", "set_prop", [o, key, resv]), ctr))
+    }
+  }
+}
+
+/// Lower an assignment to a static class field: `C.f = e` or a compound
+/// `C.f op= e`. The plain form writes `static_set`; a compound form reads
+/// `static_get`, combines with the same guarded dispatch as any operator, and
+/// writes back. (A logical static assignment falls through `apply_compound` to a
+/// clean Unsupported error — a rare form left for later.)
+fn lower_static_assign(
+  op: ast.AssignmentOp,
+  cname: String,
+  field: String,
+  right: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  let ckey = static_class_key(ctx, cname)
+  let fkey = ir.ConstBinary(<<field:utf8>>)
+  case op {
+    ast.Assign -> {
+      use #(bv, v, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
+      Ok(bind_after(bv, ir.CallHost("js", "static_set", [ckey, fkey, v]), ctr))
+    }
+    _ -> {
+      let #(bcur, cur, ctr) =
+        bind_after([], ir.CallHost("js", "static_get", [ckey, fkey]), ctr)
+      use #(brv, rv, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
+      use #(bres, resv, ctr) <- result_try(apply_compound(
+        op,
+        cur,
+        rv,
+        list.append(bcur, brv),
+        ctr,
+      ))
+      Ok(bind_after(
+        bres,
+        ir.CallHost("js", "static_set", [ckey, fkey, resv]),
+        ctr,
+      ))
+    }
   }
 }
 
@@ -3467,7 +3617,20 @@ fn lower_member(
         Some(result) -> Ok(result)
         None -> lower_member_get(object, property, computed, env, ctx, ctr)
       }
-    _, _, _ -> lower_member_get(object, property, computed, env, ctx, ctr)
+    _, _, _ ->
+      // `C.staticField` — read the class's static storage.
+      case static_field_target(object, property, computed, ctx) {
+        Some(#(cname, field)) ->
+          Ok(bind_after(
+            [],
+            ir.CallHost("js", "static_get", [
+              static_class_key(ctx, cname),
+              ir.ConstBinary(<<field:utf8>>),
+            ]),
+            ctr,
+          ))
+        None -> lower_member_get(object, property, computed, env, ctx, ctr)
+      }
   }
 }
 
