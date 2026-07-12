@@ -254,6 +254,11 @@ pub fn gen_make(step: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "gen_next")
 pub fn gen_next(gen: Dynamic, args: Dynamic) -> Dynamic
 
+/// Materialize the source of a `for-of` as an array: arrays and strings pass
+/// through, a generator is drained to an array, anything else becomes empty.
+@external(erlang, "twocore_rt_js_ffi", "iter_array")
+pub fn iter_array(source: Dynamic) -> Dynamic
+
 /// Read a static class field `Class.field` (`class` is the module-qualified name).
 /// Returns `undefined` if unset.
 @external(erlang, "twocore_rt_js_ffi", "static_get")

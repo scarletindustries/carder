@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, gen_make/1, gen_next/2, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/1, array_fill/2, array_at/2,
@@ -825,6 +825,28 @@ new_object() ->
 gen_make(StepFn) ->
     cell_new({js_gen, StepFn}).
 
+%% The source of a `for-of` as an array: an array passes through, a string is
+%% left as-is (for-of indexes it directly), and a GENERATOR is drained to an array
+%% by driving `.next()` to completion (so a finite generator iterates; an infinite
+%% one would loop — use manual `.next()` there). Anything else is empty.
+iter_array(X) when is_reference(X) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_gen, _} -> new_array(drain_gen(X, []));
+        {js_array, _, _} -> X;
+        _ -> new_array([])
+    end;
+iter_array(X) when is_binary(X) ->
+    X;
+iter_array(_) ->
+    new_array([]).
+
+drain_gen(Gen, Acc) ->
+    R = gen_next(Gen, []),
+    case get_prop(R, <<"done">>) of
+        true -> lists:reverse(Acc);
+        _ -> drain_gen(Gen, [get_prop(R, <<"value">>) | Acc])
+    end.
+
 %% `gen.next(v)` — advance the generator (StepFn returns the `{value, done}`
 %% object). On a non-generator receiver, delegate to a user `next` method (so an
 %% ordinary iterator/cursor object with its own `next` still works).
@@ -1528,6 +1550,7 @@ array_to_list(Recv) ->
 array_spread_into(Target, Value) when is_reference(Value) ->
     case erlang:get(?CELL_KEY(Value)) of
         {js_array, Len, Map} -> array_push(Target, arr_list(Len, Map));
+        {js_gen, _} -> array_push(Target, drain_gen(Value, []));
         _ -> type_error(Value)
     end;
 array_spread_into(Target, Value) when is_binary(Value) ->

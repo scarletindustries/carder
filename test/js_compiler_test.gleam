@@ -1951,6 +1951,28 @@ pub fn generator_drive_to_done_test() {
   to_float(call(m, "f", [])) |> should.equal(10.0)
 }
 
+pub fn generator_for_of_test() {
+  // for-of iterates a finite generator, draining it element by element.
+  let m =
+    compile(
+      "function* range(n) { for (let i = 0; i < n; i++) yield i * i; } "
+      <> "function f() { let s = 0; for (const x of range(4)) s += x; return s; }",
+    )
+  // 0 + 1 + 4 + 9 = 14
+  to_float(call(m, "f", [])) |> should.equal(14.0)
+}
+
+pub fn generator_spread_test() {
+  // Spreading a generator into an array collects its yielded values.
+  let m =
+    compile(
+      "function* g() { yield 10; yield 20; yield 30; } "
+      <> "function f() { let a = [...g()]; return a[0] + a[1] * 10 + a[2] * 100 + a.length; }",
+    )
+  // 10 + 200 + 3000 + 3 = 3213
+  to_float(call(m, "f", [])) |> should.equal(3213.0)
+}
+
 pub fn generator_done_test() {
   // .done is false while yielding, true once the body completes.
   let m =

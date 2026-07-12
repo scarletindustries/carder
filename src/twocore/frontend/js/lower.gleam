@@ -37,7 +37,9 @@
 //// inheritance); `console.log`. Control flow threads mutated variables as loop-carried params /
 //// phi-merged `If`s.
 ////
-//// Control flow also includes `for-of` (over arrays/strings), `switch` (with
+//// Control flow also includes `for-of` (over arrays/strings/generators — a
+//// generator source is drained to an array, so an *infinite* generator cannot be
+//// `for-of`'d; drive it with manual `.next()` instead), `switch` (with
 //// fall-through, default in any position, and `break` that targets the switch), and
 //// `throw` / `try`/`catch` (a thrown JS value transported via the module's `js_exn`
 //// tag; `return`/`break`/`continue` inside a try body transfer out correctly), and
@@ -2306,7 +2308,22 @@ fn lower_for_of(
       update: Some(update),
       body: inner_body,
     )
-  let block = ast.BlockStatement(body: [wrap(decl(arr, right)), wrap(for_stmt)])
+  // Materialize the source as an array so the index loop below works uniformly
+  // for arrays, strings, and generators (drained). `Object.__iterArray` is an
+  // intrinsic lowered to the `iter_array` runtime op.
+  let source =
+    ast.CallExpression(
+      span: sp,
+      callee: ast.MemberExpression(
+        span: sp,
+        object: ident("Object"),
+        property: ident("__iterArray"),
+        computed: False,
+      ),
+      arguments: [right],
+    )
+  let block =
+    ast.BlockStatement(body: [wrap(decl(arr, source)), wrap(for_stmt)])
   lower_stmt(block, env, ctx, ctr, k)
 }
 
@@ -4112,6 +4129,9 @@ fn lower_static_call(
     "Object", "__rest", [o, excluded] -> host("object_rest", [o, excluded])
     // internal helper the generator transform emits: wrap a step closure.
     "Object", "__genMake", [step] -> host("gen_make", [step])
+    // internal helper the for-of desugar emits: materialize the loop source as an
+    // array (arrays/strings pass through, generators are drained).
+    "Object", "__iterArray", [source] -> host("iter_array", [source])
     "Object", "keys", [o, ..] -> host("object_keys", [o])
     "Object", "values", [o, ..] -> host("object_values", [o])
     "Object", "entries", [o, ..] -> host("object_entries", [o])
