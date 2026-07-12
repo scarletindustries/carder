@@ -92,6 +92,12 @@ gleam build              # the runner loads build/dev/erlang/*/ebin
 ## Rules (from CLAUDE.md — hard gates)
 
 - Always `gleam format` (CI fails on unformatted) and keep `gleam build` warning-free.
+- **`erlc`-gate the FFI after every edit:** `mkdir -p /tmp/ffi && erlc -Wall -o /tmp/ffi
+  src/twocore_rt_js_ffi.erl` must be CLEAN. `gleam build` can reuse a stale `.beam` and
+  will NOT surface a `function foo/1 already defined` error — but that error makes the
+  whole module fail to load at runtime, so *every* JS test then fails with `Error("undef")`.
+  This bites hardest when merging parallel branches (two agents add the same helper, e.g.
+  `to_length/1`): resolve to ONE definition, then re-`erlc` before committing.
 - Tests are **spec-driven**, never change-detectors: assert what the ECMAScript spec
   says; if a test and the code disagree, the spec wins and the code is wrong.
 - **Never** Claude-brand commits/PRs (no `Co-Authored-By: Claude`, no "Generated with
