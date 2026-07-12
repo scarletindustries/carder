@@ -25,8 +25,8 @@
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
 //// expressions, arrow functions, closures
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
-//// & fields, `new`, `this`, method calls, `extends`/`super` inheritance);
-//// `console.log`. Control flow threads mutated variables as loop-carried params /
+//// & fields, static methods, `new`, `this`, method calls, `extends`/`super`
+//// inheritance); `console.log`. Control flow threads mutated variables as loop-carried params /
 //// phi-merged `If`s.
 ////
 //// Control flow also includes `for-of` (over arrays/strings), `switch` (with
@@ -45,8 +45,8 @@
 //// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
 //// `String.fromCharCode`, and `Date.now`.
 ////
-//// Not yet (a clean `Unsupported` error / panic): static/getter/setter class members,
-//// nested/defaulted destructuring, call spread `f(...a)`, rest params, regex,
+//// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
+//// members, nested/defaulted destructuring, call spread `f(...a)`, rest params, regex,
 //// `try`/`finally`, generators/async, and `continue` inside a `do/while`. (A derived
 //// class needs an explicit constructor that calls `super(…)`; field initializers run
 //// before `super()` rather than after — v1 ordering simplifications. A regular function
@@ -142,6 +142,7 @@ type ClassInfo {
     super_class: Option(String),
     ctor_arity: Int,
     methods: List(#(String, Int)),
+    statics: List(#(String, Int)),
   )
 }
 
@@ -246,13 +247,14 @@ pub fn program(
 /// The name of the module-level exception tag that transports a thrown JS value.
 const js_exn_tag = "js_exn"
 
-/// A class's constructor (params + body, if any), instance methods (name + params +
-/// body), and instance fields (name + optional initializer). Static members, getters/
-/// setters, computed keys, and inheritance are `Unsupported`.
+/// A class's constructor (params + body, if any), instance methods, static methods
+/// (each name + params + body), and instance fields (name + optional initializer).
+/// Getters/setters, static fields, and computed keys are `Unsupported`.
 type ClassParts {
   ClassParts(
     ctor: Option(#(List(ast.Pattern), ast.Statement)),
     methods: List(#(String, List(ast.Pattern), ast.Statement)),
+    statics: List(#(String, List(ast.Pattern), ast.Statement)),
     fields: List(#(String, Option(ast.Expression))),
   )
 }
@@ -281,11 +283,27 @@ fn as_class_decl(
 }
 
 fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
-  list.try_fold(body, ClassParts(None, [], []), fn(acc, el) {
+  list.try_fold(body, ClassParts(None, [], [], []), fn(acc, el) {
     case el {
       ast.ClassMethod(value:, kind: ast.MethodConstructor, is_static: False, ..) -> {
         use #(params, b) <- result_try(method_fn(value))
         Ok(ClassParts(..acc, ctor: Some(#(params, b))))
+      }
+      // static method — called as `C.method(...)`, no `this`.
+      ast.ClassMethod(
+        key: ast.Identifier(name:, ..),
+        value:,
+        kind: ast.MethodMethod,
+        is_static: True,
+        computed: False,
+      ) -> {
+        use #(params, b) <- result_try(method_fn(value))
+        Ok(
+          ClassParts(
+            ..acc,
+            statics: list.append(acc.statics, [#(name, params, b)]),
+          ),
+        )
       }
       ast.ClassMethod(
         key: ast.Identifier(name:, ..),
@@ -366,10 +384,11 @@ fn ctor_body_stmts(parts: ClassParts) -> List(ast.Statement) {
 /// Every statement list belonging to a class (constructor + method bodies) — used to
 /// feed the lambda pre-pass so closures inside methods are collected.
 fn class_scan_stmts(parts: ClassParts) -> List(ast.Statement) {
-  list.append(
+  list.flatten([
     ctor_body_stmts(parts),
     list.flat_map(parts.methods, fn(m) { block_stmts(m.2) }),
-  )
+    list.flat_map(parts.statics, fn(m) { block_stmts(m.2) }),
+  ])
 }
 
 /// Lower a class constructor/method to an IR function whose FIRST parameter is `this`.
@@ -406,6 +425,7 @@ fn class_info(parent: Option(String), parts: ClassParts) -> ClassInfo {
     super_class: parent,
     ctor_arity: ctor_arity,
     methods: list.map(parts.methods, fn(m) { #(m.0, list.length(m.1)) }),
+    statics: list.map(parts.statics, fn(m) { #(m.0, list.length(m.1)) }),
   )
 }
 
@@ -440,7 +460,14 @@ fn lower_class(
       )
     }),
   )
-  Ok([ctor_fn, ..method_fns])
+  // static methods are plain functions (no `this`): reuse the top-level function path.
+  use static_fns <- result_try(
+    list.try_map(parts.statics, fn(m) {
+      let #(mname, mparams, mbody) = m
+      lower_function(cname <> "$static$" <> mname, mparams, mbody, cctx)
+    }),
+  )
+  Ok(list.flatten([[ctor_fn], method_fns, static_fns]))
 }
 
 /// The instance methods to install for `new C(…)`, ancestors-first (so an overriding
@@ -2407,6 +2434,57 @@ fn lower_new(
 /// by name to their `rt_js` ops; an unknown method name is a property-lookup-and-call
 /// (object/class instance methods). The receiver is evaluated once.
 fn lower_method(
+  object: ast.Expression,
+  method: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  // `C.staticMethod(args)` — a class's static method is a plain `C$static$name` call.
+  case static_method(object, method, ctx) {
+    Some(arity) -> {
+      use #(binds, argvals, ctr) <- result_try(lower_args(
+        arguments,
+        env,
+        ctx,
+        ctr,
+      ))
+      let cname = object_ident_name(object)
+      Ok(bind_after(
+        binds,
+        ir.CallDirect(cname <> "$static$" <> method, fit_args(argvals, arity)),
+        ctr,
+      ))
+    }
+    None -> lower_instance_method(object, method, arguments, env, ctx, ctr)
+  }
+}
+
+/// The arity of `C.method` if `C` is a known class with static method `method`.
+fn static_method(
+  object: ast.Expression,
+  method: String,
+  ctx: Ctx,
+) -> Option(Int) {
+  case object {
+    ast.Identifier(name: cname, ..) ->
+      case dict.get(ctx.classes, cname) {
+        Ok(info) -> option.from_result(list.key_find(info.statics, method))
+        Error(Nil) -> None
+      }
+    _ -> None
+  }
+}
+
+fn object_ident_name(object: ast.Expression) -> String {
+  case object {
+    ast.Identifier(name:, ..) -> name
+    _ -> ""
+  }
+}
+
+fn lower_instance_method(
   object: ast.Expression,
   method: String,
   arguments: List(ast.Expression),

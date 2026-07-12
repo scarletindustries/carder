@@ -1315,6 +1315,24 @@ pub fn integration_json_roundtrip_test() {
   to_float(call(m, "run", [])) |> should.equal(55.0)
 }
 
+// ── static class methods ─────────────────────────────────────────────────────
+
+pub fn class_static_test() {
+  let m =
+    compile(
+      "class MathUtils { static square(x) { return x * x; } static add(a, b) { return a + b; } } function f() { return MathUtils.square(5) + MathUtils.add(2, 3); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(30.0)
+}
+
+pub fn class_static_calls_static_test() {
+  let m =
+    compile(
+      "class C { static base() { return 10; } static compute(x) { return C.base() + x; } } function f() { return C.compute(5); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(15.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {
