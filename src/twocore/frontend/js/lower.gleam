@@ -54,9 +54,10 @@
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
 //// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
 //// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
-//// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`/`freeze`/`isFrozen`
-//// (freeze makes direct property/element writes and `delete` non-strict no-ops;
-//// mutating array METHODS like `push` are NOT blocked — a v1 limitation),
+//// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`/`getOwnPropertyNames`/
+//// `freeze`/`isFrozen` (freeze makes direct property/element writes and `delete`
+//// non-strict no-ops; mutating array METHODS like `push` are NOT blocked — a v1
+//// limitation. `getOwnPropertyNames` == `keys` here, as all props are enumerable),
 //// `Number.isInteger`/`isNaN`/`isFinite` and the constants
 //// `Number.MAX_SAFE_INTEGER`/`MIN_SAFE_INTEGER`/`MAX_VALUE`/`MIN_VALUE`/`EPSILON`/
 //// `POSITIVE_INFINITY`/`NEGATIVE_INFINITY`/`NaN`, `JSON.stringify`/`parse`,
@@ -4171,6 +4172,9 @@ fn lower_static_call(
     "Object", "fromEntries", [e, ..] -> host("object_from_entries", [e])
     "Object", "freeze", [o, ..] -> host("object_freeze", [o])
     "Object", "isFrozen", [o, ..] -> host("object_is_frozen", [o])
+    // No non-enumerable own properties exist in this model, so getOwnPropertyNames
+    // is Object.keys (an array's "length" pseudo-property is omitted — a v1 gap).
+    "Object", "getOwnPropertyNames", [o, ..] -> host("object_keys", [o])
     // Object.assign(target, ...sources) — copy each source into target, return target.
     "Object", "assign", [target, ..sources] -> {
       let #(binds2, ctr) =

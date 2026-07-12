@@ -1291,6 +1291,15 @@ pub fn object_from_entries_test() {
   num("Object.fromEntries(Object.entries({ x: 5 })).x") |> should.equal(5.0)
 }
 
+pub fn object_get_own_property_names_test() {
+  // getOwnPropertyNames returns the own string keys (like Object.keys here).
+  let m =
+    compile(
+      "function f() { let names = Object.getOwnPropertyNames({ a: 1, b: 2, c: 3 }); return names.length * 100 + (names.indexOf(\"b\") >= 0 ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(301.0)
+}
+
 pub fn object_freeze_returns_object_test() {
   // Object.freeze(o) returns the SAME object (identity), still readable.
   let m =
