@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, get_prop/2, set_prop/3, has_prop/2, delete_prop/2,
+    new_object/0, get_prop/2, set_prop/3, define_accessor/4, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, array_to_list/1,
@@ -852,7 +852,7 @@ get_prop(Recv, Key) when is_reference(Recv) ->
                 _ -> undefined
             end;
         M when is_map(M) ->
-            maps:get(prop_key(Key), M, undefined);
+            resolve_get(maps:get(prop_key(Key), M, undefined));
         _ ->
             type_error(Recv)
     end;
@@ -861,17 +861,56 @@ get_prop(Recv, Key) when is_binary(Recv) ->
 get_prop(Recv, _Key) ->
     type_error(Recv).
 
+%% Resolve a stored property value: if it is an accessor, invoke its getter
+%% (a `this`-bound 0-arg closure); a setter-only accessor reads as `undefined`.
+%% A plain value passes through. JS values are never raw tuples, so the
+%% `{js_accessor, …}` marker is unambiguous.
+resolve_get({js_accessor, G, _}) when is_function(G) -> call_cb(G, []);
+resolve_get({js_accessor, _, _}) -> undefined;
+resolve_get(V) -> V.
+
 %% recv[key] = v — stores and returns v (the value of a JS assignment).
 set_prop(Recv, Key, V) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
-        {js_array, Len, Map} -> array_set(Recv, Len, Map, Key, V);
+        {js_array, Len, Map} ->
+            array_set(Recv, Len, Map, Key, V);
         M when is_map(M) ->
-            erlang:put(?CELL_KEY(Recv), maps:put(prop_key(Key), V, M)),
-            V;
-        _ -> type_error(Recv)
+            K = prop_key(Key),
+            case maps:get(K, M, undefined) of
+                %% accessor with a setter: invoke it (this-bound), don't store.
+                {js_accessor, _, S} when is_function(S) ->
+                    call_cb(S, [V]),
+                    V;
+                %% getter-only accessor: assignment is ignored (non-strict mode).
+                {js_accessor, _, _} ->
+                    V;
+                _ ->
+                    erlang:put(?CELL_KEY(Recv), maps:put(K, V, M)),
+                    V
+            end;
+        _ ->
+            type_error(Recv)
     end;
 set_prop(Recv, _Key, _V) ->
     type_error(Recv).
+
+%% Install an accessor property `{js_accessor, Getter, Setter}` on `Obj` under
+%% `Key`. Getter/Setter are `this`-bound closures (0-arg / 1-arg) or `undefined`.
+%% Stored directly (bypassing the setter check in set_prop) so it defines/replaces
+%% the property. Returns `undefined` (the value of a class/object accessor decl).
+define_accessor(Obj, Key, Getter, Setter) when is_reference(Obj) ->
+    case erlang:get(?CELL_KEY(Obj)) of
+        M when is_map(M) ->
+            erlang:put(
+                ?CELL_KEY(Obj),
+                maps:put(prop_key(Key), {js_accessor, Getter, Setter}, M)
+            ),
+            undefined;
+        _ ->
+            type_error(Obj)
+    end;
+define_accessor(Obj, _, _, _) ->
+    type_error(Obj).
 
 %% delete recv[key] — remove the property; always returns `true` (non-strict).
 delete_prop(Recv, Key) when is_reference(Recv) ->
@@ -2158,9 +2197,11 @@ is_nullish(null) -> 1;
 is_nullish(undefined) -> 1;
 is_nullish(_) -> 0.
 
+%% keys are listed WITHOUT invoking getters; values/entries resolve accessors.
 object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
-object_values(O) -> new_array([V || {_, V} <- obj_pairs(O)]).
-object_entries(O) -> new_array([new_array([K, V]) || {K, V} <- obj_pairs(O)]).
+object_values(O) -> new_array([resolve_get(V) || {_, V} <- obj_pairs(O)]).
+object_entries(O) ->
+    new_array([new_array([K, resolve_get(V)]) || {K, V} <- obj_pairs(O)]).
 
 %% Object.fromEntries(pairs) — build an object from an array of [key, value] arrays.
 object_from_entries(Entries) when is_reference(Entries) ->
@@ -2185,7 +2226,9 @@ object_from_entries(_) ->
 %% Copy `source`'s own properties into `target` (in place); behind object spread
 %% `{...o}` and `Object.assign`. A null/undefined/primitive source is a no-op.
 object_assign_into(Target, Source) when is_reference(Source) ->
-    lists:foreach(fun({K, V}) -> set_prop(Target, K, V) end, obj_pairs(Source)),
+    lists:foreach(
+        fun({K, V}) -> set_prop(Target, K, resolve_get(V)) end, obj_pairs(Source)
+    ),
     Target;
 object_assign_into(Target, _Source) ->
     Target.
@@ -2241,9 +2284,13 @@ unicode_escape(B) ->
 
 json_ref(Ref) ->
     case erlang:get(?CELL_KEY(Ref)) of
-        {js_array, Len, Map} -> json_arr(arr_list(Len, Map));
-        M when is_map(M) -> json_obj(maps:to_list(M));
-        _ -> skip
+        {js_array, Len, Map} ->
+            json_arr(arr_list(Len, Map));
+        M when is_map(M) ->
+            %% resolve getters so serialization sees the produced value.
+            json_obj([{K, resolve_get(V)} || {K, V} <- maps:to_list(M)]);
+        _ ->
+            skip
     end.
 
 json_arr(List) ->

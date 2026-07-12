@@ -241,6 +241,16 @@ pub fn get_prop(obj: Dynamic, key: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "set_prop")
 pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 
+/// Install an accessor property: `getter`/`setter` are `this`-bound closures or
+/// `undefined`. Defines `obj.key` as a getter/setter pair; returns `undefined`.
+@external(erlang, "twocore_rt_js_ffi", "define_accessor")
+pub fn define_accessor(
+  obj: Dynamic,
+  key: Dynamic,
+  getter: Dynamic,
+  setter: Dynamic,
+) -> Dynamic
+
 /// `key in obj` → i32 `1`/`0` (own properties only, like `get_prop`).
 @external(erlang, "twocore_rt_js_ffi", "has_prop")
 pub fn has_prop(obj: Dynamic, key: Dynamic) -> Int

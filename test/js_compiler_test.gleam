@@ -1732,6 +1732,73 @@ pub fn number_constants_test() {
   val("Number.NaN !== Number.NaN") |> should.equal(dyn(True))
 }
 
+pub fn class_getter_test() {
+  // A getter computes its value on property access.
+  let m =
+    compile(
+      "class C { constructor(r) { this.r = r; } get area() { return this.r * this.r; } } "
+      <> "function f() { let c = new C(3); return c.area; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(9.0)
+}
+
+pub fn class_setter_test() {
+  // A setter runs on assignment; the paired getter reads it back.
+  let m =
+    compile(
+      "class C { constructor() { this._v = 0; } get v() { return this._v; } set v(x) { this._v = x * 2; } } "
+      <> "function f() { let c = new C(); c.v = 5; return c.v; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+}
+
+pub fn accessor_inheritance_test() {
+  let base = "class A { get kind() { return \"A\"; } } "
+  // a subclass inherits the parent's accessor…
+  let m =
+    compile(
+      base
+      <> "class B extends A { constructor() { super(); } } "
+      <> "function f() { let b = new B(); return b.kind; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"A">>))
+  // …and can override it.
+  let n =
+    compile(
+      base
+      <> "class B extends A { constructor() { super(); } get kind() { return \"B\"; } } "
+      <> "function f() { let b = new B(); return b.kind; }",
+    )
+  call(n, "f", []) |> should.equal(dyn(<<"B">>))
+}
+
+pub fn getter_no_leak_test() {
+  // Enumeration and JSON must INVOKE the getter (sentinel 777), never expose the
+  // raw accessor marker — a leaked marker would fail these membership checks.
+  let src = "class C { get magic() { return 777; } } "
+  let m =
+    compile(
+      src <> "function f() { return Object.values(new C()).includes(777); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+  let n =
+    compile(
+      src
+      <> "function f() { return JSON.stringify(new C()).includes(\"777\"); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn getter_only_assign_test() {
+  // Assigning to a getter-only property is a silent no-op (sloppy mode).
+  let m =
+    compile(
+      "class C { get x() { return 42; } } "
+      <> "function f() { let c = new C(); c.x = 99; return c.x; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {

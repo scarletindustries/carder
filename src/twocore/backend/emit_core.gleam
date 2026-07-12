@@ -4195,6 +4195,7 @@ fn resolve_js(op: String) -> Option(String) {
     "new_object" -> Some("new_object")
     "get_prop" -> Some("get_prop")
     "set_prop" -> Some("set_prop")
+    "define_accessor" -> Some("define_accessor")
     "has_prop" -> Some("has_prop")
     "delete_prop" -> Some("delete_prop")
     // arrays

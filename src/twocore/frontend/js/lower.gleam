@@ -28,7 +28,8 @@
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
 //// expressions, arrow functions, closures
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
-//// & fields, static methods, `new`, `this`, method calls, `extends`/`super`
+//// & fields, static methods, instance getters/setters `get x()`/`set x(v)`
+//// (inherited and overridable), `new`, `this`, method calls, `extends`/`super`
 //// inheritance); `console.log`. Control flow threads mutated variables as loop-carried params /
 //// phi-merged `If`s.
 ////
@@ -57,8 +58,9 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
-//// members, defaulted/rest destructuring, `try`/`finally`, generators/async,
+//// Not yet (a clean `Unsupported` error / panic): static-field class members and
+//// object-literal getters/setters (class getters/setters ARE supported),
+//// defaulted/rest destructuring, `try`/`finally`, generators/async,
 //// and `continue` inside a `do/while`. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
 //// function, is a v1 limitation. A derived
@@ -168,6 +170,9 @@ type ClassInfo {
     ctor_arity: Int,
     methods: List(#(String, Int)),
     statics: List(#(String, Int)),
+    // instance accessors: (name, has_getter, has_setter). The lifted functions
+    // are `C$get$name` / `C$set$name`.
+    accessors: List(#(String, Bool, Bool)),
   )
 }
 
@@ -292,14 +297,27 @@ pub fn program(
 const js_exn_tag = "js_exn"
 
 /// A class's constructor (params + body, if any), instance methods, static methods
-/// (each name + params + body), and instance fields (name + optional initializer).
-/// Getters/setters, static fields, and computed keys are `Unsupported`.
+/// (each name + params + body), instance fields (name + optional initializer), and
+/// instance accessors (getter/setter pairs). Static fields and computed keys are
+/// `Unsupported`.
 type ClassParts {
   ClassParts(
     ctor: Option(#(List(ast.Pattern), ast.Statement)),
     methods: List(#(String, List(ast.Pattern), ast.Statement)),
     statics: List(#(String, List(ast.Pattern), ast.Statement)),
     fields: List(#(String, Option(ast.Expression))),
+    accessors: List(Accessor),
+  )
+}
+
+/// An instance accessor property: a `get name()` and/or `set name(v)`. Each of
+/// `getter`/`setter` is the accessor function's `#(params, body)` — the getter's
+/// params are empty, the setter's is a single value parameter.
+type Accessor {
+  Accessor(
+    name: String,
+    getter: Option(#(List(ast.Pattern), ast.Statement)),
+    setter: Option(#(List(ast.Pattern), ast.Statement)),
   )
 }
 
@@ -327,7 +345,7 @@ fn as_class_decl(
 }
 
 fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
-  list.try_fold(body, ClassParts(None, [], [], []), fn(acc, el) {
+  list.try_fold(body, ClassParts(None, [], [], [], []), fn(acc, el) {
     case el {
       ast.ClassMethod(value:, kind: ast.MethodConstructor, is_static: False, ..) -> {
         use #(params, b) <- result_try(method_fn(value))
@@ -371,12 +389,70 @@ fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
         computed: False,
       ) ->
         Ok(ClassParts(..acc, fields: list.append(acc.fields, [#(name, init)])))
+      // instance getter `get name() { … }`
+      ast.ClassMethod(
+        key: ast.Identifier(name:, ..),
+        value:,
+        kind: ast.MethodGet,
+        is_static: False,
+        computed: False,
+      ) -> {
+        use fn_ <- result_try(method_fn(value))
+        Ok(
+          ClassParts(
+            ..acc,
+            accessors: upsert_accessor(acc.accessors, name, Some(fn_), None),
+          ),
+        )
+      }
+      // instance setter `set name(v) { … }`
+      ast.ClassMethod(
+        key: ast.Identifier(name:, ..),
+        value:,
+        kind: ast.MethodSet,
+        is_static: False,
+        computed: False,
+      ) -> {
+        use fn_ <- result_try(method_fn(value))
+        Ok(
+          ClassParts(
+            ..acc,
+            accessors: upsert_accessor(acc.accessors, name, None, Some(fn_)),
+          ),
+        )
+      }
       _ ->
         Error(Unsupported(
-          "class element (static/getter/setter/computed/extends)",
+          "class element (static field/computed key/non-identifier extends)",
         ))
     }
   })
+}
+
+/// Merge a getter or setter into the accessor list under `name`, combining with
+/// an existing entry for the same property (so `get x`/`set x` become one
+/// accessor). A repeated getter (or setter) replaces the earlier one.
+fn upsert_accessor(
+  accessors: List(Accessor),
+  name: String,
+  getter: Option(#(List(ast.Pattern), ast.Statement)),
+  setter: Option(#(List(ast.Pattern), ast.Statement)),
+) -> List(Accessor) {
+  case list.any(accessors, fn(a) { a.name == name }) {
+    True ->
+      list.map(accessors, fn(a) {
+        case a.name == name {
+          True ->
+            Accessor(
+              name: name,
+              getter: option.or(getter, a.getter),
+              setter: option.or(setter, a.setter),
+            )
+          False -> a
+        }
+      })
+    False -> list.append(accessors, [Accessor(name, getter, setter)])
+  }
 }
 
 fn method_fn(
@@ -432,6 +508,17 @@ fn class_scan_stmts(parts: ClassParts) -> List(ast.Statement) {
     ctor_body_stmts(parts),
     list.flat_map(parts.methods, fn(m) { block_stmts(m.2) }),
     list.flat_map(parts.statics, fn(m) { block_stmts(m.2) }),
+    list.flat_map(parts.accessors, fn(a) {
+      let g = case a.getter {
+        Some(#(_, b)) -> block_stmts(b)
+        None -> []
+      }
+      let s = case a.setter {
+        Some(#(_, b)) -> block_stmts(b)
+        None -> []
+      }
+      list.append(g, s)
+    }),
   ])
 }
 
@@ -474,6 +561,9 @@ fn class_info(parent: Option(String), parts: ClassParts) -> ClassInfo {
     ctor_arity: ctor_arity,
     methods: list.map(parts.methods, fn(m) { #(m.0, list.length(m.1)) }),
     statics: list.map(parts.statics, fn(m) { #(m.0, list.length(m.1)) }),
+    accessors: list.map(parts.accessors, fn(a) {
+      #(a.name, option.is_some(a.getter), option.is_some(a.setter))
+    }),
   )
 }
 
@@ -515,7 +605,40 @@ fn lower_class(
       lower_function(cname <> "$static$" <> mname, mparams, mbody, cctx)
     }),
   )
-  Ok(list.flatten([[ctor_fn], method_fns, static_fns]))
+  // accessors: each getter is `C$get$name(this)`, each setter `C$set$name(this, v)`,
+  // lowered like a method (this-first). A property may have either or both.
+  use accessor_fns <- result_try(
+    list.try_map(parts.accessors, fn(a) {
+      use gfns <- result_try(case a.getter {
+        Some(#(gp, gb)) -> {
+          use f <- result_try(lower_class_method(
+            cname <> "$get$" <> a.name,
+            gp,
+            block_stmts(gb),
+            cctx,
+          ))
+          Ok([f])
+        }
+        None -> Ok([])
+      })
+      use sfns <- result_try(case a.setter {
+        Some(#(sp, sb)) -> {
+          use f <- result_try(lower_class_method(
+            cname <> "$set$" <> a.name,
+            sp,
+            block_stmts(sb),
+            cctx,
+          ))
+          Ok([f])
+        }
+        None -> Ok([])
+      })
+      Ok(list.append(gfns, sfns))
+    }),
+  )
+  Ok(
+    list.flatten([[ctor_fn], method_fns, static_fns, list.flatten(accessor_fns)]),
+  )
 }
 
 /// The instance methods to install for `new C(…)`, ancestors-first (so an overriding
@@ -547,6 +670,25 @@ fn chain_methods(
         None -> []
       }
       let own = list.map(info.methods, fn(m) { #(cname, m.0, m.1) })
+      list.append(ancestors, own)
+    }
+  }
+}
+
+/// The instance accessors to install for `new C(…)`, ancestors-first (so an
+/// overriding child accessor wins): `(defining_class, name, has_getter, has_setter)`.
+fn chain_accessors(
+  cname: String,
+  classes: Dict(String, ClassInfo),
+) -> List(#(String, String, Bool, Bool)) {
+  case dict.get(classes, cname) {
+    Error(Nil) -> []
+    Ok(info) -> {
+      let ancestors = case info.super_class {
+        Some(p) -> chain_accessors(p, classes)
+        None -> []
+      }
+      let own = list.map(info.accessors, fn(a) { #(cname, a.0, a.1, a.2) })
       list.append(ancestors, own)
     }
   }
@@ -2848,6 +2990,49 @@ fn lower_new(
                     ctr,
                   )
                 #(bs, ctr)
+              },
+            )
+          // install each accessor (getter/setter) in the chain as a `this`-bound
+          // accessor property (ancestors first, so an overriding child wins).
+          let #(binds, ctr) =
+            list.fold(
+              chain_accessors(cname, ctx.classes),
+              #(binds, ctr),
+              fn(acc, a) {
+                let #(binds, ctr) = acc
+                let #(defclass, aname, has_get, has_set) = a
+                // MakeClosure's arity is the post-capture (user) arg count: a
+                // getter takes none, a setter takes one; `this` is the capture.
+                let #(bg, getter_v, ctr) = case has_get {
+                  True ->
+                    bind_after(
+                      binds,
+                      ir.MakeClosure(defclass <> "$get$" <> aname, [this_v], 0),
+                      ctr,
+                    )
+                  False -> #(binds, undefined(), ctr)
+                }
+                let #(bsv, setter_v, ctr) = case has_set {
+                  True ->
+                    bind_after(
+                      bg,
+                      ir.MakeClosure(defclass <> "$set$" <> aname, [this_v], 1),
+                      ctr,
+                    )
+                  False -> #(bg, undefined(), ctr)
+                }
+                let #(bd, _r, ctr) =
+                  bind_after(
+                    bsv,
+                    ir.CallHost("js", "define_accessor", [
+                      this_v,
+                      ir.ConstBinary(<<aname:utf8>>),
+                      getter_v,
+                      setter_v,
+                    ]),
+                    ctr,
+                  )
+                #(bd, ctr)
               },
             )
           // tag the instance with `@@is_<Class>` for every class in the chain, so
