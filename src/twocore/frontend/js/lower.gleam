@@ -22,8 +22,10 @@
 //// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
 //// Control flow threads mutated variables as loop-carried params / phi-merged `If`s.
 ////
-//// Control flow also includes `for-of` (over arrays/strings) and `switch` (with
-//// fall-through, default in any position, and `break` that targets the switch).
+//// Control flow also includes `for-of` (over arrays/strings), `switch` (with
+//// fall-through, default in any position, and `break` that targets the switch), and
+//// `throw` / `try`/`catch` (a thrown JS value transported via the module's `js_exn`
+//// tag; `return`/`break`/`continue` inside a try body transfer out correctly).
 ////
 //// Builtins: the `Math` namespace (functions + constants); array methods (push/pop/
 //// shift/unshift, map/filter/forEach/reduce/some/every/find/findIndex, indexOf/
@@ -34,9 +36,11 @@
 //// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`.
 ////
-//// Not yet (a clean `Unsupported` error / panic): classes, `try/catch/throw`,
-//// `for-in`, regex, `JSON`, and `continue` inside a `do/while`. Scope is one flat
-//// function scope per JS function (block-scoped `let` is treated as function-scoped).
+//// Not yet (a clean `Unsupported` error / panic): classes, `for-in`, regex, `JSON`,
+//// `try`/`finally`, and `continue` inside a `do/while`. Only an explicit `throw` is
+//// caught (a runtime type error propagates), and a variable mutated in a try body
+//// before a throw keeps its pre-try value in the handler. Scope is one flat function
+//// scope per JS function (block-scoped `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -167,23 +171,25 @@ pub fn program(
   // The named JS functions (exported) plus the internal lifted lambdas (not exported).
   let named = [main, ..funcs]
   let functions = list.append(named, lambda_funcs)
-  Ok(
-    ir.Module(
-      name: module_name,
-      uses_numerics: True,
-      memories: [],
-      globals: [],
-      imports: [],
-      functions: functions,
-      exports: list.map(named, fn(f) { ir.ExportFn(f.name, f.name) }),
-      data_segments: [],
-      tables: [],
-      elements: [],
-      start: None,
-      tags: [],
-    ),
-  )
+  Ok(ir.Module(
+    name: module_name,
+    uses_numerics: True,
+    memories: [],
+    globals: [],
+    imports: [],
+    functions: functions,
+    exports: list.map(named, fn(f) { ir.ExportFn(f.name, f.name) }),
+    data_segments: [],
+    tables: [],
+    elements: [],
+    start: None,
+    // The single exception tag carrying a thrown JS value (`throw x` / `try`/`catch`).
+    tags: [ir.TagDecl(js_exn_tag, [ir.TTerm])],
+  ))
 }
+
+/// The name of the module-level exception tag that transports a thrown JS value.
+const js_exn_tag = "js_exn"
 
 fn as_function_decl(
   s: ast.Statement,
@@ -312,6 +318,13 @@ fn lower_stmt(
       lower_for_of(left, right, body, env, ctx, ctr, k)
     ast.SwitchStatement(discriminant:, cases:) ->
       lower_switch(discriminant, cases, env, ctx, ctr, k)
+    // `throw e` — raise the JS exception tag carrying `e`; the continuation is dead.
+    ast.ThrowStatement(argument: arg) -> {
+      use #(binds, v, ctr) <- result_try(lower_expr(arg, env, ctx, ctr))
+      Ok(#(emit_lets(binds, ir.Throw(js_exn_tag, [v])), ctr))
+    }
+    ast.TryStatement(block:, handler:, finalizer:) ->
+      lower_try(block, handler, finalizer, env, ctx, ctr, k)
 
     ast.BreakStatement(label: None) ->
       case ctx.brk {
@@ -855,6 +868,78 @@ fn lower_switch(
     ctr,
     k,
   )
+}
+
+/// `try { B } catch (e) { H }` — lower to the IR `Try`: the body and handler each
+/// yield the block's mutated (carried) variables on normal completion, and a `throw`
+/// inside `B` (via the `js_exn` tag) transfers to `H` with the thrown value bound to
+/// `e`. `return`/`break`/`continue` inside `B`/`H` transfer out of the try as usual.
+///
+/// v1 limits: `finally` and a non-identifier catch binding are `Unsupported`, and — as
+/// with all our SSA-style mutation — variables mutated in `B` before a throw are NOT
+/// visible in `H` (the handler sees their pre-try values).
+fn lower_try(
+  block: ast.Statement,
+  handler: Option(ast.CatchClause),
+  finalizer: Option(ast.Statement),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  case finalizer, handler {
+    Some(_), _ -> Error(Unsupported("try/finally"))
+    None, None -> Error(Unsupported("try without catch"))
+    None, Some(ast.CatchClause(param:, body: cbody)) -> {
+      use e_name <- result_try(case param {
+        None -> Ok("$exn")
+        Some(ast.IdentifierPattern(name:, ..)) -> Ok(name)
+        Some(_) -> Error(Unsupported("destructuring catch binding"))
+      })
+      let body_stmts = block_stmts(block)
+      let catch_stmts = block_stmts(cbody)
+      let carried =
+        list.append(assigned_in(body_stmts), assigned_in(catch_stmts))
+        |> list.unique
+        |> list.filter(dict.has_key(env, _))
+      let tys = list.map(carried, fn(_) { ir.TTerm })
+      // fall-through of either arm yields the carried variables' current values.
+      let yield_carried: Cont = fn(env2, ctr2) {
+        Ok(#(ir.Values(carried_vals(env2, carried)), ctr2))
+      }
+      use #(body_expr, ctr) <- result_try(lower_stmts(
+        body_stmts,
+        env,
+        ctx,
+        ctr,
+        yield_carried,
+      ))
+      let henv = dict.insert(env, e_name, ir.Var(e_name))
+      use #(handler_expr, ctr) <- result_try(lower_stmts(
+        catch_stmts,
+        henv,
+        ctx,
+        ctr,
+        yield_carried,
+      ))
+      let try_expr =
+        ir.Try(result: tys, body: body_expr, handlers: [
+          ir.CatchHandler(
+            on: ir.OnTag(js_exn_tag),
+            payload: [e_name],
+            exnref: None,
+            handler: handler_expr,
+          ),
+        ])
+      let #(after, ctr) = fresh_n(list.length(carried), ctr)
+      let env2 =
+        list.fold(list.zip(carried, after), env, fn(acc, p) {
+          dict.insert(acc, p.0, ir.Var(p.1))
+        })
+      use #(rest, ctr) <- result_try(k(env2, ctr))
+      Ok(#(ir.Let(after, try_expr, rest), ctr))
+    }
+  }
 }
 
 /// Shared loop skeleton: bind the carried vars' entry values, run the `Loop`, then
@@ -2165,6 +2250,19 @@ fn assigned_in_stmt(s: ast.Statement) -> List(String) {
       list.flat_map(cases, fn(c) {
         assigned_in(list.map(c.consequent, fn(w) { w.statement }))
       })
+    ast.ThrowStatement(argument: a) -> assigned_of_expr(a)
+    ast.TryStatement(block:, handler:, finalizer:) ->
+      list.flatten([
+        assigned_in_stmt(block),
+        case handler {
+          Some(ast.CatchClause(body:, ..)) -> assigned_in_stmt(body)
+          None -> []
+        },
+        case finalizer {
+          Some(f) -> assigned_in_stmt(f)
+          None -> []
+        },
+      ])
     _ -> []
   }
 }
@@ -2314,6 +2412,18 @@ fn child_stmts(s: ast.Statement) -> List(ast.Statement) {
       list.flat_map(cases, fn(c) {
         list.map(c.consequent, fn(w) { w.statement })
       })
+    ast.TryStatement(block:, handler:, finalizer:) ->
+      list.flatten([
+        [block],
+        case handler {
+          Some(ast.CatchClause(body:, ..)) -> [body]
+          None -> []
+        },
+        case finalizer {
+          Some(f) -> [f]
+          None -> []
+        },
+      ])
     _ -> []
   }
 }
@@ -2358,6 +2468,13 @@ fn declared_stmt(s: ast.Statement) -> List(String) {
       declared_stmt(d)
     ast.ForOfStatement(left:, ..) -> for_of_declared(left)
     ast.ForInStatement(left:, ..) -> for_of_declared(left)
+    ast.TryStatement(
+      handler: Some(ast.CatchClause(
+        param: Some(ast.IdentifierPattern(name: n, ..)),
+        ..,
+      )),
+      ..,
+    ) -> [n]
     _ -> []
   }
   list.append(here, list.flat_map(child_stmts(s), declared_stmt))

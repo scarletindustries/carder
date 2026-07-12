@@ -847,6 +847,64 @@ pub fn number_static_test() {
   call(s, "f", []) |> should.equal(dyn(False))
 }
 
+// ── try / catch / throw ──────────────────────────────────────────────────────
+
+pub fn try_catch_test() {
+  let m =
+    compile("function f() { try { throw \"boom\"; } catch (e) { return e; } }")
+  call(m, "f", []) |> should.equal(dyn(<<"boom">>))
+}
+
+pub fn try_throw_number_test() {
+  let m =
+    compile("function f() { try { throw 42; } catch (e) { return e * 2; } }")
+  to_float(call(m, "f", [])) |> should.equal(84.0)
+}
+
+pub fn try_no_throw_test() {
+  let m =
+    compile(
+      "function f() { let x = 1; try { x = 2; } catch (e) { x = 3; } return x; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(2.0)
+}
+
+pub fn try_throw_skips_rest_test() {
+  let m =
+    compile(
+      "function f() { let x = 1; try { throw 0; x = 99; } catch (e) { x = 5; } return x; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(5.0)
+}
+
+pub fn try_return_in_body_test() {
+  // a `return` inside a try body returns from the function (it is NOT caught)
+  let m =
+    compile(
+      "function f() { try { return \"early\"; } catch (e) { return \"caught\"; } }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"early">>))
+}
+
+pub fn try_catch_from_callee_test() {
+  // a throw propagates across a call and is caught
+  let m =
+    compile(
+      "function boom() { throw \"err\"; } function f() { try { boom(); return \"no\"; } catch (e) { return e; } }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"err">>))
+}
+
+pub fn try_catch_in_loop_test() {
+  // try/catch nested in a loop, mutating a loop-carried variable
+  let m =
+    compile(
+      "function f() { let s = 0; for (let i = 0; i < 5; i++) { try { if (i === 2) { throw 0; } s += i; } catch (e) { s += 100; } } return s; }",
+    )
+  // i=0→s0, i=1→s1, i=2→throw s101, i=3→s104, i=4→s108
+  to_float(call(m, "f", [])) |> should.equal(108.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {
