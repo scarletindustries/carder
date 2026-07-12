@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, gen_make/1, gen_next/2, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/1, array_fill/2, array_at/2,
@@ -817,6 +817,25 @@ cell_set(Ref, _) ->
 new_object() ->
     cell_new(#{}).
 
+%% A generator object — a cell holding the compiled step closure. The frontend
+%% transforms `function* g(){…}` into a state machine (a closure over a persistent
+%% context) and hands the step function here. `.next(v)` drives one step. Once the
+%% state machine reaches its DONE state it permanently returns {value:undefined,
+%% done:true}, so no extra done-tracking is needed here.
+gen_make(StepFn) ->
+    cell_new({js_gen, StepFn}).
+
+%% `gen.next(v)` — advance the generator (StepFn returns the `{value, done}`
+%% object). On a non-generator receiver, delegate to a user `next` method (so an
+%% ordinary iterator/cursor object with its own `next` still works).
+gen_next(Recv, Args) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_gen, StepFn} -> call_cb(StepFn, [arg(Args, 0)]);
+        _ -> delegate(Recv, <<"next">>, Args)
+    end;
+gen_next(Recv, Args) ->
+    delegate(Recv, <<"next">>, Args).
+
 %% Static class fields live in the process dictionary keyed by a module-qualified
 %% class name (`ModuleName$Class`, unique per compiled JS module) so two modules
 %% that both declare `class C` do not share static state. `Class`/`Field` are
@@ -884,6 +903,10 @@ get_prop(Recv, Key) when is_reference(Recv) ->
                 <<"size">> -> maps:size(D);
                 _ -> undefined
             end;
+        %% a generator object: arbitrary property reads are `undefined` (`.next`
+        %% is dispatched by the compiler to gen_next, not via get_prop).
+        {js_gen, _} ->
+            undefined;
         M when is_map(M) ->
             resolve_get(maps:get(prop_key(Key), M, undefined));
         _ ->

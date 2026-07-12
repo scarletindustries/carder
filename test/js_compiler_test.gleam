@@ -1900,6 +1900,37 @@ pub fn array_from_map_test() {
   |> should.equal(dyn(<<"AB">>))
 }
 
+pub fn generator_basic_test() {
+  // A straight-line generator: .next() advances through the yields.
+  let m =
+    compile(
+      "function* g() { yield 1; yield 2; yield 3; } "
+      <> "function f() { let it = g(); return it.next().value * 100 + it.next().value * 10 + it.next().value; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(123.0)
+}
+
+pub fn generator_sent_test() {
+  // A yield expression evaluates to the value passed to the next .next(v).
+  let m =
+    compile(
+      "function* g() { let a = yield 1; let b = yield a + 10; return a + b; } "
+      <> "function f() { let it = g(); it.next(); let r2 = it.next(5); let r3 = it.next(7); return r2.value * 100 + r3.value; }",
+    )
+  // resume a=5 → yield 15 (r2.value); resume b=7 → return 12 (r3.value)
+  to_float(call(m, "f", [])) |> should.equal(1512.0)
+}
+
+pub fn generator_done_test() {
+  // .done is false while yielding, true once the body completes.
+  let m =
+    compile(
+      "function* g() { yield 1; } "
+      <> "function f() { let it = g(); let a = it.next(); let b = it.next(); return (a.done ? 1 : 0) * 10 + (b.done ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
 pub fn new_spread_test() {
   let cls =
     "class Point { constructor(x, y) { this.x = x; this.y = y; } sum() { return this.x + this.y; } } "

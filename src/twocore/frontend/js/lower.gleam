@@ -854,10 +854,369 @@ fn as_function_decl(
   s: ast.Statement,
 ) -> Result(#(String, List(ast.Pattern), ast.Statement), Nil) {
   case s {
+    ast.FunctionDeclaration(
+      name: Some(name),
+      params:,
+      body:,
+      is_generator: True,
+      ..,
+    ) ->
+      case transform_generator(params, body) {
+        // a generator: replace the body with its state machine.
+        Ok(new_body) -> Ok(#(name, params, new_body))
+        // an unsupported generator shape: leave the body so lowering the
+        // remaining `yield` reports a clean Unsupported error.
+        Error(_) -> Ok(#(name, params, body))
+      }
     ast.FunctionDeclaration(name: Some(name), params:, body:, ..) ->
       Ok(#(name, params, body))
     _ -> Error(Nil)
   }
+}
+
+// ── generator transform (function* → a resumable state machine) ───────────────
+//
+// A generator lowers to a normal function that returns a state-machine closure.
+// Local variables (params + declared) live in a persistent `%ctx` object so they
+// survive across `.next()` calls: each step LOADs them from `%ctx` at entry and
+// SAVEs them before every `yield`/return. Control flow becomes a `while (true)
+// switch (%ctx["@@state"])` where a `yield` returns `{value, done:false}` (and
+// records the resume state) and `return e` yields `{value:e, done:true}`.
+
+const gen_ctx = "%ctx"
+
+const gen_sent = "%sent"
+
+const gen_done_state = -1
+
+type GenSt {
+  GenSt(cases: List(#(Int, List(ast.Statement))), counter: Int)
+}
+
+type GenClass {
+  GenPlainC
+  GenReturnC(ast.Expression)
+  GenYieldC(ast.Expression, Option(ast.Expression))
+  GenUnsupportedC
+}
+
+fn gen_sp() -> ast.Span {
+  ast.Span(0, 0)
+}
+
+fn gen_id(name: String) -> ast.Expression {
+  ast.Identifier(span: gen_sp(), name: name)
+}
+
+/// `%ctx.name` — a hoisted local / the state object's field.
+fn gen_ctx_member(name: String) -> ast.Expression {
+  ast.MemberExpression(
+    span: gen_sp(),
+    object: gen_id(gen_ctx),
+    property: gen_id(name),
+    computed: False,
+  )
+}
+
+/// `%ctx["@@state"]` — the state-machine program counter.
+fn gen_state() -> ast.Expression {
+  ast.MemberExpression(
+    span: gen_sp(),
+    object: gen_id(gen_ctx),
+    property: ast.StringExpression(span: gen_sp(), value: "@@state"),
+    computed: True,
+  )
+}
+
+fn gen_num(n: Int) -> ast.Expression {
+  ast.NumberLiteral(span: gen_sp(), value: int.to_float(n))
+}
+
+fn gen_undef() -> ast.Expression {
+  ast.UndefinedExpression(span: gen_sp())
+}
+
+fn gen_wrap_stmt(s: ast.Statement) -> ast.StmtWithLine {
+  ast.StmtWithLine(line: 0, statement: s)
+}
+
+fn gen_assign(target: ast.Expression, value: ast.Expression) -> ast.Statement {
+  ast.ExpressionStatement(
+    directive: None,
+    expression: ast.AssignmentExpression(
+      span: gen_sp(),
+      operator: ast.Assign,
+      left: target,
+      right: value,
+    ),
+  )
+}
+
+/// `{ value: e, done: <b> }` — the result object each step returns.
+fn gen_result(e: ast.Expression, done: Bool) -> ast.Expression {
+  let prop = fn(k, v) {
+    ast.Property(
+      key: gen_id(k),
+      value: v,
+      kind: ast.Init,
+      computed: False,
+      shorthand: False,
+      method: False,
+    )
+  }
+  ast.ObjectExpression(span: gen_sp(), properties: [
+    prop("value", e),
+    prop("done", ast.BooleanLiteral(span: gen_sp(), value: done)),
+  ])
+}
+
+/// `%ctx.x = x; …` — persist all locals before suspending.
+fn gen_saves(locals: List(String)) -> List(ast.Statement) {
+  list.map(locals, fn(n) { gen_assign(gen_ctx_member(n), gen_id(n)) })
+}
+
+/// The statements that end a case with a `yield`: save locals, set the resume
+/// state, and return `{value: e, done: false}`.
+fn gen_yield_ret(
+  e: ast.Expression,
+  resume: Int,
+  locals: List(String),
+) -> List(ast.Statement) {
+  list.flatten([
+    gen_saves(locals),
+    [
+      gen_assign(gen_state(), gen_num(resume)),
+      ast.ReturnStatement(argument: Some(gen_result(e, False))),
+    ],
+  ])
+}
+
+/// The statements that end a case with a generator `return e`.
+fn gen_done_ret(
+  e: ast.Expression,
+  locals: List(String),
+) -> List(ast.Statement) {
+  list.flatten([
+    gen_saves(locals),
+    [
+      gen_assign(gen_state(), gen_num(gen_done_state)),
+      ast.ReturnStatement(argument: Some(gen_result(e, True))),
+    ],
+  ])
+}
+
+/// Classify a generator-body statement for the CFG builder.
+fn classify_gen(s: ast.Statement) -> GenClass {
+  case s {
+    ast.ReturnStatement(argument: arg) -> {
+      let e = option.unwrap(arg, gen_undef())
+      case has_yield_e(e) {
+        True -> GenUnsupportedC
+        False -> GenReturnC(e)
+      }
+    }
+    ast.ExpressionStatement(
+      expression: ast.YieldExpression(argument:, is_delegate: False, ..),
+      ..,
+    ) -> GenYieldC(option.unwrap(argument, gen_undef()), None)
+    ast.ExpressionStatement(
+      expression: ast.AssignmentExpression(
+        operator: ast.Assign,
+        left:,
+        right: ast.YieldExpression(argument:, is_delegate: False, ..),
+        ..,
+      ),
+      ..,
+    ) -> GenYieldC(option.unwrap(argument, gen_undef()), Some(left))
+    ast.VariableDeclaration(
+      declarations: [
+        ast.VariableDeclarator(
+          id: ast.IdentifierPattern(name: x, ..),
+          init: Some(ast.YieldExpression(argument:, is_delegate: False, ..)),
+        ),
+      ],
+      ..,
+    ) -> GenYieldC(option.unwrap(argument, gen_undef()), Some(gen_id(x)))
+    _ ->
+      case has_yield_s(s) {
+        True -> GenUnsupportedC
+        False -> GenPlainC
+      }
+  }
+}
+
+/// Does expression `e` contain a `yield` (not inside a nested function)?
+fn has_yield_e(e: ast.Expression) -> Bool {
+  case e {
+    ast.YieldExpression(..) -> True
+    ast.FunctionExpression(..) | ast.ArrowFunctionExpression(..) -> False
+    _ -> list.any(child_exprs(e), has_yield_e)
+  }
+}
+
+fn has_yield_s(s: ast.Statement) -> Bool {
+  list.any(stmt_exprs(s), has_yield_e) || list.any(child_stmts(s), has_yield_s)
+}
+
+fn gen_fresh(st: GenSt) -> #(Int, GenSt) {
+  #(st.counter, GenSt(..st, counter: st.counter + 1))
+}
+
+fn gen_add(label: Int, stmts: List(ast.Statement), st: GenSt) -> GenSt {
+  GenSt(..st, cases: list.append(st.cases, [#(label, stmts)]))
+}
+
+/// Build the state machine for a straight-line statement sequence (increment 1:
+/// yields must be at statement level; control flow CONTAINING a yield is a clean
+/// Unsupported for now). `acc` is the current case's statements, reversed.
+fn tr_seq(
+  stmts: List(ast.Statement),
+  entry: Int,
+  acc: List(ast.Statement),
+  locals: List(String),
+  st: GenSt,
+) -> Result(GenSt, Error) {
+  case stmts {
+    [] ->
+      Ok(gen_add(
+        entry,
+        list.append(list.reverse(acc), gen_done_ret(gen_undef(), locals)),
+        st,
+      ))
+    [s, ..rest] ->
+      case classify_gen(s) {
+        GenPlainC -> tr_seq(rest, entry, [s, ..acc], locals, st)
+        GenReturnC(e) ->
+          Ok(gen_add(
+            entry,
+            list.append(list.reverse(acc), gen_done_ret(e, locals)),
+            st,
+          ))
+        GenYieldC(e, target) -> {
+          let #(resume, st) = gen_fresh(st)
+          let st =
+            gen_add(
+              entry,
+              list.append(list.reverse(acc), gen_yield_ret(e, resume, locals)),
+              st,
+            )
+          let resume_acc = case target {
+            Some(t) -> [gen_assign(t, gen_id(gen_sent))]
+            None -> []
+          }
+          tr_seq(rest, resume, resume_acc, locals, st)
+        }
+        GenUnsupportedC ->
+          Error(Unsupported(
+            "generator: control flow around a yield is not yet supported",
+          ))
+      }
+  }
+}
+
+/// Wrap the built cases into the generator's outer function body.
+fn gen_wrap(
+  param_names: List(String),
+  locals: List(String),
+  st: GenSt,
+) -> ast.Statement {
+  let sp = gen_sp()
+  // load: var l1 = %ctx.l1, l2 = %ctx.l2, …
+  let load =
+    ast.VariableDeclaration(
+      kind: ast.Var,
+      declarations: list.map(locals, fn(n) {
+        ast.VariableDeclarator(
+          id: ast.IdentifierPattern(name: n, span: sp),
+          init: Some(gen_ctx_member(n)),
+        )
+      }),
+    )
+  let user_cases =
+    list.map(st.cases, fn(c) {
+      ast.SwitchCase(
+        condition: Some(gen_num(c.0)),
+        consequent: list.map(c.1, gen_wrap_stmt),
+      )
+    })
+  let done_case =
+    ast.SwitchCase(condition: Some(gen_num(gen_done_state)), consequent: [
+      gen_wrap_stmt(
+        ast.ReturnStatement(argument: Some(gen_result(gen_undef(), True))),
+      ),
+    ])
+  let switch =
+    ast.SwitchStatement(
+      discriminant: gen_state(),
+      cases: list.append(user_cases, [done_case]),
+    )
+  let while_ =
+    ast.WhileStatement(
+      condition: ast.BooleanLiteral(span: sp, value: True),
+      body: ast.BlockStatement(body: [gen_wrap_stmt(switch)]),
+    )
+  let step_fn =
+    ast.FunctionExpression(
+      span: sp,
+      name: None,
+      name_span: None,
+      params: [ast.IdentifierPattern(name: gen_sent, span: sp)],
+      body: ast.BlockStatement(body: [
+        gen_wrap_stmt(load),
+        gen_wrap_stmt(while_),
+      ]),
+      is_generator: False,
+      is_async: False,
+    )
+  let genmake =
+    ast.CallExpression(
+      span: sp,
+      callee: ast.MemberExpression(
+        span: sp,
+        object: gen_id("Object"),
+        property: gen_id("__genMake"),
+        computed: False,
+      ),
+      arguments: [step_fn],
+    )
+  let ctx_decl =
+    ast.VariableDeclaration(kind: ast.Let, declarations: [
+      ast.VariableDeclarator(
+        id: ast.IdentifierPattern(name: gen_ctx, span: sp),
+        init: Some(ast.ObjectExpression(span: sp, properties: [])),
+      ),
+    ])
+  let state_init = gen_assign(gen_state(), gen_num(0))
+  let param_inits =
+    list.map(param_names, fn(p) { gen_assign(gen_ctx_member(p), gen_id(p)) })
+  ast.BlockStatement(body: list.map(
+    list.flatten([
+      [ctx_decl, state_init],
+      param_inits,
+      [ast.ReturnStatement(argument: Some(genmake))],
+    ]),
+    gen_wrap_stmt,
+  ))
+}
+
+/// Transform `function* g(params) { body }` into a normal function body that
+/// builds and returns the generator state machine. Errors (→ a clean Unsupported
+/// at the call site) for shapes not yet handled.
+fn transform_generator(
+  params: List(ast.Pattern),
+  body: ast.Statement,
+) -> Result(ast.Statement, Error) {
+  let param_names = pattern_names_lax(params)
+  let body_stmts = block_stmts(body)
+  let locals = list.unique(list.append(param_names, declared_stmts(body_stmts)))
+  use st <- result_try(tr_seq(
+    body_stmts,
+    0,
+    [],
+    locals,
+    GenSt(cases: [], counter: 1),
+  ))
+  Ok(gen_wrap(param_names, locals, st))
 }
 
 fn lower_function(
@@ -2286,6 +2645,10 @@ fn lower_expr(
     ast.UndefinedExpression(..) -> Ok(#([], undefined(), ctr))
     ast.TemplateLiteral(quasis:, expressions:, ..) ->
       lower_template(quasis, expressions, env, ctx, ctr)
+    // A `yield` that survived (the enclosing generator's shape wasn't transformed).
+    ast.YieldExpression(..) ->
+      Error(Unsupported("yield in an unsupported generator shape"))
+    ast.AwaitExpression(..) -> Error(Unsupported("await / async functions"))
     ast.TaggedTemplateExpression(tag:, cooked:, raw:, expressions:, ..) ->
       lower_tagged_template(tag, cooked, raw, expressions, env, ctx, ctr)
 
@@ -3425,6 +3788,8 @@ fn lower_static_call(
     }
     // internal helper the destructuring desugar emits for `{ a, ...rest }`.
     "Object", "__rest", [o, excluded] -> host("object_rest", [o, excluded])
+    // internal helper the generator transform emits: wrap a step closure.
+    "Object", "__genMake", [step] -> host("gen_make", [step])
     "Object", "keys", [o, ..] -> host("object_keys", [o])
     "Object", "values", [o, ..] -> host("object_values", [o])
     "Object", "entries", [o, ..] -> host("object_entries", [o])
@@ -3912,6 +4277,9 @@ fn lower_instance_method(
     "filter", [f, ..] -> host("array_filter", [f])
     // forEach + Map/Set methods dispatch on the receiver type in the runtime and
     // delegate (with ALL args) to a same-named user method on a plain object.
+    // generator `.next(v)` — advances a generator, or delegates to a user
+    // `next` method on an ordinary iterator object.
+    "next", _ -> coll("gen_next")
     "forEach", _ -> coll("js_m_foreach")
     "get", _ -> coll("js_m_get")
     "set", _ -> coll("js_m_set")

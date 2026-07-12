@@ -246,6 +246,14 @@ pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "define_data")
 pub fn define_data(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 
+/// Wrap a generator step closure into a generator object.
+@external(erlang, "twocore_rt_js_ffi", "gen_make")
+pub fn gen_make(step: Dynamic) -> Dynamic
+
+/// `gen.next(v)` — advance a generator (or delegate to a user `next` method).
+@external(erlang, "twocore_rt_js_ffi", "gen_next")
+pub fn gen_next(gen: Dynamic, args: Dynamic) -> Dynamic
+
 /// Read a static class field `Class.field` (`class` is the module-qualified name).
 /// Returns `undefined` if unset.
 @external(erlang, "twocore_rt_js_ffi", "static_get")

@@ -4195,6 +4195,8 @@ fn resolve_js(op: String) -> Option(String) {
     "new_object" -> Some("new_object")
     "get_prop" -> Some("get_prop")
     "set_prop" -> Some("set_prop")
+    "gen_make" -> Some("gen_make")
+    "gen_next" -> Some("gen_next")
     "define_data" -> Some("define_data")
     "define_accessor" -> Some("define_accessor")
     "static_get" -> Some("static_get")
