@@ -2703,6 +2703,8 @@ fn lower_instance_method(
     "lastIndexOf", [x, ..] -> host("array_last_index_of", [x])
     "toFixed", [d, ..] -> host("num_to_fixed", [d])
     "toFixed", [] -> host("num_to_fixed", [undefined()])
+    "toString", [] -> host("to_string_dispatch", [])
+    "toString", [radix, ..] -> host("num_to_string_radix", [radix])
     "reduce", [f] -> host("array_reduce1", [f])
     "reduce", [f, init, ..] -> host("array_reduce", [f, init])
     "sort", [] -> host("array_sort", [undefined()])

@@ -4216,6 +4216,8 @@ fn resolve_js(op: String) -> Option(String) {
     "array_find_last_index" -> Some("array_find_last_index")
     "array_last_index_of" -> Some("array_last_index_of")
     "num_to_fixed" -> Some("num_to_fixed")
+    "to_string_dispatch" -> Some("to_string_dispatch")
+    "num_to_string_radix" -> Some("num_to_string_radix")
     "array_map" -> Some("array_map")
     "array_filter" -> Some("array_filter")
     "array_foreach" -> Some("array_foreach")

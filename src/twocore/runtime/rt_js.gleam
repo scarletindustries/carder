@@ -326,6 +326,14 @@ pub fn array_last_index_of(arr: Dynamic, x: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "num_to_fixed")
 pub fn num_to_fixed(n: Dynamic, d: Dynamic) -> Dynamic
 
+/// `recv.toString()` — a user `toString` method wins, else the default ToString.
+@external(erlang, "twocore_rt_js_ffi", "to_string_dispatch")
+pub fn to_string_dispatch(recv: Dynamic) -> Dynamic
+
+/// `num.toString(radix)` — base-`radix` integer string (else default ToString).
+@external(erlang, "twocore_rt_js_ffi", "num_to_string_radix")
+pub fn num_to_string_radix(n: Dynamic, radix: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 

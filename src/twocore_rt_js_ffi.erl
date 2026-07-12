@@ -69,6 +69,7 @@
     str_pad_start/3, str_pad_end/3, string_from_char_code/1, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/2, num_to_fixed/2,
+    to_string_dispatch/1, num_to_string_radix/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
@@ -1242,6 +1243,35 @@ alast_idx([{E, I} | Rest], X, Acc) ->
     case strict_eq(E, X) of
         1 -> alast_idx(Rest, X, I);
         0 -> alast_idx(Rest, X, Acc)
+    end.
+
+%% recv.toString() — a user-defined `toString` method (a function property) wins;
+%% otherwise the default ToString.
+to_string_dispatch(Recv) when is_reference(Recv) ->
+    case get_prop(Recv, <<"toString">>) of
+        F when is_function(F) -> F();
+        _ -> to_string(Recv)
+    end;
+to_string_dispatch(Recv) ->
+    to_string(Recv).
+
+%% num.toString(radix) — base-`radix` (2..36) integer string; else default ToString.
+num_to_string_radix(N, Radix) ->
+    R =
+        case coerce_num(Radix) of
+            nan -> 10;
+            _ -> trunc(as_float(coerce_num(Radix)))
+        end,
+    case R >= 2 andalso R =< 36 andalso R =/= 10 of
+        false ->
+            to_string(N);
+        true ->
+            case coerce_num(N) of
+                Num when is_integer(Num) ->
+                    list_to_binary(string:lowercase(integer_to_list(Num, R)));
+                _ ->
+                    to_string(N)
+            end
     end.
 
 %% num.toFixed(d) — fixed-point string with `d` decimals.

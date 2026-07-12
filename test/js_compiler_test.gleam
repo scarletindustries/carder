@@ -1388,6 +1388,23 @@ pub fn labeled_continue_test() {
   to_float(call(m, "f", [])) |> should.equal(3.0)
 }
 
+// ── toString ─────────────────────────────────────────────────────────────────
+
+pub fn to_string_test() {
+  let h = compile("function f() { return (255).toString(16); }")
+  call(h, "f", []) |> should.equal(dyn(<<"ff">>))
+  let n = compile("function f() { return (5).toString(); }")
+  call(n, "f", []) |> should.equal(dyn(<<"5">>))
+  let a = compile("function f() { return [1, 2, 3].toString(); }")
+  call(a, "f", []) |> should.equal(dyn(<<"1,2,3">>))
+  // a user-defined toString() method wins
+  let c =
+    compile(
+      "class C { toString() { return \"custom\"; } } function f() { let o = new C(); return o.toString(); }",
+    )
+  call(c, "f", []) |> should.equal(dyn(<<"custom">>))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {
