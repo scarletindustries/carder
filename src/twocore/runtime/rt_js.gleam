@@ -419,6 +419,10 @@ pub fn is_nan(x: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "is_finite")
 pub fn is_finite(x: Dynamic) -> Dynamic
 
+/// `x` is `null` or `undefined` → i32 `1`/`0` (behind `??` and optional chaining `?.`).
+@external(erlang, "twocore_rt_js_ffi", "is_nullish")
+pub fn is_nullish(x: Dynamic) -> Int
+
 /// `Number.isNaN(x)` — x IS the NaN number (no coercion).
 @external(erlang, "twocore_rt_js_ffi", "number_is_nan")
 pub fn number_is_nan(x: Dynamic) -> Dynamic

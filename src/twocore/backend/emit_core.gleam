@@ -4239,6 +4239,7 @@ fn resolve_js(op: String) -> Option(String) {
     "parse_float" -> Some("parse_float")
     "is_nan" -> Some("is_nan")
     "is_finite" -> Some("is_finite")
+    "is_nullish" -> Some("is_nullish")
     "number_is_nan" -> Some("number_is_nan")
     "number_is_finite" -> Some("number_is_finite")
     "number_is_integer" -> Some("number_is_integer")

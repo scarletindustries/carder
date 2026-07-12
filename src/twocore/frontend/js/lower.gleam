@@ -14,9 +14,10 @@
 ////
 //// Supported subset (v1): top-level `function` declarations (recursion, mutual
 //// recursion, calls); number/string/boolean/null/undefined/template literals;
-//// `+ - * / %`, all comparisons, `&& || !`, bitwise/shift `& | ^ ~ << >> >>>`, unary
-//// `- + ! ~ typeof void`, `?:`; `let/const/var`, `= += -= *= /= %= &= |= ^= <<= >>=
-//// >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`, `break/continue`,
+//// `+ - * / %`, all comparisons, `&& || ! ??`, bitwise/shift `& | ^ ~ << >> >>>`, unary
+//// `- + ! ~ typeof void`, `?:`, optional chaining `?.`; `let/const/var`, `= += -= *= /=
+//// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
+//// `for-in`, `break/continue`,
 //// `return`, blocks; objects `{}` with `.prop`/`[k]` get/set; arrays `[…]` with
 //// indexing, `.length`, `.push`/`.pop`; first-class functions — function expressions,
 //// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
@@ -36,8 +37,9 @@
 //// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`.
 ////
-//// Not yet (a clean `Unsupported` error / panic): classes, `for-in`, regex, `JSON`,
-//// `try`/`finally`, and `continue` inside a `do/while`. Only an explicit `throw` is
+//// Not yet (a clean `Unsupported` error / panic): classes, destructuring, spread,
+//// default parameters, regex, `JSON`, `try`/`finally`, and `continue` inside a
+//// `do/while`. Only an explicit `throw` is
 //// caught (a runtime type error propagates), and a variable mutated in a try body
 //// before a throw keeps its pre-try value in the handler. Scope is one flat function
 //// scope per JS function (block-scoped `let` is treated as function-scoped).
@@ -316,6 +318,23 @@ fn lower_stmt(
       lower_for(init, condition, update, body, env, ctx, ctr, k)
     ast.ForOfStatement(left:, right:, body:, ..) ->
       lower_for_of(left, right, body, env, ctx, ctr, k)
+    // `for (k in obj)` — iterate the object's own keys (desugar to for-of over
+    // `Object.keys(obj)`; order is the backing map's, a documented deviation).
+    ast.ForInStatement(left:, right:, body:) -> {
+      let sp = ast.Span(0, 0)
+      let keys =
+        ast.CallExpression(
+          span: sp,
+          callee: ast.MemberExpression(
+            span: sp,
+            object: ast.Identifier(span: sp, name: "Object"),
+            property: ast.Identifier(span: sp, name: "keys"),
+            computed: False,
+          ),
+          arguments: [right],
+        )
+      lower_for_of(left, keys, body, env, ctx, ctr, k)
+    }
     ast.SwitchStatement(discriminant:, cases:) ->
       lower_switch(discriminant, cases, env, ctx, ctr, k)
     // `throw e` — raise the JS exception tag carrying `e`; the continuation is dead.
@@ -1148,6 +1167,10 @@ fn lower_expr(
       lower_call(callee, arguments, env, ctx, ctr)
     ast.MemberExpression(object:, property:, computed:, ..) ->
       lower_member(object, property, computed, env, ctx, ctr)
+    ast.OptionalMemberExpression(object:, property:, computed:, ..) ->
+      lower_optional_member(object, property, computed, env, ctx, ctr)
+    ast.OptionalCallExpression(callee:, arguments:, ..) ->
+      lower_optional_call(callee, arguments, env, ctx, ctr)
     ast.ObjectExpression(properties:, ..) ->
       lower_object(properties, env, ctx, ctr)
     ast.ArrayExpression(elements:, ..) -> lower_array(elements, env, ctx, ctr)
@@ -1372,21 +1395,24 @@ fn lower_logical(
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
   // Short-circuit: the rhs is evaluated only in the branch that yields it.
-  // `a && b` → truthy(a) ? b : a ; `a || b` → truthy(a) ? a : b.
+  // `a && b` → truthy(a) ? b : a ; `a || b` → truthy(a) ? a : b ;
+  // `a ?? b` → is_nullish(a) ? b : a.
   use #(bl, l, ctr) <- result_try(lower_expr(left, env, ctx, ctr))
   use #(br, r, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
   let #(tvar, ctr) = fresh(ctr)
   let l_branch = ir.Values([l])
   // rhs bindings live INSIDE its branch, so a side-effecting rhs isn't run eagerly.
   let r_branch = emit_lets(br, ir.Values([r]))
-  let #(then_b, else_b) = case op {
-    ast.LogicalAnd -> #(r_branch, l_branch)
-    _ -> #(l_branch, r_branch)
+  // The guard op on `l` and which branch yields the rhs.
+  let #(guard_op, then_b, else_b) = case op {
+    ast.LogicalAnd -> #("truthy", r_branch, l_branch)
+    ast.NullishCoalescing -> #("is_nullish", r_branch, l_branch)
+    _ -> #("truthy", l_branch, r_branch)
   }
   let expr =
     ir.Let(
       [tvar],
-      ir.CallHost("js", "truthy", [l]),
+      ir.CallHost("js", guard_op, [l]),
       ir.If(
         cond: ir.Var(tvar),
         result: [ir.TTerm],
@@ -2043,6 +2069,62 @@ fn lower_member_get(
   ))
 }
 
+/// `a?.b` / `a?.[k]` — if `a` is null/undefined the whole access is `undefined` (and
+/// the key is not evaluated); otherwise it is a normal property read.
+fn lower_optional_member(
+  object: ast.Expression,
+  property: ast.Expression,
+  computed: Bool,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bo, o, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+  use #(bk, key, ctr) <- result_try(member_key(
+    property,
+    computed,
+    env,
+    ctx,
+    ctr,
+  ))
+  let #(bn, nvar, ctr) =
+    bind_after(bo, ir.CallHost("js", "is_nullish", [o]), ctr)
+  let #(bg, getv, ctr) =
+    bind_after(bk, ir.CallHost("js", "get_prop", [o, key]), ctr)
+  let expr =
+    ir.If(
+      cond: nvar,
+      result: [ir.TTerm],
+      then_branch: ir.Values([undefined()]),
+      else_branch: emit_lets(bg, ir.Values([getv])),
+    )
+  Ok(bind_after(bn, expr, ctr))
+}
+
+/// `f?.(args)` — if `f` is null/undefined the call yields `undefined` (and the args
+/// are not evaluated); otherwise it applies `f`.
+fn lower_optional_call(
+  callee: ast.Expression,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bc, cv, ctr) <- result_try(lower_expr(callee, env, ctx, ctr))
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(bn, nvar, ctr) =
+    bind_after(bc, ir.CallHost("js", "is_nullish", [cv]), ctr)
+  let #(bcall, callv, ctr) = bind_after(ba, ir.CallClosure(cv, argvals), ctr)
+  let expr =
+    ir.If(
+      cond: nvar,
+      result: [ir.TTerm],
+      then_branch: ir.Values([undefined()]),
+      else_branch: emit_lets(bcall, ir.Values([callv])),
+    )
+  Ok(bind_after(bn, expr, ctr))
+}
+
 fn member_key(
   property: ast.Expression,
   computed: Bool,
@@ -2340,6 +2422,12 @@ fn child_exprs(e: ast.Expression) -> List(ast.Expression) {
         True -> [object, property]
         False -> [object]
       }
+    ast.OptionalMemberExpression(object:, property:, computed:, ..) ->
+      case computed {
+        True -> [object, property]
+        False -> [object]
+      }
+    ast.OptionalCallExpression(callee:, arguments:, ..) -> [callee, ..arguments]
     ast.ObjectExpression(properties:, ..) ->
       list.flat_map(properties, fn(p) {
         case p {

@@ -905,6 +905,69 @@ pub fn try_catch_in_loop_test() {
   to_float(call(m, "f", [])) |> should.equal(108.0)
 }
 
+// ── nullish coalescing + for-in ──────────────────────────────────────────────
+
+pub fn nullish_coalescing_test() {
+  let a = compile("function f() { let x = null; return x ?? 5; }")
+  to_float(call(a, "f", [])) |> should.equal(5.0)
+  // 0 is NOT nullish (differs from ||)
+  let b = compile("function f() { let x = 0; return x ?? 99; }")
+  to_float(call(b, "f", [])) |> should.equal(0.0)
+  let c = compile("function f() { let x = undefined; return x ?? 7; }")
+  to_float(call(c, "f", [])) |> should.equal(7.0)
+  // empty string is NOT nullish
+  let d = compile("function f() { return \"\" ?? \"x\"; }")
+  call(d, "f", []) |> should.equal(dyn(<<"">>))
+}
+
+pub fn for_in_test() {
+  let m =
+    compile(
+      "function f() { let o = { a: 1, b: 2, c: 3 }; let n = 0; for (let k in o) { n++; } return n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  let s =
+    compile(
+      "function f() { let o = { a: 10, b: 20 }; let s = 0; for (let k in o) { s += o[k]; } return s; }",
+    )
+  to_float(call(s, "f", [])) |> should.equal(30.0)
+}
+
+// ── optional chaining ────────────────────────────────────────────────────────
+
+pub fn optional_member_test() {
+  let m = compile("function f() { let o = { a: 5 }; return o?.a; }")
+  to_float(call(m, "f", [])) |> should.equal(5.0)
+  let n = compile("function f() { let o = null; return o?.a === undefined; }")
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn optional_chain_test() {
+  let m = compile("function f() { let o = { a: { b: 7 } }; return o?.a?.b; }")
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+  // missing middle link → undefined, no crash
+  let n = compile("function f() { let o = {}; return o?.a?.b === undefined; }")
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn optional_computed_test() {
+  let m =
+    compile("function f() { let o = { x: 9 }; let k = \"x\"; return o?.[k]; }")
+  to_float(call(m, "f", [])) |> should.equal(9.0)
+}
+
+pub fn optional_call_test() {
+  let m = compile("function f() { let g = x => x * 2; return g?.(5); }")
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+  let n = compile("function f() { let g = null; return g?.(5) === undefined; }")
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn optional_with_nullish_test() {
+  let m = compile("function f() { let o = null; return o?.a ?? \"default\"; }")
+  call(m, "f", []) |> should.equal(dyn(<<"default">>))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

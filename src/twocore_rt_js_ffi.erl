@@ -74,7 +74,7 @@
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
     str_trim_end/1, str_repeat/2, str_starts_with/2, str_ends_with/2,
     str_replace/3, str_replace_all/3,
-    parse_int/2, parse_float/1, is_nan/1, is_finite/1,
+    parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
     object_keys/1, object_values/1, object_entries/1,
     empty_list/0, console_log/1, not_callable/1
@@ -1446,6 +1446,11 @@ obj_pairs(O) when is_reference(O) ->
     end;
 obj_pairs(O) ->
     type_error(O).
+
+%% is `x` null or undefined? → i32 1|0 (behind `??` and `?.`).
+is_nullish(null) -> 1;
+is_nullish(undefined) -> 1;
+is_nullish(_) -> 0.
 
 object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
 object_values(O) -> new_array([V || {_, V} <- obj_pairs(O)]).
