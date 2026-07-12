@@ -768,9 +768,16 @@ pub fn object_is_frozen(obj: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_from_entries")
 pub fn object_from_entries(entries: Dynamic) -> Dynamic
 
-/// `JSON.stringify(v)` → a JSON string (undefined/function → `undefined`).
+/// `JSON.stringify(value, replacer, space)` → a JSON string, or `undefined` when
+/// the root value serializes to nothing. `replacer` is a filter/transform (an
+/// Array PropertyList or a callable), `space` the indentation gap; pass
+/// `undefined` for either to omit it.
 @external(erlang, "twocore_rt_js_ffi", "json_stringify")
-pub fn json_stringify(v: Dynamic) -> Dynamic
+pub fn json_stringify(
+  value: Dynamic,
+  replacer: Dynamic,
+  space: Dynamic,
+) -> Dynamic
 
 /// `JSON.parse(s)` → the parsed value (malformed input is a type error).
 @external(erlang, "twocore_rt_js_ffi", "json_parse")

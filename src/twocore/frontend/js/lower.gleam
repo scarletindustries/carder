@@ -4363,7 +4363,12 @@ fn lower_static_call(
     "Number", "parseInt", [s] -> host("parse_int", [s, undefined()])
     "Number", "parseInt", [s, r, ..] -> host("parse_int", [s, r])
     "Number", "parseFloat", [s, ..] -> host("parse_float", [s])
-    "JSON", "stringify", [v, ..] -> host("json_stringify", [v])
+    // JSON.stringify(value[, replacer[, space]]) — replacer (array/function) and
+    // space (indent) are runtime values; pass `undefined` for any omitted arg.
+    "JSON", "stringify", [v] ->
+      host("json_stringify", [v, undefined(), undefined()])
+    "JSON", "stringify", [v, r] -> host("json_stringify", [v, r, undefined()])
+    "JSON", "stringify", [v, r, s, ..] -> host("json_stringify", [v, r, s])
     "JSON", "parse", [s, ..] -> host("json_parse", [s])
     "Array", "from", [x] -> host("array_from", [x])
     "Array", "from", [x, mapfn, ..] -> host("array_from_map", [x, mapfn])
