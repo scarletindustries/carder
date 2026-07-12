@@ -1151,6 +1151,31 @@ pub fn string_slice_substring_test() {
   call(s, "f", []) |> should.equal(dyn(<<"el">>))
 }
 
+pub fn string_char_at_coercion_test() {
+  // §22.1.3.1/§22.1.3.2: `pos` is ToIntegerOrInfinity — ToNumber then truncate
+  // toward zero. A numeric string is coerced (not treated as index 0), and a
+  // fraction is truncated toward zero.
+  val("'abcd'.charAt('   +00200.0000E-0002   ')")
+  |> should.equal(dyn(<<"c">>))
+  val("'abc'.charAt(1.99999)") |> should.equal(dyn(<<"b">>))
+  val("'abc'.charAt(0.99999)") |> should.equal(dyn(<<"a">>))
+  val("'abc'.charAt(-0.99999)") |> should.equal(dyn(<<"a">>))
+  // Out of range (negative, past the end, or ±Infinity) → "".
+  val("'abc'.charAt(-1)") |> should.equal(dyn(<<"">>))
+  val("'abc'.charAt(3)") |> should.equal(dyn(<<"">>))
+  val("'abc'.charAt(Infinity)") |> should.equal(dyn(<<"">>))
+  // Omitted argument → position 0.
+  val("'abc'.charAt()") |> should.equal(dyn(<<"a">>))
+
+  // charCodeAt shares the coercion; out of range is NaN (so x !== x).
+  num("'abcd'.charCodeAt('   +00200.0000E-0002   ')")
+  |> should.equal(99.0)
+  num("'abc'.charCodeAt(1.99999)") |> should.equal(98.0)
+  num("'abc'.charCodeAt()") |> should.equal(97.0)
+  val("'abc'.charCodeAt(5) !== 'abc'.charCodeAt(5)")
+  |> should.equal(dyn(True))
+}
+
 pub fn string_split_test() {
   num("\"a,b,c\".split(\",\").length") |> should.equal(3.0)
   let j = compile("function f() { return \"a,b,c\".split(\",\")[1]; }")
