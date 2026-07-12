@@ -99,6 +99,16 @@
 %% `rt_state`'s instance key or a generated module's own keys).
 -define(CELL_KEY(Ref), {twocore_rt_js_cell, Ref}).
 
+%% The exact set of code points ToNumber(String) strips from both ends: the ES
+%% WhiteSpace set (TAB, VT, FF, SP, NBSP, ZWNBSP, and Space_Separator U+1680 /
+%% U+2000–U+200A / U+202F / U+205F / U+3000) plus LineTerminator (LF, CR, LS, PS).
+-define(JS_WS, [
+    16#09, 16#0A, 16#0B, 16#0C, 16#0D, 16#20, 16#A0, 16#1680,
+    16#2000, 16#2001, 16#2002, 16#2003, 16#2004, 16#2005, 16#2006, 16#2007,
+    16#2008, 16#2009, 16#200A, 16#2028, 16#2029, 16#202F, 16#205F, 16#3000,
+    16#FEFF
+]).
+
 %% ───────────────────────── errors ─────────────────────────
 
 %% Raise the JS runtime error convention: `{js_error, Kind, Detail}`.
@@ -798,7 +808,7 @@ type_of(V) ->
 %% normalized before binary_to_float. Radix prefixes ("0x10") → NaN (header
 %% divergence note).
 str_to_num(Bin) ->
-    T = string:trim(Bin),
+    T = unicode:characters_to_binary(string:trim(Bin, both, ?JS_WS)),
     case T of
         <<>> -> 0;
         <<"Infinity">> -> inf;

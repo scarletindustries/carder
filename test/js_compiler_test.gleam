@@ -998,6 +998,21 @@ pub fn coercion_globals_test() {
   call(t, "f", []) |> should.equal(dyn(True))
 }
 
+pub fn number_string_whitespace_test() {
+  // ToNumber(String) strips the full ES WhiteSpace + LineTerminator set from both
+  // ends; a string of only whitespace is 0 (not NaN).
+  num("Number('   ')") |> should.equal(0.0)
+  num("Number('\\t\\n\\r')") |> should.equal(0.0)
+  num("Number('\\u000B\\u000C')") |> should.equal(0.0)
+  // Unicode whitespace: NBSP, line/paragraph separators, ideographic space.
+  num("Number('\\u00A0')") |> should.equal(0.0)
+  num("Number('\\u2028')") |> should.equal(0.0)
+  num("Number('\\u3000')") |> should.equal(0.0)
+  // Whitespace around a value is stripped, leaving the number.
+  num("Number('  \\t 42 \\n ')") |> should.equal(42.0)
+  num("Number('\\u00A0-3.5\\u00A0')") |> should.equal(-3.5)
+}
+
 pub fn array_static_test() {
   let a = compile("function f() { return Array.isArray([1, 2]); }")
   call(a, "f", []) |> should.equal(dyn(True))
