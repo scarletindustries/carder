@@ -2533,6 +2533,135 @@ pub fn regex_match_split_test() {
   num("\"a,b;c\".split(/[,;]/).length") |> should.equal(3.0)
 }
 
+// ── RegExp.prototype.exec (test262 built-ins/RegExp/prototype/exec) ───────────
+// §22.2.7.2 RegExpBuiltinExec: exec returns `[matched, cap1…capN]` with own
+// `index`/`input`/`groups`, or `null`.
+pub fn regex_exec_test() {
+  // No match → null.
+  val("/x/.exec(\"abc\") === null") |> should.equal(dyn(True))
+  // Leftmost match; array holds the whole match; index/input are own props.
+  num("/1|12/.exec(\"123\").length") |> should.equal(1.0)
+  num("/1|12/.exec(\"123\").index") |> should.equal(0.0)
+  val("/1|12/.exec(\"123\")[0]") |> should.equal(dyn(<<"1">>))
+  val("/1|12/.exec(\"123\").input") |> should.equal(dyn(<<"123">>))
+  // Capture groups populate indices 1..N; index is the match start.
+  val("/(a)(b)/.exec(\"zab\")[1]") |> should.equal(dyn(<<"a">>))
+  val("/(a)(b)/.exec(\"zab\")[2]") |> should.equal(dyn(<<"b">>))
+  num("/(a)(b)/.exec(\"zab\").index") |> should.equal(1.0)
+  // A trailing optional group that did not participate is `undefined` but still
+  // occupies its slot, so `length` reflects the total group count (here 3).
+  num("/(a)(b)?/.exec(\"a\").length") |> should.equal(3.0)
+  val("/(a)(b)?/.exec(\"a\")[2] === undefined") |> should.equal(dyn(True))
+  // Named captures land in `groups`; absent when the pattern has none.
+  val("/(?<y>a)/.exec(\"a\").groups.y") |> should.equal(dyn(<<"a">>))
+  val("/a/.exec(\"a\").groups === undefined") |> should.equal(dyn(True))
+}
+
+// exec/test update `lastIndex` for a global or sticky regex (to the code-point
+// index past the match), and leave it untouched otherwise (§22.2.7.2 step 15).
+pub fn regex_lastindex_test() {
+  // Non-global: lastIndex is never written.
+  let a =
+    compile("function f() { var r = /a/; r.exec(\"a\"); return r.lastIndex; }")
+  to_float(call(a, "f", [])) |> should.equal(0.0)
+  // Global: advanced to the end of the match.
+  let g =
+    compile(
+      "function f() { var r = /a/g; r.exec(\"aXa\"); return r.lastIndex; }",
+    )
+  to_float(call(g, "f", [])) |> should.equal(1.0)
+  // Sticky test() also sets lastIndex to the match end.
+  let y =
+    compile(
+      "function f() { var r = /abc/y; r.test(\"abc\"); return r.lastIndex; }",
+    )
+  to_float(call(y, "f", [])) |> should.equal(3.0)
+  // A user-assigned lastIndex is honoured as the search start (global).
+  let s =
+    compile(
+      "function f() { var r = /a/g; r.lastIndex = 2; return r.exec(\"aaa\").index; }",
+    )
+  to_float(call(s, "f", [])) |> should.equal(2.0)
+  // Global test() walks matches then resets on failure: /a/g over "aa" is
+  // true, true, false → 2 successes.
+  let t =
+    compile(
+      "function f() { var r = /a/g; var n = 0; if (r.test(\"aa\")) n++; if (r.test(\"aa\")) n++; if (r.test(\"aa\")) n++; return n; }",
+    )
+  to_float(call(t, "f", [])) |> should.equal(2.0)
+}
+
+// The RegExp flag getters (test262 built-ins/RegExp/prototype/{global,sticky,…}).
+pub fn regex_getters_test() {
+  val("/abc/.source") |> should.equal(dyn(<<"abc">>))
+  val("/a/g.global") |> should.equal(dyn(True))
+  val("/a/.global") |> should.equal(dyn(False))
+  val("/a/i.ignoreCase") |> should.equal(dyn(True))
+  val("/a/m.multiline") |> should.equal(dyn(True))
+  val("/a/s.dotAll") |> should.equal(dyn(True))
+  val("/a/y.sticky") |> should.equal(dyn(True))
+  val("/a/u.unicode") |> should.equal(dyn(True))
+  val("/a/d.hasIndices") |> should.equal(dyn(True))
+  val("/a/.sticky") |> should.equal(dyn(False))
+}
+
+// String.prototype.search (test262 built-ins/String/prototype/search): the
+// code-point index of the first match, or -1.
+pub fn regex_search_test() {
+  num("\"abcdef\".search(/cd/)") |> should.equal(2.0)
+  num("\"hello\".search(/l/)") |> should.equal(2.0)
+  num("\"abc\".search(/x/)") |> should.equal(-1.0)
+}
+
+// String.prototype.match, non-global: returns the exec array (with captures and
+// `index`); global: an array of every matched substring, else null.
+pub fn regex_match_more_test() {
+  num("\"abc123\".match(/(\\d)(\\d)/).length") |> should.equal(3.0)
+  num("\"abc123\".match(/\\d+/).index") |> should.equal(3.0)
+  val("\"abc\".match(/x/) === null") |> should.equal(dyn(True))
+  val("\"a1b2\".match(/\\d/g)[1]") |> should.equal(dyn(<<"2">>))
+}
+
+// String.prototype.split with a regex (test262 .../split/separator-regexp):
+// capturing groups are spliced into the output and empty matches follow the JS
+// (not PCRE) rules.
+pub fn regex_split_more_test() {
+  // Captures appear between the surrounding pieces.
+  num("\"a1b2c\".split(/(\\d)/).length") |> should.equal(5.0)
+  val("\"a1b2c\".split(/(\\d)/)[1]") |> should.equal(dyn(<<"1">>))
+  // A zero-width match at the start is not a split point: "x".split(/^/) → ["x"].
+  num("\"x\".split(/^/).length") |> should.equal(1.0)
+  // "xx".split(/a*/) → ["x","x"] (empty matches between characters).
+  num("\"xx\".split(/a*/).length") |> should.equal(2.0)
+}
+
+// String.prototype.replace with a regex (test262 .../replace/*): GetSubstitution
+// expands `$&`, `` $` ``, `$'`, `$$`, `$n`/`$nn`, and `$<name>`; a function
+// replacer receives (match, …captures, position, string).
+pub fn regex_replace_substitution_test() {
+  val("\"abc\".replace(/b/, \"[$&]\")") |> should.equal(dyn(<<"a[b]c">>))
+  val("\"abc\".replace(/b/, \"$`\")") |> should.equal(dyn(<<"aac">>))
+  val("\"abc\".replace(/b/, \"$'\")") |> should.equal(dyn(<<"acc">>))
+  val("\"abc\".replace(/b/, \"$$\")") |> should.equal(dyn(<<"a$c">>))
+  // `$0` is a literal (not a capture index); `$1`/`$2` are captures.
+  val("\"foo-x-bar\".replace(/x/, \"|$0|\")")
+  |> should.equal(dyn(<<"foo-|$0|-bar">>))
+  // Named-group substitution.
+  val("\"2024-01\".replace(/(?<y>\\d+)-(?<m>\\d+)/, \"$<m>/$<y>\")")
+  |> should.equal(dyn(<<"01/2024">>))
+  // Function replacer over a global regex.
+  let f =
+    compile(
+      "function f() { return \"a1b2\".replace(/\\d/g, function(m){ return \"[\" + m + \"]\"; }); }",
+    )
+  call(f, "f", []) |> should.equal(dyn(<<"a[1]b[2]">>))
+  // replaceAll requires a global regex; a global one replaces every match.
+  val("\"a.b.c\".replaceAll(/\\./g, \"-\")") |> should.equal(dyn(<<"a-b-c">>))
+  // A non-global regex passed to replaceAll is a TypeError (§22.1.3.20).
+  let bad = compile("function f() { return \"a\".replaceAll(/a/, \"b\"); }")
+  catch_apply(bad, atom.create("f"), []) |> should.be_error
+}
+
 // ── Map / Set ────────────────────────────────────────────────────────────────
 
 pub fn map_test() {

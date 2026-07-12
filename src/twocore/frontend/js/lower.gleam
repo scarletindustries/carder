@@ -5018,9 +5018,15 @@ fn lower_instance_method(
     "toPrecision", [] -> host("num_to_precision", [undefined()])
     "toString", [] -> host("to_string_dispatch", [])
     "toString", [radix, ..] -> host("num_to_string_radix", [radix])
-    // regex: `re.test(str)` and `str.match(re)`.
+    // regex: `re.test(str)`, `re.exec(str)`, and `str.match/search(re)`.
     "test", [s, ..] -> host("regex_test", [s])
+    "test", [] -> host("regex_test", [undefined()])
+    "exec", [s, ..] -> host("regex_exec", [s])
+    "exec", [] -> host("regex_exec", [undefined()])
     "match", [re, ..] -> host("str_match", [re])
+    "match", [] -> host("str_match", [undefined()])
+    "search", [re, ..] -> host("str_search", [re])
+    "search", [] -> host("str_search", [undefined()])
     "reduce", [f] -> host("array_reduce1", [f])
     "reduce", [f, init, ..] -> host("array_reduce", [f, init])
     "reduceRight", [f] -> host("array_reduce_right1", [f])
