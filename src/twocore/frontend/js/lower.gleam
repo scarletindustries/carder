@@ -96,6 +96,12 @@
 ////     BMP text (the common case) is exact.
 ////   * `Object.keys`/`values`/`entries` return keys in the backing map's iteration order,
 ////     not JS property-insertion order.
+////   * Within a SINGLE class, if a method and a getter/setter share a name, the accessor
+////     wins regardless of source order (JS: the later declaration wins). Across the
+////     inheritance chain, override order IS correct (a child method beats a parent
+////     accessor and vice versa), and an instance field always shadows a same-named
+////     accessor. Sharing a name between a method and an accessor in one class is the only
+////     unhandled sub-case.
 ////   * A class instance method whose name matches a builtin ARRAY/STRING method
 ////     (`push`/`pop`/`map`/`filter`/`slice`/`indexOf`/…) is shadowed by the builtin at a
 ////     `obj.method(…)` call site. The collection names `get`/`set`/`has`/`add`/`delete`/
@@ -173,6 +179,9 @@ type ClassInfo {
     // instance accessors: (name, has_getter, has_setter). The lifted functions
     // are `C$get$name` / `C$set$name`.
     accessors: List(#(String, Bool, Bool)),
+    // instance field names — a field shadows a same-named accessor (own data
+    // property beats a prototype accessor), so such accessors are not installed.
+    fields: List(String),
   )
 }
 
@@ -564,6 +573,7 @@ fn class_info(parent: Option(String), parts: ClassParts) -> ClassInfo {
     accessors: list.map(parts.accessors, fn(a) {
       #(a.name, option.is_some(a.getter), option.is_some(a.setter))
     }),
+    fields: list.map(parts.fields, fn(f) { f.0 }),
   )
 }
 
@@ -658,38 +668,64 @@ fn class_chain(
   }
 }
 
-fn chain_methods(
+/// One prototype member to install on a `new C(…)` instance: a method or an
+/// accessor, tagged with the class that defines it.
+type MemberInstall {
+  MethodMember(defclass: String, name: String, arity: Int)
+  AccessorMember(defclass: String, name: String, has_get: Bool, has_set: Bool)
+}
+
+/// The prototype members (methods + accessors) to install for `new C(…)`, in
+/// install order: ANCESTORS FIRST, and within each class its methods then its
+/// accessors. Each install overwrites the key, so a member defined later in this
+/// order (a child's, or a same-class member after an earlier one) wins — matching
+/// JS override semantics. An accessor whose name is shadowed by a field ANYWHERE
+/// in the chain is dropped: an instance data field always beats a prototype
+/// accessor.
+fn chain_members(
   cname: String,
   classes: Dict(String, ClassInfo),
-) -> List(#(String, String, Int)) {
+) -> List(MemberInstall) {
+  let shadowed = field_names_in_chain(cname, classes)
+  chain_members_loop(cname, classes, shadowed)
+}
+
+fn chain_members_loop(
+  cname: String,
+  classes: Dict(String, ClassInfo),
+  shadowed: List(String),
+) -> List(MemberInstall) {
   case dict.get(classes, cname) {
     Error(Nil) -> []
     Ok(info) -> {
       let ancestors = case info.super_class {
-        Some(p) -> chain_methods(p, classes)
+        Some(p) -> chain_members_loop(p, classes, shadowed)
         None -> []
       }
-      let own = list.map(info.methods, fn(m) { #(cname, m.0, m.1) })
-      list.append(ancestors, own)
+      let methods =
+        list.map(info.methods, fn(m) { MethodMember(cname, m.0, m.1) })
+      let accessors =
+        info.accessors
+        |> list.filter(fn(a) { !list.contains(shadowed, a.0) })
+        |> list.map(fn(a) { AccessorMember(cname, a.0, a.1, a.2) })
+      list.flatten([ancestors, methods, accessors])
     }
   }
 }
 
-/// The instance accessors to install for `new C(…)`, ancestors-first (so an
-/// overriding child accessor wins): `(defining_class, name, has_getter, has_setter)`.
-fn chain_accessors(
+/// Every instance field name declared anywhere in `cname`'s inheritance chain.
+fn field_names_in_chain(
   cname: String,
   classes: Dict(String, ClassInfo),
-) -> List(#(String, String, Bool, Bool)) {
+) -> List(String) {
   case dict.get(classes, cname) {
     Error(Nil) -> []
     Ok(info) -> {
       let ancestors = case info.super_class {
-        Some(p) -> chain_accessors(p, classes)
+        Some(p) -> field_names_in_chain(p, classes)
         None -> []
       }
-      let own = list.map(info.accessors, fn(a) { #(cname, a.0, a.1, a.2) })
-      list.append(ancestors, own)
+      list.append(info.fields, ancestors)
     }
   }
 }
@@ -2976,75 +3012,86 @@ fn lower_new(
         Ok(info) -> {
           let #(binds, this_v, ctr) =
             bind_after([], ir.CallHost("js", "new_object", []), ctr)
-          // install every method in the class chain as a closure over `this`
-          // (ancestors first, so an overriding child method wins).
+          // install the prototype members (methods + accessors) in one ordered
+          // pass: ancestors first, methods before accessors within a class, each
+          // overwriting the key so a later definition (a child's, or a same-name
+          // member declared after) wins — matching JS override semantics. Methods
+          // use define_data (force) so a child method can overwrite a parent
+          // accessor of the same name; accessors shadowed by a field are already
+          // dropped by chain_members.
           let #(binds, ctr) =
             list.fold(
-              chain_methods(cname, ctx.classes),
+              chain_members(cname, ctx.classes),
               #(binds, ctr),
-              fn(acc, m) {
+              fn(acc, member) {
                 let #(binds, ctr) = acc
-                let #(defclass, mname, marity) = m
-                let #(bc, closure_v, ctr) =
-                  bind_after(
-                    binds,
-                    ir.MakeClosure(defclass <> "$" <> mname, [this_v], marity),
-                    ctr,
-                  )
-                let #(bs, _r, ctr) =
-                  bind_after(
-                    bc,
-                    ir.CallHost("js", "set_prop", [
-                      this_v,
-                      ir.ConstBinary(<<mname:utf8>>),
-                      closure_v,
-                    ]),
-                    ctr,
-                  )
-                #(bs, ctr)
-              },
-            )
-          // install each accessor (getter/setter) in the chain as a `this`-bound
-          // accessor property (ancestors first, so an overriding child wins).
-          let #(binds, ctr) =
-            list.fold(
-              chain_accessors(cname, ctx.classes),
-              #(binds, ctr),
-              fn(acc, a) {
-                let #(binds, ctr) = acc
-                let #(defclass, aname, has_get, has_set) = a
-                // MakeClosure's arity is the post-capture (user) arg count: a
-                // getter takes none, a setter takes one; `this` is the capture.
-                let #(bg, getter_v, ctr) = case has_get {
-                  True ->
-                    bind_after(
-                      binds,
-                      ir.MakeClosure(defclass <> "$get$" <> aname, [this_v], 0),
-                      ctr,
-                    )
-                  False -> #(binds, undefined(), ctr)
+                case member {
+                  MethodMember(defclass, mname, marity) -> {
+                    let #(bc, closure_v, ctr) =
+                      bind_after(
+                        binds,
+                        ir.MakeClosure(
+                          defclass <> "$" <> mname,
+                          [this_v],
+                          marity,
+                        ),
+                        ctr,
+                      )
+                    let #(bs, _r, ctr) =
+                      bind_after(
+                        bc,
+                        ir.CallHost("js", "define_data", [
+                          this_v,
+                          ir.ConstBinary(<<mname:utf8>>),
+                          closure_v,
+                        ]),
+                        ctr,
+                      )
+                    #(bs, ctr)
+                  }
+                  AccessorMember(defclass, aname, has_get, has_set) -> {
+                    // MakeClosure's arity is the post-capture (user) arg count: a
+                    // getter takes none, a setter takes one; `this` is the capture.
+                    let #(bg, getter_v, ctr) = case has_get {
+                      True ->
+                        bind_after(
+                          binds,
+                          ir.MakeClosure(
+                            defclass <> "$get$" <> aname,
+                            [this_v],
+                            0,
+                          ),
+                          ctr,
+                        )
+                      False -> #(binds, undefined(), ctr)
+                    }
+                    let #(bsv, setter_v, ctr) = case has_set {
+                      True ->
+                        bind_after(
+                          bg,
+                          ir.MakeClosure(
+                            defclass <> "$set$" <> aname,
+                            [this_v],
+                            1,
+                          ),
+                          ctr,
+                        )
+                      False -> #(bg, undefined(), ctr)
+                    }
+                    let #(bd, _r, ctr) =
+                      bind_after(
+                        bsv,
+                        ir.CallHost("js", "define_accessor", [
+                          this_v,
+                          ir.ConstBinary(<<aname:utf8>>),
+                          getter_v,
+                          setter_v,
+                        ]),
+                        ctr,
+                      )
+                    #(bd, ctr)
+                  }
                 }
-                let #(bsv, setter_v, ctr) = case has_set {
-                  True ->
-                    bind_after(
-                      bg,
-                      ir.MakeClosure(defclass <> "$set$" <> aname, [this_v], 1),
-                      ctr,
-                    )
-                  False -> #(bg, undefined(), ctr)
-                }
-                let #(bd, _r, ctr) =
-                  bind_after(
-                    bsv,
-                    ir.CallHost("js", "define_accessor", [
-                      this_v,
-                      ir.ConstBinary(<<aname:utf8>>),
-                      getter_v,
-                      setter_v,
-                    ]),
-                    ctr,
-                  )
-                #(bd, ctr)
               },
             )
           // tag the instance with `@@is_<Class>` for every class in the chain, so

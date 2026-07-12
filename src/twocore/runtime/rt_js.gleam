@@ -241,6 +241,11 @@ pub fn get_prop(obj: Dynamic, key: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "set_prop")
 pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 
+/// Define an own DATA property `obj[key] = v` with [[DefineOwnProperty]]
+/// semantics — overwrites any existing value or accessor. Returns `v`.
+@external(erlang, "twocore_rt_js_ffi", "define_data")
+pub fn define_data(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
+
 /// Install an accessor property: `getter`/`setter` are `this`-bound closures or
 /// `undefined`. Defines `obj.key` as a getter/setter pair; returns `undefined`.
 @external(erlang, "twocore_rt_js_ffi", "define_accessor")

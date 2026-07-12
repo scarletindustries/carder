@@ -1789,6 +1789,38 @@ pub fn getter_no_leak_test() {
   call(n, "f", []) |> should.equal(dyn(True))
 }
 
+pub fn method_overrides_accessor_test() {
+  let base = "class A { get value() { return \"getter\"; } } "
+  let derived =
+    "class B extends A { constructor() { super(); } value() { return \"method\"; } } "
+  // A child method overriding a parent getter of the same name: the method wins.
+  let m = compile(base <> derived <> "function f() { return new B().value(); }")
+  call(m, "f", []) |> should.equal(dyn(<<"method">>))
+  // reading it (not calling) yields the method function, not the getter value.
+  let n =
+    compile(base <> derived <> "function f() { return typeof new B().value; }")
+  call(n, "f", []) |> should.equal(dyn(<<"function">>))
+}
+
+pub fn field_shadows_accessor_test() {
+  // An instance field shadows a same-named accessor (own data property beats a
+  // prototype accessor), so the field value wins.
+  let m =
+    compile(
+      "class C { x = 5; get x() { return 42; } } "
+      <> "function f() { let c = new C(); return c.x; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(5.0)
+  // a field in the parent shadows an accessor declared in the child too.
+  let n =
+    compile(
+      "class A { x = 1; } "
+      <> "class B extends A { constructor() { super(); } get x() { return 2; } } "
+      <> "function f() { let b = new B(); return b.x; }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(1.0)
+}
+
 pub fn getter_only_assign_test() {
   // Assigning to a getter-only property is a silent no-op (sloppy mode).
   let m =

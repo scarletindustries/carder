@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, get_prop/2, set_prop/3, define_accessor/4, has_prop/2, delete_prop/2,
+    new_object/0, get_prop/2, set_prop/3, define_data/3, define_accessor/4, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, array_to_list/1,
@@ -894,6 +894,21 @@ set_prop(Recv, Key, V) when is_reference(Recv) ->
 set_prop(Recv, _Key, _V) ->
     type_error(Recv).
 
+%% Define an own DATA property `Key = V` on `Obj`, storing directly and
+%% unconditionally — bypassing set_prop's accessor check so it overwrites any
+%% existing value OR accessor at that key (JS [[DefineOwnProperty]] semantics,
+%% used to install methods and class fields, which shadow same-named accessors).
+define_data(Obj, Key, V) when is_reference(Obj) ->
+    case erlang:get(?CELL_KEY(Obj)) of
+        M when is_map(M) ->
+            erlang:put(?CELL_KEY(Obj), maps:put(prop_key(Key), V, M)),
+            V;
+        _ ->
+            type_error(Obj)
+    end;
+define_data(Obj, _, _) ->
+    type_error(Obj).
+
 %% Install an accessor property `{js_accessor, Getter, Setter}` on `Obj` under
 %% `Key`. Getter/Setter are `this`-bound closures (0-arg / 1-arg) or `undefined`.
 %% Stored directly (bypassing the setter check in set_prop) so it defines/replaces
@@ -1149,9 +1164,23 @@ string_from_char_code(Codes) ->
     from_cps([(trunc(as_float(coerce_num(C))) band 16#FFFF) || C <- Codes]).
 
 %% String.fromCodePoint(...points) — build a string from full Unicode code
-%% points (unlike fromCharCode, no ToUint16 masking).
+%% points (unlike fromCharCode, no ToUint16 masking). Each argument must be an
+%% integer in [0, 0x10FFFF]; a fractional, negative, or out-of-range value is a
+%% RangeError (signalled here as a js_error, like other range violations).
 string_from_code_point(Codes) ->
-    from_cps([trunc(as_float(coerce_num(C))) || C <- Codes]).
+    from_cps([code_point_of(C) || C <- Codes]).
+
+code_point_of(C) ->
+    case coerce_num(C) of
+        N when is_number(N) ->
+            I = trunc(N),
+            case I == N andalso I >= 0 andalso I =< 16#10FFFF of
+                true -> I;
+                false -> type_error(C)
+            end;
+        _ ->
+            type_error(C)
+    end.
 
 %% String.raw(template, ...substitutions) — the default tagged-template tag
 %% (§22.1.2.4): concatenate the RAW literal segments (template.raw), inserting
