@@ -391,6 +391,32 @@ pub fn array_literal_test() {
   to_float(call(m, "f", [])) |> should.equal(40.0)
 }
 
+pub fn array_constructor_length_test() {
+  // new Array(n) / Array(n): a single number is the length — a sparse array of
+  // holes (reads return undefined), NOT a one-element array.
+  let m =
+    compile(
+      "function f() { let a = new Array(3); let b = Array(5); return a.length * 100 + b.length * 10 + (a[0] === undefined ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(351.0)
+}
+
+pub fn array_constructor_elements_test() {
+  // Multiple args (or a single non-number) become the elements.
+  let m =
+    compile(
+      "function f() { let a = new Array(1, 2, 3); let b = Array(\"x\"); return a.length * 1000 + a[2] * 100 + b.length * 10 + (b[0] === \"x\" ? 1 : 0); }",
+    )
+  // len 3, a[2]=3, b.length=1, b[0]==="x" → 3000 + 300 + 10 + 1 = 3311
+  to_float(call(m, "f", [])) |> should.equal(3311.0)
+}
+
+pub fn array_constructor_empty_test() {
+  let m =
+    compile("function f() { return Array().length + new Array().length; }")
+  to_float(call(m, "f", [])) |> should.equal(0.0)
+}
+
 pub fn array_length_test() {
   let m = compile("function f() { let a = [1, 2, 3]; return a.length; }")
   to_float(call(m, "f", [])) |> should.equal(3.0)

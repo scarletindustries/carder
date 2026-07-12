@@ -4207,6 +4207,7 @@ fn resolve_js(op: String) -> Option(String) {
     "delete_prop" -> Some("delete_prop")
     // arrays
     "new_array" -> Some("new_array")
+    "array_construct" -> Some("array_construct")
     "array_push" -> Some("array_push")
     "array_pop" -> Some("array_pop")
     "is_array" -> Some("is_array")

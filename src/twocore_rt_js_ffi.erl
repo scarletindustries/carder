@@ -65,7 +65,7 @@
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
-    new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
+    new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
@@ -1143,6 +1143,25 @@ new_array(List) when is_list(List) ->
     cell_new({js_array, Len, Map});
 new_array(V) ->
     type_error(V).
+
+%% `Array(...)` / `new Array(...)`: a SINGLE numeric argument is the new array's
+%% LENGTH — a sparse array of that many holes (reads return undefined). Any other
+%% argument list becomes the elements. A single Number that is not a valid array
+%% length (negative, fractional, or ≥ 2^32, incl. NaN/±Infinity) is a RangeError.
+array_construct([N]) when is_number(N); N =:= inf; N =:= neg_inf; N =:= nan ->
+    case is_array_length(N) of
+        true -> cell_new({js_array, trunc(as_float(N)), #{}});
+        false -> erlang:error({js_error, range_error, <<"Invalid array length">>})
+    end;
+array_construct(Args) when is_list(Args) ->
+    new_array(Args);
+array_construct(V) ->
+    type_error(V).
+
+is_array_length(N) when is_integer(N) -> N >= 0 andalso N < 16#100000000;
+is_array_length(N) when is_float(N) ->
+    N >= 0 andalso N < 16#100000000 andalso trunc(N) == N;
+is_array_length(_) -> false.
 
 %% Normalize an array property key: an integer index stays an integer, a
 %% canonical numeric string becomes that index, `length` is left as-is, and

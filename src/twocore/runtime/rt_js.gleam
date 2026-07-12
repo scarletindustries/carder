@@ -299,6 +299,11 @@ pub fn delete_prop(obj: Dynamic, key: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_array")
 pub fn new_array(elements: Dynamic) -> Dynamic
 
+/// `Array(...)` / `new Array(...)` — a single numeric argument is the new array's
+/// length (a sparse array of holes); any other argument list becomes the elements.
+@external(erlang, "twocore_rt_js_ffi", "array_construct")
+pub fn array_construct(args: Dynamic) -> Dynamic
+
 /// `arr.push(...vals)` — append each element of the cons list `vals`; returns the
 /// array's new length.
 @external(erlang, "twocore_rt_js_ffi", "array_push")

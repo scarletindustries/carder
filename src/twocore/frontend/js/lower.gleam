@@ -3930,6 +3930,9 @@ fn lower_call_fixed(
       computed: False,
       ..,
     ) -> lower_math_call(method, arguments, env, ctx, ctr)
+    // `Array(...)` called without `new` — identical to `new Array(...)`.
+    ast.Identifier(name: "Array", ..) ->
+      lower_array_construct(arguments, env, ctx, ctr)
     // Array.* / Object.* / Number.* statics (namespaces, not values).
     ast.MemberExpression(
       object: ast.Identifier(name: ns, ..),
@@ -4332,6 +4335,9 @@ fn lower_new(
       lower_builtin_new("new_map", arguments, env, ctx, ctr)
     ast.Identifier(name: "Set", ..) ->
       lower_builtin_new("new_set", arguments, env, ctx, ctr)
+    // `new Array(n)` (length) / `new Array(a, b, …)` (elements).
+    ast.Identifier(name: "Array", ..) ->
+      lower_array_construct(arguments, env, ctx, ctr)
     ast.Identifier(name: cname, ..) ->
       case dict.get(ctx.classes, cname) {
         Error(Nil) ->
@@ -4521,6 +4527,19 @@ fn lower_new(
 
 /// `new Map(init?)` / `new Set(init?)` — a built-in collection constructor. Passes the
 /// optional first argument (an array seed) to the runtime constructor.
+/// `Array(...)` / `new Array(...)` — pass all arguments as a cons list to the
+/// `array_construct` runtime op, which decides length-vs-elements at runtime.
+fn lower_array_construct(
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+  Ok(bind_after(binds2, ir.CallHost("js", "array_construct", [listv]), ctr))
+}
+
 fn lower_builtin_new(
   op: String,
   arguments: List(ast.Expression),
