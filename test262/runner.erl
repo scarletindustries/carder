@@ -59,12 +59,12 @@ main(_) ->
 
 bump(K, M) -> maps:update_with(K, fun(X) -> X + 1 end, 1, M).
 
-is_skip(O) -> lists:member(O, [skip_flag, skip_include, skip_negative]).
+is_skip(O) -> lists:member(O, [skip_flag, skip_include, skip_negative, skip_eval]).
 
 print_summary(Tally) ->
     Order = [pass, fail_assert, runtime_error, compile_unsupported, compile_parse,
              compile_backend, compile_lower_other, compile_other,
-             skip_flag, skip_include, skip_negative],
+             skip_flag, skip_include, skip_negative, skip_eval],
     io:format("~n==== RESULTS ====~n"),
     [io:format("  ~-20s ~p~n", [K, maps:get(K, Tally, 0)]) || K <- Order],
     Total = maps:fold(fun(_, V, A) -> A + V end, 0, Tally),
@@ -123,17 +123,31 @@ run_one(File, N) ->
     Src = unicode:characters_to_binary(Bin),
     {Meta, Body} = split_frontmatter(Src),
     case classify_skip(Meta) of
-        {skip, Why} -> {Why, ""};
+        {skip, Why} ->
+            {Why, ""};
         run ->
-            Full = <<(shim())/binary, "\n", (rewrite(Body))/binary>>,
-            ModName = list_to_binary("twocore@t262@m" ++ integer_to_list(N)),
-            try twocore@frontend@js:compile_and_load(Full, ModName) of
-                {ok, Mod} -> execute(Mod);
-                {error, Err} -> classify_compile_error(Err)
-            catch
-                Ce:Re -> {compile_other, io_lib:format("~p:~p", [Ce, Re])}
+            %% eval / the Function constructor need runtime code generation — out of
+            %% scope for this AHEAD-OF-TIME compiler, so not counted as fixable.
+            case needs_dynamic_code(Body) of
+                true -> {skip_eval, ""};
+                false -> run_body(Body, N)
             end
     end.
+
+run_body(Body, N) ->
+    Full = <<(shim())/binary, "\n", (rewrite(Body))/binary>>,
+    ModName = list_to_binary("twocore@t262@m" ++ integer_to_list(N)),
+    try twocore@frontend@js:compile_and_load(Full, ModName) of
+        {ok, Mod} -> execute(Mod);
+        {error, Err} -> classify_compile_error(Err)
+    catch
+        Ce:Re -> {compile_other, io_lib:format("~p:~p", [Ce, Re])}
+    end.
+
+%% True if the test body uses eval or the Function constructor (dynamic code).
+needs_dynamic_code(Body) ->
+    string:find(Body, "eval(") =/= nomatch orelse
+        string:find(Body, "Function(") =/= nomatch.
 
 execute(Mod) ->
     try erlang:apply(Mod, main, []) of

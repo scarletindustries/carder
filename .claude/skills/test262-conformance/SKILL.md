@@ -101,6 +101,10 @@ gleam build              # the runner loads build/dev/erlang/*/ebin
 
 ## Where NOT to waste time
 
+- **`eval` and the `Function` constructor are a permanent boundary** — this is an
+  ahead-of-time compiler with no runtime code generation, so they are rejected with
+  a clear error and the runner auto-skips any test whose body uses them (`skip_eval`).
+  Never try to "support" eval; the goal is to make the AOT path excellent.
 - **Areas dominated by `skip_include`** (need `propertyHelper.js`, `testTypedArray.js`,
   etc.) — unreachable until the harness features exist.
 - **`Object.defineProperty` / descriptors, `Symbol`, `Proxy`** — large, pervasive;

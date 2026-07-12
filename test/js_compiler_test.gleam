@@ -629,6 +629,23 @@ pub fn closure_rejects_reassigned_capture_test() {
   }
 }
 
+pub fn eval_function_aot_boundary_test() {
+  // `eval` and the `Function` constructor need runtime code generation. This is an
+  // ahead-of-time compiler, so they are a deliberate, permanent boundary — a clear
+  // compile-time error, not an incidental "unknown identifier".
+  let reject = fn(src) {
+    let name = "twocore@jstest@aot" <> int.to_string(int_abs(unique()))
+    case js.compile_and_load(src, name) {
+      Error(_) -> Nil
+      Ok(_) ->
+        panic as "expected eval/Function to be rejected (AOT-only boundary)"
+    }
+  }
+  reject("function f() { return eval(\"1 + 1\"); }")
+  reject("function f() { return new Function(\"return 1\"); }")
+  reject("function f() { return Function(\"a\", \"return a\")(1); }")
+}
+
 // ── for-of ───────────────────────────────────────────────────────────────────
 
 pub fn for_of_test() {

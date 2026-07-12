@@ -69,6 +69,12 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
+//// DELIBERATE BOUNDARY — `eval` and the `Function` constructor are permanently
+//// unsupported (a clear `Unsupported` error): this is an AHEAD-OF-TIME compiler with
+//// no runtime code generation. All code must be available to compile up front. (A
+//// future direction could hand a dynamic string off to an embedded arc VM, but that
+//// is explicitly out of scope — the focus is making the AOT path excellent.)
+////
 //// Not yet (a clean `Unsupported` error / panic): generators/async, and a
 //// `return`/`break`/`continue` inside a `try`/`finally` body (it would bypass the
 //// finally, so it is rejected). Static
@@ -3982,7 +3988,13 @@ fn lower_spread_call(
                   ))
                 }
                 False ->
-                  Error(Unsupported("spread call to unknown '" <> fname <> "'"))
+                  case dynamic_code(fname) {
+                    True -> Error(dynamic_code_unsupported(fname))
+                    False ->
+                      Error(Unsupported(
+                        "spread call to unknown '" <> fname <> "'",
+                      ))
+                  }
               }
           }
       }
@@ -4131,7 +4143,11 @@ fn lower_call_fixed(
                   case is_global_fn(fname) {
                     True -> lower_global_call(fname, arguments, env, ctx, ctr)
                     False ->
-                      Error(Unsupported("call to unknown '" <> fname <> "'"))
+                      case dynamic_code(fname) {
+                        True -> Error(dynamic_code_unsupported(fname))
+                        False ->
+                          Error(Unsupported("call to unknown '" <> fname <> "'"))
+                      }
                   }
               }
           }
@@ -4207,6 +4223,24 @@ fn super_method_arity(ctx: Ctx, class: String, method: String) -> Option(Int) {
 }
 
 /// Whether `name` is a supported global builtin FUNCTION (called as `name(...)`).
+/// Names that would require RUNTIME code generation from strings. This compiler is
+/// AHEAD-OF-TIME only (no VM embedded), so these are a deliberate, permanent
+/// boundary — rejected with a clear message rather than an incidental "unknown".
+/// (A future direction could hand these off to an embedded arc VM; out of scope.)
+fn dynamic_code(name: String) -> Bool {
+  name == "eval" || name == "Function"
+}
+
+/// The typed error for a use of `eval` / the `Function` constructor.
+fn dynamic_code_unsupported(name: String) -> Error {
+  Unsupported(
+    name
+    <> " is not supported: this is an ahead-of-time compiler with no runtime code "
+    <> "generation (no `eval`, no `Function` constructor). Provide the code to "
+    <> "compile ahead of time instead of building it from a string at runtime.",
+  )
+}
+
 fn is_global_fn(name: String) -> Bool {
   case name {
     "String"
@@ -4458,7 +4492,11 @@ fn lower_new(
     ast.Identifier(name: cname, ..) ->
       case dict.get(ctx.classes, cname) {
         Error(Nil) ->
-          Error(Unsupported("new " <> cname <> "(…) (unknown class)"))
+          case dynamic_code(cname) {
+            True -> Error(dynamic_code_unsupported(cname))
+            False ->
+              Error(Unsupported("new " <> cname <> "(…) (unknown class)"))
+          }
         Ok(info) -> {
           let #(binds, this_v, ctr) =
             bind_after([], ir.CallHost("js", "new_object", []), ctr)
