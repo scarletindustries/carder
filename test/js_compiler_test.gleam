@@ -1113,6 +1113,37 @@ pub fn class_this_in_closure_test() {
   to_float(call(m, "f", [])) |> should.equal(12.0)
 }
 
+// ── JSON ─────────────────────────────────────────────────────────────────────
+
+pub fn json_stringify_test() {
+  let m = compile("function f() { return JSON.stringify(42); }")
+  call(m, "f", []) |> should.equal(dyn(<<"42">>))
+  let a = compile("function f() { return JSON.stringify([1, 2, 3]); }")
+  call(a, "f", []) |> should.equal(dyn(<<"[1,2,3]">>))
+  let o = compile("function f() { return JSON.stringify({ a: 1 }); }")
+  call(o, "f", []) |> should.equal(dyn(<<"{\"a\":1}">>))
+  let s = compile("function f() { return JSON.stringify(\"hi\"); }")
+  call(s, "f", []) |> should.equal(dyn(<<"\"hi\"">>))
+}
+
+pub fn json_parse_test() {
+  num("JSON.parse(\"42\")") |> should.equal(42.0)
+  num("JSON.parse(\"[1, 2, 3]\").length") |> should.equal(3.0)
+  let m = compile("function f() { return JSON.parse('{\"a\":5}').a; }")
+  to_float(call(m, "f", [])) |> should.equal(5.0)
+  let s = compile("function f() { return JSON.parse('\"hello\"'); }")
+  call(s, "f", []) |> should.equal(dyn(<<"hello">>))
+}
+
+pub fn json_roundtrip_test() {
+  num("JSON.parse(JSON.stringify([10, 20, 30]))[1]") |> should.equal(20.0)
+  let m =
+    compile(
+      "function f() { let o = { name: \"x\", n: 7 }; let s = JSON.stringify(o); return JSON.parse(s).n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

@@ -39,13 +39,14 @@
 //// split/trim/repeat/startsWith/endsWith/replace/replaceAll); the global functions
 //// `parseInt`/`parseFloat`/`isNaN`/`isFinite`/`String`/`Number`/`Boolean`; and the
 //// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
-//// `Number.isInteger`/`isNaN`/`isFinite`.
+//// `Number.isInteger`/`isNaN`/`isFinite`, and `JSON.stringify`/`JSON.parse`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): class inheritance (`extends`/
 //// `super`), static/getter/setter members, nested/defaulted destructuring, object/call
-//// spread, rest params, regex, `JSON`, `try`/`finally`, and `continue` inside a
-//// `do/while`. (A regular function EXPRESSION captures `this` lexically like an arrow,
-//// rather than binding it dynamically.)
+//// spread, rest params, regex, `try`/`finally`, generators/async, and `continue`
+//// inside a `do/while`. (A regular function EXPRESSION captures `this` lexically like
+//// an arrow, rather than binding it dynamically. `JSON`/`Object.keys` key order follows
+//// the backing map, not insertion order.)
 //// (A default value on an arrow/function-EXPRESSION param only applies when it is
 //// called with the full arity or through an array method, since a closure call site
 //// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
@@ -1998,7 +1999,7 @@ fn lower_call(
       computed: False,
       ..,
     )
-      if ns == "Array" || ns == "Object" || ns == "Number"
+      if ns == "Array" || ns == "Object" || ns == "Number" || ns == "JSON"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
     // recv.method(args) — method dispatch (array/string methods).
     ast.MemberExpression(
@@ -2137,6 +2138,8 @@ fn lower_static_call(
     "Number", "parseInt", [s] -> host("parse_int", [s, undefined()])
     "Number", "parseInt", [s, r, ..] -> host("parse_int", [s, r])
     "Number", "parseFloat", [s, ..] -> host("parse_float", [s])
+    "JSON", "stringify", [v, ..] -> host("json_stringify", [v])
+    "JSON", "parse", [s, ..] -> host("json_parse", [s])
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }

@@ -452,6 +452,14 @@ pub fn object_values(o: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_entries")
 pub fn object_entries(o: Dynamic) -> Dynamic
 
+/// `JSON.stringify(v)` → a JSON string (undefined/function → `undefined`).
+@external(erlang, "twocore_rt_js_ffi", "json_stringify")
+pub fn json_stringify(v: Dynamic) -> Dynamic
+
+/// `JSON.parse(s)` → the parsed value (malformed input is a type error).
+@external(erlang, "twocore_rt_js_ffi", "json_parse")
+pub fn json_parse(s: Dynamic) -> Dynamic
+
 // ───────────────────────── lists / console / misc ─────────────────────────
 
 /// The empty BEAM list `[]` (arity 0) — the nil tail an args-cons-list build starts from.

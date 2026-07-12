@@ -77,6 +77,7 @@
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
     object_keys/1, object_values/1, object_entries/1,
+    json_stringify/1, json_parse/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -1467,6 +1468,181 @@ is_nullish(_) -> 0.
 object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
 object_values(O) -> new_array([V || {_, V} <- obj_pairs(O)]).
 object_entries(O) -> new_array([new_array([K, V]) || {K, V} <- obj_pairs(O)]).
+
+%% ── JSON ─────────────────────────────────────────────────
+
+%% JSON.stringify(v) — a JSON binary, or `undefined` for undefined/function/other.
+json_stringify(V) ->
+    case json_enc(V) of
+        skip -> undefined;
+        Io -> iolist_to_binary(Io)
+    end.
+
+json_enc(V) ->
+    case js_type(V) of
+        number -> json_num(V);
+        boolean -> to_string(V);
+        string -> json_str(V);
+        null -> <<"null">>;
+        undefined -> skip;
+        function -> skip;
+        object -> json_ref(V);
+        other -> skip
+    end.
+
+json_num(js_nan) -> <<"null">>;
+json_num(js_inf) -> <<"null">>;
+json_num(js_neg_inf) -> <<"null">>;
+json_num(N) -> to_string(N).
+
+json_str(Bin) -> [$", json_escape(Bin), $"].
+
+json_escape(Bin) -> [esc_byte(B) || <<B>> <= Bin].
+
+esc_byte($") -> <<"\\\"">>;
+esc_byte($\\) -> <<"\\\\">>;
+esc_byte($\n) -> <<"\\n">>;
+esc_byte($\t) -> <<"\\t">>;
+esc_byte($\r) -> <<"\\r">>;
+esc_byte(B) -> <<B>>.
+
+json_ref(Ref) ->
+    case erlang:get(?CELL_KEY(Ref)) of
+        {js_array, Len, Map} -> json_arr(arr_list(Len, Map));
+        M when is_map(M) -> json_obj(maps:to_list(M));
+        _ -> skip
+    end.
+
+json_arr(List) ->
+    Elems = [json_elem(E) || E <- List],
+    [$[, lists:join($,, Elems), $]].
+
+%% array elements that don't serialize (undefined/function) become null.
+json_elem(E) ->
+    case json_enc(E) of
+        skip -> <<"null">>;
+        Io -> Io
+    end.
+
+json_obj(Pairs) ->
+    KVs =
+        lists:filtermap(
+            fun({K, Val}) ->
+                case json_enc(Val) of
+                    skip -> false;
+                    Io -> {true, [json_str(K), $:, Io]}
+                end
+            end,
+            Pairs
+        ),
+    [${, lists:join($,, KVs), $}].
+
+%% JSON.parse(str) — parse JSON text to JS terms (numbers, binaries, true/false/null,
+%% arrays, objects). Malformed input is a type_error.
+json_parse(Str) ->
+    Bin = to_string(Str),
+    case json_val(json_ws(Bin)) of
+        {ok, V, Rest} ->
+            case json_ws(Rest) of
+                <<>> -> V;
+                _ -> type_error(Str)
+            end;
+        error ->
+            type_error(Str)
+    end.
+
+json_ws(<<C, R/binary>>) when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r ->
+    json_ws(R);
+json_ws(B) ->
+    B.
+
+json_val(<<"true", R/binary>>) -> {ok, true, R};
+json_val(<<"false", R/binary>>) -> {ok, false, R};
+json_val(<<"null", R/binary>>) -> {ok, null, R};
+json_val(<<$", R/binary>>) -> json_pstr(R, []);
+json_val(<<$[, R/binary>>) -> json_parr(json_ws(R), []);
+json_val(<<${, R/binary>>) -> json_pobj(json_ws(R), new_object());
+json_val(<<C, _/binary>> = B) when C =:= $-; C >= $0, C =< $9 -> json_pnum(B);
+json_val(_) -> error.
+
+json_pstr(<<$", R/binary>>, Acc) ->
+    {ok, unicode:characters_to_binary(lists:reverse(Acc)), R};
+json_pstr(<<$\\, $", R/binary>>, Acc) -> json_pstr(R, [$" | Acc]);
+json_pstr(<<$\\, $\\, R/binary>>, Acc) -> json_pstr(R, [$\\ | Acc]);
+json_pstr(<<$\\, $/, R/binary>>, Acc) -> json_pstr(R, [$/ | Acc]);
+json_pstr(<<$\\, $n, R/binary>>, Acc) -> json_pstr(R, [$\n | Acc]);
+json_pstr(<<$\\, $t, R/binary>>, Acc) -> json_pstr(R, [$\t | Acc]);
+json_pstr(<<$\\, $r, R/binary>>, Acc) -> json_pstr(R, [$\r | Acc]);
+json_pstr(<<$\\, $u, H:4/binary, R/binary>>, Acc) ->
+    json_pstr(R, [binary_to_integer(H, 16) | Acc]);
+json_pstr(<<C/utf8, R/binary>>, Acc) -> json_pstr(R, [C | Acc]);
+json_pstr(_, _) -> error.
+
+json_pnum(B) ->
+    {Tok, Rest} = json_num_tok(B, []),
+    case string:to_float(Tok) of
+        {error, _} ->
+            case string:to_integer(Tok) of
+                {error, _} -> error;
+                {I, <<>>} -> {ok, I, Rest};
+                _ -> error
+            end;
+        {F, <<>>} ->
+            {ok, F, Rest}
+    end.
+
+json_num_tok(<<C, R/binary>>, Acc) when
+    C >= $0, C =< $9;
+    C =:= $-;
+    C =:= $+;
+    C =:= $.;
+    C =:= $e;
+    C =:= $E
+->
+    json_num_tok(R, [C | Acc]);
+json_num_tok(R, Acc) ->
+    {list_to_binary(lists:reverse(Acc)), R}.
+
+json_parr(<<$], R/binary>>, Acc) ->
+    {ok, new_array(lists:reverse(Acc)), R};
+json_parr(B, Acc) ->
+    case json_val(B) of
+        {ok, V, R} ->
+            case json_ws(R) of
+                <<$,, R2/binary>> -> json_parr(json_ws(R2), [V | Acc]);
+                <<$], R2/binary>> -> {ok, new_array(lists:reverse([V | Acc])), R2};
+                _ -> error
+            end;
+        error ->
+            error
+    end.
+
+json_pobj(<<$}, R/binary>>, Obj) ->
+    {ok, Obj, R};
+json_pobj(<<$", R/binary>>, Obj) ->
+    case json_pstr(R, []) of
+        {ok, Key, R1} ->
+            case json_ws(R1) of
+                <<$:, R2/binary>> ->
+                    case json_val(json_ws(R2)) of
+                        {ok, V, R3} ->
+                            set_prop(Obj, Key, V),
+                            case json_ws(R3) of
+                                <<$,, R4/binary>> -> json_pobj(json_ws(R4), Obj);
+                                <<$}, R4/binary>> -> {ok, Obj, R4};
+                                _ -> error
+                            end;
+                        error ->
+                            error
+                    end;
+                _ ->
+                    error
+            end;
+        error ->
+            error
+    end;
+json_pobj(_, _) ->
+    error.
 
 %% ───────────────────────── lists / console / misc ─────────────────────────
 
