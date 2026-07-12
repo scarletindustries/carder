@@ -834,6 +834,17 @@ pub fn array_query_test() {
   call(c, "f", []) |> should.equal(dyn(True))
 }
 
+pub fn array_includes_from_index_test() {
+  // includes(element, fromIndex): searches from fromIndex (negatives from the end);
+  // no argument searches for undefined.
+  num("[1, 2, 3, 2].includes(2, 2) ? 1 : 0") |> should.equal(1.0)
+  num("[1, 2, 3].includes(1, 1) ? 1 : 0") |> should.equal(0.0)
+  num("[1, 2, 3].includes(3, -1) ? 1 : 0") |> should.equal(1.0)
+  num("[1, 2, 3].includes(1, 5) ? 1 : 0") |> should.equal(0.0)
+  num("[].includes() ? 1 : 0") |> should.equal(0.0)
+  num("[undefined, 1].includes() ? 1 : 0") |> should.equal(1.0)
+}
+
 pub fn array_some_every_test() {
   let s = compile("function f() { return [1, 2, 3].some(x => x > 2); }")
   call(s, "f", []) |> should.equal(dyn(True))

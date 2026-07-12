@@ -78,8 +78,8 @@
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
-    array_some/2, array_every/2, array_find/2,
-    array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
+    array_some/2, array_every/2, array_find/2, array_includes/3,
+    array_find_index/2, array_index_of/2, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
@@ -2180,10 +2180,26 @@ aidx([E | Es], I, X) ->
 
 %% includes → a JS boolean atom. Unlike indexOf (which uses ===), Array.includes
 %% uses SameValueZero, so `[NaN].includes(NaN)` is true.
-array_includes(Recv, X) when is_binary(Recv) -> array_index_of(Recv, X) =/= -1;
-array_includes(Recv, X) ->
+%% includes(searchElement, fromIndex) — SameValueZero search from `fromIndex`
+%% (ToIntegerOrInfinity, negatives from the end, clamped). A string receiver does a
+%% substring test (its position argument is not yet honoured).
+array_includes(Recv, X, _From) when is_binary(Recv) ->
+    array_index_of(Recv, X) =/= -1;
+array_includes(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
-    a_incl(arr_list(Len, Map), X).
+    Start =
+        case coerce_num(From) of
+            nan -> 0;
+            neg_inf -> 0;
+            inf -> Len;
+            N ->
+                V = trunc(as_float(N)),
+                case V < 0 of
+                    true -> max(Len + V, 0);
+                    false -> V
+                end
+        end,
+    a_incl(lists:nthtail(min(Start, Len), arr_list(Len, Map)), X).
 a_incl([], _) -> false;
 a_incl([E | Es], X) ->
     case same_value_zero(E, X) of

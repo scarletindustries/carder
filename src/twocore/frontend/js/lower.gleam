@@ -4852,7 +4852,9 @@ fn lower_instance_method(
     "sort", [cmp, ..] -> host("array_sort", [cmp])
     // queries
     "indexOf", [x, ..] -> host("array_index_of", [x])
-    "includes", [x, ..] -> host("array_includes", [x])
+    "includes", [x, from, ..] -> host("array_includes", [x, from])
+    "includes", [x] -> host("array_includes", [x, undefined()])
+    "includes", [] -> host("array_includes", [undefined(), undefined()])
     "join", [] -> host("array_join", [ir.ConstBinary(<<",">>)])
     "join", [sep, ..] -> host("array_join", [sep])
     "slice", [] -> host("array_slice", [undefined(), undefined()])

@@ -554,7 +554,7 @@ pub fn array_index_of(arr: Dynamic, x: Dynamic) -> Dynamic
 
 /// `arr.includes(x)` → JS boolean (strict equality).
 @external(erlang, "twocore_rt_js_ffi", "array_includes")
-pub fn array_includes(arr: Dynamic, x: Dynamic) -> Dynamic
+pub fn array_includes(arr: Dynamic, x: Dynamic, from: Dynamic) -> Dynamic
 
 /// `arr.join(sep)` → the elements ToString'd and joined by `sep` (null/undefined → "").
 @external(erlang, "twocore_rt_js_ffi", "array_join")
