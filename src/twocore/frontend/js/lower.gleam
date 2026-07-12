@@ -535,10 +535,12 @@ fn static_class_key(ctx: Ctx, cname: String) -> ir.Value {
   ir.ConstBinary(<<{ ctx.module_name <> "$" <> cname }:utf8>>)
 }
 
-/// If `object.property` reads/writes a static field of a known class, returns the
-/// DEFINING class name and the field name (for `static_get`/`static_set`). The
-/// defining class is resolved up the `extends` chain, so `B.x` for a static `x`
-/// declared on a parent `A` uses A's storage key — static fields are inherited.
+/// If `object.property` reads/writes a static field, returns the RECEIVER class
+/// name (the class actually named) and the field name. The field is recognised
+/// when it is declared anywhere in the receiver's `extends` chain (static fields
+/// are inherited), but the receiver — not the declaring ancestor — is returned:
+/// a WRITE creates an own property on the receiver, and a READ walks the chain
+/// from the receiver up (`static_key_chain`).
 fn static_field_target(
   object: ast.Expression,
   property: ast.Expression,
@@ -548,11 +550,17 @@ fn static_field_target(
   case object, property, computed {
     ast.Identifier(name: cname, ..), ast.Identifier(name: field, ..), False ->
       case static_owner(cname, field, ctx) {
-        Some(owner) -> Some(#(owner, field))
+        Some(_owner) -> Some(#(cname, field))
         None -> None
       }
     _, _, _ -> None
   }
+}
+
+/// The module-qualified static storage keys for `cname`'s inheritance chain,
+/// receiver first then ancestors — the lookup order for reading a static field.
+fn static_key_chain(ctx: Ctx, cname: String) -> List(ir.Value) {
+  list.map(class_chain(cname, ctx.classes), fn(c) { static_class_key(ctx, c) })
 }
 
 /// The nearest class in `cname`'s inheritance chain (self first) that declares
@@ -2518,6 +2526,8 @@ fn lower_static_assign(
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  // The receiver's own key is written; a compound read walks the chain (so
+  // `B.f += 1` sees an inherited value before creating B's own).
   let ckey = static_class_key(ctx, cname)
   let fkey = ir.ConstBinary(<<field:utf8>>)
   case op {
@@ -2526,8 +2536,14 @@ fn lower_static_assign(
       Ok(bind_after(bv, ir.CallHost("js", "static_set", [ckey, fkey, v]), ctr))
     }
     _ -> {
+      let #(bkeys, keys, ctr) =
+        build_list(static_key_chain(ctx, cname), [], ctr)
       let #(bcur, cur, ctr) =
-        bind_after([], ir.CallHost("js", "static_get", [ckey, fkey]), ctr)
+        bind_after(
+          bkeys,
+          ir.CallHost("js", "static_get_chain", [keys, fkey]),
+          ctr,
+        )
       use #(brv, rv, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
       use #(bres, resv, ctr) <- result_try(apply_compound(
         op,
@@ -3330,23 +3346,50 @@ fn lower_method(
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
-  // `C.staticMethod(args)` — a class's static method is a plain `C$static$name` call.
-  case static_method(object, method, ctx) {
-    Some(arity) -> {
-      use #(binds, argvals, ctr) <- result_try(lower_args(
-        arguments,
-        env,
-        ctx,
-        ctr,
-      ))
-      let cname = object_ident_name(object)
-      Ok(bind_after(
-        binds,
-        ir.CallDirect(cname <> "$static$" <> method, fit_args(argvals, arity)),
-        ctr,
-      ))
+  let prop = ast.Identifier(span: ast.Span(0, 0), name: method)
+  case static_field_target(object, prop, False, ctx) {
+    // `C.staticField(args)` — a static field shadows a same-named static method
+    // (the field-initializer overwrites the method); call the field's value, so a
+    // static field holding a function is callable (and a non-function is a
+    // not-callable error, as in JS).
+    Some(#(cname, field)) -> {
+      let #(bkeys, keys, ctr) =
+        build_list(static_key_chain(ctx, cname), [], ctr)
+      let #(bf, fv, ctr) =
+        bind_after(
+          bkeys,
+          ir.CallHost("js", "static_get_chain", [
+            keys,
+            ir.ConstBinary(<<field:utf8>>),
+          ]),
+          ctr,
+        )
+      use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+      let #(bl, listv, ctr) = build_list(argvals, list.append(bf, ba), ctr)
+      Ok(bind_after(bl, ir.CallHost("js", "apply_fn", [fv, listv]), ctr))
     }
-    None -> lower_instance_method(object, method, arguments, env, ctx, ctr)
+    None ->
+      // `C.staticMethod(args)` — a class's static method is a `C$static$name` call.
+      case static_method(object, method, ctx) {
+        Some(arity) -> {
+          use #(binds, argvals, ctr) <- result_try(lower_args(
+            arguments,
+            env,
+            ctx,
+            ctr,
+          ))
+          let cname = object_ident_name(object)
+          Ok(bind_after(
+            binds,
+            ir.CallDirect(
+              cname <> "$static$" <> method,
+              fit_args(argvals, arity),
+            ),
+            ctr,
+          ))
+        }
+        None -> lower_instance_method(object, method, arguments, env, ctx, ctr)
+      }
   }
 }
 
@@ -3633,17 +3676,22 @@ fn lower_member(
         None -> lower_member_get(object, property, computed, env, ctx, ctr)
       }
     _, _, _ ->
-      // `C.staticField` — read the class's static storage.
+      // `C.staticField` — read the static storage, walking the inheritance chain
+      // (receiver first) so an own value written on a subclass shadows the
+      // ancestor's declared value.
       case static_field_target(object, property, computed, ctx) {
-        Some(#(cname, field)) ->
+        Some(#(cname, field)) -> {
+          let #(bl, keys, ctr) =
+            build_list(static_key_chain(ctx, cname), [], ctr)
           Ok(bind_after(
-            [],
-            ir.CallHost("js", "static_get", [
-              static_class_key(ctx, cname),
+            bl,
+            ir.CallHost("js", "static_get_chain", [
+              keys,
               ir.ConstBinary(<<field:utf8>>),
             ]),
             ctr,
           ))
+        }
         None -> lower_member_get(object, property, computed, env, ctx, ctr)
       }
   }

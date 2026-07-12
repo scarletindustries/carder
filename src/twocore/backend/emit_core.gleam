@@ -4198,6 +4198,7 @@ fn resolve_js(op: String) -> Option(String) {
     "define_data" -> Some("define_data")
     "define_accessor" -> Some("define_accessor")
     "static_get" -> Some("static_get")
+    "static_get_chain" -> Some("static_get_chain")
     "static_set" -> Some("static_set")
     "has_prop" -> Some("has_prop")
     "delete_prop" -> Some("delete_prop")

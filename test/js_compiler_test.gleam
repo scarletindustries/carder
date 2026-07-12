@@ -1820,6 +1820,16 @@ pub fn static_field_mutation_test() {
   to_float(call(n, "f", [])) |> should.equal(15.0)
 }
 
+pub fn static_field_call_test() {
+  // A static field holding a function is callable via C.field(...).
+  let m =
+    compile(
+      "class C { static make = () => 7; } function f() { return C.make(); }",
+    )
+  call(m, "main", [])
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+}
+
 pub fn static_field_inheritance_test() {
   // A subclass reads a static field declared on a parent (via C's storage key).
   let m =
@@ -1829,14 +1839,15 @@ pub fn static_field_inheritance_test() {
     )
   call(m, "main", [])
   to_float(call(m, "f", [])) |> should.equal(7.0)
-  // writing through the child updates the shared (parent-owned) storage.
+  // writing through the child creates the child's OWN static; the parent (and
+  // siblings) are unaffected. A.n stays 1, B.n becomes 9 → 1*100 + 9 = 109.
   let n =
     compile(
       "class A { static n = 1; } class B extends A {} "
-      <> "function f() { B.n = 9; return A.n; }",
+      <> "function f() { B.n = 9; return A.n * 100 + B.n; }",
     )
   call(n, "main", [])
-  to_float(call(n, "f", [])) |> should.equal(9.0)
+  to_float(call(n, "f", [])) |> should.equal(109.0)
 }
 
 pub fn method_overrides_accessor_test() {

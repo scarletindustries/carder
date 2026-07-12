@@ -64,7 +64,7 @@
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
-    static_get/2, static_set/3, has_prop/2, delete_prop/2,
+    static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, array_to_list/1,
@@ -823,6 +823,19 @@ new_object() ->
 %% for an unset field.
 static_get(Class, Field) ->
     maps:get(Field, static_map(Class), undefined).
+
+%% Read a static field along the inheritance chain: `Keys` is the receiver class
+%% key first, then its ancestors. The first class that OWNS the field wins (an
+%% assignment to an inherited static creates an own property on the receiver, so
+%% the receiver's own key must be consulted before the declaring ancestor's).
+static_get_chain([], _Field) ->
+    undefined;
+static_get_chain([Key | Rest], Field) ->
+    M = static_map(Key),
+    case maps:is_key(Field, M) of
+        true -> maps:get(Field, M);
+        false -> static_get_chain(Rest, Field)
+    end.
 
 static_set(Class, Field, V) ->
     erlang:put({js_static_class, Class}, maps:put(Field, V, static_map(Class))),

@@ -251,6 +251,11 @@ pub fn define_data(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "static_get")
 pub fn static_get(class: Dynamic, field: Dynamic) -> Dynamic
 
+/// Read a static field along a chain of class keys (receiver first, then
+/// ancestors); the first class that owns the field wins. Returns `undefined`.
+@external(erlang, "twocore_rt_js_ffi", "static_get_chain")
+pub fn static_get_chain(keys: Dynamic, field: Dynamic) -> Dynamic
+
 /// Write a static class field `Class.field = v`; returns `v`.
 @external(erlang, "twocore_rt_js_ffi", "static_set")
 pub fn static_set(class: Dynamic, field: Dynamic, v: Dynamic) -> Dynamic
