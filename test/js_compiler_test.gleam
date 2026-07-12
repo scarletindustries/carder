@@ -462,6 +462,19 @@ pub fn global_increment_test() {
   to_float(call(m, "f", [])) |> should.equal(4.0)
 }
 
+pub fn global_loop_counter_test() {
+  // A global used as a `for` loop counter: the loop reads/writes it through the
+  // store each iteration (it is not env-loop-carried), and must still terminate
+  // and sum correctly.
+  let m =
+    compile(
+      "var i = 0; var acc = 0; "
+      <> "function f() { acc = 0; for (i = 0; i < 4; i = i + 1) { acc = acc + i; } return acc; }",
+    )
+  // 0 + 1 + 2 + 3 = 6
+  to_float(call(m, "f", [])) |> should.equal(6.0)
+}
+
 pub fn global_shadow_test() {
   // A function-local of the same name SHADOWS the global (env wins).
   let m =
