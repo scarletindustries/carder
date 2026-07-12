@@ -417,6 +417,30 @@ pub fn array_constructor_empty_test() {
   to_float(call(m, "f", [])) |> should.equal(0.0)
 }
 
+pub fn first_class_top_level_fn_test() {
+  // A bare reference to a top-level function is that function as a value —
+  // assignable, and passable as a callback. (Used to panic in the emitter.)
+  let m =
+    compile(
+      "function add(a, b) { return a + b; } function isBig(x) { return x > 10; } "
+      <> "function f() { let g = add; return g(2, 3) * 100 + [5, 12, 3, 20].filter(isBig).length; }",
+    )
+  // add(2,3)=5 → 500; filter isBig over [5,12,3,20] → [12,20] length 2 → 502
+  to_float(call(m, "f", [])) |> should.equal(502.0)
+}
+
+pub fn first_class_fn_arity_fit_test() {
+  // A named callback declared with FEWER params than the caller passes is fine —
+  // the extra (index, array) arguments are dropped (JS ignores extras).
+  let m =
+    compile(
+      "function dbl(x) { return x * 2; } "
+      <> "function f() { return [1, 2, 3].map(dbl).reduce(function(a, b) { return a + b; }, 0); }",
+    )
+  // map dbl → [2,4,6], reduce sum → 12
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+}
+
 pub fn array_length_test() {
   let m = compile("function f() { let a = [1, 2, 3]; return a.length; }")
   to_float(call(m, "f", [])) |> should.equal(3.0)

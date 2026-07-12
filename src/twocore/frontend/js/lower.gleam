@@ -3035,10 +3035,13 @@ fn lower_expr(
             Some(v) -> Ok(#([], v, ctr))
             // A bare reference to a top-level function is that function as a value.
             None ->
-              case list.contains(ctx.funcs, x) {
-                True ->
-                  Ok(bind1(ir.MakeClosure(x, [], fn_arity_unknown(x)), ctr))
-                False -> Error(Unsupported("unbound identifier '" <> x <> "'"))
+              case dict.get(ctx.fn_arity, x) {
+                // A bare reference to a top-level function is that function as a
+                // first-class value: a zero-capture closure over it (`call_cb`
+                // fits the argument count to the function's arity at call time).
+                Ok(arity) -> Ok(bind1(ir.MakeClosure(x, [], arity), ctr))
+                Error(_) ->
+                  Error(Unsupported("unbound identifier '" <> x <> "'"))
               }
           }
       }
@@ -5355,13 +5358,6 @@ fn bool_expr(i32v: ir.Value) -> ir.Expr {
 
 /// A conservative arity for a bare top-level-function reference used as a value.
 /// We don't track arities here (v1), so a plain reference is unsupported precisely.
-fn fn_arity_unknown(name: String) -> Int {
-  // A closure over a top-level function needs its arity; not tracked in v1.
-  panic as {
-    "js: first-class use of function '" <> name <> "' not supported yet"
-  }
-}
-
 fn num_key(v: Float) -> String {
   case is_integral(v) {
     True -> int.to_string(float.truncate(v))
