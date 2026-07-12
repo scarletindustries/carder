@@ -66,7 +66,7 @@
     new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
-    array_from/1, array_from_map/2, array_flat/1, array_fill/2, array_at/2,
+    array_from/1, array_from_map/2, array_flat/1, array_fill/4, array_at/2,
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
@@ -1321,9 +1321,36 @@ flat_one(E) ->
     end.
 
 %% arr.fill(v) — set every element to v (in place); returns the array.
-array_fill(Recv, V) ->
-    {Len, _Map} = arr_content(Recv),
-    arr_store(Recv, lists:duplicate(Len, V)).
+%% arr.fill(value, start, end) — fill indices [start, end) with `value` and return
+%% the array. start/end are ToIntegerOrInfinity, clamped to [0, len] with negatives
+%% counting from the end; an omitted start is 0 and an omitted end is len.
+array_fill(Recv, V, Start, End) ->
+    {Len, Map} = arr_content(Recv),
+    S = fill_clamp(Start, Len, 0),
+    E = fill_clamp(End, Len, Len),
+    erlang:put(?CELL_KEY(Recv), {js_array, Len, fill_range(Map, S, E, V)}),
+    Recv.
+
+fill_clamp(undefined, _Len, Default) ->
+    Default;
+fill_clamp(I, Len, _Default) ->
+    case coerce_num(I) of
+        nan ->
+            0;
+        inf ->
+            Len;
+        neg_inf ->
+            0;
+        Num ->
+            N = trunc(as_float(Num)),
+            case N < 0 of
+                true -> max(Len + N, 0);
+                false -> min(N, Len)
+            end
+    end.
+
+fill_range(Map, S, E, _V) when S >= E -> Map;
+fill_range(Map, S, E, V) -> fill_range(maps:put(S, V, Map), S + 1, E, V).
 
 %% arr.at(i) / str.at(i) — element at index i (negative counts from the end), else
 %% undefined.

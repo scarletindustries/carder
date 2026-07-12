@@ -1488,6 +1488,19 @@ pub fn array_fill_at_test() {
   num("[10, 20, 30].at(-1)") |> should.equal(30.0)
 }
 
+pub fn array_fill_range_test() {
+  // fill(value, start, end): only [start, end) is filled; negatives count from
+  // the end; omitted end is the length.
+  let m =
+    compile(
+      "function f() { let a = [0, 0, 0].fill(8, 1, 2); let b = [0, 0, 0, 0, 0].fill(8, -3, 4); "
+      <> "let c = [1, 2, 3, 4].fill(9, 2); "
+      <> "return a[0]*100 + a[1]*10 + a[2] + '/' + b.join('') + '/' + c.join(''); }",
+    )
+  // a=[0,8,0]→080; b=[0,0,8,8,0]; c=[1,2,9,9]
+  call(m, "f", []) |> should.equal(dyn(<<"80/00880/1299">>))
+}
+
 pub fn string_pad_test() {
   let s = compile("function f() { return \"5\".padStart(3, \"0\"); }")
   call(s, "f", []) |> should.equal(dyn(<<"005">>))

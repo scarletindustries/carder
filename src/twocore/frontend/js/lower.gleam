@@ -4793,7 +4793,9 @@ fn lower_instance_method(
     }
     "reverse", _ -> host("array_reverse", [])
     "flat", _ -> host("array_flat", [])
-    "fill", [v, ..] -> host("array_fill", [v])
+    "fill", [v, s, e, ..] -> host("array_fill", [v, s, e])
+    "fill", [v, s] -> host("array_fill", [v, s, undefined()])
+    "fill", [v] -> host("array_fill", [v, undefined(), undefined()])
     "at", [i, ..] -> host("array_at", [i])
     "padStart", [n] -> host("str_pad_start", [n, ir.ConstBinary(<<" ">>)])
     "padStart", [n, p, ..] -> host("str_pad_start", [n, p])

@@ -348,9 +348,15 @@ pub fn array_from_map(x: Dynamic, map_fn: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_flat")
 pub fn array_flat(arr: Dynamic) -> Dynamic
 
-/// `arr.fill(v)` — set every element to `v` in place; returns the array.
+/// `arr.fill(v, start, end)` — set elements in `[start, end)` to `v` in place
+/// (defaults: start 0, end length); returns the array.
 @external(erlang, "twocore_rt_js_ffi", "array_fill")
-pub fn array_fill(arr: Dynamic, v: Dynamic) -> Dynamic
+pub fn array_fill(
+  arr: Dynamic,
+  v: Dynamic,
+  start: Dynamic,
+  end: Dynamic,
+) -> Dynamic
 
 /// `arr.at(i)` / `str.at(i)` — element at `i` (negative counts from the end), else
 /// `undefined`.
