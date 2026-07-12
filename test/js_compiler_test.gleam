@@ -1884,6 +1884,40 @@ pub fn object_rest_destructure_test() {
   |> should.equal(7.0)
 }
 
+pub fn try_finally_normal_test() {
+  // finally runs on normal completion; its effect is visible afterward.
+  num(
+    "(function(){ let o = { n: 0 }; try { o.n = 1; } finally { o.n = o.n + 10; } return o.n; })()",
+  )
+  |> should.equal(11.0)
+}
+
+pub fn try_catch_finally_test() {
+  // finally runs after the catch handler.
+  num(
+    "(function(){ let o = { log: 0 }; try { throw 5; } catch (e) { o.log = e; } finally { o.log = o.log + 100; } return o.log; })()",
+  )
+  |> should.equal(105.0)
+}
+
+pub fn try_finally_reraise_test() {
+  // With no catch, finally runs and the exception propagates to an outer catch.
+  num(
+    "(function(){ let o = { cleaned: 0, caught: 0 }; try { try { throw 7; } finally { o.cleaned = 1; } } catch (e) { o.caught = e; } return o.cleaned * 10 + o.caught; })()",
+  )
+  |> should.equal(17.0)
+}
+
+pub fn try_finally_control_flow_unsupported_test() {
+  // A return inside a try/finally would bypass finally, so it is a clean error.
+  let assert Error(_) =
+    js.compile_and_load(
+      "function f() { try { return 1; } finally { } }",
+      "twocore@jstest@tfctl",
+    )
+  Nil
+}
+
 pub fn member_update_test() {
   // obj.p++ reads and writes the property.
   num("(function(){ let o = { n: 5 }; o.n++; o.n++; return o.n; })()")

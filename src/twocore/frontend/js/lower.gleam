@@ -40,7 +40,9 @@
 //// Control flow also includes `for-of` (over arrays/strings), `switch` (with
 //// fall-through, default in any position, and `break` that targets the switch), and
 //// `throw` / `try`/`catch` (a thrown JS value transported via the module's `js_exn`
-//// tag; `return`/`break`/`continue` inside a try body transfer out correctly).
+//// tag; `return`/`break`/`continue` inside a try body transfer out correctly), and
+//// `try`/`finally` / `try`/`catch`/`finally` for cleanup (`finally` runs on normal
+//// completion and re-raises on an exception).
 ////
 //// Builtins: the `Math` namespace (functions + constants); array methods (push/pop/
 //// shift/unshift, map/filter/forEach/reduce/reduceRight/some/every/find/findIndex,
@@ -62,8 +64,9 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): `try`/`finally` and
-//// generators/async. Static
+//// Not yet (a clean `Unsupported` error / panic): generators/async, and a
+//// `return`/`break`/`continue` inside a `try`/`finally` body (it would bypass the
+//// finally, so it is rejected). Static
 //// field initializers run when the module's `main/0` runs (like any top-level
 //// state), so `C.x` reads `undefined` until then. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
@@ -1868,26 +1871,130 @@ fn lower_try(
   k: Cont,
 ) -> Result(#(ir.Expr, Int), Error) {
   case finalizer, handler {
-    Some(_), _ -> Error(Unsupported("try/finally"))
+    Some(fin), _ -> lower_try_finally(block, handler, fin, env, ctx, ctr, k)
     None, None -> Error(Unsupported("try without catch"))
-    None, Some(ast.CatchClause(param:, body: cbody)) -> {
-      use e_name <- result_try(case param {
-        None -> Ok("%exn")
-        Some(ast.IdentifierPattern(name:, ..)) -> Ok(name)
-        Some(_) -> Error(Unsupported("destructuring catch binding"))
-      })
-      let body_stmts = block_stmts(block)
-      let catch_stmts = block_stmts(cbody)
-      let carried =
-        list.append(assigned_in(body_stmts), assigned_in(catch_stmts))
-        |> list.unique
-        |> list.filter(dict.has_key(env, _))
-      let tys = list.map(carried, fn(_) { ir.TTerm })
-      // fall-through of either arm yields the carried variables' current values.
-      let yield_carried: Cont = fn(env2, ctr2) {
-        Ok(#(ir.Values(carried_vals(env2, carried)), ctr2))
-      }
-      use #(body_expr, ctr) <- result_try(lower_stmts(
+    None, Some(cc) -> lower_try_catch(block, cc, env, ctx, ctr, k)
+  }
+}
+
+/// The catch binding name: an explicit identifier, or `%exn` when omitted.
+fn catch_binding(param: Option(ast.Pattern)) -> Result(String, Error) {
+  case param {
+    None -> Ok("%exn")
+    Some(ast.IdentifierPattern(name:, ..)) -> Ok(name)
+    Some(_) -> Error(Unsupported("destructuring catch binding"))
+  }
+}
+
+fn lower_try_catch(
+  block: ast.Statement,
+  cc: ast.CatchClause,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  let ast.CatchClause(param:, body: cbody) = cc
+  use e_name <- result_try(catch_binding(param))
+  let body_stmts = block_stmts(block)
+  let catch_stmts = block_stmts(cbody)
+  let carried =
+    list.append(assigned_in(body_stmts), assigned_in(catch_stmts))
+    |> list.unique
+    |> list.filter(dict.has_key(env, _))
+  let tys = list.map(carried, fn(_) { ir.TTerm })
+  // fall-through of either arm yields the carried variables' current values.
+  let yield_carried: Cont = fn(env2, ctr2) {
+    Ok(#(ir.Values(carried_vals(env2, carried)), ctr2))
+  }
+  use #(body_expr, ctr) <- result_try(lower_stmts(
+    body_stmts,
+    env,
+    ctx,
+    ctr,
+    yield_carried,
+  ))
+  let henv = dict.insert(env, e_name, ir.Var(e_name))
+  use #(handler_expr, ctr) <- result_try(lower_stmts(
+    catch_stmts,
+    henv,
+    ctx,
+    ctr,
+    yield_carried,
+  ))
+  let try_expr =
+    ir.Try(result: tys, body: body_expr, handlers: [
+      ir.CatchHandler(
+        on: ir.OnTag(js_exn_tag),
+        payload: [e_name],
+        exnref: None,
+        handler: handler_expr,
+      ),
+    ])
+  let #(after, ctr) = fresh_n(list.length(carried), ctr)
+  let env2 =
+    list.fold(list.zip(carried, after), env, fn(acc, p) {
+      dict.insert(acc, p.0, ir.Var(p.1))
+    })
+  use #(rest, ctr) <- result_try(k(env2, ctr))
+  Ok(#(ir.Let(after, try_expr, rest), ctr))
+}
+
+/// `try { B } finally { F }` and `try { B } catch (e) { C } finally { F }` for the
+/// CLEANUP case: `F` runs on normal completion of the try/catch, and on an
+/// (explicit) exception it runs then the exception is RE-RAISED (via an `OnAll`
+/// handler that captures the exception, runs `F`, and `throw_ref`s it). A
+/// `return`/`break`/`continue` that would exit the try (bypassing `F`) is a clean
+/// `Unsupported` — as is control flow inside `F` itself. `F` is lowered twice
+/// (the normal path and the re-raise path). Like all our try handling, only an
+/// explicit `throw` is intercepted; a variable mutated in `B` before a throw
+/// keeps its pre-try value in `F`'s re-raise path.
+fn lower_try_finally(
+  block: ast.Statement,
+  handler: Option(ast.CatchClause),
+  finalizer: ast.Statement,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  let body_stmts = block_stmts(block)
+  let fin_stmts = block_stmts(finalizer)
+  let catch_stmts = case handler {
+    Some(ast.CatchClause(body: cb, ..)) -> block_stmts(cb)
+    None -> []
+  }
+  use _ <- result_try(
+    case
+      transfers_out(body_stmts)
+      || transfers_out(catch_stmts)
+      || transfers_out(fin_stmts)
+    {
+      True ->
+        Error(Unsupported(
+          "return/break/continue inside a try/finally (would bypass finally)",
+        ))
+      False -> Ok(Nil)
+    },
+  )
+  let carried =
+    list.flatten([
+      assigned_in(body_stmts),
+      assigned_in(catch_stmts),
+      assigned_in(fin_stmts),
+    ])
+    |> list.unique
+    |> list.filter(dict.has_key(env, _))
+  let tys = list.map(carried, fn(_) { ir.TTerm })
+  let yield_carried: Cont = fn(env2, ctr2) {
+    Ok(#(ir.Values(carried_vals(env2, carried)), ctr2))
+  }
+  // The protected region: `B` alone, or `try B catch C`, yielding the carried set.
+  use #(inner_expr, ctr) <- result_try(case handler {
+    None -> lower_stmts(body_stmts, env, ctx, ctr, yield_carried)
+    Some(ast.CatchClause(param:, body: cbody)) -> {
+      use e_name <- result_try(catch_binding(param))
+      use #(body_e, ctr) <- result_try(lower_stmts(
         body_stmts,
         env,
         ctx,
@@ -1895,30 +2002,99 @@ fn lower_try(
         yield_carried,
       ))
       let henv = dict.insert(env, e_name, ir.Var(e_name))
-      use #(handler_expr, ctr) <- result_try(lower_stmts(
-        catch_stmts,
+      use #(catch_e, ctr) <- result_try(lower_stmts(
+        block_stmts(cbody),
         henv,
         ctx,
         ctr,
         yield_carried,
       ))
-      let try_expr =
-        ir.Try(result: tys, body: body_expr, handlers: [
+      Ok(#(
+        ir.Try(result: tys, body: body_e, handlers: [
           ir.CatchHandler(
             on: ir.OnTag(js_exn_tag),
             payload: [e_name],
             exnref: None,
-            handler: handler_expr,
+            handler: catch_e,
           ),
-        ])
-      let #(after, ctr) = fresh_n(list.length(carried), ctr)
-      let env2 =
-        list.fold(list.zip(carried, after), env, fn(acc, p) {
-          dict.insert(acc, p.0, ir.Var(p.1))
-        })
-      use #(rest, ctr) <- result_try(k(env2, ctr))
-      Ok(#(ir.Let(after, try_expr, rest), ctr))
+        ]),
+        ctr,
+      ))
     }
+  })
+  // Re-raise path: capture the exception, run F for effect, then throw_ref it.
+  let #(exnref, ctr) = fresh(ctr)
+  use #(fin_handler, ctr) <- result_try(
+    lower_stmts(fin_stmts, env, ctx, ctr, fn(_env2, ctr2) {
+      Ok(#(ir.ThrowRef(ir.Var(exnref)), ctr2))
+    }),
+  )
+  let outer_try =
+    ir.Try(result: tys, body: inner_expr, handlers: [
+      ir.CatchHandler(
+        on: ir.OnAll,
+        payload: [],
+        exnref: Some(exnref),
+        handler: fin_handler,
+      ),
+    ])
+  // Normal path: bind the try's carried result, run F (which sees it and may
+  // mutate it), then continue with F's carried values.
+  let #(after, ctr) = fresh_n(list.length(carried), ctr)
+  let env_after =
+    list.fold(list.zip(carried, after), env, fn(acc, p) {
+      dict.insert(acc, p.0, ir.Var(p.1))
+    })
+  use #(fin_normal, ctr) <- result_try(lower_stmts(
+    fin_stmts,
+    env_after,
+    ctx,
+    ctr,
+    yield_carried,
+  ))
+  let #(after2, ctr) = fresh_n(list.length(carried), ctr)
+  let env_after2 =
+    list.fold(list.zip(carried, after2), env, fn(acc, p) {
+      dict.insert(acc, p.0, ir.Var(p.1))
+    })
+  use #(rest, ctr) <- result_try(k(env_after2, ctr))
+  Ok(#(ir.Let(after, outer_try, ir.Let(after2, fin_normal, rest)), ctr))
+}
+
+/// True if `stmts` contain a `return`/`break`/`continue` that would transfer OUT
+/// of the region (a return not in a nested function; an unlabeled break/continue
+/// not absorbed by a loop/switch within the region; any LABELED break/continue,
+/// treated conservatively as escaping). Used to reject control flow that would
+/// bypass a `finally`.
+fn transfers_out(stmts: List(ast.Statement)) -> Bool {
+  list.any(stmts, fn(s) { stmt_transfers(s, False, False) })
+}
+
+fn stmt_transfers(s: ast.Statement, in_loop: Bool, in_break: Bool) -> Bool {
+  case s {
+    ast.ReturnStatement(..) -> True
+    ast.BreakStatement(label: Some(_)) -> True
+    ast.ContinueStatement(label: Some(_)) -> True
+    ast.BreakStatement(label: None) -> !in_break
+    ast.ContinueStatement(label: None) -> !in_loop
+    // a nested function is its own return target.
+    ast.FunctionDeclaration(..) -> False
+    // a loop absorbs unlabeled break/continue; a return inside still escapes.
+    ast.WhileStatement(body:, ..)
+    | ast.DoWhileStatement(body:, ..)
+    | ast.ForStatement(body:, ..)
+    | ast.ForOfStatement(body:, ..)
+    | ast.ForInStatement(body:, ..) ->
+      list.any(block_stmts(body), fn(c) { stmt_transfers(c, True, True) })
+    // a switch absorbs unlabeled break but NOT continue (which targets a loop).
+    ast.SwitchStatement(cases:, ..) ->
+      list.any(cases, fn(c) {
+        list.any(c.consequent, fn(w) {
+          stmt_transfers(w.statement, in_loop, True)
+        })
+      })
+    _ ->
+      list.any(child_stmts(s), fn(c) { stmt_transfers(c, in_loop, in_break) })
   }
 }
 
