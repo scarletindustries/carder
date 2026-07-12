@@ -357,6 +357,45 @@ pub fn regex_flags(re: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "str_match")
 pub fn str_match(str: Dynamic, re: Dynamic) -> Dynamic
 
+// ───────────────────────── Map / Set ─────────────────────────
+// `new Map()`/`new Set()`; the methods delegate to a same-named user method when the
+// receiver is a plain object, so they don't shadow user APIs. `.size` reads via get_prop.
+
+/// `new Map(init?)` / `new Set(init?)` — optionally seeded from an array (of pairs).
+@external(erlang, "twocore_rt_js_ffi", "new_map")
+pub fn new_map(init: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "new_set")
+pub fn new_set(init: Dynamic) -> Dynamic
+
+// Each takes the receiver + a cons-list of ALL the call's arguments — so a delegated
+// user method (plain-object receiver) receives every argument.
+
+/// `map.set(k, v)` (returns the map) / `map.get(k)` / `set.add(v)` (returns the set).
+@external(erlang, "twocore_rt_js_ffi", "js_m_set")
+pub fn js_m_set(recv: Dynamic, args: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "js_m_get")
+pub fn js_m_get(recv: Dynamic, args: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "js_m_add")
+pub fn js_m_add(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `map.has(k)` / `set.has(v)` → JS boolean; `map.delete(k)` / `set.delete(v)` → boolean.
+@external(erlang, "twocore_rt_js_ffi", "js_m_has")
+pub fn js_m_has(recv: Dynamic, args: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "js_m_delete")
+pub fn js_m_delete(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `map.clear()` / `set.clear()`.
+@external(erlang, "twocore_rt_js_ffi", "js_m_clear")
+pub fn js_m_clear(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `forEach(fn)` across arrays, Maps `fn(v, k, m)`, and Sets `fn(v, v, s)`.
+@external(erlang, "twocore_rt_js_ffi", "js_m_foreach")
+pub fn js_m_foreach(recv: Dynamic, args: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 

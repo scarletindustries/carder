@@ -71,6 +71,8 @@
     array_last_index_of/2, num_to_fixed/2,
     to_string_dispatch/1, num_to_string_radix/2,
     new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
+    new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
+    js_m_delete/2, js_m_clear/2, js_m_foreach/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
@@ -825,6 +827,16 @@ get_prop(Recv, Key) when is_reference(Recv) ->
                 <<"multiline">> -> has_flag(Flags, $m);
                 _ -> undefined
             end;
+        {js_map, D} ->
+            case Key of
+                <<"size">> -> maps:size(D);
+                _ -> undefined
+            end;
+        {js_set, D} ->
+            case Key of
+                <<"size">> -> maps:size(D);
+                _ -> undefined
+            end;
         M when is_map(M) ->
             maps:get(prop_key(Key), M, undefined);
         _ ->
@@ -1068,6 +1080,139 @@ string_from_char_code(Codes) ->
 %% Date.now() — milliseconds since the Unix epoch.
 date_now() ->
     erlang:system_time(millisecond).
+
+%% ── Map / Set ────────────────────────────────────────────
+%% A Map is a cell `{js_map, Data}` (Erlang map: JS-value key → value); a Set is
+%% `{js_set, Data}` (value → true). Keys use Erlang term equality (object identity for
+%% refs, value for primitives; NaN keys work via the js_nan sentinel). The method names
+%% (set/get/add/has/delete/clear/forEach) DELEGATE to a user method of the same name
+%% when the receiver is a plain object, so they don't clobber user APIs. Iteration order
+%% is the backing map's, not insertion order (a v1 deviation).
+
+new_map(Init) ->
+    M = cell_new({js_map, #{}}),
+    case is_array(Init) of
+        1 ->
+            {Len, Map} = arr_content(Init),
+            lists:foreach(
+                fun(Pair) ->
+                    case is_array(Pair) of
+                        1 ->
+                            {_, PM} = arr_content(Pair),
+                            js_m_set(M, [maps:get(0, PM, undefined), maps:get(1, PM, undefined)]);
+                        0 ->
+                            ok
+                    end
+                end,
+                arr_list(Len, Map)
+            );
+        0 ->
+            ok
+    end,
+    M.
+
+new_set(Init) ->
+    S = cell_new({js_set, #{}}),
+    case is_array(Init) of
+        1 ->
+            {Len, Map} = arr_content(Init),
+            lists:foreach(fun(V) -> js_m_add(S, [V]) end, arr_list(Len, Map));
+        0 ->
+            ok
+    end,
+    S.
+
+%% Each collection method takes the receiver + the FULL argument list, so that a
+%% delegated user method (when the receiver is a plain object) gets all its arguments.
+
+js_m_set(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, D} ->
+            erlang:put(?CELL_KEY(Recv), {js_map, maps:put(arg(Args, 0), arg(Args, 1), D)}),
+            Recv;
+        _ ->
+            delegate(Recv, <<"set">>, Args)
+    end.
+
+js_m_get(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, D} -> maps:get(arg(Args, 0), D, undefined);
+        _ -> delegate(Recv, <<"get">>, Args)
+    end.
+
+js_m_add(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_set, D} ->
+            erlang:put(?CELL_KEY(Recv), {js_set, maps:put(arg(Args, 0), true, D)}),
+            Recv;
+        _ ->
+            delegate(Recv, <<"add">>, Args)
+    end.
+
+js_m_has(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, D} -> maps:is_key(arg(Args, 0), D);
+        {js_set, D} -> maps:is_key(arg(Args, 0), D);
+        _ -> delegate(Recv, <<"has">>, Args)
+    end.
+
+js_m_delete(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, D} ->
+            erlang:put(?CELL_KEY(Recv), {js_map, maps:remove(arg(Args, 0), D)}),
+            true;
+        {js_set, D} ->
+            erlang:put(?CELL_KEY(Recv), {js_set, maps:remove(arg(Args, 0), D)}),
+            true;
+        _ ->
+            delegate(Recv, <<"delete">>, Args)
+    end.
+
+js_m_clear(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, _} ->
+            erlang:put(?CELL_KEY(Recv), {js_map, #{}}),
+            undefined;
+        {js_set, _} ->
+            erlang:put(?CELL_KEY(Recv), {js_set, #{}}),
+            undefined;
+        _ ->
+            delegate(Recv, <<"clear">>, Args)
+    end.
+
+%% forEach across arrays, Maps (fn(v, k, m)), Sets (fn(v, v, s)), or a user method.
+js_m_foreach(Recv, Args) ->
+    Fn = arg(Args, 0),
+    case is_array(Recv) of
+        1 ->
+            array_foreach(Recv, Fn);
+        0 ->
+            case cell_tag(Recv) of
+                {js_map, D} ->
+                    maps:foreach(fun(K, V) -> call_cb(Fn, [V, K, Recv]) end, D),
+                    undefined;
+                {js_set, D} ->
+                    maps:foreach(fun(V, _) -> call_cb(Fn, [V, V, Recv]) end, D),
+                    undefined;
+                _ ->
+                    delegate(Recv, <<"forEach">>, Args)
+            end
+    end.
+
+%% The cell's tagged content, or `undefined` for a non-reference (so the delegate path
+%% is taken for primitives / plain values).
+cell_tag(Recv) when is_reference(Recv) -> erlang:get(?CELL_KEY(Recv));
+cell_tag(_) -> undefined.
+
+arg([], _) -> undefined;
+arg([X | _], 0) -> X;
+arg([_ | Xs], N) -> arg(Xs, N - 1).
+
+delegate(Recv, Name, Args) ->
+    case get_prop(Recv, Name) of
+        F when is_function(F) -> call_cb(F, Args);
+        _ -> type_error(Recv)
+    end.
 
 %% ── regex ────────────────────────────────────────────────
 %% A regex `/pat/flags` is a cell holding `{js_regex, CompiledMP, Flags, Source}`.

@@ -1434,6 +1434,54 @@ pub fn regex_match_split_test() {
   num("\"a,b;c\".split(/[,;]/).length") |> should.equal(3.0)
 }
 
+// ── Map / Set ────────────────────────────────────────────────────────────────
+
+pub fn map_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); return m.get(\"a\") + m.size; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  // has / delete
+  let d =
+    compile(
+      "function f() { let m = new Map(); m.set(\"x\", 5); let h1 = m.has(\"x\"); m.delete(\"x\"); let h2 = m.has(\"x\"); return h1 && !h2; }",
+    )
+  call(d, "f", []) |> should.equal(dyn(True))
+  // seeded from pairs
+  let s =
+    compile(
+      "function f() { let m = new Map([[\"a\", 1], [\"b\", 2]]); return m.get(\"b\"); }",
+    )
+  to_float(call(s, "f", [])) |> should.equal(2.0)
+}
+
+pub fn set_test() {
+  let m =
+    compile(
+      "function f() { let s = new Set(); s.add(1); s.add(2); s.add(1); return s.size; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(2.0)
+  let seed =
+    compile("function f() { let s = new Set([1, 2, 2, 3]); return s.size; }")
+  to_float(call(seed, "f", [])) |> should.equal(3.0)
+}
+
+pub fn set_foreach_test() {
+  let m =
+    compile(
+      "function f() { let out = []; new Set([1, 2, 3]).forEach(v => out.push(v)); return out.length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
+pub fn method_delegation_test() {
+  // a user object's own `set` method isn't clobbered by the Map dispatch
+  let m =
+    compile("function f() { let o = { set: x => x * 2 }; return o.set(21); }")
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

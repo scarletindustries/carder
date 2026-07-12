@@ -46,11 +46,14 @@
 //// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
 //// `String.fromCharCode`, and `Date.now`. Regex literals `/pat/flags` (backed by
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
+//// `Map`/`Set` (`new Map()`/`new Set()`, `.set`/`.get`/`.add`/`.has`/`.delete`/`.clear`/
+//// `.forEach`/`.size`; these method names delegate to a same-named user method on a
+//// plain object).
 ////
 //// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
 //// members, nested/defaulted destructuring, call spread `f(...a)`, rest params,
-//// `Map`/`Set`, `try`/`finally`, generators/async, and `continue` inside a `do/while`.
-//// (A derived
+//// `try`/`finally`, generators/async, tagged templates, and `continue` inside a
+//// `do/while`. (A derived
 //// class needs an explicit constructor that calls `super(…)`; field initializers run
 //// before `super()` rather than after — v1 ordering simplifications. A regular function
 //// EXPRESSION captures `this` lexically like an arrow. `JSON`/`Object.keys` key order
@@ -2530,6 +2533,11 @@ fn lower_new(
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
   case callee {
+    // `new Map()` / `new Set()` — built-in collections (optionally seeded).
+    ast.Identifier(name: "Map", ..) ->
+      lower_builtin_new("new_map", arguments, env, ctx, ctr)
+    ast.Identifier(name: "Set", ..) ->
+      lower_builtin_new("new_set", arguments, env, ctx, ctr)
     ast.Identifier(name: cname, ..) ->
       case dict.get(ctx.classes, cname) {
         Error(Nil) ->
@@ -2607,8 +2615,26 @@ fn lower_new(
   }
 }
 
-/// `recv.method(args)` — a method call. Dispatches the built-in array/string methods
-/// by name to their `rt_js` ops; an unknown method name is a property-lookup-and-call
+/// `new Map(init?)` / `new Set(init?)` — a built-in collection constructor. Passes the
+/// optional first argument (an array seed) to the runtime constructor.
+fn lower_builtin_new(
+  op: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let init = case argvals {
+    [x, ..] -> x
+    [] -> undefined()
+  }
+  Ok(bind_after(binds, ir.CallHost("js", op, [init]), ctr))
+}
+
+/// `recv.method(args)` — a method call. Dispatches the built-in array/string/Map/Set
+/// methods by name to their `rt_js` ops (Map/Set methods delegate to a same-named user
+/// method on a plain object); an unknown method name is a property-lookup-and-call
 /// (object/class instance methods). The receiver is evaluated once.
 fn lower_method(
   object: ast.Expression,
@@ -2676,6 +2702,12 @@ fn lower_instance_method(
   let host = fn(name, extra) {
     Ok(bind_after(pre, ir.CallHost("js", name, [recv, ..extra]), ctr))
   }
+  // A collection method `name` applied to `[recv, <cons-list of ALL args>]` — so a
+  // delegated user method receives every argument.
+  let coll = fn(name) {
+    let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
+    Ok(bind_after(binds2, ir.CallHost("js", name, [recv, listv]), ctr))
+  }
   case method, argvals {
     // mutators / stack ops
     "push", _ -> {
@@ -2703,7 +2735,15 @@ fn lower_instance_method(
     // iteration with a callback
     "map", [f, ..] -> host("array_map", [f])
     "filter", [f, ..] -> host("array_filter", [f])
-    "forEach", [f, ..] -> host("array_foreach", [f])
+    // forEach + Map/Set methods dispatch on the receiver type in the runtime and
+    // delegate (with ALL args) to a same-named user method on a plain object.
+    "forEach", _ -> coll("js_m_foreach")
+    "get", _ -> coll("js_m_get")
+    "set", _ -> coll("js_m_set")
+    "add", _ -> coll("js_m_add")
+    "has", _ -> coll("js_m_has")
+    "delete", _ -> coll("js_m_delete")
+    "clear", _ -> coll("js_m_clear")
     "some", [f, ..] -> host("array_some", [f])
     "every", [f, ..] -> host("array_every", [f])
     "find", [f, ..] -> host("array_find", [f])
