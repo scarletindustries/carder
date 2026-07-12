@@ -893,13 +893,6 @@ type GenSt {
   GenSt(cases: List(#(Int, List(ast.Statement))), counter: Int)
 }
 
-type GenClass {
-  GenPlainC
-  GenReturnC(ast.Expression)
-  GenYieldC(ast.Expression, Option(ast.Expression))
-  GenUnsupportedC
-}
-
 fn gen_sp() -> ast.Span {
   ast.Span(0, 0)
 }
@@ -1005,43 +998,47 @@ fn gen_done_ret(
   ])
 }
 
-/// Classify a generator-body statement for the CFG builder.
-fn classify_gen(s: ast.Statement) -> GenClass {
-  case s {
-    ast.ReturnStatement(argument: arg) -> {
-      let e = option.unwrap(arg, gen_undef())
-      case has_yield_e(e) {
-        True -> GenUnsupportedC
-        False -> GenReturnC(e)
-      }
-    }
-    ast.ExpressionStatement(
-      expression: ast.YieldExpression(argument:, is_delegate: False, ..),
-      ..,
-    ) -> GenYieldC(option.unwrap(argument, gen_undef()), None)
-    ast.ExpressionStatement(
-      expression: ast.AssignmentExpression(
-        operator: ast.Assign,
-        left:,
-        right: ast.YieldExpression(argument:, is_delegate: False, ..),
-        ..,
+/// A goto: `%ctx["@@state"] = n; continue;` (re-enter the while/switch).
+fn gen_goto(n: Int) -> List(ast.Statement) {
+  [gen_assign(gen_state(), gen_num(n)), ast.ContinueStatement(label: None)]
+}
+
+/// A conditional goto: `%ctx["@@state"] = c ? then : else; continue;`.
+fn gen_cond_goto(
+  c: ast.Expression,
+  then_l: Int,
+  else_l: Int,
+) -> List(ast.Statement) {
+  [
+    gen_assign(
+      gen_state(),
+      ast.ConditionalExpression(
+        span: gen_sp(),
+        condition: c,
+        consequent: gen_num(then_l),
+        alternate: gen_num(else_l),
       ),
-      ..,
-    ) -> GenYieldC(option.unwrap(argument, gen_undef()), Some(left))
-    ast.VariableDeclaration(
-      declarations: [
-        ast.VariableDeclarator(
-          id: ast.IdentifierPattern(name: x, ..),
-          init: Some(ast.YieldExpression(argument:, is_delegate: False, ..)),
-        ),
-      ],
-      ..,
-    ) -> GenYieldC(option.unwrap(argument, gen_undef()), Some(gen_id(x)))
-    _ ->
-      case has_yield_s(s) {
-        True -> GenUnsupportedC
-        False -> GenPlainC
-      }
+    ),
+    ast.ContinueStatement(label: None),
+  ]
+}
+
+/// A loop/if condition must be yield-free (a yield in it is not yet handled).
+fn gen_no_yield(e: ast.Expression) -> Result(Nil, Error) {
+  case has_yield_e(e) {
+    True -> Error(Unsupported("generator: yield in a loop/if condition"))
+    False -> Ok(Nil)
+  }
+}
+
+/// The statements of a `for` init clause (a declaration or expression).
+fn for_init_stmts(init: Option(ast.ForInit)) -> List(ast.Statement) {
+  case init {
+    Some(ast.ForInitDeclaration(d)) -> [d]
+    Some(ast.ForInitExpression(e)) -> [
+      ast.ExpressionStatement(expression: e, directive: None),
+    ]
+    _ -> []
   }
 }
 
@@ -1066,52 +1063,373 @@ fn gen_add(label: Int, stmts: List(ast.Statement), st: GenSt) -> GenSt {
   GenSt(..st, cases: list.append(st.cases, [#(label, stmts)]))
 }
 
-/// Build the state machine for a straight-line statement sequence (increment 1:
-/// yields must be at statement level; control flow CONTAINING a yield is a clean
-/// Unsupported for now). `acc` is the current case's statements, reversed.
-fn tr_seq(
+/// Build a sub-sequence into a fresh entry state: executing from the returned
+/// entry label runs `stmts`, then jumps to `next`. `brk`/`cont` are the current
+/// break/continue target states.
+fn gen_build(
+  stmts: List(ast.Statement),
+  next: Int,
+  brk: Int,
+  cont: Int,
+  locals: List(String),
+  st: GenSt,
+) -> Result(#(Int, GenSt), Error) {
+  let #(entry, st) = gen_fresh(st)
+  use st <- result_try(gen_process(
+    stmts,
+    entry,
+    [],
+    next,
+    brk,
+    cont,
+    locals,
+    st,
+  ))
+  Ok(#(entry, st))
+}
+
+/// The heart of the transform: process a statement list into the state machine.
+/// `entry`/`acc` are the case currently being accumulated (acc reversed). A yield
+/// or yield-containing control-flow statement flushes the case and creates the
+/// state transitions; a yield-free statement is accumulated verbatim.
+fn gen_process(
   stmts: List(ast.Statement),
   entry: Int,
   acc: List(ast.Statement),
+  next: Int,
+  brk: Int,
+  cont: Int,
   locals: List(String),
   st: GenSt,
 ) -> Result(GenSt, Error) {
+  let plain = fn() {
+    case stmts {
+      [s, ..rest] ->
+        gen_process(rest, entry, [s, ..acc], next, brk, cont, locals, st)
+      [] -> Ok(st)
+    }
+  }
   case stmts {
-    [] ->
-      Ok(gen_add(
-        entry,
-        list.append(list.reverse(acc), gen_done_ret(gen_undef(), locals)),
-        st,
-      ))
+    [] -> Ok(gen_add(entry, list.append(list.reverse(acc), gen_goto(next)), st))
     [s, ..rest] ->
-      case classify_gen(s) {
-        GenPlainC -> tr_seq(rest, entry, [s, ..acc], locals, st)
-        GenReturnC(e) ->
-          Ok(gen_add(
+      case s {
+        // `yield e;`
+        ast.ExpressionStatement(
+          expression: ast.YieldExpression(argument:, is_delegate: False, ..),
+          ..,
+        ) ->
+          gen_emit_yield(
+            option.unwrap(argument, gen_undef()),
+            None,
+            rest,
             entry,
-            list.append(list.reverse(acc), gen_done_ret(e, locals)),
+            acc,
+            next,
+            brk,
+            cont,
+            locals,
             st,
-          ))
-        GenYieldC(e, target) -> {
-          let #(resume, st) = gen_fresh(st)
-          let st =
-            gen_add(
-              entry,
-              list.append(list.reverse(acc), gen_yield_ret(e, resume, locals)),
-              st,
-            )
-          let resume_acc = case target {
-            Some(t) -> [gen_assign(t, gen_id(gen_sent))]
-            None -> []
+          )
+        // `target = yield e;`
+        ast.ExpressionStatement(
+          expression: ast.AssignmentExpression(
+            operator: ast.Assign,
+            left:,
+            right: ast.YieldExpression(argument:, is_delegate: False, ..),
+            ..,
+          ),
+          ..,
+        ) ->
+          gen_emit_yield(
+            option.unwrap(argument, gen_undef()),
+            Some(left),
+            rest,
+            entry,
+            acc,
+            next,
+            brk,
+            cont,
+            locals,
+            st,
+          )
+        // `let x = yield e;`
+        ast.VariableDeclaration(
+          declarations: [
+            ast.VariableDeclarator(
+              id: ast.IdentifierPattern(name: x, ..),
+              init: Some(ast.YieldExpression(argument:, is_delegate: False, ..)),
+            ),
+          ],
+          ..,
+        ) ->
+          gen_emit_yield(
+            option.unwrap(argument, gen_undef()),
+            Some(gen_id(x)),
+            rest,
+            entry,
+            acc,
+            next,
+            brk,
+            cont,
+            locals,
+            st,
+          )
+        // `return e;` — yields {value:e, done:true}; rest is dead.
+        ast.ReturnStatement(argument: arg) ->
+          case has_yield_e(option.unwrap(arg, gen_undef())) {
+            True -> Error(Unsupported("generator: yield inside a return value"))
+            False ->
+              Ok(gen_add(
+                entry,
+                list.append(
+                  list.reverse(acc),
+                  gen_done_ret(option.unwrap(arg, gen_undef()), locals),
+                ),
+                st,
+              ))
           }
-          tr_seq(rest, resume, resume_acc, locals, st)
-        }
-        GenUnsupportedC ->
-          Error(Unsupported(
-            "generator: control flow around a yield is not yet supported",
-          ))
+        // break / continue → goto the loop's exit/head; rest is dead.
+        ast.BreakStatement(label: None) ->
+          Ok(gen_add(entry, list.append(list.reverse(acc), gen_goto(brk)), st))
+        ast.ContinueStatement(label: None) ->
+          Ok(gen_add(entry, list.append(list.reverse(acc), gen_goto(cont)), st))
+        ast.BreakStatement(label: Some(_))
+        | ast.ContinueStatement(label: Some(_)) ->
+          Error(Unsupported("generator: labeled break/continue"))
+        // a block containing a yield is inlined (our scope is flat); else plain.
+        ast.BlockStatement(body: inner) ->
+          case has_yield_s(s) {
+            True ->
+              gen_process(
+                list.append(list.map(inner, fn(w) { w.statement }), rest),
+                entry,
+                acc,
+                next,
+                brk,
+                cont,
+                locals,
+                st,
+              )
+            False -> plain()
+          }
+        // if / while / for containing a yield are flattened; else accumulated.
+        ast.IfStatement(condition:, consequent:, alternate:) ->
+          case has_yield_s(s) {
+            True ->
+              gen_emit_if(
+                condition,
+                consequent,
+                alternate,
+                rest,
+                entry,
+                acc,
+                next,
+                brk,
+                cont,
+                locals,
+                st,
+              )
+            False -> plain()
+          }
+        ast.WhileStatement(condition:, body:) ->
+          case has_yield_s(s) {
+            True ->
+              gen_emit_while(
+                condition,
+                body,
+                rest,
+                entry,
+                acc,
+                next,
+                brk,
+                cont,
+                locals,
+                st,
+              )
+            False -> plain()
+          }
+        ast.ForStatement(init:, condition:, update:, body:) ->
+          case has_yield_s(s) {
+            True ->
+              gen_emit_for(
+                init,
+                condition,
+                update,
+                body,
+                rest,
+                entry,
+                acc,
+                next,
+                brk,
+                cont,
+                locals,
+                st,
+              )
+            False -> plain()
+          }
+        // do-while / for-of / for-in / switch / try containing a yield are not
+        // yet flattened; a yield-free one is a plain accumulated statement.
+        _ ->
+          case has_yield_s(s) {
+            True ->
+              Error(Unsupported(
+                "generator: yield inside this construct is not yet supported",
+              ))
+            False -> plain()
+          }
       }
   }
+}
+
+/// Flush the current case with a yield-return, then continue in the resume case
+/// (which first binds the sent value to `target`, if any).
+fn gen_emit_yield(
+  e: ast.Expression,
+  target: Option(ast.Expression),
+  rest: List(ast.Statement),
+  entry: Int,
+  acc: List(ast.Statement),
+  next: Int,
+  brk: Int,
+  cont: Int,
+  locals: List(String),
+  st: GenSt,
+) -> Result(GenSt, Error) {
+  use _ <- result_try(gen_no_yield(e))
+  let #(resume, st) = gen_fresh(st)
+  let st =
+    gen_add(
+      entry,
+      list.append(list.reverse(acc), gen_yield_ret(e, resume, locals)),
+      st,
+    )
+  let resume_acc = case target {
+    Some(t) -> [gen_assign(t, gen_id(gen_sent))]
+    None -> []
+  }
+  gen_process(rest, resume, resume_acc, next, brk, cont, locals, st)
+}
+
+fn gen_emit_if(
+  c: ast.Expression,
+  then_s: ast.Statement,
+  else_s: Option(ast.Statement),
+  rest: List(ast.Statement),
+  entry: Int,
+  acc: List(ast.Statement),
+  next: Int,
+  brk: Int,
+  cont: Int,
+  locals: List(String),
+  st: GenSt,
+) -> Result(GenSt, Error) {
+  use _ <- result_try(gen_no_yield(c))
+  let #(after, st) = gen_fresh(st)
+  use #(t_entry, st) <- result_try(gen_build(
+    block_stmts(then_s),
+    after,
+    brk,
+    cont,
+    locals,
+    st,
+  ))
+  let else_stmts = case else_s {
+    Some(e) -> block_stmts(e)
+    None -> []
+  }
+  use #(e_entry, st) <- result_try(gen_build(
+    else_stmts,
+    after,
+    brk,
+    cont,
+    locals,
+    st,
+  ))
+  let st =
+    gen_add(
+      entry,
+      list.append(list.reverse(acc), gen_cond_goto(c, t_entry, e_entry)),
+      st,
+    )
+  gen_process(rest, after, [], next, brk, cont, locals, st)
+}
+
+fn gen_emit_while(
+  c: ast.Expression,
+  body: ast.Statement,
+  rest: List(ast.Statement),
+  entry: Int,
+  acc: List(ast.Statement),
+  next: Int,
+  brk: Int,
+  cont: Int,
+  locals: List(String),
+  st: GenSt,
+) -> Result(GenSt, Error) {
+  use _ <- result_try(gen_no_yield(c))
+  let #(head, st) = gen_fresh(st)
+  let #(after, st) = gen_fresh(st)
+  // body: break → after, continue → head.
+  use #(body_entry, st) <- result_try(gen_build(
+    block_stmts(body),
+    head,
+    after,
+    head,
+    locals,
+    st,
+  ))
+  let st = gen_add(head, gen_cond_goto(c, body_entry, after), st)
+  let st = gen_add(entry, list.append(list.reverse(acc), gen_goto(head)), st)
+  gen_process(rest, after, [], next, brk, cont, locals, st)
+}
+
+fn gen_emit_for(
+  init: Option(ast.ForInit),
+  c: Option(ast.Expression),
+  upd: Option(ast.Expression),
+  body: ast.Statement,
+  rest: List(ast.Statement),
+  entry: Int,
+  acc: List(ast.Statement),
+  next: Int,
+  brk: Int,
+  cont: Int,
+  locals: List(String),
+  st: GenSt,
+) -> Result(GenSt, Error) {
+  let cond = option.unwrap(c, ast.BooleanLiteral(span: gen_sp(), value: True))
+  use _ <- result_try(gen_no_yield(cond))
+  let #(head, st) = gen_fresh(st)
+  let #(after, st) = gen_fresh(st)
+  let #(step_l, st) = gen_fresh(st)
+  // update case: run the update expression, then re-test at head.
+  let upd_stmts = case upd {
+    Some(u) -> [ast.ExpressionStatement(expression: u, directive: None)]
+    None -> []
+  }
+  let st = gen_add(step_l, list.append(upd_stmts, gen_goto(head)), st)
+  // body: break → after, continue → the update step.
+  use #(body_entry, st) <- result_try(gen_build(
+    block_stmts(body),
+    step_l,
+    after,
+    step_l,
+    locals,
+    st,
+  ))
+  let st = gen_add(head, gen_cond_goto(cond, body_entry, after), st)
+  // entry case: run the init, then enter the loop head.
+  let st =
+    gen_add(
+      entry,
+      list.flatten([
+        list.reverse(acc),
+        for_init_stmts(init),
+        gen_goto(head),
+      ]),
+      st,
+    )
+  gen_process(rest, after, [], next, brk, cont, locals, st)
 }
 
 /// Wrap the built cases into the generator's outer function body.
@@ -1209,10 +1527,14 @@ fn transform_generator(
   let param_names = pattern_names_lax(params)
   let body_stmts = block_stmts(body)
   let locals = list.unique(list.append(param_names, declared_stmts(body_stmts)))
-  use st <- result_try(tr_seq(
+  // Case 0 is the entry; normal completion jumps to the DONE state.
+  use st <- result_try(gen_process(
     body_stmts,
     0,
     [],
+    gen_done_state,
+    gen_done_state,
+    gen_done_state,
     locals,
     GenSt(cases: [], counter: 1),
   ))

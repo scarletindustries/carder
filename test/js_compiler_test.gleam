@@ -1921,6 +1921,36 @@ pub fn generator_sent_test() {
   to_float(call(m, "f", [])) |> should.equal(1512.0)
 }
 
+pub fn generator_for_loop_test() {
+  // A generator with a for loop yielding each i (yield inside a flattened loop).
+  let m =
+    compile(
+      "function* range(n) { for (let i = 0; i < n; i++) yield i; } "
+      <> "function f() { let it = range(3); return it.next().value * 100 + it.next().value * 10 + it.next().value; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+}
+
+pub fn generator_while_if_test() {
+  // A while loop with a conditional yield: yields the even numbers below n.
+  let m =
+    compile(
+      "function* evens(n) { let i = 0; while (i < n) { if (i % 2 === 0) yield i; i++; } } "
+      <> "function f() { let it = evens(5); return it.next().value * 100 + it.next().value * 10 + it.next().value; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(24.0)
+}
+
+pub fn generator_drive_to_done_test() {
+  // Drive a generator to completion with a manual .next() loop, summing values.
+  let m =
+    compile(
+      "function* range(n) { for (let i = 0; i < n; i++) yield i; } "
+      <> "function f() { let it = range(5); let s = 0; let r = it.next(); while (!r.done) { s += r.value; r = it.next(); } return s; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+}
+
 pub fn generator_done_test() {
   // .done is false while yielding, true once the body completes.
   let m =
