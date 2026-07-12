@@ -46,7 +46,9 @@
 //// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
 //// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
-//// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
+//// `Number.isInteger`/`isNaN`/`isFinite` and the constants
+//// `Number.MAX_SAFE_INTEGER`/`MIN_SAFE_INTEGER`/`MAX_VALUE`/`MIN_VALUE`/`EPSILON`/
+//// `POSITIVE_INFINITY`/`NEGATIVE_INFINITY`/`NaN`, `JSON.stringify`/`parse`,
 //// `String.fromCharCode`/`fromCodePoint`/`String.raw`, and `Date.now`. Tagged templates
 //// `` tag`…${e}…` `` (the tag receives the cooked strings array with a `.raw`
 //// property, then the substitutions). Regex literals `/pat/flags` (backed by
@@ -3215,7 +3217,35 @@ fn lower_member(
         Some(v) -> Ok(#([], v, ctr))
         None -> Error(Unsupported("Math." <> c))
       }
+    // Number.MAX_SAFE_INTEGER / EPSILON / … — compile-time numeric constants.
+    ast.Identifier(name: "Number", ..), ast.Identifier(name: c, ..), False ->
+      case number_const(c, ctr) {
+        Some(result) -> Ok(result)
+        None -> lower_member_get(object, property, computed, env, ctx, ctr)
+      }
     _, _, _ -> lower_member_get(object, property, computed, env, ctx, ctr)
+  }
+}
+
+/// A `Number` static constant (`Number.MAX_SAFE_INTEGER`, `EPSILON`, …). The
+/// two safe-integer bounds go through `number_literal` so they are boxed
+/// integers (participating in exact integer arithmetic like a typed literal);
+/// the others are float terms or the numeric sentinels. `None` if `name` is not
+/// a known Number constant (so the caller can fall through to a normal member).
+fn number_const(
+  name: String,
+  ctr: Int,
+) -> Option(#(List(Bind), ir.Value, Int)) {
+  case name {
+    "MAX_SAFE_INTEGER" -> Some(number_literal(9_007_199_254_740_991.0, ctr))
+    "MIN_SAFE_INTEGER" -> Some(number_literal(-9_007_199_254_740_991.0, ctr))
+    "MAX_VALUE" -> Some(#([], ir.ConstFloatTerm(1.7976931348623157e308), ctr))
+    "MIN_VALUE" -> Some(#([], ir.ConstFloatTerm(5.0e-324), ctr))
+    "EPSILON" -> Some(#([], ir.ConstFloatTerm(2.220446049250313e-16), ctr))
+    "POSITIVE_INFINITY" -> Some(#([], ir.ConstAtom("js_inf"), ctr))
+    "NEGATIVE_INFINITY" -> Some(#([], ir.ConstAtom("js_neg_inf"), ctr))
+    "NaN" -> Some(#([], ir.ConstAtom("js_nan"), ctr))
+    _ -> None
   }
 }
 

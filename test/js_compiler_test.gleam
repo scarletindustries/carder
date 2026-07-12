@@ -1717,6 +1717,21 @@ pub fn logical_assign_test() {
   |> should.equal(42.0)
 }
 
+pub fn number_constants_test() {
+  num("Number.MAX_SAFE_INTEGER") |> should.equal(9_007_199_254_740_991.0)
+  num("Number.MIN_SAFE_INTEGER") |> should.equal(-9_007_199_254_740_991.0)
+  val("Number.MAX_SAFE_INTEGER === 9007199254740991")
+  |> should.equal(dyn(True))
+  // MAX_SAFE_INTEGER is a boxed integer, so exact integer arithmetic applies.
+  val("Number.MAX_SAFE_INTEGER + 1 === 9007199254740992")
+  |> should.equal(dyn(True))
+  val("Number.EPSILON > 0") |> should.equal(dyn(True))
+  val("typeof Number.MAX_VALUE") |> should.equal(dyn(<<"number">>))
+  val("Number.POSITIVE_INFINITY === Infinity") |> should.equal(dyn(True))
+  val("Number.NEGATIVE_INFINITY === -Infinity") |> should.equal(dyn(True))
+  val("Number.NaN !== Number.NaN") |> should.equal(dyn(True))
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {
