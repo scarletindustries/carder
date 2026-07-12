@@ -79,7 +79,10 @@
 //// called with the full arity or through an array method, since a closure call site
 //// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
 //// caught (a runtime type error propagates), and a variable mutated in a try body
-//// before a throw keeps its pre-try value in the handler. Scope is one flat function
+//// before a throw keeps its pre-try value in the handler — this applies equally to a
+//// `finally`'s EXCEPTIONAL (re-raise) path, which acts as a handler and so sees the
+//// pre-try value of a scalar the body mutated before throwing; the finally's
+//// NORMAL-completion path DOES see the mutation. Scope is one flat function
 //// scope per JS function (block-scoped `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
