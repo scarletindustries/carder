@@ -1820,6 +1820,38 @@ pub fn static_field_mutation_test() {
   to_float(call(n, "f", [])) |> should.equal(15.0)
 }
 
+pub fn defaulted_destructure_test() {
+  // A missing array element falls back to its default.
+  num("(function(){ let [a, b = 9] = [1]; return a + b; })()")
+  |> should.equal(10.0)
+  // Explicit undefined triggers the default…
+  num("(function(){ let [a = 5] = [undefined]; return a; })()")
+  |> should.equal(5.0)
+  // …but null does NOT (the default is only for undefined).
+  val("(function(){ let [a = 5] = [null]; return a === null; })()")
+  |> should.equal(dyn(True))
+  // Object property default, and a present value overrides the default.
+  num("(function(){ let { x, y = 7 } = { x: 1 }; return x + y; })()")
+  |> should.equal(8.0)
+  num("(function(){ let { x = 100 } = { x: 3 }; return x; })()")
+  |> should.equal(3.0)
+}
+
+pub fn rest_destructure_test() {
+  // Array rest binds the remaining elements as a fresh array.
+  num(
+    "(function(){ let [a, ...rest] = [1, 2, 3, 4]; return a * 10 + rest.length; })()",
+  )
+  |> should.equal(13.0)
+  num(
+    "(function(){ let [a, ...rest] = [1, 2, 3, 4]; return rest[0] + rest[1]; })()",
+  )
+  |> should.equal(5.0)
+  // Rest of a fully-consumed array is empty.
+  num("(function(){ let [a, ...rest] = [7]; return rest.length; })()")
+  |> should.equal(0.0)
+}
+
 pub fn object_getter_test() {
   // An object-literal getter computes on access with dynamic `this` = the object.
   let m =

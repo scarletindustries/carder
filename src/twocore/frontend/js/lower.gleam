@@ -22,7 +22,8 @@
 //// %= **= &= |= ^= <<= >>= >>>=`, logical assignment `&&= ||= ??=`, and `++`/`--`;
 //// `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue` (incl. labeled `break outer`/`continue outer`),
-//// `return`, blocks; array/object destructuring (incl. nested) in `let`/`const`/`var`;
+//// `return`, blocks; array/object destructuring in `let`/`const`/`var` — nested,
+//// defaults (`[a = 1]`, `{ k: a = 1 }`), and array rest (`[a, ...rest]`);
 //// objects
 //// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, method shorthand, and
 //// getters/setters (`get x()`/`set x(v)`, `this`-bound to the object); arrays `[…]`
@@ -60,7 +61,8 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): defaulted/rest destructuring,
+//// Not yet (a clean `Unsupported` error / panic): object-REST destructuring
+//// (`{ a, ...rest }`; array rest and all defaults ARE supported),
 //// `try`/`finally`, generators/async, and `continue` inside a `do/while`. Static
 //// field initializers run when the module's `main/0` runs (like any top-level
 //// state), so `C.x` reads `undefined` until then. (Rest params and call spread apply to
@@ -1091,6 +1093,28 @@ fn lower_var_decls(
 /// `init` plus one simple declarator per bound name (`a = $d[0]`, `x = $d.x`, …). v1
 /// handles a flat pattern of identifiers (holes allowed); nested patterns, defaults,
 /// and rest elements are `Unsupported`.
+/// `access === undefined ? default : access` — the value of a destructuring
+/// target with a default (`= default`). The default applies ONLY when the value
+/// is `undefined` (not `null`, per §13.15.5). `access` is a member read on a
+/// stable temp, so evaluating it in both arms has no observable double effect.
+fn defaulted(
+  access: ast.Expression,
+  default: ast.Expression,
+) -> ast.Expression {
+  let sp = ast.Span(0, 0)
+  ast.ConditionalExpression(
+    span: sp,
+    condition: ast.BinaryExpression(
+      sp,
+      ast.StrictEqual,
+      access,
+      ast.UndefinedExpression(span: sp),
+    ),
+    consequent: default,
+    alternate: access,
+  )
+}
+
 fn desugar_destructure(
   pattern: ast.Pattern,
   init: ast.Expression,
@@ -1111,28 +1135,54 @@ fn desugar_destructure(
       use decls <- result_try(
         list.try_fold(indexed, [], fn(acc, pair) {
           let #(el, i) = pair
+          let access =
+            ast.MemberExpression(
+              span: sp,
+              object: d_id,
+              property: ast.NumberLiteral(span: sp, value: int.to_float(i)),
+              computed: True,
+            )
           case el {
             None -> Ok(acc)
-            Some(ast.AssignmentPattern(..)) ->
-              Error(Unsupported("defaulted destructuring element"))
-            Some(ast.RestElement(..)) ->
-              Error(Unsupported("rest element in a destructuring pattern"))
+            // `[a = default]` — the element with `undefined` falls back to default.
+            Some(ast.AssignmentPattern(left: pat, right: default)) ->
+              Ok(
+                list.append(acc, [
+                  ast.VariableDeclarator(
+                    id: pat,
+                    init: Some(defaulted(access, default)),
+                  ),
+                ]),
+              )
+            // `[a, ...rest]` — rest binds the remaining elements: `tmp.slice(i)`.
+            Some(ast.RestElement(argument: pat)) -> {
+              let rest =
+                ast.CallExpression(
+                  span: sp,
+                  callee: ast.MemberExpression(
+                    span: sp,
+                    object: d_id,
+                    property: ast.Identifier(span: sp, name: "slice"),
+                    computed: False,
+                  ),
+                  arguments: [
+                    ast.NumberLiteral(span: sp, value: int.to_float(i)),
+                  ],
+                )
+              Ok(
+                list.append(acc, [
+                  ast.VariableDeclarator(id: pat, init: Some(rest)),
+                ]),
+              )
+            }
             // any binding pattern (identifier OR nested array/object) — a nested one is
             // re-desugared by `lower_var_decls` when it processes this declarator.
-            Some(pat) -> {
-              let access =
-                ast.MemberExpression(
-                  span: sp,
-                  object: d_id,
-                  property: ast.NumberLiteral(span: sp, value: int.to_float(i)),
-                  computed: True,
-                )
+            Some(pat) ->
               Ok(
                 list.append(acc, [
                   ast.VariableDeclarator(id: pat, init: Some(access)),
                 ]),
               )
-            }
           }
         }),
       )
@@ -1142,8 +1192,25 @@ fn desugar_destructure(
       use decls <- result_try(
         list.try_map(properties, fn(p) {
           case p {
-            ast.PatternProperty(value: ast.AssignmentPattern(..), ..) ->
-              Error(Unsupported("defaulted object destructuring"))
+            // `{ k: a = default }` — the property with `undefined` falls back.
+            ast.PatternProperty(
+              key:,
+              value: ast.AssignmentPattern(left: pat, right: default),
+              computed:,
+              ..,
+            ) -> {
+              let access =
+                ast.MemberExpression(
+                  span: sp,
+                  object: d_id,
+                  property: key,
+                  computed: computed,
+                )
+              Ok(ast.VariableDeclarator(
+                id: pat,
+                init: Some(defaulted(access, default)),
+              ))
+            }
             // any binding pattern for the value — a nested one re-desugars.
             ast.PatternProperty(key:, value: valpat, computed:, ..) -> {
               let access =
