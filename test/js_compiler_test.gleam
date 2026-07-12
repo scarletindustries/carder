@@ -1248,6 +1248,20 @@ pub fn date_now_test() {
   call(m, "f", []) |> should.equal(dyn(True))
 }
 
+// ── array finishers + toFixed ────────────────────────────────────────────────
+
+pub fn array_finishers_test() {
+  num("[1, 2, 3].flatMap(x => [x, x * 10]).length") |> should.equal(6.0)
+  num("[1, 2, 3, 4].findLast(x => x < 3)") |> should.equal(2.0)
+  num("[1, 2, 3, 4].findLastIndex(x => x < 3)") |> should.equal(1.0)
+  num("[1, 2, 1, 3].lastIndexOf(1)") |> should.equal(2.0)
+}
+
+pub fn to_fixed_test() {
+  let m = compile("function f() { return (3.14159).toFixed(2); }")
+  call(m, "f", []) |> should.equal(dyn(<<"3.14">>))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

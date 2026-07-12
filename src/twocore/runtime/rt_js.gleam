@@ -303,6 +303,25 @@ pub fn string_from_char_code(codes: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "date_now")
 pub fn date_now() -> Dynamic
 
+/// `arr.flatMap(fn)` — map then flatten one level.
+@external(erlang, "twocore_rt_js_ffi", "array_flat_map")
+pub fn array_flat_map(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.findLast(fn)` / `findLastIndex(fn)` — like find/findIndex, from the end.
+@external(erlang, "twocore_rt_js_ffi", "array_find_last")
+pub fn array_find_last(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "array_find_last_index")
+pub fn array_find_last_index(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.lastIndexOf(x)` — last strict-equal index, or `-1`.
+@external(erlang, "twocore_rt_js_ffi", "array_last_index_of")
+pub fn array_last_index_of(arr: Dynamic, x: Dynamic) -> Dynamic
+
+/// `num.toFixed(d)` — a fixed-point string with `d` decimals.
+@external(erlang, "twocore_rt_js_ffi", "num_to_fixed")
+pub fn num_to_fixed(n: Dynamic, d: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 

@@ -67,6 +67,8 @@
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1, date_now/0,
+    array_flat_map/2, array_find_last/2, array_find_last_index/2,
+    array_last_index_of/2, num_to_fixed/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
@@ -1180,6 +1182,64 @@ afindi(Fn, Arr, [X | Xs], I) ->
     case truthy(call_cb(Fn, [X, I, Arr])) of
         1 -> I;
         0 -> afindi(Fn, Arr, Xs, I + 1)
+    end.
+
+%% arr.flatMap(fn) — map then flatten one level.
+array_flat_map(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(lists:flatmap(
+        fun({X, I}) -> flat_one(call_cb(Fn, [X, I, Recv])) end,
+        index_pairs(arr_list(Len, Map))
+    )).
+
+index_pairs(L) -> index_pairs(L, 0).
+index_pairs([], _) -> [];
+index_pairs([X | Xs], I) -> [{X, I} | index_pairs(Xs, I + 1)].
+
+%% arr.findLast(fn) / findLastIndex(fn) — like find/findIndex, from the end.
+array_find_last(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    afind_last(Fn, Recv, index_pairs(arr_list(Len, Map)), undefined).
+afind_last(_, _, [], Acc) -> Acc;
+afind_last(Fn, Arr, [{X, I} | Rest], Acc) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        1 -> afind_last(Fn, Arr, Rest, X);
+        0 -> afind_last(Fn, Arr, Rest, Acc)
+    end.
+
+array_find_last_index(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    afind_last_i(Fn, Recv, index_pairs(arr_list(Len, Map)), -1).
+afind_last_i(_, _, [], Acc) -> Acc;
+afind_last_i(Fn, Arr, [{X, I} | Rest], Acc) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        1 -> afind_last_i(Fn, Arr, Rest, I);
+        0 -> afind_last_i(Fn, Arr, Rest, Acc)
+    end.
+
+%% arr.lastIndexOf(x) — last strict-equal index, or -1.
+array_last_index_of(Recv, X) ->
+    {Len, Map} = arr_content(Recv),
+    alast_idx(index_pairs(arr_list(Len, Map)), X, -1).
+alast_idx([], _, Acc) -> Acc;
+alast_idx([{E, I} | Rest], X, Acc) ->
+    case strict_eq(E, X) of
+        1 -> alast_idx(Rest, X, I);
+        0 -> alast_idx(Rest, X, Acc)
+    end.
+
+%% num.toFixed(d) — fixed-point string with `d` decimals.
+num_to_fixed(N, D) ->
+    Digits =
+        case coerce_num(D) of
+            nan -> 0;
+            _ -> max(0, trunc(as_float(coerce_num(D))))
+        end,
+    case coerce_num(N) of
+        nan -> <<"NaN">>;
+        inf -> <<"Infinity">>;
+        neg_inf -> <<"-Infinity">>;
+        Num -> float_to_binary(as_float(Num), [{decimals, Digits}])
     end.
 
 %% ── array value methods ──────────────────────────────────
