@@ -2554,9 +2554,44 @@ str_split(Str, Sep) ->
         SepBin -> new_array(binary:split(Str, SepBin, [global]))
     end.
 
-str_trim(Str) -> unicode:characters_to_binary(string:trim(Str)).
-str_trim_start(Str) -> unicode:characters_to_binary(string:trim(Str, leading)).
-str_trim_end(Str) -> unicode:characters_to_binary(string:trim(Str, trailing)).
+%% str.trim() / trimStart() / trimEnd() — remove leading and/or trailing runs
+%% of code points that are JS WhiteSpace or LineTerminator (see `is_js_ws/1`).
+%% The JS whitespace set differs from Erlang's `string:trim` default (it must
+%% include U+FEFF and U+00A0 and excludes non-WhiteSpace Unicode spaces), so we
+%% trim against the ECMAScript set explicitly.
+str_trim(Str) -> from_cps(trim_trailing(trim_leading(cps(Str)))).
+str_trim_start(Str) -> from_cps(trim_leading(cps(Str))).
+str_trim_end(Str) -> from_cps(trim_trailing(cps(Str))).
+
+trim_leading([C | Rest]) ->
+    case is_js_ws(C) of
+        true -> trim_leading(Rest);
+        false -> [C | Rest]
+    end;
+trim_leading([]) ->
+    [].
+
+trim_trailing(Cps) -> lists:reverse(trim_leading(lists:reverse(Cps))).
+
+%% True when the code point is ECMAScript WhiteSpace or a LineTerminator
+%% (per ECMAScript §12.2/§12.3): tab, LF, VT, FF, CR, space, NBSP, the Unicode
+%% "space separator" (Zs) code points, LS/PS, and the ZWNBSP/BOM (U+FEFF).
+is_js_ws(16#0009) -> true;
+is_js_ws(16#000A) -> true;
+is_js_ws(16#000B) -> true;
+is_js_ws(16#000C) -> true;
+is_js_ws(16#000D) -> true;
+is_js_ws(16#0020) -> true;
+is_js_ws(16#00A0) -> true;
+is_js_ws(16#1680) -> true;
+is_js_ws(C) when C >= 16#2000, C =< 16#200A -> true;
+is_js_ws(16#2028) -> true;
+is_js_ws(16#2029) -> true;
+is_js_ws(16#202F) -> true;
+is_js_ws(16#205F) -> true;
+is_js_ws(16#3000) -> true;
+is_js_ws(16#FEFF) -> true;
+is_js_ws(_) -> false.
 
 str_repeat(Str, N) ->
     Count =
