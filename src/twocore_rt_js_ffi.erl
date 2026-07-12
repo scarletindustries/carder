@@ -74,7 +74,8 @@
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/3, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
     to_string_dispatch/1, num_to_string_radix/2,
-    new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
+    new_regex/2, regex_test/2, regex_exec/2, regex_source/1, regex_flags/1,
+    str_match/2, str_search/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
@@ -1030,6 +1031,12 @@ get_prop(Recv, Key) when is_reference(Recv) ->
                 <<"global">> -> has_flag(Flags, $g);
                 <<"ignoreCase">> -> has_flag(Flags, $i);
                 <<"multiline">> -> has_flag(Flags, $m);
+                <<"dotAll">> -> has_flag(Flags, $s);
+                <<"sticky">> -> has_flag(Flags, $y);
+                <<"unicode">> -> has_flag(Flags, $u);
+                <<"unicodeSets">> -> has_flag(Flags, $v);
+                <<"hasIndices">> -> has_flag(Flags, $d);
+                <<"lastIndex">> -> regex_last_index_raw(Recv);
                 _ -> undefined
             end;
         {js_map, D} ->
@@ -1080,6 +1087,15 @@ set_prop_live(Recv, Key, V) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, Len, Map} ->
             array_set(Recv, Len, Map, Key, V);
+        {js_regex, _, _, _} ->
+            %% `lastIndex` is the only writable data property of a RegExp; the
+            %% flag getters (`global`, `source`, …) live on the prototype and a
+            %% write to them is a silent no-op in non-strict mode.
+            case Key of
+                <<"lastIndex">> -> regex_set_last_index(Recv, V);
+                _ -> ok
+            end,
+            V;
         M when is_map(M) ->
             K = prop_key(Key),
             case maps:get(K, M, undefined) of
@@ -2097,12 +2113,159 @@ regex_content(Re) ->
         _ -> type_error(Re)
     end.
 
-%% re.test(str) → boolean.
+%% re.test(str) → JS boolean. Per §22.2.6.15 this is `RegExpExec(R, S) != null`,
+%% so — like exec — it advances `lastIndex` for a global/sticky regex.
 regex_test(Re, Str) ->
-    {MP, _F, _S} = regex_content(Re),
-    case re:run(to_string(Str), MP, [{capture, none}]) of
-        match -> true;
-        nomatch -> false
+    regex_exec(Re, Str) =/= null.
+
+%% RegExp.prototype.exec(string) — RegExpBuiltinExec (§22.2.7.2).
+%%
+%% Runs the compiled pattern against ToString(string), honouring the regex's
+%% `lastIndex` (only consulted for global/sticky regexes, else the search starts
+%% at 0) and the sticky (`y`) flag (which anchors the match at that position).
+%% Returns `null` on no match, otherwise a JS array `[matched | captures]` with
+%% own properties `index` (code-point offset of the match), `input` (the subject
+%% string), and `groups` (an object of named captures, or `undefined` when the
+%% pattern has none). Unmatched optional captures appear as `undefined`. For a
+%% global or sticky regex `lastIndex` is updated to the code-point index just past
+%% the match (or reset to 0 when the match fails or `lastIndex` is out of range).
+%% Indices are code-point based to match this runtime's string model.
+regex_exec(Re, Str) ->
+    {MP, Flags, Src} = regex_content(Re),
+    S = to_string(Str),
+    Global = has_flag(Flags, $g),
+    Sticky = has_flag(Flags, $y),
+    Track = Global orelse Sticky,
+    Start =
+        case Track of
+            true -> regex_last_index_int(Re);
+            false -> 0
+        end,
+    case re_exec_cp(MP, S, Start, Sticky, regex_group_count(Src)) of
+        nomatch ->
+            case Track of
+                true -> regex_set_last_index(Re, 0);
+                false -> ok
+            end,
+            null;
+        {match, StartCp, EndCp, [Whole | Caps], Groups} ->
+            case Track of
+                true -> regex_set_last_index(Re, EndCp);
+                false -> ok
+            end,
+            Arr = new_array([Whole | Caps]),
+            set_prop(Arr, <<"index">>, StartCp),
+            set_prop(Arr, <<"input">>, S),
+            set_prop(Arr, <<"groups">>, Groups),
+            Arr
+    end.
+
+%% Core matcher shared by exec/test/match/search/split. Runs `MP` against `S`
+%% starting at code-point index `StartCp`; when `Sticky` is true the match must
+%% begin exactly at `StartCp` (anchored). `NG` is the pattern's capturing-group
+%% count — captures are requested by explicit number `[0..NG]` so that trailing
+%% non-participating groups (which `re`'s `all` spec drops) still appear, as
+%% `undefined`, giving the exec array its spec-mandated length. Returns `nomatch`,
+%% or `{match, StartCp, EndCp, [Whole | Caps], Groups}` where the offsets are
+%% code-point indices, each capture is a binary or `undefined`, and `Groups` is a
+%% named-capture object or `undefined`. `StartCp` past the end yields `nomatch`.
+re_exec_cp(MP, S, StartCp, Sticky, NG) ->
+    Cps = cps(S),
+    Len = length(Cps),
+    case StartCp > Len of
+        true ->
+            nomatch;
+        false ->
+            ByteOff = byte_size(from_cps(lists:sublist(Cps, 1, StartCp))),
+            Anchor =
+                case Sticky of
+                    true -> [anchored];
+                    false -> []
+                end,
+            Spec = [{offset, ByteOff}, {capture, lists:seq(0, NG), index} | Anchor],
+            case re:run(S, MP, Spec) of
+                nomatch ->
+                    nomatch;
+                {match, [{MSB, MLB} | GroupOffs]} ->
+                    StartCp2 = length(cps(binary:part(S, 0, MSB))),
+                    EndCp2 = length(cps(binary:part(S, 0, MSB + MLB))),
+                    Bins = [group_binary(S, {MSB, MLB}) | [group_binary(S, G) || G <- GroupOffs]],
+                    Groups = regex_named_groups(MP, S, ByteOff, Anchor),
+                    {match, StartCp2, EndCp2, Bins, Groups}
+            end
+    end.
+
+%% A capture's byte {offset,length} → its substring, or `undefined` for an
+%% unmatched optional group (which `re` reports with a negative offset).
+group_binary(_S, {Off, _Len}) when Off < 0 -> undefined;
+group_binary(S, {Off, Len}) -> binary:part(S, Off, Len).
+
+%% Count the capturing groups in a regex source. Skips escaped characters and
+%% character classes `[...]`, and treats `(?…)` as non-capturing EXCEPT a named
+%% group `(?<name>…)` (distinguished from lookbehind `(?<=`/`(?<!`). Used to size
+%% the numbered-capture request so trailing optional groups are not dropped.
+regex_group_count(Src) -> rgc(Src, 0, false).
+
+rgc(<<>>, N, _InClass) ->
+    N;
+rgc(<<$\\, _C, R/binary>>, N, InClass) ->
+    rgc(R, N, InClass);
+rgc(<<$[, R/binary>>, N, false) ->
+    rgc(R, N, true);
+rgc(<<$], R/binary>>, N, true) ->
+    rgc(R, N, false);
+rgc(<<_C, R/binary>>, N, true) ->
+    rgc(R, N, true);
+rgc(<<$(, $?, $<, C, R/binary>>, N, false) when C =/= $=, C =/= $! ->
+    rgc(<<C, R/binary>>, N + 1, false);
+rgc(<<$(, $?, R/binary>>, N, false) ->
+    rgc(R, N, false);
+rgc(<<$(, R/binary>>, N, false) ->
+    rgc(R, N + 1, false);
+rgc(<<_C, R/binary>>, N, false) ->
+    rgc(R, N, false).
+
+%% The `groups` object for a match: `undefined` when the pattern has no named
+%% captures, otherwise an object mapping each `(?<name>…)` name to its captured
+%% substring (or `undefined` when that named group did not participate).
+regex_named_groups(MP, S, ByteOff, Anchor) ->
+    case re:inspect(MP, namelist) of
+        {namelist, []} ->
+            undefined;
+        {namelist, Names} ->
+            Obj = new_object(),
+            case re:run(S, MP, [{offset, ByteOff}, {capture, all_names, index} | Anchor]) of
+                {match, Offs} ->
+                    lists:foreach(
+                        fun({Name, Off}) -> define_data(Obj, Name, group_binary(S, Off)) end,
+                        lists:zip(Names, Offs)
+                    );
+                _ ->
+                    ok
+            end,
+            Obj
+    end.
+
+%% ── regex lastIndex (a per-object mutable slot) ──────────
+%% Held in a separate process-dictionary entry keyed by the regex cell, so it
+%% never appears among enumerable properties.
+regex_last_index_raw(Re) ->
+    case erlang:get({js_regex_li, Re}) of
+        undefined -> 0;
+        V -> V
+    end.
+
+regex_set_last_index(Re, V) ->
+    erlang:put({js_regex_li, Re}, V).
+
+%% ToLength(R.lastIndex) as a non-negative integer (§7.1.20). NaN/undefined → 0;
+%% +Infinity → a value past any string so the match fails, per spec.
+regex_last_index_int(Re) ->
+    case coerce_num(regex_last_index_raw(Re)) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> 1 bsl 53;
+        N -> max(0, trunc(as_float(N)))
     end.
 
 %% re.source / re.flags.
@@ -2113,46 +2276,252 @@ regex_flags(Re) ->
     {_MP, F, _S} = regex_content(Re),
     F.
 
-%% str.match(re) → array of matches (global) or [full, groups…] (non-global), else null.
-str_match(Str, Re) ->
+%% String.prototype.match(re) (§22.2.6.8 via RegExp.prototype[@@match]). A
+%% non-regex `Re` is coerced to `new RegExp(Re)`. For a global regex: reset
+%% `lastIndex`, collect every matched substring (advancing past empty matches),
+%% returning an array of substrings or `null` when there is no match. Otherwise
+%% delegate to `exec`, so the result is the exec array (with index/input/groups)
+%% or `null`.
+str_match(Str, Re0) ->
+    Re = ensure_regex(Re0),
     {MP, Flags, _S} = regex_content(Re),
-    S = to_string(Str),
     case has_flag(Flags, $g) of
         true ->
-            case re:run(S, MP, [global, {capture, first, binary}]) of
-                {match, Ms} -> new_array([M || [M] <- Ms]);
-                match -> new_array([]);
-                nomatch -> null
+            regex_set_last_index(Re, 0),
+            case regex_match_loop(MP, to_string(Str), 0, []) of
+                [] -> null;
+                Acc -> new_array(lists:reverse(Acc))
             end;
         false ->
-            case re:run(S, MP, [{capture, all, binary}]) of
-                {match, Groups} -> new_array(Groups);
-                nomatch -> null
+            regex_exec(Re, Str)
+    end.
+
+%% Accumulate every whole-match substring of a global match, advancing one code
+%% point past an empty match so the loop terminates (per AdvanceStringIndex). Only
+%% the whole match is needed, so captures are not requested (NG = 0).
+regex_match_loop(MP, S, Pos, Acc) ->
+    case re_exec_cp(MP, S, Pos, false, 0) of
+        nomatch ->
+            Acc;
+        {match, StartCp, EndCp, [Whole | _], _Groups} ->
+            Next =
+                case EndCp =:= StartCp of
+                    true -> EndCp + 1;
+                    false -> EndCp
+                end,
+            regex_match_loop(MP, S, Next, [Whole | Acc])
+    end.
+
+%% String.prototype.search(re) (§22.2.6.11). A non-regex `Re` is coerced to
+%% `new RegExp(Re)`. Ignores `lastIndex`/global (always searches from the start)
+%% and returns the code-point index of the first match, or -1 when there is none.
+str_search(Str, Re0) ->
+    {MP, _Flags, _S} = as_regex(Re0),
+    case re_exec_cp(MP, to_string(Str), 0, false, 0) of
+        nomatch -> -1;
+        {match, StartCp, _EndCp, _Bins, _Groups} -> StartCp
+    end.
+
+%% Coerce a value used where a regex is expected (`str.match`/`search`/`split`
+%% with a non-regex argument): a regex passes through as a cell, anything else is
+%% compiled via `new RegExp(ToString(v))` (`undefined` → the empty pattern).
+ensure_regex(V) ->
+    case is_regex(V) of
+        true -> V;
+        false -> new_regex(regex_arg_pat(V), <<>>)
+    end.
+
+as_regex(V) -> regex_content(ensure_regex(V)).
+
+regex_arg_pat(undefined) -> <<>>;
+regex_arg_pat(V) -> to_string(V).
+
+%% String.prototype.replace with a regex search (§22.2.6.11 RegExp[@@replace]).
+%%
+%% Replaces the first match (or every match, if the regex is global). `Repl` is
+%% either a replacement template string — expanded by GetSubstitution (`$$`,
+%% `$&`, `` $` ``, `$'`, `$n`/`$nn` numbered captures, `$<name>` named captures) —
+%% or a function, which is called with `(matched, cap1…capN, position, string)`
+%% and whose result (ToString'd) is spliced in. Empty matches advance one code
+%% point (so a global empty-matching pattern terminates). Indices are code-point
+%% based; a global regex has its `lastIndex` reset to 0 first.
+str_replace_regex(Str, Re, Repl) ->
+    {MP, Flags, Src} = regex_content(Re),
+    NG = regex_group_count(Src),
+    S = to_string(Str),
+    Global = has_flag(Flags, $g),
+    case Global of
+        true -> regex_set_last_index(Re, 0);
+        false -> ok
+    end,
+    Cps = cps(S),
+    Size = length(Cps),
+    IsFn = is_function(Repl),
+    replace_loop(MP, S, Cps, Size, 0, 0, Global, Repl, IsFn, NG, <<>>).
+
+%% Walk the subject replacing matches. `Pos` is the next search position and
+%% `Copied` the code-point index up to which `S` has already been emitted into
+%% `Acc`; both are code-point indices. `NG` sizes the capture request.
+replace_loop(MP, S, Cps, Size, Pos, Copied, Global, Repl, IsFn, NG, Acc) ->
+    case re_exec_cp(MP, S, Pos, false, NG) of
+        nomatch ->
+            <<Acc/binary, (cp_sub(Cps, Copied, Size))/binary>>;
+        {match, StartCp, EndCp, [Whole | Caps], Groups} ->
+            Between = cp_sub(Cps, Copied, StartCp),
+            Replacement =
+                case IsFn of
+                    true ->
+                        to_string(call_cb(Repl, [Whole | Caps] ++ [StartCp, S]));
+                    false ->
+                        gsub(to_string(Repl), Whole, S, StartCp, Caps, Groups)
+                end,
+            Acc1 = <<Acc/binary, Between/binary, Replacement/binary>>,
+            case Global of
+                false ->
+                    <<Acc1/binary, (cp_sub(Cps, EndCp, Size))/binary>>;
+                true ->
+                    Next =
+                        case EndCp =:= StartCp of
+                            true -> EndCp + 1;
+                            false -> EndCp
+                        end,
+                    replace_loop(MP, S, Cps, Size, Next, EndCp, Global, Repl, IsFn, NG, Acc1)
             end
     end.
 
-%% str.replace / str.split when the pattern is a regex.
-str_replace_regex(Str, Re, Repl) ->
-    {MP, Flags, _S} = regex_content(Re),
-    ReplErl = js_repl_to_erl(to_string(Repl)),
-    Opts =
-        case has_flag(Flags, $g) of
-            true -> [global, {return, binary}];
-            false -> [{return, binary}]
-        end,
-    re:replace(to_string(Str), MP, ReplErl, Opts).
+%% GetSubstitution (§22.2.6.11.1): expand a replacement template against one
+%% match. `Matched` is the whole match, `S` the subject, `Position` the match's
+%% code-point start, `Captures` the numbered captures (each a binary or
+%% `undefined`), and `Named` the named-captures object (or `undefined`).
+gsub(Template, Matched, S, Position, Captures, Named) ->
+    Cps = cps(S),
+    Size = length(Cps),
+    Prefix = cp_sub(Cps, 0, Position),
+    Suffix = cp_sub(Cps, Position + length(cps(Matched)), Size),
+    Ctx = {Matched, Prefix, Suffix, Captures, length(Captures), Named},
+    gsub_scan(Template, Ctx, <<>>).
 
+gsub_scan(<<>>, _Ctx, Acc) ->
+    Acc;
+gsub_scan(<<$$, Rest/binary>>, Ctx, Acc) ->
+    {Sub, Rest2} = gsub_dollar(Rest, Ctx),
+    gsub_scan(Rest2, Ctx, <<Acc/binary, Sub/binary>>);
+gsub_scan(<<Ch, Rest/binary>>, Ctx, Acc) ->
+    gsub_scan(Rest, Ctx, <<Acc/binary, Ch>>).
+
+%% Resolve the substitution that follows a `$`, returning `{Replacement, Rest}`.
+%% An unrecognised `$x` (or a trailing `$`) is a literal `$`, with `x` left to be
+%% rescanned as ordinary text.
+gsub_dollar(<<$$, R/binary>>, _Ctx) ->
+    {<<$$>>, R};
+gsub_dollar(<<$&, R/binary>>, {M, _P, _S, _C, _L, _N}) ->
+    {M, R};
+gsub_dollar(<<$`, R/binary>>, {_M, P, _S, _C, _L, _N}) ->
+    {P, R};
+gsub_dollar(<<$', R/binary>>, {_M, _P, Suf, _C, _L, _N}) ->
+    {Suf, R};
+gsub_dollar(<<$<, R/binary>>, Ctx) ->
+    gsub_named(R, Ctx);
+gsub_dollar(<<D, _/binary>> = In, Ctx) when D >= $0, D =< $9 ->
+    gsub_digits(In, Ctx);
+gsub_dollar(R, _Ctx) ->
+    {<<$$>>, R}.
+
+%% `$n` / `$nn` numbered capture. Prefers a two-digit index when it names a real
+%% capture; otherwise falls back to one digit; `$0` and out-of-range indices are
+%% literal (the `$` is emitted and the digits are rescanned as text).
+gsub_digits(<<D1, D2, R/binary>>, {_M, _P, _S, Caps, Len, _N})
+    when D1 >= $0, D1 =< $9, D2 >= $0, D2 =< $9 ->
+    N2 = (D1 - $0) * 10 + (D2 - $0),
+    N1 = D1 - $0,
+    case in_range(N2, Len) of
+        true -> {cap_str(Caps, N2), R};
+        false ->
+            case in_range(N1, Len) of
+                true -> {cap_str(Caps, N1), <<D2, R/binary>>};
+                false -> {<<$$>>, <<D1, D2, R/binary>>}
+            end
+    end;
+gsub_digits(<<D1, R/binary>>, {_M, _P, _S, Caps, Len, _N}) when D1 >= $0, D1 =< $9 ->
+    N1 = D1 - $0,
+    case in_range(N1, Len) of
+        true -> {cap_str(Caps, N1), R};
+        false -> {<<$$>>, <<D1, R/binary>>}
+    end.
+
+in_range(N, Len) -> N >= 1 andalso N =< Len.
+
+%% The n-th capture (1-based) as a string; an unmatched (`undefined`) capture
+%% substitutes the empty string.
+cap_str(Caps, N) ->
+    case lists:nth(N, Caps) of
+        undefined -> <<>>;
+        B -> B
+    end.
+
+%% `$<name>` named-capture substitution. With no named captures at all the
+%% literal `$<` is kept; an unterminated `$<…` (no `>`) is likewise literal.
+gsub_named(R, {_M, _P, _S, _C, _L, undefined}) ->
+    {<<$$, $<>>, R};
+gsub_named(R, {_M, _P, _S, _C, _L, Named}) ->
+    case binary:split(R, <<">">>) of
+        [Name, Rest] ->
+            case get_prop(Named, Name) of
+                undefined -> {<<>>, Rest};
+                V -> {to_string(V), Rest}
+            end;
+        _ ->
+            {<<$$, $<>>, R}
+    end.
+
+%% String.prototype.split with a regex separator (§22.2.6.14 RegExp[@@split]).
+%% Splits `Str` at every match of the separator, using a sticky (anchored) probe
+%% at each position so match boundaries follow JS semantics: a zero-width match
+%% at the current split point is skipped, and any capturing groups in the
+%% separator contribute their captures (or `undefined`) between the surrounding
+%% pieces. Indices are code-point based. `Re` may be a non-regex value (coerced).
 str_split_regex(Str, Re) ->
-    {MP, _Flags, _S} = regex_content(Re),
-    new_array(re:split(to_string(Str), MP, [{return, binary}])).
+    {MP, _Flags, Src} = as_regex(Re),
+    NG = regex_group_count(Src),
+    S = to_string(Str),
+    Cps = cps(S),
+    Size = length(Cps),
+    case Size of
+        0 ->
+            %% An empty subject yields `[]` if the separator matches "", else `[""]`.
+            case re_exec_cp(MP, S, 0, true, NG) of
+                nomatch -> new_array([S]);
+                _ -> new_array([])
+            end;
+        _ ->
+            new_array(split_loop(MP, S, Cps, Size, 0, 0, NG, []))
+    end.
 
-%% Translate a JS replacement string's `$1`/`$&`/`$$` into `re:replace`'s `\1`/`\0`/`$`.
-js_repl_to_erl(Bin) -> iolist_to_binary(repl_scan(Bin)).
-repl_scan(<<"$$", R/binary>>) -> [$$ | repl_scan(R)];
-repl_scan(<<"$&", R/binary>>) -> [<<"\\0">> | repl_scan(R)];
-repl_scan(<<$$, D, R/binary>>) when D >= $0, D =< $9 -> [$\\, D | repl_scan(R)];
-repl_scan(<<C, R/binary>>) -> [C | repl_scan(R)];
-repl_scan(<<>>) -> [].
+%% Scan for separator matches. `P` is the start of the pending piece and `Q` the
+%% current probe position (both code-point indices); `Acc` holds the output
+%% elements in reverse. On reaching the end, append the trailing piece `S[P..]`.
+split_loop(_MP, _S, Cps, Size, P, Q, _NG, Acc) when Q >= Size ->
+    lists:reverse([cp_sub(Cps, P, Size) | Acc]);
+split_loop(MP, S, Cps, Size, P, Q, NG, Acc) ->
+    case re_exec_cp(MP, S, Q, true, NG) of
+        nomatch ->
+            split_loop(MP, S, Cps, Size, P, Q + 1, NG, Acc);
+        {match, _StartCp, EndCp, [_Whole | Caps], _Groups} ->
+            E = min(EndCp, Size),
+            case E =:= P of
+                %% Zero-width match at the current split point: skip it.
+                true ->
+                    split_loop(MP, S, Cps, Size, P, Q + 1, NG, Acc);
+                false ->
+                    Piece = cp_sub(Cps, P, Q),
+                    Acc1 = lists:reverse([Piece | Caps]) ++ Acc,
+                    split_loop(MP, S, Cps, Size, E, E, NG, Acc1)
+            end
+    end.
+
+%% The substring of a code-point list over the half-open code-point range
+%% [From, To) as a binary.
+cp_sub(Cps, From, To) -> from_cps(lists:sublist(Cps, From + 1, max(0, To - From))).
 
 %% Apply a JS function value to a runtime-length argument list (behind call spread
 %% `f(...args)`); arity-adaptive like a callback.
@@ -3182,10 +3551,21 @@ expand_repl(<<C, R/binary>>, M, B, A, Acc) ->
 %% str.replaceAll(search, repl) — every occurrence, with the same `$` expansion
 %% (`` $` ``/`$'` reference the whole original string, tracked via the offset).
 str_replace_all(Str, Search, Repl) ->
-    ReplBin = to_string(Repl),
-    case to_string(Search) of
-        <<>> -> Str;
-        SearchBin -> ra_expand(Str, SearchBin, ReplBin, Str, 0, <<>>)
+    case is_regex(Search) of
+        true ->
+            %% replaceAll with a NON-global regex is a TypeError (§22.1.3.20);
+            %% a global one replaces every match via the regex replace path.
+            {_MP, Flags, _S} = regex_content(Search),
+            case has_flag(Flags, $g) of
+                true -> str_replace_regex(Str, Search, Repl);
+                false -> type_error(Search)
+            end;
+        false ->
+            ReplBin = to_string(Repl),
+            case to_string(Search) of
+                <<>> -> Str;
+                SearchBin -> ra_expand(Str, SearchBin, ReplBin, Str, 0, <<>>)
+            end
     end.
 
 ra_expand(Rest, SearchBin, ReplBin, Full, Off, Acc) ->

@@ -4244,9 +4244,11 @@ fn resolve_js(op: String) -> Option(String) {
     // regex
     "new_regex" -> Some("new_regex")
     "regex_test" -> Some("regex_test")
+    "regex_exec" -> Some("regex_exec")
     "regex_source" -> Some("regex_source")
     "regex_flags" -> Some("regex_flags")
     "str_match" -> Some("str_match")
+    "str_search" -> Some("str_search")
     // Map / Set
     "new_map" -> Some("new_map")
     "new_set" -> Some("new_set")

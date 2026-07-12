@@ -467,9 +467,14 @@ pub fn num_to_string_radix(n: Dynamic, radix: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_regex")
 pub fn new_regex(pattern: Dynamic, flags: Dynamic) -> Dynamic
 
-/// `re.test(str)` → JS boolean.
+/// `re.test(str)` → JS boolean (advances `lastIndex` for a global/sticky regex).
 @external(erlang, "twocore_rt_js_ffi", "regex_test")
 pub fn regex_test(re: Dynamic, str: Dynamic) -> Dynamic
+
+/// `re.exec(str)` → an exec-result array (`[matched | captures]` with
+/// `index`/`input`/`groups`), or `null`; updates `lastIndex` for global/sticky.
+@external(erlang, "twocore_rt_js_ffi", "regex_exec")
+pub fn regex_exec(re: Dynamic, str: Dynamic) -> Dynamic
 
 /// `re.source` / `re.flags`.
 @external(erlang, "twocore_rt_js_ffi", "regex_source")
@@ -478,9 +483,14 @@ pub fn regex_source(re: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "regex_flags")
 pub fn regex_flags(re: Dynamic) -> Dynamic
 
-/// `str.match(re)` → array of matches (global) or `[full, groups…]`, else null.
+/// `str.match(re)` → array of matches (global) or the exec array
+/// (`[full, groups…]` with index/input/groups) non-global, else null.
 @external(erlang, "twocore_rt_js_ffi", "str_match")
 pub fn str_match(str: Dynamic, re: Dynamic) -> Dynamic
+
+/// `str.search(re)` → code-point index of the first match, or -1.
+@external(erlang, "twocore_rt_js_ffi", "str_search")
+pub fn str_search(str: Dynamic, re: Dynamic) -> Dynamic
 
 // ───────────────────────── Map / Set ─────────────────────────
 // `new Map()`/`new Set()`; the methods delegate to a same-named user method when the
