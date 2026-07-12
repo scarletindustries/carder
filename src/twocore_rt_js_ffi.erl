@@ -1032,12 +1032,12 @@ get_prop(Recv, Key) when is_reference(Recv) ->
                 <<"multiline">> -> has_flag(Flags, $m);
                 _ -> undefined
             end;
-        {js_map, D} ->
+        {js_map, _, D} ->
             case Key of
                 <<"size">> -> maps:size(D);
                 _ -> undefined
             end;
-        {js_set, D} ->
+        {js_set, _, D} ->
             case Key of
                 <<"size">> -> maps:size(D);
                 _ -> undefined
@@ -1924,15 +1924,22 @@ civil_from_days(Z0) ->
 range_error(Detail) -> erlang:error({js_error, range_error, Detail}).
 
 %% ── Map / Set ────────────────────────────────────────────
-%% A Map is a cell `{js_map, Data}` (Erlang map: JS-value key → value); a Set is
-%% `{js_set, Data}` (value → true). Keys use Erlang term equality (object identity for
-%% refs, value for primitives; NaN keys work via the js_nan sentinel). The method names
-%% (set/get/add/has/delete/clear/forEach) DELEGATE to a user method of the same name
-%% when the receiver is a plain object, so they don't clobber user APIs. Iteration order
-%% is the backing map's, not insertion order (a v1 deviation).
+%% A Map is a cell `{js_map, Next, Data}` and a Set `{js_set, Next, Data}`. For a
+%% Map, `Data` is an Erlang map `Key => {Seq, Value}`; for a Set, `Value => Seq`.
+%% `Seq` is a per-collection monotonically increasing insertion index and `Next` the
+%% next index to hand out; iteration (forEach / keys / values / entries) walks entries
+%% in ascending `Seq`, i.e. INSERTION ORDER as the spec requires (23.1.3.5 etc.).
+%% Updating an existing key keeps its `Seq` (position); a delete-then-re-insert gets a
+%% fresh (larger) `Seq`, so it moves to the end.
+%%
+%% Key equality is SameValueZero: `mapkey_norm/1` folds every integral float to the
+%% equal integer (so `1` and `1.0` are one key) and `-0` to `+0`, and NaN is already the
+%% single `js_nan` sentinel — so all NaN keys coincide. The method names
+%% (set/get/add/has/delete/clear/forEach/keys/values/entries) DELEGATE to a user method
+%% of the same name when the receiver is a plain object, so they don't clobber user APIs.
 
 new_map(Init) ->
-    M = cell_new({js_map, #{}}),
+    M = cell_new({js_map, 0, #{}}),
     case is_array(Init) of
         1 ->
             {Len, Map} = arr_content(Init),
@@ -1954,7 +1961,7 @@ new_map(Init) ->
     M.
 
 new_set(Init) ->
-    S = cell_new({js_set, #{}}),
+    S = cell_new({js_set, 0, #{}}),
     case is_array(Init) of
         1 ->
             {Len, Map} = arr_content(Init),
@@ -1964,13 +1971,32 @@ new_set(Init) ->
     end,
     S.
 
+%% SameValueZero key canonicalization. An integral float becomes the equal integer
+%% (unifying `1`/`1.0` and collapsing `-0.0` to `0`); every other term (non-integral
+%% float, string, boolean, ref, the `js_nan`/`js_inf`/`js_neg_inf` sentinels) is left as
+%% is. Guarantees that keys the spec deems equal share one Erlang map key.
+mapkey_norm(F) when is_float(F) ->
+    T = trunc(F),
+    case T == F of
+        true -> T;
+        false -> F
+    end;
+mapkey_norm(K) -> K.
+
 %% Each collection method takes the receiver + the FULL argument list, so that a
 %% delegated user method (when the receiver is a plain object) gets all its arguments.
 
 js_m_set(Recv, Args) ->
     case cell_tag(Recv) of
-        {js_map, D} ->
-            erlang:put(?CELL_KEY(Recv), {js_map, maps:put(arg(Args, 0), arg(Args, 1), D)}),
+        {js_map, Next, D} ->
+            K = mapkey_norm(arg(Args, 0)),
+            V = arg(Args, 1),
+            {Next2, Seq} =
+                case maps:get(K, D, undefined) of
+                    {OldSeq, _} -> {Next, OldSeq};
+                    undefined -> {Next + 1, Next}
+                end,
+            erlang:put(?CELL_KEY(Recv), {js_map, Next2, maps:put(K, {Seq, V}, D)}),
             Recv;
         _ ->
             delegate(Recv, <<"set">>, Args)
@@ -1978,14 +2004,25 @@ js_m_set(Recv, Args) ->
 
 js_m_get(Recv, Args) ->
     case cell_tag(Recv) of
-        {js_map, D} -> maps:get(arg(Args, 0), D, undefined);
-        _ -> delegate(Recv, <<"get">>, Args)
+        {js_map, _, D} ->
+            case maps:get(mapkey_norm(arg(Args, 0)), D, undefined) of
+                {_Seq, V} -> V;
+                undefined -> undefined
+            end;
+        _ ->
+            delegate(Recv, <<"get">>, Args)
     end.
 
 js_m_add(Recv, Args) ->
     case cell_tag(Recv) of
-        {js_set, D} ->
-            erlang:put(?CELL_KEY(Recv), {js_set, maps:put(arg(Args, 0), true, D)}),
+        {js_set, Next, D} ->
+            V = mapkey_norm(arg(Args, 0)),
+            {Next2, D2} =
+                case maps:is_key(V, D) of
+                    true -> {Next, D};
+                    false -> {Next + 1, maps:put(V, Next, D)}
+                end,
+            erlang:put(?CELL_KEY(Recv), {js_set, Next2, D2}),
             Recv;
         _ ->
             delegate(Recv, <<"add">>, Args)
@@ -1993,36 +2030,53 @@ js_m_add(Recv, Args) ->
 
 js_m_has(Recv, Args) ->
     case cell_tag(Recv) of
-        {js_map, D} -> maps:is_key(arg(Args, 0), D);
-        {js_set, D} -> maps:is_key(arg(Args, 0), D);
+        {js_map, _, D} -> maps:is_key(mapkey_norm(arg(Args, 0)), D);
+        {js_set, _, D} -> maps:is_key(mapkey_norm(arg(Args, 0)), D);
         _ -> delegate(Recv, <<"has">>, Args)
     end.
 
+%% delete returns `true` only when an entry was actually removed, `false` otherwise
+%% (Map.prototype.delete step 6 / Set.prototype.delete step 6).
 js_m_delete(Recv, Args) ->
     case cell_tag(Recv) of
-        {js_map, D} ->
-            erlang:put(?CELL_KEY(Recv), {js_map, maps:remove(arg(Args, 0), D)}),
-            true;
-        {js_set, D} ->
-            erlang:put(?CELL_KEY(Recv), {js_set, maps:remove(arg(Args, 0), D)}),
-            true;
+        {js_map, Next, D} ->
+            K = mapkey_norm(arg(Args, 0)),
+            case maps:is_key(K, D) of
+                true ->
+                    erlang:put(?CELL_KEY(Recv), {js_map, Next, maps:remove(K, D)}),
+                    true;
+                false ->
+                    false
+            end;
+        {js_set, Next, D} ->
+            V = mapkey_norm(arg(Args, 0)),
+            case maps:is_key(V, D) of
+                true ->
+                    erlang:put(?CELL_KEY(Recv), {js_set, Next, maps:remove(V, D)}),
+                    true;
+                false ->
+                    false
+            end;
         _ ->
             delegate(Recv, <<"delete">>, Args)
     end.
 
 js_m_clear(Recv, Args) ->
     case cell_tag(Recv) of
-        {js_map, _} ->
-            erlang:put(?CELL_KEY(Recv), {js_map, #{}}),
+        {js_map, Next, _} ->
+            erlang:put(?CELL_KEY(Recv), {js_map, Next, #{}}),
             undefined;
-        {js_set, _} ->
-            erlang:put(?CELL_KEY(Recv), {js_set, #{}}),
+        {js_set, Next, _} ->
+            erlang:put(?CELL_KEY(Recv), {js_set, Next, #{}}),
             undefined;
         _ ->
             delegate(Recv, <<"clear">>, Args)
     end.
 
 %% forEach across arrays, Maps (fn(v, k, m)), Sets (fn(v, v, s)), or a user method.
+%% For Maps/Sets the walk is by ascending Seq and RE-READS the live cell between calls,
+%% so entries inserted during iteration are visited and entries deleted before they are
+%% reached are skipped (23.1.3.5 / 23.2.3.6, which iterate the live entries list).
 js_m_foreach(Recv, Args) ->
     Fn = arg(Args, 0),
     case is_array(Recv) of
@@ -2030,15 +2084,66 @@ js_m_foreach(Recv, Args) ->
             array_foreach(Recv, Fn);
         0 ->
             case cell_tag(Recv) of
-                {js_map, D} ->
-                    maps:foreach(fun(K, V) -> call_cb(Fn, [V, K, Recv]) end, D),
+                {js_map, _, _} ->
+                    map_foreach(Recv, Fn, -1),
                     undefined;
-                {js_set, D} ->
-                    maps:foreach(fun(V, _) -> call_cb(Fn, [V, V, Recv]) end, D),
+                {js_set, _, _} ->
+                    set_foreach(Recv, Fn, -1),
                     undefined;
                 _ ->
                     delegate(Recv, <<"forEach">>, Args)
             end
+    end.
+
+map_foreach(Recv, Fn, Last) ->
+    case next_map_entry(Recv, Last) of
+        none ->
+            ok;
+        {Seq, K, V} ->
+            call_cb(Fn, [V, K, Recv]),
+            map_foreach(Recv, Fn, Seq)
+    end.
+
+set_foreach(Recv, Fn, Last) ->
+    case next_set_entry(Recv, Last) of
+        none ->
+            ok;
+        {Seq, V} ->
+            call_cb(Fn, [V, V, Recv]),
+            set_foreach(Recv, Fn, Seq)
+    end.
+
+%% The live entry with the smallest Seq strictly greater than `Last`, or `none`.
+next_map_entry(Recv, Last) ->
+    case cell_tag(Recv) of
+        {js_map, _, D} ->
+            maps:fold(
+                fun
+                    (K, {Seq, V}, none) when Seq > Last -> {Seq, K, V};
+                    (K, {Seq, V}, {BSeq, _, _}) when Seq > Last, Seq < BSeq -> {Seq, K, V};
+                    (_, _, Acc) -> Acc
+                end,
+                none,
+                D
+            );
+        _ ->
+            none
+    end.
+
+next_set_entry(Recv, Last) ->
+    case cell_tag(Recv) of
+        {js_set, _, D} ->
+            maps:fold(
+                fun
+                    (V, Seq, none) when Seq > Last -> {Seq, V};
+                    (V, Seq, {BSeq, _}) when Seq > Last, Seq < BSeq -> {Seq, V};
+                    (_, _, Acc) -> Acc
+                end,
+                none,
+                D
+            );
+        _ ->
+            none
     end.
 
 %% The cell's tagged content, or `undefined` for a non-reference (so the delegate path

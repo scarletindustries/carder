@@ -2262,6 +2262,83 @@ pub fn method_delegation_test() {
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
 
+pub fn map_delete_returns_boolean_test() {
+  // 24.1.3.3 Map.prototype.delete returns `true` only when it actually removes an
+  // entry; a key that is absent (or was already deleted) yields `false`.
+  let m =
+    compile(
+      "function f() { let m = new Map([[\"a\", 1]]); return m.delete(\"a\") === true && m.delete(\"a\") === false && m.delete(\"z\") === false; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn set_delete_returns_boolean_test() {
+  // 24.2.3.4 Set.prototype.delete returns `true` only when it removes a value.
+  let m =
+    compile(
+      "function f() { let s = new Set([1]); return s.delete(1) === true && s.delete(1) === false && s.delete(9) === false; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn map_foreach_insertion_order_test() {
+  // 24.1.3.5 forEach visits entries in insertion order. Re-`set`ting an existing key
+  // keeps its position (only the value changes); a delete-then-re-insert appends it.
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.set(\"c\", 3); m.set(\"a\", 9); m.delete(\"b\"); m.set(\"b\", 5); let out = []; m.forEach((v, k) => out.push(k + v)); return out.join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("a9,c3,b5"))
+}
+
+pub fn map_foreach_deleted_during_test() {
+  // 24.1.3.5 an entry deleted before it is reached during iteration is not visited.
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.set(\"a\", 0); m.set(\"b\", 1); let out = []; m.forEach((v, k) => { if (k === \"a\") { m.delete(\"b\"); } out.push(k); }); return out.join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("a"))
+}
+
+pub fn map_foreach_added_during_test() {
+  // 24.1.3.5 an entry appended during iteration IS visited before forEach returns.
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.set(\"a\", 1); let out = []; m.forEach((v, k) => { if (k === \"a\") { m.set(\"b\", 2); } out.push(k); }); return out.join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("a,b"))
+}
+
+pub fn map_samevaluezero_keys_test() {
+  // 24.1.3 Map keys compare with SameValueZero: NaN keys coincide, -0 and +0 are one
+  // key, and 1 and 1.0 are the same numeric key (there is one JS Number type).
+  let nan =
+    compile(
+      "function f() { let m = new Map(); m.set(NaN, \"x\"); return m.get(NaN) + \",\" + m.size; }",
+    )
+  call(nan, "f", []) |> should.equal(dyn("x,1"))
+  let zero =
+    compile(
+      "function f() { let m = new Map(); m.set(-0, \"a\"); m.set(0, \"b\"); return m.get(-0) + \",\" + m.size; }",
+    )
+  call(zero, "f", []) |> should.equal(dyn("b,1"))
+  let int_float =
+    compile(
+      "function f() { let m = new Map(); m.set(1, \"i\"); return m.get(1.0) + \",\" + m.has(1.0); }",
+    )
+  call(int_float, "f", []) |> should.equal(dyn("i,true"))
+}
+
+pub fn set_foreach_order_test() {
+  // 24.2.3.6 Set.prototype.forEach visits values in insertion order and calls back
+  // with (value, value, set) — a Set's key is its value.
+  let m =
+    compile(
+      "function f() { let s = new Set(); s.add(2); s.add(1); s.add(2); let out = []; s.forEach((v, k) => out.push(v + \":\" + k)); return out.join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("2:2,1:1"))
+}
+
 // ── call spread ──────────────────────────────────────────────────────────────
 
 pub fn call_spread_test() {
