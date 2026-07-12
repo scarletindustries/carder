@@ -1820,6 +1820,38 @@ pub fn static_field_mutation_test() {
   to_float(call(n, "f", [])) |> should.equal(15.0)
 }
 
+pub fn object_getter_test() {
+  // An object-literal getter computes on access with dynamic `this` = the object.
+  let m =
+    compile(
+      "function f() { let o = { y: 5, get x() { return this.y * 2; } }; return o.x; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+}
+
+pub fn object_setter_test() {
+  // A getter/setter PAIR on one key; the setter mutates through `this`.
+  let m =
+    compile(
+      "function f() { let o = { _v: 0, get v() { return this._v; }, set v(x) { this._v = x + 1; } }; o.v = 4; return o.v; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(5.0)
+}
+
+pub fn object_getter_no_leak_test() {
+  // Object.values and JSON invoke the getter (sentinel 777), never leak the marker.
+  let m =
+    compile(
+      "function f() { let o = { get magic() { return 777; } }; return Object.values(o).includes(777); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+  let n =
+    compile(
+      "function f() { let o = { get magic() { return 777; } }; return JSON.stringify(o).includes(\"777\"); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
 pub fn static_field_call_test() {
   // A static field holding a function is callable via C.field(...).
   let m =

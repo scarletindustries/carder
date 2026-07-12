@@ -24,7 +24,8 @@
 //// `for-in`, `break/continue` (incl. labeled `break outer`/`continue outer`),
 //// `return`, blocks; array/object destructuring (incl. nested) in `let`/`const`/`var`;
 //// objects
-//// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, and method shorthand; arrays `[…]`
+//// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, method shorthand, and
+//// getters/setters (`get x()`/`set x(v)`, `this`-bound to the object); arrays `[…]`
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
 //// expressions, arrow functions, closures
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
@@ -59,8 +60,7 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): object-literal getters/setters
-//// (class getters/setters ARE supported), defaulted/rest destructuring,
+//// Not yet (a clean `Unsupported` error / panic): defaulted/rest destructuring,
 //// `try`/`finally`, generators/async, and `continue` inside a `do/while`. Static
 //// field initializers run when the module's `main/0` runs (like any top-level
 //// state), so `C.x` reads `undefined` until then. (Rest params and call spread apply to
@@ -3826,37 +3826,129 @@ fn lower_object(
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
   let #(binds, obj, ctr) =
     bind_after([], ir.CallHost("js", "new_object", []), ctr)
-  list.try_fold(properties, #(binds, obj, ctr), fn(acc, prop) {
-    let #(binds, obj, ctr) = acc
-    case prop {
-      ast.Property(key:, value:, computed:, ..) -> {
-        use #(bk, key, ctr) <- result_try(object_key(
-          key,
-          computed,
-          env,
-          ctx,
-          ctr,
-        ))
-        use #(bv, v, ctr) <- result_try(lower_expr(value, env, ctx, ctr))
-        // set_prop returns the value; we thread the object handle forward (it is a
-        // stable ref — set mutates it), so `obj` stays the result.
-        let pre = list.flatten([binds, bk, bv])
-        let #(binds2, _r, ctr) =
-          bind_after(pre, ir.CallHost("js", "set_prop", [obj, key, v]), ctr)
-        Ok(#(binds2, obj, ctr))
-      }
-      // `{...src}` — copy src's own properties in (later keys override earlier ones).
-      ast.SpreadProperty(argument:) -> {
-        use #(bs, sv, ctr) <- result_try(lower_expr(argument, env, ctx, ctr))
-        let #(binds2, _r, ctr) =
-          bind_after(
-            list.append(binds, bs),
-            ir.CallHost("js", "object_assign_into", [obj, sv]),
+  // Data and spread properties install in source order; getter/setter properties
+  // are grouped by key and installed afterward as accessors.
+  use #(binds, ctr) <- result_try(
+    list.try_fold(properties, #(binds, ctr), fn(acc, prop) {
+      let #(binds, ctr) = acc
+      case prop {
+        // `key: value` and method shorthand `foo() {}` (both PropertyKind.Init).
+        ast.Property(kind: ast.Init, key:, value:, computed:, ..) -> {
+          use #(bk, key, ctr) <- result_try(object_key(
+            key,
+            computed,
+            env,
+            ctx,
             ctr,
-          )
-        Ok(#(binds2, obj, ctr))
+          ))
+          use #(bv, v, ctr) <- result_try(lower_expr(value, env, ctx, ctr))
+          let pre = list.flatten([binds, bk, bv])
+          let #(binds2, _r, ctr) =
+            bind_after(pre, ir.CallHost("js", "set_prop", [obj, key, v]), ctr)
+          Ok(#(binds2, ctr))
+        }
+        // `{...src}` — copy src's own properties in (later keys override earlier).
+        ast.SpreadProperty(argument:) -> {
+          use #(bs, sv, ctr) <- result_try(lower_expr(argument, env, ctx, ctr))
+          let #(binds2, _r, ctr) =
+            bind_after(
+              list.append(binds, bs),
+              ir.CallHost("js", "object_assign_into", [obj, sv]),
+              ctr,
+            )
+          Ok(#(binds2, ctr))
+        }
+        // getters/setters handled by install_obj_accessors, grouped by key.
+        ast.Property(kind: ast.Get, ..) -> Ok(#(binds, ctr))
+        ast.Property(kind: ast.Set, ..) -> Ok(#(binds, ctr))
       }
-    }
+    }),
+  )
+  use #(binds, ctr) <- result_try(install_obj_accessors(
+    properties,
+    obj,
+    binds,
+    env,
+    ctx,
+    ctr,
+  ))
+  Ok(#(binds, obj, ctr))
+}
+
+/// Install the object literal's getter/setter properties as accessors on `obj`.
+/// Getters/setters are grouped by property key (a `get x`/`set x` pair becomes
+/// one accessor), each `this`-bound to `obj`. Data-vs-accessor ordering: an
+/// accessor installs after the data pass, so if a data property and an accessor
+/// share a key the accessor wins regardless of source order (a rare collision).
+fn install_obj_accessors(
+  properties: List(ast.Property),
+  obj: ir.Value,
+  binds: List(Bind),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), Int), Error) {
+  // (key name, is_getter, accessor-function span), in source order.
+  use entries <- result_try(
+    list.try_fold(properties, [], fn(acc, prop) {
+      case prop {
+        ast.Property(kind: ast.Get, key:, value:, ..) -> {
+          use name <- result_try(accessor_key_name(key))
+          Ok(list.append(acc, [#(name, True, ast.expression_span(value))]))
+        }
+        ast.Property(kind: ast.Set, key:, value:, ..) -> {
+          use name <- result_try(accessor_key_name(key))
+          Ok(list.append(acc, [#(name, False, ast.expression_span(value))]))
+        }
+        _ -> Ok(acc)
+      }
+    }),
+  )
+  // Unique accessor key names, in first-seen order.
+  let keys =
+    list.fold(entries, [], fn(acc, e) {
+      case list.contains(acc, e.0) {
+        True -> acc
+        False -> list.append(acc, [e.0])
+      }
+    })
+  list.try_fold(keys, #(binds, ctr), fn(acc, kname) {
+    let #(binds, ctr) = acc
+    let getter_span =
+      list.find_map(entries, fn(e) {
+        case e.0 == kname && e.1 {
+          True -> Ok(e.2)
+          False -> Error(Nil)
+        }
+      })
+    let setter_span =
+      list.find_map(entries, fn(e) {
+        case e.0 == kname && !e.1 {
+          True -> Ok(e.2)
+          False -> Error(Nil)
+        }
+      })
+    use #(gbinds, getter_v, ctr) <- result_try(case getter_span {
+      Ok(sp) -> lower_obj_accessor_closure(sp, obj, env, ctx, ctr)
+      Error(Nil) -> Ok(#([], undefined(), ctr))
+    })
+    use #(sbinds, setter_v, ctr) <- result_try(case setter_span {
+      Ok(sp) -> lower_obj_accessor_closure(sp, obj, env, ctx, ctr)
+      Error(Nil) -> Ok(#([], undefined(), ctr))
+    })
+    let pre = list.flatten([binds, gbinds, sbinds])
+    let #(binds2, _r, ctr) =
+      bind_after(
+        pre,
+        ir.CallHost("js", "define_accessor", [
+          obj,
+          ir.ConstBinary(<<kname:utf8>>),
+          getter_v,
+          setter_v,
+        ]),
+        ctr,
+      )
+    Ok(#(binds2, ctr))
   })
 }
 
@@ -4465,6 +4557,71 @@ fn lambda_nodes_expr(e: ast.Expression) -> List(RawLambda) {
 
 /// The pre-pass: assign each lambda a unique lifted name and resolve its captures,
 /// keyed by source span. `globals` are the top-level function names.
+/// Make a `this`-bound closure for an object-literal getter/setter: the accessor
+/// function is a normal collected lambda (keyed by its span), but its `this`
+/// capture is filled with `obj` — the object being built — rather than the
+/// enclosing `this`, giving a getter/setter the dynamic `this` JS requires.
+fn lower_obj_accessor_closure(
+  span: ast.Span,
+  obj: ir.Value,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case dict.get(ctx.lambdas, span) {
+    Error(Nil) -> Error(Unsupported("object accessor (not collected)"))
+    Ok(lam) -> {
+      // Reject closing over a reassigned variable (as with any closure); `this`
+      // is exempt since it is supplied as the object, not captured from scope.
+      let mutated =
+        list.filter(lam.captures, fn(c) {
+          c != "this"
+          && {
+            list.contains(ctx.scope_mutated, c)
+            || list.contains(assigned_in(lam.body), c)
+          }
+        })
+      case mutated {
+        [c, ..] ->
+          Error(Unsupported(
+            "object accessor closes over reassigned variable '" <> c <> "'",
+          ))
+        [] -> {
+          use capture_vals <- result_try(
+            list.try_map(lam.captures, fn(c) {
+              case c == "this" {
+                True -> Ok(obj)
+                False ->
+                  case dict.get(env, c) {
+                    Ok(v) -> Ok(v)
+                    Error(Nil) ->
+                      Error(Unsupported(
+                        "object accessor capture of unbound '" <> c <> "'",
+                      ))
+                  }
+              }
+            }),
+          )
+          Ok(bind1(
+            ir.MakeClosure(lam.name, capture_vals, list.length(lam.params)),
+            ctr,
+          ))
+        }
+      }
+    }
+  }
+}
+
+/// The static property-key string of a non-computed object accessor.
+fn accessor_key_name(key: ast.Expression) -> Result(String, Error) {
+  case key {
+    ast.Identifier(name:, ..) -> Ok(name)
+    ast.StringExpression(value:, ..) -> Ok(value)
+    ast.NumberLiteral(value:, ..) -> Ok(num_key(value))
+    _ -> Error(Unsupported("computed object accessor key"))
+  }
+}
+
 fn collect_lambdas(
   stmts: List(ast.Statement),
   globals: List(String),
