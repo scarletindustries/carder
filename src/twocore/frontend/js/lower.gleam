@@ -4995,6 +4995,11 @@ fn lower_instance_method(
     "has", _ -> coll("js_m_has")
     "delete", _ -> coll("js_m_delete")
     "clear", _ -> coll("js_m_clear")
+    // Map/Set iterators — a live `{value, done}` cursor driven by `.next()`. On a
+    // plain object these delegate to a same-named user method.
+    "keys", _ -> coll("js_m_keys")
+    "values", _ -> coll("js_m_values")
+    "entries", _ -> coll("js_m_entries")
     "some", [f, ..] -> host("array_some", [f])
     "every", [f, ..] -> host("array_every", [f])
     "find", [f, ..] -> host("array_find", [f])

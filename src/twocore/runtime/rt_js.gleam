@@ -529,6 +529,17 @@ pub fn js_m_clear(recv: Dynamic, args: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "js_m_foreach")
 pub fn js_m_foreach(recv: Dynamic, args: Dynamic) -> Dynamic
 
+/// `map.keys()`/`set.keys()`, `.values()`, `.entries()` — a live iterator object whose
+/// `.next()` yields `{value, done}` in insertion order (a Set's key == its value).
+@external(erlang, "twocore_rt_js_ffi", "js_m_keys")
+pub fn js_m_keys(recv: Dynamic, args: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "js_m_values")
+pub fn js_m_values(recv: Dynamic, args: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "js_m_entries")
+pub fn js_m_entries(recv: Dynamic, args: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 
