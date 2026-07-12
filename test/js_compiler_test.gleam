@@ -2747,3 +2747,30 @@ pub fn numeric_globals_no_arg_test() {
   num("Number.isNaN(parseInt()) ? 1 : 0") |> should.equal(1.0)
   num("Number.isNaN(parseFloat()) ? 1 : 0") |> should.equal(1.0)
 }
+
+pub fn number_is_safe_integer_test() {
+  // Number.isSafeInteger(x): x is an integer-valued number with |x| ≤ 2^53 − 1
+  // (9007199254740991) — no coercion (sec-number.issafeinteger).
+  let a =
+    compile("function f() { return Number.isSafeInteger(9007199254740991); }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  // 2^53 itself is one past the safe range.
+  let b =
+    compile("function f() { return Number.isSafeInteger(9007199254740992); }")
+  call(b, "f", []) |> should.equal(dyn(False))
+  let c = compile("function f() { return Number.isSafeInteger(0); }")
+  call(c, "f", []) |> should.equal(dyn(True))
+  let n =
+    compile("function f() { return Number.isSafeInteger(-9007199254740991); }")
+  call(n, "f", []) |> should.equal(dyn(True))
+  // Non-integers are false.
+  let d = compile("function f() { return Number.isSafeInteger(1.1); }")
+  call(d, "f", []) |> should.equal(dyn(False))
+  // No coercion: numeric strings, booleans, NaN and the infinities are all false.
+  let s = compile("function f() { return Number.isSafeInteger(\"1\"); }")
+  call(s, "f", []) |> should.equal(dyn(False))
+  let i = compile("function f() { return Number.isSafeInteger(Infinity); }")
+  call(i, "f", []) |> should.equal(dyn(False))
+  let m = compile("function f() { return Number.isSafeInteger(NaN); }")
+  call(m, "f", []) |> should.equal(dyn(False))
+}

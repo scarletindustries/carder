@@ -89,6 +89,7 @@
     str_replace/3, str_replace_all/3,
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
+    number_is_safe_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
     object_rest/2, object_freeze/1, object_is_frozen/1,
     object_from_entries/1,
@@ -2760,6 +2761,16 @@ number_is_finite(_) -> false.
 number_is_integer(X) when is_integer(X) -> true;
 number_is_integer(X) when is_float(X) -> X == trunc(X);
 number_is_integer(_) -> false.
+
+%% Number.isSafeInteger — like Number.isInteger (NO coercion; only real numbers
+%% qualify) but additionally bounded to the safe-integer range |x| ≤ 2^53 − 1
+%% (9007199254740991), so 2^53 itself and the infinities/NaN are all false.
+number_is_safe_integer(X) when is_integer(X) ->
+    abs(X) =< 9007199254740991;
+number_is_safe_integer(X) when is_float(X) ->
+    X == trunc(X) andalso abs(X) =< 9007199254740991.0;
+number_is_safe_integer(_) ->
+    false.
 
 %% ── Object statics ───────────────────────────────────────
 %% NOTE: key order follows the backing map's iteration order, not JS insertion order

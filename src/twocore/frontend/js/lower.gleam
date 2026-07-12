@@ -4352,8 +4352,14 @@ fn lower_static_call(
       Ok(#(binds2, target, ctr))
     }
     "Number", "isInteger", [x, ..] -> host("number_is_integer", [x])
+    "Number", "isInteger", [] -> host("number_is_integer", [undefined()])
+    "Number", "isSafeInteger", [x, ..] -> host("number_is_safe_integer", [x])
+    "Number", "isSafeInteger", [] ->
+      host("number_is_safe_integer", [undefined()])
     "Number", "isNaN", [x, ..] -> host("number_is_nan", [x])
+    "Number", "isNaN", [] -> host("number_is_nan", [undefined()])
     "Number", "isFinite", [x, ..] -> host("number_is_finite", [x])
+    "Number", "isFinite", [] -> host("number_is_finite", [undefined()])
     "Number", "parseInt", [s] -> host("parse_int", [s, undefined()])
     "Number", "parseInt", [s, r, ..] -> host("parse_int", [s, r])
     "Number", "parseFloat", [s, ..] -> host("parse_float", [s])
