@@ -95,6 +95,8 @@
     object_rest/2, object_freeze/1, object_is_frozen/1,
     object_from_entries/1,
     json_stringify/1, json_parse/1,
+    encode_uri_component/1, encode_uri/1,
+    decode_uri_component/1, decode_uri/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -3352,6 +3354,169 @@ is_finite(X) ->
         neg_inf -> false;
         _ -> true
     end.
+
+%% ───────────────────────── URI encode / decode ─────────────────────────
+%%
+%% The four global URI functions (ECMAScript §19.2.6). JS strings are UTF-8
+%% binaries here, so encoding is a per-BYTE scan (every unescaped character is
+%% ASCII, so this is equivalent to the spec's per-code-point scan) and decoding
+%% collects raw octets from %XX escapes and re-validates them as UTF-8. A
+%% malformed %-escape, a bad UTF-8 octet sequence (overlong form, surrogate, or
+%% code point > U+10FFFF), or an out-of-input truncation is a URIError.
+%%
+%% NOTE: lone surrogates are unrepresentable in this UTF-8 string model, so the
+%% encode-side "unpaired surrogate → URIError" rule never fires here (those
+%% inputs cannot be constructed); the tests that exercise it need String
+%% surrogate literals and are out of reach for this v1.
+
+%% encodeURIComponent(uriComponent) — percent-encode ToString(x)'s UTF-8 bytes,
+%% leaving only uriUnescaped (A-Za-z0-9 and `- _ . ! ~ * ' ( )`) literal.
+encode_uri_component(V) -> uri_encode(to_string(V), component).
+
+%% encodeURI(uri) — like encodeURIComponent but ALSO leaves the uriReserved set
+%% and `#` (`; / ? : @ & = + $ , #`) literal.
+encode_uri(V) -> uri_encode(to_string(V), full).
+
+%% decodeURIComponent(encodedURIComponent) — reverse encodeURIComponent: decode
+%% every %XX escape (the reserved set is empty here, so nothing is preserved).
+decode_uri_component(V) -> uri_decode(to_string(V), component).
+
+%% decodeURI(encodedURI) — reverse encodeURI: decode %XX escapes, but a single
+%% octet whose character is in the reserved set (`; / ? : @ & = + $ , #`) is
+%% LEFT as its original escape substring verbatim (case preserved), per §19.2.6.
+decode_uri(V) -> uri_decode(to_string(V), full).
+
+%% Percent-encode the UTF-8 binary `Str`. `Mode` selects the unescaped set:
+%% `component` keeps only uriUnescaped; `full` also keeps uriReserved ∪ `#`.
+uri_encode(Str, Mode) -> uri_encode(Str, Mode, <<>>).
+
+uri_encode(<<>>, _Mode, Acc) ->
+    Acc;
+uri_encode(<<B, Rest/binary>>, Mode, Acc) ->
+    case uri_keep(B, Mode) of
+        true -> uri_encode(Rest, Mode, <<Acc/binary, B>>);
+        false -> uri_encode(Rest, Mode, <<Acc/binary, $%, (uri_hex2(B))/binary>>)
+    end.
+
+%% True if byte `B` must stay literal when encoding in `Mode`.
+uri_keep(B, component) -> uri_unescaped(B);
+uri_keep(B, full) -> uri_unescaped(B) orelse uri_reserved(B).
+
+%% uriUnescaped :: uriAlpha | DecimalDigit | uriMark
+%% (uriMark = `-` `_` `.` `!` `~` `*` `'` `(` `)`).
+uri_unescaped(B) ->
+    (B >= $A andalso B =< $Z) orelse
+        (B >= $a andalso B =< $z) orelse
+        (B >= $0 andalso B =< $9) orelse
+        lists:member(B, [$-, $_, $., $!, $~, $*, $', $(, $)]).
+
+%% uriReserved ∪ `#` — kept literal by encodeURI, and preserved (not decoded)
+%% by decodeURI.
+uri_reserved(B) ->
+    lists:member(B, [$;, $/, $?, $:, $@, $&, $=, $+, $$, $,, $#]).
+
+%% The two UPPERCASE hex digits of a byte (0..255), as a 2-byte binary.
+uri_hex2(B) ->
+    <<(uri_hexdig(B bsr 4)), (uri_hexdig(B band 16#0F))>>.
+
+uri_hexdig(N) when N < 10 -> $0 + N;
+uri_hexdig(N) -> $A + (N - 10).
+
+%% Decode the UTF-8 binary `Str`. `Mode` = `component` (empty reserved set →
+%% decode everything) or `full` (a decoded reserved character is left as its
+%% original escape).
+uri_decode(Str, Mode) -> uri_decode(Str, Mode, <<>>).
+
+uri_decode(<<>>, _Mode, Acc) ->
+    Acc;
+uri_decode(<<$%, Rest/binary>>, Mode, Acc) ->
+    {B1, R1} = uri_hexbyte(Rest),
+    case B1 < 16#80 of
+        true ->
+            %% Single ASCII octet. In `full` mode a reserved char is preserved
+            %% verbatim as its ORIGINAL escape (original case), else emitted raw.
+            case Mode =:= full andalso uri_reserved(B1) of
+                true ->
+                    <<H1, H2, _/binary>> = Rest,
+                    uri_decode(R1, Mode, <<Acc/binary, $%, H1, H2>>);
+                false ->
+                    uri_decode(R1, Mode, <<Acc/binary, B1>>)
+            end;
+        false ->
+            %% Multi-octet UTF-8 lead: gather the continuation escapes, validate,
+            %% and emit the decoded code point (always > U+007F, never reserved).
+            N = uri_leadlen(B1),
+            {CP, R2} = uri_conts(N - 1, R1, [B1]),
+            uri_decode(R2, Mode, <<Acc/binary, CP/utf8>>)
+    end;
+uri_decode(<<C, Rest/binary>>, Mode, Acc) ->
+    uri_decode(Rest, Mode, <<Acc/binary, C>>).
+
+%% Read exactly two hex digits off the front of `Bin`; return {Byte, Rest}.
+%% Fewer than two remaining chars, or a non-hex digit, is a URIError.
+uri_hexbyte(<<H1, H2, Rest/binary>>) ->
+    case {uri_hexval(H1), uri_hexval(H2)} of
+        {D1, D2} when is_integer(D1), is_integer(D2) -> {D1 * 16 + D2, Rest};
+        _ -> uri_error()
+    end;
+uri_hexbyte(_) ->
+    uri_error().
+
+uri_hexval(C) when C >= $0, C =< $9 -> C - $0;
+uri_hexval(C) when C >= $A, C =< $F -> C - $A + 10;
+uri_hexval(C) when C >= $a, C =< $f -> C - $a + 10;
+uri_hexval(_) -> error.
+
+%% Number of octets in a UTF-8 sequence given its lead byte (2..4). A
+%% continuation byte (10xxxxxx) or a 5+-octet lead (11111xxx) as a lead is a
+%% URIError.
+uri_leadlen(B) when B >= 16#C0, B =< 16#DF -> 2;
+uri_leadlen(B) when B >= 16#E0, B =< 16#EF -> 3;
+uri_leadlen(B) when B >= 16#F0, B =< 16#F7 -> 4;
+uri_leadlen(_) -> uri_error().
+
+%% Read `K` further `%XX` continuation escapes onto the octet accumulator
+%% (reversed), then decode + range-validate the full sequence. Each continuation
+%% must be a `%`-escape of a 10xxxxxx byte; anything else is a URIError.
+uri_conts(0, Bin, Acc) ->
+    {uri_codepoint(lists:reverse(Acc)), Bin};
+uri_conts(K, <<$%, Bin/binary>>, Acc) ->
+    {B, Rest} = uri_hexbyte(Bin),
+    case B band 16#C0 =:= 16#80 of
+        true -> uri_conts(K - 1, Rest, [B | Acc]);
+        false -> uri_error()
+    end;
+uri_conts(_, _, _) ->
+    uri_error().
+
+%% Assemble a Unicode code point from its 2/3/4 UTF-8 octets, rejecting overlong
+%% encodings, UTF-16 surrogates, and values above U+10FFFF (RFC 3629). Returns
+%% the code point, or raises a URIError.
+uri_codepoint([B1, B2]) ->
+    CP = ((B1 band 16#1F) bsl 6) bor (B2 band 16#3F),
+    case CP >= 16#80 of
+        true -> CP;
+        false -> uri_error()
+    end;
+uri_codepoint([B1, B2, B3]) ->
+    CP =
+        ((B1 band 16#0F) bsl 12) bor ((B2 band 16#3F) bsl 6) bor
+            (B3 band 16#3F),
+    case CP >= 16#800 andalso not (CP >= 16#D800 andalso CP =< 16#DFFF) of
+        true -> CP;
+        false -> uri_error()
+    end;
+uri_codepoint([B1, B2, B3, B4]) ->
+    CP =
+        ((B1 band 16#07) bsl 18) bor ((B2 band 16#3F) bsl 12) bor
+            ((B3 band 16#3F) bsl 6) bor (B4 band 16#3F),
+    case CP >= 16#10000 andalso CP =< 16#10FFFF of
+        true -> CP;
+        false -> uri_error()
+    end.
+
+%% A JS URIError (§19.2.6.5): a malformed %-escape or invalid UTF-8 octet run.
+uri_error() -> erlang:error({js_error, uri_error, <<"URI malformed">>}).
 
 %% Number.isNaN / Number.isFinite — NO coercion (only actual numbers qualify).
 number_is_nan(js_nan) -> true;
