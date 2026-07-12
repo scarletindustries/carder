@@ -771,6 +771,44 @@ pub fn math_hypot_special_values_test() {
   num("Number.isNaN(Math.hypot(NaN, 3)) ? 1 : 0") |> should.equal(1.0)
 }
 
+pub fn math_atan_special_values_test() {
+  // atan is bounded by ±π/2, reached exactly at the infinities. (sin/cos/tan/
+  // asin/acos are all NaN at ±∞ — see below — but atan is not.)
+  num("Math.atan(Infinity) === Math.PI / 2 ? 1 : 0") |> should.equal(1.0)
+  num("Math.atan(-Infinity) === -Math.PI / 2 ? 1 : 0") |> should.equal(1.0)
+  num("Math.atan(0)") |> should.equal(0.0)
+  num("Number.isNaN(Math.atan(NaN)) ? 1 : 0") |> should.equal(1.0)
+  // Contrast: the other inverse/forward trig functions ARE NaN at infinity.
+  num("Number.isNaN(Math.asin(Infinity)) ? 1 : 0") |> should.equal(1.0)
+  num("Number.isNaN(Math.sin(Infinity)) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn math_atan2_special_values_test() {
+  // The ECMAScript atan2 special-value table for the infinities — these must be
+  // EXACT (approximating ±∞ with the largest double gave a denormal, not ±0).
+  // finite y, x = +∞ → a signed zero by y's sign.
+  num("Math.atan2(1, Infinity) === 0 ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.atan2(-1, Infinity) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  // finite y, x = −∞ → ±π by y's sign.
+  num("Math.atan2(1, -Infinity) === Math.PI ? 1 : 0") |> should.equal(1.0)
+  num("Math.atan2(-1, -Infinity) === -Math.PI ? 1 : 0") |> should.equal(1.0)
+  // y = ±∞, x finite → ±π/2.
+  num("Math.atan2(Infinity, 5) === Math.PI / 2 ? 1 : 0") |> should.equal(1.0)
+  num("Math.atan2(-Infinity, 5) === -Math.PI / 2 ? 1 : 0") |> should.equal(1.0)
+  // both infinite → an odd multiple of π/4.
+  num("Math.atan2(Infinity, Infinity) === Math.PI / 4 ? 1 : 0")
+  |> should.equal(1.0)
+  num("Math.atan2(Infinity, -Infinity) === 3 * Math.PI / 4 ? 1 : 0")
+  |> should.equal(1.0)
+  num("Math.atan2(-Infinity, Infinity) === -Math.PI / 4 ? 1 : 0")
+  |> should.equal(1.0)
+  num("Math.atan2(-Infinity, -Infinity) === -3 * Math.PI / 4 ? 1 : 0")
+  |> should.equal(1.0)
+  // NaN in either argument → NaN.
+  num("Number.isNaN(Math.atan2(NaN, 1)) ? 1 : 0") |> should.equal(1.0)
+  num("Number.isNaN(Math.atan2(1, NaN)) ? 1 : 0") |> should.equal(1.0)
+}
+
 pub fn math_hyperbolic_test() {
   // ES2015 hyperbolics and inverses.
   num("Math.sinh(0)") |> should.equal(0.0)
