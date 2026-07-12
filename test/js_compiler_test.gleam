@@ -1951,6 +1951,22 @@ pub fn generator_drive_to_done_test() {
   to_float(call(m, "f", [])) |> should.equal(10.0)
 }
 
+pub fn generator_loop_invariant_local_test() {
+  // A generator whose loop body reads a local assigned BEFORE the loop and never
+  // re-assigned inside it must still see that value on every iteration. Regression
+  // against a state-machine bug where such a loop-INVARIANT local was dropped
+  // across the flattened loop's back-edge (the loop only carried mutated locals),
+  // so the generator hung. Locals now round-trip through `%ctx` on every state
+  // transition, so an invariant local survives.
+  let m =
+    compile(
+      "function* g(n) { let step = 2; for (let i = 0; i < n; i++) yield i * step; } "
+      <> "function f() { let it = g(4); return it.next().value * 1000 + it.next().value * 100 + it.next().value * 10 + it.next().value; }",
+    )
+  // yields 0, 2, 4, 6 → 0*1000 + 2*100 + 4*10 + 6 = 246
+  to_float(call(m, "f", [])) |> should.equal(246.0)
+}
+
 pub fn generator_for_of_test() {
   // for-of iterates a finite generator, draining it element by element.
   let m =

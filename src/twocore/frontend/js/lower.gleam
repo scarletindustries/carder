@@ -1000,29 +1000,42 @@ fn gen_done_ret(
   ])
 }
 
-/// A goto: `%ctx["@@state"] = n; continue;` (re-enter the while/switch).
-fn gen_goto(n: Int) -> List(ast.Statement) {
-  [gen_assign(gen_state(), gen_num(n)), ast.ContinueStatement(label: None)]
+/// A goto: `<save locals>; %ctx["@@state"] = n; continue;` (re-enter the
+/// while/switch). Locals are saved to `%ctx` before the jump because each loop
+/// iteration RELOADS them from `%ctx` (see `gen_wrap`) — that is how a local
+/// written in one state reaches a later state across the loop's back-edge, even a
+/// loop-invariant one the JS-level loop lowering would not carry.
+fn gen_goto(n: Int, locals: List(String)) -> List(ast.Statement) {
+  list.flatten([
+    gen_saves(locals),
+    [gen_assign(gen_state(), gen_num(n)), ast.ContinueStatement(label: None)],
+  ])
 }
 
-/// A conditional goto: `%ctx["@@state"] = c ? then : else; continue;`.
+/// A conditional goto: `<save locals>; %ctx["@@state"] = c ? then : else;
+/// continue;`. Saves locals first for the same reason as `gen_goto`; `c` reads the
+/// live local vars (identical to what was just saved).
 fn gen_cond_goto(
   c: ast.Expression,
   then_l: Int,
   else_l: Int,
+  locals: List(String),
 ) -> List(ast.Statement) {
-  [
-    gen_assign(
-      gen_state(),
-      ast.ConditionalExpression(
-        span: gen_sp(),
-        condition: c,
-        consequent: gen_num(then_l),
-        alternate: gen_num(else_l),
+  list.flatten([
+    gen_saves(locals),
+    [
+      gen_assign(
+        gen_state(),
+        ast.ConditionalExpression(
+          span: gen_sp(),
+          condition: c,
+          consequent: gen_num(then_l),
+          alternate: gen_num(else_l),
+        ),
       ),
-    ),
-    ast.ContinueStatement(label: None),
-  ]
+      ast.ContinueStatement(label: None),
+    ],
+  ])
 }
 
 /// A loop/if condition must be yield-free (a yield in it is not yet handled).
@@ -1112,7 +1125,12 @@ fn gen_process(
     }
   }
   case stmts {
-    [] -> Ok(gen_add(entry, list.append(list.reverse(acc), gen_goto(next)), st))
+    [] ->
+      Ok(gen_add(
+        entry,
+        list.append(list.reverse(acc), gen_goto(next, locals)),
+        st,
+      ))
     [s, ..rest] ->
       case s {
         // `yield e;`
@@ -1192,9 +1210,17 @@ fn gen_process(
           }
         // break / continue → goto the loop's exit/head; rest is dead.
         ast.BreakStatement(label: None) ->
-          Ok(gen_add(entry, list.append(list.reverse(acc), gen_goto(brk)), st))
+          Ok(gen_add(
+            entry,
+            list.append(list.reverse(acc), gen_goto(brk, locals)),
+            st,
+          ))
         ast.ContinueStatement(label: None) ->
-          Ok(gen_add(entry, list.append(list.reverse(acc), gen_goto(cont)), st))
+          Ok(gen_add(
+            entry,
+            list.append(list.reverse(acc), gen_goto(cont, locals)),
+            st,
+          ))
         ast.BreakStatement(label: Some(_))
         | ast.ContinueStatement(label: Some(_)) ->
           Error(Unsupported("generator: labeled break/continue"))
@@ -1350,7 +1376,7 @@ fn gen_emit_if(
   let st =
     gen_add(
       entry,
-      list.append(list.reverse(acc), gen_cond_goto(c, t_entry, e_entry)),
+      list.append(list.reverse(acc), gen_cond_goto(c, t_entry, e_entry, locals)),
       st,
     )
   gen_process(rest, after, [], next, brk, cont, locals, st)
@@ -1380,8 +1406,9 @@ fn gen_emit_while(
     locals,
     st,
   ))
-  let st = gen_add(head, gen_cond_goto(c, body_entry, after), st)
-  let st = gen_add(entry, list.append(list.reverse(acc), gen_goto(head)), st)
+  let st = gen_add(head, gen_cond_goto(c, body_entry, after, locals), st)
+  let st =
+    gen_add(entry, list.append(list.reverse(acc), gen_goto(head, locals)), st)
   gen_process(rest, after, [], next, brk, cont, locals, st)
 }
 
@@ -1409,7 +1436,7 @@ fn gen_emit_for(
     Some(u) -> [ast.ExpressionStatement(expression: u, directive: None)]
     None -> []
   }
-  let st = gen_add(step_l, list.append(upd_stmts, gen_goto(head)), st)
+  let st = gen_add(step_l, list.append(upd_stmts, gen_goto(head, locals)), st)
   // body: break → after, continue → the update step.
   use #(body_entry, st) <- result_try(gen_build(
     block_stmts(body),
@@ -1419,7 +1446,7 @@ fn gen_emit_for(
     locals,
     st,
   ))
-  let st = gen_add(head, gen_cond_goto(cond, body_entry, after), st)
+  let st = gen_add(head, gen_cond_goto(cond, body_entry, after, locals), st)
   // entry case: run the init, then enter the loop head.
   let st =
     gen_add(
@@ -1427,7 +1454,7 @@ fn gen_emit_for(
       list.flatten([
         list.reverse(acc),
         for_init_stmts(init),
-        gen_goto(head),
+        gen_goto(head, locals),
       ]),
       st,
     )
@@ -1470,10 +1497,17 @@ fn gen_wrap(
       discriminant: gen_state(),
       cases: list.append(user_cases, [done_case]),
     )
+  // The load runs at the TOP OF EACH ITERATION (not once at step entry): every
+  // state saves the locals it touches back to `%ctx` before its goto/yield, so
+  // re-loading here threads all locals across state transitions through `%ctx` —
+  // including loop-invariant locals the JS-level loop lowering would not carry.
   let while_ =
     ast.WhileStatement(
       condition: ast.BooleanLiteral(span: sp, value: True),
-      body: ast.BlockStatement(body: [gen_wrap_stmt(switch)]),
+      body: ast.BlockStatement(body: [
+        gen_wrap_stmt(load),
+        gen_wrap_stmt(switch),
+      ]),
     )
   let step_fn =
     ast.FunctionExpression(
@@ -1481,10 +1515,7 @@ fn gen_wrap(
       name: None,
       name_span: None,
       params: [ast.IdentifierPattern(name: gen_sent, span: sp)],
-      body: ast.BlockStatement(body: [
-        gen_wrap_stmt(load),
-        gen_wrap_stmt(while_),
-      ]),
+      body: ast.BlockStatement(body: [gen_wrap_stmt(while_)]),
       is_generator: False,
       is_async: False,
     )
