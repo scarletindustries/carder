@@ -425,6 +425,82 @@ pub fn array_typeof_and_string_test() {
   call(s, "f", []) |> should.equal(dyn(<<"1,2,3">>))
 }
 
+// ── closures / first-class functions ─────────────────────────────────────────
+
+pub fn arrow_no_capture_test() {
+  let m = compile("function f() { let g = x => x * 2; return g(21); }")
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
+pub fn function_expression_test() {
+  let m =
+    compile(
+      "function f() { let add = function(a, b) { return a + b; }; return add(3, 4); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+}
+
+pub fn arrow_capture_test() {
+  // captures the immutable parameter `n`
+  let m = compile("function f(n) { let g = x => x + n; return g(10); }")
+  to_float(call(m, "f", [dyn(5)])) |> should.equal(15.0)
+}
+
+pub fn higher_order_test() {
+  // pass a closure to another function that applies it twice
+  let m =
+    compile(
+      "function twice(f, x) { return f(f(x)); } function run() { return twice(n => n + 3, 10); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(16.0)
+}
+
+pub fn iife_test() {
+  let m = compile("function f() { return (x => x + 1)(41); }")
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
+pub fn returned_closure_test() {
+  // `adder` returns a closure capturing its parameter
+  let m =
+    compile(
+      "function adder(n) { return x => x + n; } function run() { let add5 = adder(5); return add5(10); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(15.0)
+}
+
+pub fn nested_closure_test() {
+  // curried: f(1)(2)(3) === 6
+  let m =
+    compile(
+      "function f(a) { return b => (c => a + b + c); } function run() { return f(1)(2)(3); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(6.0)
+}
+
+pub fn closure_over_mutable_object_test() {
+  // capturing an array (a stable ref) is fine — the ref is shared, so pushes through
+  // the closure are visible. Only reassigning a captured VARIABLE is rejected.
+  let m =
+    compile(
+      "function f() { let acc = []; let add = x => acc.push(x); add(1); add(2); add(3); return acc.length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
+pub fn closure_rejects_reassigned_capture_test() {
+  // value-capture of a reassigned variable would be unsound, so it is rejected.
+  let r =
+    js.compile_and_load(
+      "function f() { let n = 0; let g = () => n; n = 5; return g(); }",
+      "twocore@jstest@rej" <> int.to_string(int_abs(unique())),
+    )
+  case r {
+    Error(_) -> Nil
+    Ok(_) -> panic as "expected closure over reassigned variable to be rejected"
+  }
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

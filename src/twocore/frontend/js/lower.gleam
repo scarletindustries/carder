@@ -18,13 +18,14 @@
 //// `- + ! ~ typeof void`, `?:`; `let/const/var`, `= += -= *= /= %= &= |= ^= <<= >>=
 //// >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`, `break/continue`,
 //// `return`, blocks; objects `{}` with `.prop`/`[k]` get/set; arrays `[…]` with
-//// indexing, `.length`, `.push`/`.pop`; `console.log`. Control flow threads mutated
-//// variables as loop-carried params / phi-merged `If` results.
+//// indexing, `.length`, `.push`/`.pop`; first-class functions — function expressions,
+//// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
+//// Control flow threads mutated variables as loop-carried params / phi-merged `If`s.
 ////
-//// Not yet (a clean `Unsupported` error / panic): first-class functions & closures,
-//// classes, `try/catch/throw`, `switch`, `for-in/of`, regex, most String/Array/Math
-//// builtins, and `continue` inside a `do/while`. Scope is one flat function scope per
-//// JS function (block-scoped `let` is treated as function-scoped).
+//// Not yet (a clean `Unsupported` error / panic): classes, `try/catch/throw`,
+//// `switch`, `for-in/of`, regex, most String/Array/Math builtins, and `continue`
+//// inside a `do/while`. Scope is one flat function scope per JS function (block-scoped
+//// `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -38,6 +39,10 @@
 ////   * A POSTFIX `x++`/`x--` yields the NEW value (not the pre-increment value) when its
 ////     result is used inside a larger expression. As a statement or a `for` update — where
 ////     the value is discarded — it is exact.
+////   * Closures capture enclosing variables BY VALUE (a snapshot at creation). Capturing a
+////     variable that is REASSIGNED in its scope (or by the closure) is rejected with a typed
+////     error rather than silently diverging from JS's capture-by-reference; capturing a
+////     mutable OBJECT/array is fine (the shared reference is what's captured).
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -74,10 +79,30 @@ type Loop {
 type Bind =
   #(String, ir.Expr)
 
-/// Immutable per-function context: the set of top-level function names (a call to
-/// one is a `CallDirect`) and the current loop, if any.
+/// A lifted function/arrow expression: its generated IR name, parameter names, body
+/// (normalised to a statement list), and the enclosing-scope variables it captures
+/// (in the order they become the IR function's LEADING parameters, per `MakeClosure`).
+type Lambda {
+  Lambda(
+    name: String,
+    params: List(String),
+    body: List(ast.Statement),
+    captures: List(String),
+  )
+}
+
+/// Immutable per-function context: the set of top-level function names (a call to one
+/// is a `CallDirect`); the current loop, if any; every lifted lambda keyed by its
+/// source span (so an arrow/function-expression node lowers to a `MakeClosure` of its
+/// lifted function); and the set of variables reassigned in the CURRENT function scope
+/// (a closure that captures one of these by value would be unsound, so it is rejected).
 type Ctx {
-  Ctx(funcs: List(String), loop: Option(Loop))
+  Ctx(
+    funcs: List(String),
+    loop: Option(Loop),
+    lambdas: Dict(ast.Span, Lambda),
+    scope_mutated: List(String),
+  )
 }
 
 // ── entry ───────────────────────────────────────────────────────────────────
@@ -96,7 +121,19 @@ pub fn program(
   let decls = list.filter_map(stmts, as_function_decl)
   let fn_names = list.map(decls, fn(d) { d.0 })
   let top = list.filter(stmts, fn(s) { as_function_decl(s) == Error(Nil) })
-  let ctx = Ctx(funcs: fn_names, loop: None)
+
+  // Pre-pass: lift every function/arrow expression (in top-level code AND inside the
+  // declared functions) to a named IR function, keyed by span, with its captures.
+  let scan =
+    list.append(
+      top,
+      list.flat_map(decls, fn(d) {
+        let #(_, _, body) = d
+        block_stmts(body)
+      }),
+    )
+  use lambdas <- result_try(collect_lambdas(scan, fn_names))
+  let ctx = Ctx(funcs: fn_names, loop: None, lambdas:, scope_mutated: [])
 
   use funcs <- result_try(
     list.try_map(decls, fn(d) {
@@ -105,8 +142,13 @@ pub fn program(
     }),
   )
   use main <- result_try(lower_main(top, ctx))
+  use lambda_funcs <- result_try(
+    list.try_map(dict.values(lambdas), fn(lam) { lower_lambda(lam, ctx) }),
+  )
 
-  let functions = [main, ..funcs]
+  // The named JS functions (exported) plus the internal lifted lambdas (not exported).
+  let named = [main, ..funcs]
+  let functions = list.append(named, lambda_funcs)
   Ok(
     ir.Module(
       name: module_name,
@@ -115,7 +157,7 @@ pub fn program(
       globals: [],
       imports: [],
       functions: functions,
-      exports: list.map(functions, fn(f) { ir.ExportFn(f.name, f.name) }),
+      exports: list.map(named, fn(f) { ir.ExportFn(f.name, f.name) }),
       data_segments: [],
       tables: [],
       elements: [],
@@ -141,27 +183,15 @@ fn lower_function(
   body: ast.Statement,
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  use param_names <- result_try(
-    list.try_map(params, fn(p) {
-      case p {
-        ast.IdentifierPattern(name: n, ..) -> Ok(n)
-        _ -> Error(Unsupported("non-identifier parameter pattern"))
-      }
-    }),
-  )
+  use pnames <- result_try(param_names(params))
   let env =
-    list.fold(param_names, dict.new(), fn(acc, n) {
-      dict.insert(acc, n, ir.Var(n))
-    })
-  use #(body_expr, _ctr) <- result_try(lower_body(
-    block_stmts(body),
-    env,
-    ctx,
-    0,
-  ))
+    list.fold(pnames, dict.new(), fn(acc, n) { dict.insert(acc, n, ir.Var(n)) })
+  let stmts = block_stmts(body)
+  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
+  use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
   Ok(ir.Function(
     name: name,
-    params: list.map(param_names, fn(n) { ir.Local(n, ir.TTerm) }),
+    params: list.map(pnames, fn(n) { ir.Local(n, ir.TTerm) }),
     result: [ir.TTerm],
     locals: [],
     body: body_expr,
@@ -172,7 +202,8 @@ fn lower_main(
   stmts: List(ast.Statement),
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  use #(body, _ctr) <- result_try(lower_body(stmts, dict.new(), ctx, 0))
+  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
+  use #(body, _ctr) <- result_try(lower_body(stmts, dict.new(), ctx2, 0))
   Ok(ir.Function(
     name: "main",
     params: [],
@@ -752,6 +783,8 @@ fn lower_expr(
     ast.ObjectExpression(properties:, ..) ->
       lower_object(properties, env, ctx, ctr)
     ast.ArrayExpression(elements:, ..) -> lower_array(elements, env, ctx, ctr)
+    ast.FunctionExpression(span:, ..) -> lower_closure(span, env, ctx, ctr)
+    ast.ArrowFunctionExpression(span:, ..) -> lower_closure(span, env, ctx, ctr)
 
     _ -> Error(Unsupported("expression: " <> string_tag_expr(e)))
   }
@@ -1271,7 +1304,13 @@ fn lower_call(
             Error(_) -> Error(Unsupported("call to unknown '" <> fname <> "'"))
           }
       }
-    _ -> Error(Unsupported("call of a computed/other callee"))
+    // any other callee: evaluate it to a function value and apply it — IIFEs
+    // `(x => x)(5)`, a returned/stored closure, `getFn()(…)`, etc.
+    _ -> {
+      use #(bc, fv, ctr) <- result_try(lower_expr(callee, env, ctx, ctr))
+      use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+      Ok(bind_after(list.append(bc, ba), ir.CallClosure(fv, argvals), ctr))
+    }
   }
 }
 
@@ -1585,6 +1624,307 @@ fn assigned_of_expr(e: ast.Expression) -> List(String) {
     ast.SequenceExpression(expressions:, ..) ->
       list.flat_map(expressions, assigned_of_expr)
     _ -> []
+  }
+}
+
+// ── closures: lambda collection + free-variable (capture) analysis ────────────
+
+/// A function/arrow expression discovered by the pre-pass, before naming/capture
+/// resolution: its source span and its parameter patterns + normalised body.
+type RawLambda {
+  RawLambda(
+    span: ast.Span,
+    params: List(ast.Pattern),
+    body: List(ast.Statement),
+  )
+}
+
+/// Normalise an arrow body to a statement list: an expression body `x => e` becomes
+/// `{ return e; }`; a block body is its statements.
+fn arrow_body_stmts(body: ast.ArrowBody) -> List(ast.Statement) {
+  case body {
+    ast.ArrowBodyExpression(e) -> [ast.ReturnStatement(argument: Some(e))]
+    ast.ArrowBodyBlock(s) -> block_stmts(s)
+  }
+}
+
+/// Parameter identifier names, skipping non-identifier patterns (used only by the
+/// capture analysis, which tolerates unsupported params — lowering rejects them).
+fn pattern_names_lax(params: List(ast.Pattern)) -> List(String) {
+  list.filter_map(params, fn(p) {
+    case p {
+      ast.IdentifierPattern(name:, ..) -> Ok(name)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// Strict parameter names for lowering: every parameter must be a plain identifier.
+fn param_names(params: List(ast.Pattern)) -> Result(List(String), Error) {
+  list.try_map(params, fn(p) {
+    case p {
+      ast.IdentifierPattern(name:, ..) -> Ok(name)
+      _ -> Error(Unsupported("non-identifier parameter pattern"))
+    }
+  })
+}
+
+/// The immediate child value-expressions of `e` — the operands that are evaluated.
+/// A non-computed member/object property NAME is not a child (it is not a variable
+/// read), and a nested function/arrow is handled by the caller (a separate scope).
+fn child_exprs(e: ast.Expression) -> List(ast.Expression) {
+  case e {
+    ast.BinaryExpression(left:, right:, ..) -> [left, right]
+    ast.LogicalExpression(left:, right:, ..) -> [left, right]
+    ast.UnaryExpression(argument:, ..) -> [argument]
+    ast.UpdateExpression(argument:, ..) -> [argument]
+    ast.AssignmentExpression(left:, right:, ..) -> [left, right]
+    ast.ConditionalExpression(condition:, consequent:, alternate:, ..) -> [
+      condition,
+      consequent,
+      alternate,
+    ]
+    ast.CallExpression(callee:, arguments:, ..) -> [callee, ..arguments]
+    ast.MemberExpression(object:, property:, computed:, ..) ->
+      case computed {
+        True -> [object, property]
+        False -> [object]
+      }
+    ast.ObjectExpression(properties:, ..) ->
+      list.flat_map(properties, fn(p) {
+        case p {
+          ast.Property(key:, value:, computed: True, ..) -> [key, value]
+          ast.Property(value:, ..) -> [value]
+          _ -> []
+        }
+      })
+    ast.ArrayExpression(elements:, ..) ->
+      list.filter_map(elements, option.to_result(_, Nil))
+    ast.SequenceExpression(expressions:, ..) -> expressions
+    ast.TemplateLiteral(expressions:, ..) -> expressions
+    ast.ParenthesizedExpression(expression:, ..) -> [expression]
+    _ -> []
+  }
+}
+
+/// The identifiers READ by expression `e` (i.e. free in `e`). A nested lambda
+/// contributes ITS free variables, not its internal reads (a separate scope).
+fn reads(e: ast.Expression) -> List(String) {
+  case e {
+    ast.Identifier(name:, ..) -> [name]
+    ast.ArrowFunctionExpression(params:, body:, ..) ->
+      fv_lambda(pattern_names_lax(params), arrow_body_stmts(body))
+    ast.FunctionExpression(params:, body:, ..) ->
+      fv_lambda(pattern_names_lax(params), block_stmts(body))
+    _ -> list.flat_map(child_exprs(e), reads)
+  }
+}
+
+/// Expressions directly evaluated by a statement (NOT its nested statements).
+fn stmt_exprs(s: ast.Statement) -> List(ast.Expression) {
+  case s {
+    ast.ExpressionStatement(expression:, ..) -> [expression]
+    ast.ReturnStatement(argument: Some(e)) -> [e]
+    ast.VariableDeclaration(declarations:, ..) ->
+      list.filter_map(declarations, fn(d) { option.to_result(d.init, Nil) })
+    ast.IfStatement(condition:, ..) -> [condition]
+    ast.WhileStatement(condition:, ..) -> [condition]
+    ast.DoWhileStatement(condition:, ..) -> [condition]
+    ast.ThrowStatement(argument:) -> [argument]
+    ast.ForStatement(init:, condition:, update:, ..) ->
+      list.flatten([
+        for_init_exprs(init),
+        option.values([condition]),
+        option.values([update]),
+      ])
+    _ -> []
+  }
+}
+
+/// Nested statements inside a statement (block body, branch arms, loop body).
+fn child_stmts(s: ast.Statement) -> List(ast.Statement) {
+  case s {
+    ast.BlockStatement(..) -> block_stmts(s)
+    ast.IfStatement(consequent:, alternate:, ..) ->
+      list.append([consequent], option.values([alternate]))
+    ast.WhileStatement(body:, ..) -> [body]
+    ast.DoWhileStatement(body:, ..) -> [body]
+    ast.ForStatement(body:, ..) -> [body]
+    _ -> []
+  }
+}
+
+fn for_init_exprs(init: Option(ast.ForInit)) -> List(ast.Expression) {
+  case init {
+    Some(ast.ForInitExpression(e)) -> [e]
+    Some(ast.ForInitDeclaration(d)) -> stmt_exprs(d)
+    Some(ast.ForInitPattern(_)) -> []
+    None -> []
+  }
+}
+
+/// All identifiers read anywhere in a statement list.
+fn reads_stmts(stmts: List(ast.Statement)) -> List(String) {
+  list.flat_map(stmts, fn(s) {
+    list.append(
+      list.flat_map(stmt_exprs(s), reads),
+      list.flat_map(child_stmts(s), fn(c) { reads_stmts([c]) }),
+    )
+  })
+}
+
+/// Variables DECLARED in a statement list (own scope: `let/const/var`, `for`-init
+/// declarations, nested function-declaration names). Does not descend into nested
+/// function/arrow expression bodies (those are separate scopes).
+fn declared_stmts(stmts: List(ast.Statement)) -> List(String) {
+  list.flat_map(stmts, declared_stmt)
+}
+
+fn declared_stmt(s: ast.Statement) -> List(String) {
+  let here = case s {
+    ast.VariableDeclaration(declarations:, ..) ->
+      list.filter_map(declarations, fn(d) {
+        case d.id {
+          ast.IdentifierPattern(name:, ..) -> Ok(name)
+          _ -> Error(Nil)
+        }
+      })
+    ast.FunctionDeclaration(name: Some(n), ..) -> [n]
+    ast.ForStatement(init: Some(ast.ForInitDeclaration(d)), ..) ->
+      declared_stmt(d)
+    _ -> []
+  }
+  list.append(here, list.flat_map(child_stmts(s), declared_stmt))
+}
+
+/// Free variables of a lambda body: identifiers read but not bound by the lambda's
+/// own parameters or locals. (Top-level function/global names are removed later, when
+/// captures are resolved, so this stays independent of the enclosing scope.)
+fn fv_lambda(params: List(String), body: List(ast.Statement)) -> List(String) {
+  reads_stmts(body)
+  |> list.unique
+  |> list.filter(fn(v) {
+    !list.contains(params, v) && !list.contains(declared_stmts(body), v)
+  })
+}
+
+/// The captured variables of a lambda: its free variables minus the globals
+/// (top-level function names), which are referenced directly rather than captured.
+fn lambda_captures(
+  params: List(String),
+  body: List(ast.Statement),
+  globals: List(String),
+) -> List(String) {
+  fv_lambda(params, body)
+  |> list.filter(fn(v) { !list.contains(globals, v) })
+}
+
+/// Every function/arrow expression anywhere in a statement list (including nested
+/// ones inside other lambdas), in source order.
+fn lambda_nodes_stmts(stmts: List(ast.Statement)) -> List(RawLambda) {
+  list.flat_map(stmts, fn(s) {
+    list.append(
+      list.flat_map(stmt_exprs(s), lambda_nodes_expr),
+      list.flat_map(child_stmts(s), fn(c) { lambda_nodes_stmts([c]) }),
+    )
+  })
+}
+
+fn lambda_nodes_expr(e: ast.Expression) -> List(RawLambda) {
+  case e {
+    ast.ArrowFunctionExpression(span:, params:, body:, ..) -> {
+      let stmts = arrow_body_stmts(body)
+      [RawLambda(span, params, stmts), ..lambda_nodes_stmts(stmts)]
+    }
+    ast.FunctionExpression(span:, params:, body:, ..) -> {
+      let stmts = block_stmts(body)
+      [RawLambda(span, params, stmts), ..lambda_nodes_stmts(stmts)]
+    }
+    _ -> list.flat_map(child_exprs(e), lambda_nodes_expr)
+  }
+}
+
+/// The pre-pass: assign each lambda a unique lifted name and resolve its captures,
+/// keyed by source span. `globals` are the top-level function names.
+fn collect_lambdas(
+  stmts: List(ast.Statement),
+  globals: List(String),
+) -> Result(Dict(ast.Span, Lambda), Error) {
+  let raws = lambda_nodes_stmts(stmts)
+  use #(lambdas, _) <- result_try(
+    list.try_fold(raws, #(dict.new(), 0), fn(acc, raw) {
+      let #(acc_lambdas, i) = acc
+      use pnames <- result_try(param_names(raw.params))
+      let name = "lambda$" <> int.to_string(i)
+      let caps = lambda_captures(pnames, raw.body, globals)
+      Ok(#(
+        dict.insert(acc_lambdas, raw.span, Lambda(name, pnames, raw.body, caps)),
+        i + 1,
+      ))
+    }),
+  )
+  Ok(lambdas)
+}
+
+/// Lower one lifted lambda to an IR function: its parameters are the captures FIRST
+/// (per `MakeClosure`), then the JS parameters, all bound in a fresh env.
+fn lower_lambda(lam: Lambda, ctx: Ctx) -> Result(ir.Function, Error) {
+  let all_params = list.append(lam.captures, lam.params)
+  let env =
+    list.fold(all_params, dict.new(), fn(acc, n) {
+      dict.insert(acc, n, ir.Var(n))
+    })
+  let ctx2 = Ctx(..ctx, loop: None, scope_mutated: assigned_in(lam.body))
+  use #(body_expr, _ctr) <- result_try(lower_body(lam.body, env, ctx2, 0))
+  Ok(ir.Function(
+    name: lam.name,
+    params: list.map(all_params, fn(n) { ir.Local(n, ir.TTerm) }),
+    result: [ir.TTerm],
+    locals: [],
+    body: body_expr,
+  ))
+}
+
+/// Lower a function/arrow expression to a `MakeClosure`: look up its lifted function
+/// by span, resolve each captured variable from the enclosing env, and reject a
+/// capture that is reassigned in scope (value-capture would be unsound — the shared
+/// binding requires a cell, not yet supported).
+fn lower_closure(
+  span: ast.Span,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case dict.get(ctx.lambdas, span) {
+    Error(Nil) -> Error(Unsupported("function expression (not collected)"))
+    Ok(lam) -> {
+      let mutated_captures =
+        list.filter(lam.captures, fn(c) {
+          list.contains(ctx.scope_mutated, c)
+          || list.contains(assigned_in(lam.body), c)
+        })
+      case mutated_captures {
+        [c, ..] ->
+          Error(Unsupported("closure over reassigned variable '" <> c <> "'"))
+        [] ->
+          case
+            list.try_map(lam.captures, fn(c) {
+              case dict.get(env, c) {
+                Ok(v) -> Ok(v)
+                Error(Nil) ->
+                  Error(Unsupported("closure capture of unbound '" <> c <> "'"))
+              }
+            })
+          {
+            Error(e) -> Error(e)
+            Ok(capture_vals) ->
+              Ok(bind1(
+                ir.MakeClosure(lam.name, capture_vals, list.length(lam.params)),
+                ctr,
+              ))
+          }
+      }
+    }
   }
 }
 
