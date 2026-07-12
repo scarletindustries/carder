@@ -1681,13 +1681,56 @@ fn lower_method(
   use #(bo, recv, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
   use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
   let pre = list.append(bo, ba)
-  case method {
-    "push" -> {
+  // A method call to `rt_js` op `name` applied to `[recv, ..extra]`.
+  let host = fn(name, extra) {
+    Ok(bind_after(pre, ir.CallHost("js", name, [recv, ..extra]), ctr))
+  }
+  case method, argvals {
+    // mutators / stack ops
+    "push", _ -> {
       let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
       Ok(bind_after(binds2, ir.CallHost("js", "array_push", [recv, listv]), ctr))
     }
-    "pop" -> Ok(bind_after(pre, ir.CallHost("js", "array_pop", [recv]), ctr))
-    _ -> Error(Unsupported("method ." <> method <> "()"))
+    "pop", _ -> host("array_pop", [])
+    "shift", _ -> host("array_shift", [])
+    "unshift", _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
+      Ok(bind_after(
+        binds2,
+        ir.CallHost("js", "array_unshift", [recv, listv]),
+        ctr,
+      ))
+    }
+    "reverse", _ -> host("array_reverse", [])
+    // iteration with a callback
+    "map", [f, ..] -> host("array_map", [f])
+    "filter", [f, ..] -> host("array_filter", [f])
+    "forEach", [f, ..] -> host("array_foreach", [f])
+    "some", [f, ..] -> host("array_some", [f])
+    "every", [f, ..] -> host("array_every", [f])
+    "find", [f, ..] -> host("array_find", [f])
+    "findIndex", [f, ..] -> host("array_find_index", [f])
+    "reduce", [f] -> host("array_reduce1", [f])
+    "reduce", [f, init, ..] -> host("array_reduce", [f, init])
+    "sort", [] -> host("array_sort", [undefined()])
+    "sort", [cmp, ..] -> host("array_sort", [cmp])
+    // queries
+    "indexOf", [x, ..] -> host("array_index_of", [x])
+    "includes", [x, ..] -> host("array_includes", [x])
+    "join", [] -> host("array_join", [ir.ConstBinary(<<",">>)])
+    "join", [sep, ..] -> host("array_join", [sep])
+    "slice", [] -> host("array_slice", [undefined(), undefined()])
+    "slice", [s] -> host("array_slice", [s, undefined()])
+    "slice", [s, e, ..] -> host("array_slice", [s, e])
+    "concat", _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
+      Ok(bind_after(
+        binds2,
+        ir.CallHost("js", "array_concat", [recv, listv]),
+        ctr,
+      ))
+    }
+    _, _ -> Error(Unsupported("method ." <> method <> "()"))
   }
 }
 

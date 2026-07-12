@@ -629,6 +629,85 @@ pub fn math_random_test() {
   call(m, "f", []) |> should.equal(dyn(True))
 }
 
+// ── array iteration methods ──────────────────────────────────────────────────
+
+pub fn array_map_filter_test() {
+  let m =
+    compile("function f() { return [1, 2, 3].map(x => x * 2).join(\",\"); }")
+  call(m, "f", []) |> should.equal(dyn(<<"2,4,6">>))
+  let g =
+    compile(
+      "function f() { return [1, 2, 3, 4].filter(x => x % 2 === 0).length; }",
+    )
+  to_float(call(g, "f", [])) |> should.equal(2.0)
+}
+
+pub fn array_reduce_test() {
+  num("[1, 2, 3, 4].reduce((a, b) => a + b, 0)") |> should.equal(10.0)
+  num("[1, 2, 3, 4].reduce((a, b) => a + b)") |> should.equal(10.0)
+  num("[1, 2, 3, 4].reduce((a, b) => a * b, 1)") |> should.equal(24.0)
+}
+
+pub fn array_query_test() {
+  num("[10, 20, 30].indexOf(20)") |> should.equal(1.0)
+  num("[10, 20, 30].indexOf(99)") |> should.equal(-1.0)
+  num("[1, 2, 3, 4].find(x => x > 2)") |> should.equal(3.0)
+  num("[1, 2, 3, 4].findIndex(x => x > 2)") |> should.equal(2.0)
+  let c = compile("function f() { return [1, 2, 3].includes(2); }")
+  call(c, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn array_some_every_test() {
+  let s = compile("function f() { return [1, 2, 3].some(x => x > 2); }")
+  call(s, "f", []) |> should.equal(dyn(True))
+  let e = compile("function f() { return [2, 4, 6].every(x => x % 2 === 0); }")
+  call(e, "f", []) |> should.equal(dyn(True))
+  let n = compile("function f() { return [1, 2, 3].every(x => x > 1); }")
+  call(n, "f", []) |> should.equal(dyn(False))
+}
+
+pub fn array_slice_join_test() {
+  let m =
+    compile("function f() { return [1, 2, 3, 4, 5].slice(1, 3).join(\",\"); }")
+  call(m, "f", []) |> should.equal(dyn(<<"2,3">>))
+  let neg =
+    compile("function f() { return [1, 2, 3, 4, 5].slice(-2).join(\",\"); }")
+  call(neg, "f", []) |> should.equal(dyn(<<"4,5">>))
+}
+
+pub fn array_concat_reverse_test() {
+  num("[1, 2].concat([3, 4], 5).length") |> should.equal(5.0)
+  num("[1, 2, 3].reverse()[0]") |> should.equal(3.0)
+}
+
+pub fn array_shift_unshift_test() {
+  let m =
+    compile(
+      "function f() { let a = [1, 2, 3]; let x = a.shift(); return x * 10 + a.length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+  let u = compile("function f() { let a = [2, 3]; a.unshift(1); return a[0]; }")
+  to_float(call(u, "f", [])) |> should.equal(1.0)
+}
+
+pub fn array_sort_test() {
+  // default sort is by string
+  let d = compile("function f() { return [3, 1, 2].sort().join(\",\"); }")
+  call(d, "f", []) |> should.equal(dyn(<<"1,2,3">>))
+  // numeric comparator
+  num("[3, 1, 2].sort((a, b) => a - b)[0]") |> should.equal(1.0)
+  num("[1, 2, 3].sort((a, b) => b - a)[0]") |> should.equal(3.0)
+}
+
+pub fn array_foreach_test() {
+  // forEach mutating a shared array is fine (variable-accumulation would be rejected)
+  let m =
+    compile(
+      "function f() { let out = []; [1, 2, 3].forEach(x => out.push(x * 10)); return out.length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

@@ -266,6 +266,82 @@ pub fn array_pop(arr: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "is_array")
 pub fn is_array(x: Dynamic) -> Int
 
+// Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
+// the JS callback with its own arity (extra/missing args tolerated).
+
+/// `arr.map(fn)` → a new array of `fn(x, i, arr)`.
+@external(erlang, "twocore_rt_js_ffi", "array_map")
+pub fn array_map(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.filter(fn)` → a new array of the elements where `fn(x, i, arr)` is truthy.
+@external(erlang, "twocore_rt_js_ffi", "array_filter")
+pub fn array_filter(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.forEach(fn)` — apply `fn(x, i, arr)` to each element; returns `undefined`.
+@external(erlang, "twocore_rt_js_ffi", "array_foreach")
+pub fn array_foreach(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.reduce(fn, init)` — left fold with `fn(acc, x, i, arr)`.
+@external(erlang, "twocore_rt_js_ffi", "array_reduce")
+pub fn array_reduce(arr: Dynamic, fn_: Dynamic, init: Dynamic) -> Dynamic
+
+/// `arr.reduce(fn)` — left fold seeded by the first element (empty → TypeError).
+@external(erlang, "twocore_rt_js_ffi", "array_reduce1")
+pub fn array_reduce1(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.some(fn)` → JS boolean: any element satisfies `fn`.
+@external(erlang, "twocore_rt_js_ffi", "array_some")
+pub fn array_some(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.every(fn)` → JS boolean: all elements satisfy `fn`.
+@external(erlang, "twocore_rt_js_ffi", "array_every")
+pub fn array_every(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.find(fn)` → the first element satisfying `fn`, else `undefined`.
+@external(erlang, "twocore_rt_js_ffi", "array_find")
+pub fn array_find(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.findIndex(fn)` → the first index satisfying `fn`, else `-1`.
+@external(erlang, "twocore_rt_js_ffi", "array_find_index")
+pub fn array_find_index(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.indexOf(x)` → the first strict-equal index, else `-1`.
+@external(erlang, "twocore_rt_js_ffi", "array_index_of")
+pub fn array_index_of(arr: Dynamic, x: Dynamic) -> Dynamic
+
+/// `arr.includes(x)` → JS boolean (strict equality).
+@external(erlang, "twocore_rt_js_ffi", "array_includes")
+pub fn array_includes(arr: Dynamic, x: Dynamic) -> Dynamic
+
+/// `arr.join(sep)` → the elements ToString'd and joined by `sep` (null/undefined → "").
+@external(erlang, "twocore_rt_js_ffi", "array_join")
+pub fn array_join(arr: Dynamic, sep: Dynamic) -> Dynamic
+
+/// `arr.slice(start, end)` → a shallow sub-array (negative indices count from the end;
+/// `undefined` bounds default to `0` / `length`).
+@external(erlang, "twocore_rt_js_ffi", "array_slice")
+pub fn array_slice(arr: Dynamic, start: Dynamic, end: Dynamic) -> Dynamic
+
+/// `arr.concat(...items)` → a new array; array items are spread, others appended.
+@external(erlang, "twocore_rt_js_ffi", "array_concat")
+pub fn array_concat(arr: Dynamic, items: Dynamic) -> Dynamic
+
+/// `arr.reverse()` — reverse in place; returns the array.
+@external(erlang, "twocore_rt_js_ffi", "array_reverse")
+pub fn array_reverse(arr: Dynamic) -> Dynamic
+
+/// `arr.shift()` — remove and return the first element (`undefined` when empty).
+@external(erlang, "twocore_rt_js_ffi", "array_shift")
+pub fn array_shift(arr: Dynamic) -> Dynamic
+
+/// `arr.unshift(...vals)` — prepend each; returns the new length.
+@external(erlang, "twocore_rt_js_ffi", "array_unshift")
+pub fn array_unshift(arr: Dynamic, vals: Dynamic) -> Dynamic
+
+/// `arr.sort(cmp)` — in place; default order is by ToString, else by the comparator.
+@external(erlang, "twocore_rt_js_ffi", "array_sort")
+pub fn array_sort(arr: Dynamic, cmp: Dynamic) -> Dynamic
+
 // ───────────────────────── lists / console / misc ─────────────────────────
 
 /// The empty BEAM list `[]` (arity 0) — the nil tail an args-cons-list build starts from.

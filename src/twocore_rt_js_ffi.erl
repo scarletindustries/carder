@@ -65,6 +65,11 @@
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1,
+    array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
+    array_reduce1/2, array_some/2, array_every/2, array_find/2,
+    array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
+    array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
+    array_unshift/2, array_sort/2,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -937,6 +942,214 @@ array_to_string(Len, Map) ->
 array_elem_str(undefined) -> <<>>;
 array_elem_str(null) -> <<>>;
 array_elem_str(V) -> to_string(V).
+
+%% ── array iteration methods ──────────────────────────────
+%% These take a JS callback (a BEAM fun from MakeClosure). JS callbacks tolerate
+%% extra/missing arguments, but BEAM funs are arity-strict, so `call_cb` applies the
+%% fun with EXACTLY its own arity (padding with `undefined`), letting `x => …`,
+%% `(x, i) => …`, and `(x, i, arr) => …` all work.
+
+%% The array cell's `{Length, Map}`; a non-array is a type_error.
+arr_content(Recv) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, Len, Map} -> {Len, Map};
+        _ -> type_error(Recv)
+    end;
+arr_content(Recv) ->
+    type_error(Recv).
+
+%% Ordered element list.
+arr_list(0, _Map) -> [];
+arr_list(Len, Map) -> [maps:get(I, Map, undefined) || I <- lists:seq(0, Len - 1)].
+
+%% Store an element list back into `Recv`, returning `Recv`.
+arr_store(Recv, List) ->
+    {Len, Map} =
+        lists:foldl(fun(V, {I, M}) -> {I + 1, maps:put(I, V, M)} end, {0, #{}}, List),
+    erlang:put(?CELL_KEY(Recv), {js_array, Len, Map}),
+    Recv.
+
+%% Apply a JS callback with its own arity (pad missing args with `undefined`).
+call_cb(Fn, Args) ->
+    {arity, A} = erlang:fun_info(Fn, arity),
+    Padded = Args ++ lists:duplicate(max(0, A - length(Args)), undefined),
+    erlang:apply(Fn, lists:sublist(Padded, A)).
+
+array_map(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(amap(Fn, Recv, arr_list(Len, Map), 0)).
+amap(_, _, [], _) -> [];
+amap(Fn, Arr, [X | Xs], I) -> [call_cb(Fn, [X, I, Arr]) | amap(Fn, Arr, Xs, I + 1)].
+
+array_filter(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(afilter(Fn, Recv, arr_list(Len, Map), 0)).
+afilter(_, _, [], _) -> [];
+afilter(Fn, Arr, [X | Xs], I) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        1 -> [X | afilter(Fn, Arr, Xs, I + 1)];
+        0 -> afilter(Fn, Arr, Xs, I + 1)
+    end.
+
+array_foreach(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    aforeach(Fn, Recv, arr_list(Len, Map), 0),
+    undefined.
+aforeach(_, _, [], _) -> ok;
+aforeach(Fn, Arr, [X | Xs], I) ->
+    call_cb(Fn, [X, I, Arr]),
+    aforeach(Fn, Arr, Xs, I + 1).
+
+%% reduce with an explicit initial accumulator.
+array_reduce(Recv, Fn, Init) ->
+    {Len, Map} = arr_content(Recv),
+    areduce(Fn, Recv, arr_list(Len, Map), 0, Init).
+areduce(_, _, [], _, Acc) -> Acc;
+areduce(Fn, Arr, [X | Xs], I, Acc) ->
+    areduce(Fn, Arr, Xs, I + 1, call_cb(Fn, [Acc, X, I, Arr])).
+
+%% reduce with no initial accumulator (first element seeds it; empty → TypeError).
+array_reduce1(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    case arr_list(Len, Map) of
+        [] -> type_error(Recv);
+        [First | Rest] -> areduce(Fn, Recv, Rest, 1, First)
+    end.
+
+array_some(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    asome(Fn, Recv, arr_list(Len, Map), 0).
+asome(_, _, [], _) -> false;
+asome(Fn, Arr, [X | Xs], I) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        1 -> true;
+        0 -> asome(Fn, Arr, Xs, I + 1)
+    end.
+
+array_every(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    aevery(Fn, Recv, arr_list(Len, Map), 0).
+aevery(_, _, [], _) -> true;
+aevery(Fn, Arr, [X | Xs], I) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        0 -> false;
+        1 -> aevery(Fn, Arr, Xs, I + 1)
+    end.
+
+array_find(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    afind(Fn, Recv, arr_list(Len, Map), 0).
+afind(_, _, [], _) -> undefined;
+afind(Fn, Arr, [X | Xs], I) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        1 -> X;
+        0 -> afind(Fn, Arr, Xs, I + 1)
+    end.
+
+array_find_index(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    afindi(Fn, Recv, arr_list(Len, Map), 0).
+afindi(_, _, [], _) -> -1;
+afindi(Fn, Arr, [X | Xs], I) ->
+    case truthy(call_cb(Fn, [X, I, Arr])) of
+        1 -> I;
+        0 -> afindi(Fn, Arr, Xs, I + 1)
+    end.
+
+%% ── array value methods ──────────────────────────────────
+
+array_index_of(Recv, X) ->
+    {Len, Map} = arr_content(Recv),
+    aidx(arr_list(Len, Map), 0, X).
+aidx([], _, _) -> -1;
+aidx([E | Es], I, X) ->
+    case strict_eq(E, X) of
+        1 -> I;
+        0 -> aidx(Es, I + 1, X)
+    end.
+
+%% includes → a JS boolean atom.
+array_includes(Recv, X) ->
+    array_index_of(Recv, X) =/= -1.
+
+array_join(Recv, Sep) ->
+    {Len, Map} = arr_content(Recv),
+    SepBin = to_string(Sep),
+    Parts = [array_elem_str(E) || E <- arr_list(Len, Map)],
+    iolist_to_binary(lists:join(SepBin, Parts)).
+
+%% slice(start?, end?) with negative-from-end indices; `undefined` = defaulted.
+array_slice(Recv, Start, End) ->
+    {Len, Map} = arr_content(Recv),
+    S = slice_index(Start, Len, 0),
+    E = slice_index(End, Len, Len),
+    new_array(lists:sublist(arr_list(Len, Map), S + 1, max(0, E - S))).
+
+slice_index(undefined, _Len, Default) -> Default;
+slice_index(V, Len, _Default) ->
+    N =
+        case coerce_num(V) of
+            nan -> 0;
+            inf -> Len;
+            neg_inf -> 0;
+            Num -> trunc(as_float(Num))
+        end,
+    case N < 0 of
+        true -> max(Len + N, 0);
+        false -> min(N, Len)
+    end.
+
+%% concat(...items) — spreads array items, appends others as single elements.
+array_concat(Recv, Others) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(arr_list(Len, Map) ++ lists:flatmap(fun concat_part/1, Others)).
+concat_part(V) ->
+    case is_array(V) of
+        1 ->
+            {L, M} = arr_content(V),
+            arr_list(L, M);
+        0 ->
+            [V]
+    end.
+
+array_reverse(Recv) ->
+    {Len, Map} = arr_content(Recv),
+    arr_store(Recv, lists:reverse(arr_list(Len, Map))).
+
+array_shift(Recv) ->
+    {Len, Map} = arr_content(Recv),
+    case arr_list(Len, Map) of
+        [] ->
+            undefined;
+        [First | Rest] ->
+            arr_store(Recv, Rest),
+            First
+    end.
+
+array_unshift(Recv, Vals) ->
+    {Len, Map} = arr_content(Recv),
+    arr_store(Recv, Vals ++ arr_list(Len, Map)),
+    Len + length(Vals).
+
+%% sort(cmp?) — in place. Default order is by ToString (JS default); a comparator
+%% orders A before B when cmp(A, B) <= 0.
+array_sort(Recv, Cmp) ->
+    {Len, Map} = arr_content(Recv),
+    L = arr_list(Len, Map),
+    Sorted =
+        case Cmp of
+            undefined -> lists:sort(fun(A, B) -> to_string(A) =< to_string(B) end, L);
+            _ -> lists:sort(fun(A, B) -> sort_lte(call_cb(Cmp, [A, B])) end, L)
+        end,
+    arr_store(Recv, Sorted).
+
+sort_lte(V) ->
+    case coerce_num(V) of
+        nan -> true;
+        neg_inf -> true;
+        inf -> false;
+        N -> N =< 0
+    end.
 
 %% ───────────────────────── lists / console / misc ─────────────────────────
 
