@@ -3452,7 +3452,8 @@ fn lower_static_call(
     "Number", "parseFloat", [s, ..] -> host("parse_float", [s])
     "JSON", "stringify", [v, ..] -> host("json_stringify", [v])
     "JSON", "parse", [s, ..] -> host("json_parse", [s])
-    "Array", "from", [x, ..] -> host("array_from", [x])
+    "Array", "from", [x] -> host("array_from", [x])
+    "Array", "from", [x, mapfn, ..] -> host("array_from_map", [x, mapfn])
     "String", "fromCharCode", _ -> {
       let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
       Ok(bind_after(

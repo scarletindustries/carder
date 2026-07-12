@@ -322,6 +322,10 @@ pub fn array_to_list(arr: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_from")
 pub fn array_from(x: Dynamic) -> Dynamic
 
+/// `Array.from(x, mapFn)` — array_from then mapFn(element, index) per element.
+@external(erlang, "twocore_rt_js_ffi", "array_from_map")
+pub fn array_from_map(x: Dynamic, map_fn: Dynamic) -> Dynamic
+
 /// `arr.flat()` — flatten one level.
 @external(erlang, "twocore_rt_js_ffi", "array_flat")
 pub fn array_flat(arr: Dynamic) -> Dynamic

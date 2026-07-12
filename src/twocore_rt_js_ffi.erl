@@ -66,7 +66,7 @@
     new_object/0, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
-    array_from/1, array_flat/1, array_fill/2, array_at/2,
+    array_from/1, array_from_map/2, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
@@ -1104,6 +1104,15 @@ array_from(X) when is_binary(X) ->
     new_array([from_cps([C]) || C <- cps(X)]);
 array_from(_X) ->
     new_array([]).
+
+%% Array.from(x, mapFn) — like array_from, then apply mapFn(element, index) to
+%% each element (§23.1.2.1 step 7).
+array_from_map(X, Fn) ->
+    {Len, Map} = arr_content(array_from(X)),
+    new_array(amap_from(Fn, arr_list(Len, Map), 0)).
+
+amap_from(_Fn, [], _I) -> [];
+amap_from(Fn, [E | Es], I) -> [call_cb(Fn, [E, I]) | amap_from(Fn, Es, I + 1)].
 
 %% arr.flat() — flatten one level (array elements are spread in).
 array_flat(Recv) ->

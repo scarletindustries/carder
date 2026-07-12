@@ -4212,6 +4212,7 @@ fn resolve_js(op: String) -> Option(String) {
     "fit_list" -> Some("fit_list")
     "array_to_list" -> Some("array_to_list")
     "array_from" -> Some("array_from")
+    "array_from_map" -> Some("array_from_map")
     "array_flat" -> Some("array_flat")
     "array_fill" -> Some("array_fill")
     "array_at" -> Some("array_at")

@@ -1884,6 +1884,22 @@ pub fn object_rest_destructure_test() {
   |> should.equal(7.0)
 }
 
+pub fn array_from_map_test() {
+  // Array.from(x, mapFn) applies mapFn(element, index).
+  num(
+    "Array.from([1, 2, 3], function(x) { return x * 2; }).reduce(function(a, b) { return a + b; }, 0)",
+  )
+  |> should.equal(12.0)
+  // the index is passed as the second argument.
+  num(
+    "Array.from([10, 20], function(x, i) { return x + i; }).reduce(function(a, b) { return a + b; }, 0)",
+  )
+  |> should.equal(31.0)
+  // from a string with a map function.
+  val("Array.from(\"ab\", function(c) { return c.toUpperCase(); }).join(\"\")")
+  |> should.equal(dyn(<<"AB">>))
+}
+
 pub fn new_spread_test() {
   let cls =
     "class Point { constructor(x, y) { this.x = x; this.y = y; } sum() { return this.x + this.y; } } "
