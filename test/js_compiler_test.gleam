@@ -1570,6 +1570,52 @@ pub fn nested_destructure_test() {
   to_float(call(x, "f", [])) |> should.equal(30.0)
 }
 
+// ── lowering correctness (spec regressions) ─────────────────────────────────
+
+pub fn ssa_name_collision_test() {
+  // A user identifier shaped like a compiler temp (v0, v1, L0) must not be
+  // shadowed by a generated SSA temporary or label. Regression: a parameter
+  // named `v0` used to collapse into the first generated temp and return 2.
+  let a = compile("function f(v0) { return v0 + 1; }")
+  to_float(call(a, "f", [dyn(5)])) |> should.equal(6.0)
+
+  let b = compile("function f(v0, v1) { return v0 * v1; }")
+  to_float(call(b, "f", [dyn(3), dyn(4)])) |> should.equal(12.0)
+
+  // v0 stays live across many generated temps (each `+` mints a guard temp).
+  let c =
+    compile(
+      "function f(v0) { let s = 0; for (let i = 0; i < 4; i++) { s = s + v0; } return s; }",
+    )
+  to_float(call(c, "f", [dyn(2)])) |> should.equal(8.0)
+
+  // A user variable named like a label temp.
+  let d = compile("function f() { let L0 = 1; let L1 = 4; return L0 + L1; }")
+  to_float(call(d, "f", [])) |> should.equal(5.0)
+}
+
+pub fn super_method_arity_test() {
+  // super.pick(10) where the parent method takes (a, b): b defaults to undefined
+  // and is unused, so the result is 10. Regression: an under-applied super call
+  // used to fail to compile with an arity mismatch.
+  let m =
+    compile(
+      "class A { constructor() {} pick(a, b) { return a; } } "
+      <> "class B extends A { constructor() { super(); } pick() { return super.pick(10); } } "
+      <> "function f() { let b = new B(); return b.pick(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+
+  // Over-application: the extra arguments are dropped.
+  let n =
+    compile(
+      "class A { constructor() {} one(a) { return a; } } "
+      <> "class B extends A { constructor() { super(); } one() { return super.one(3, 9, 27); } } "
+      <> "function f() { let b = new B(); return b.one(); }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(3.0)
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {

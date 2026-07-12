@@ -794,7 +794,7 @@ fn desugar_destructure(
   ctr: Int,
 ) -> Result(#(List(ast.VariableDeclarator), Int), Error) {
   let sp = ast.Span(0, 0)
-  let tmp = "$d_" <> int.to_string(ctr)
+  let tmp = "%d_" <> int.to_string(ctr)
   let ctr = ctr + 1
   let d_id = ast.Identifier(span: sp, name: tmp)
   let temp =
@@ -1065,8 +1065,8 @@ fn lower_for_of(
 ) -> Result(#(ir.Expr, Int), Error) {
   use x_name <- result_try(for_of_var(left))
   let id = int.to_string(ctr)
-  let arr = "$of_arr_" <> id
-  let idx = "$of_idx_" <> id
+  let arr = "%of_arr_" <> id
+  let idx = "%of_idx_" <> id
   let sp = ast.Span(0, 0)
   let ident = fn(n) { ast.Identifier(span: sp, name: n) }
   let decl = fn(n, init) {
@@ -1234,9 +1234,9 @@ fn lower_switch(
   k: Cont,
 ) -> Result(#(ir.Expr, Int), Error) {
   let id = int.to_string(ctr)
-  let dv = "$sw_d_" <> id
-  let fell = "$sw_fell_" <> id
-  let any = "$sw_any_" <> id
+  let dv = "%sw_d_" <> id
+  let fell = "%sw_fell_" <> id
+  let any = "%sw_any_" <> id
   let sp = ast.Span(0, 0)
   let ident = fn(n) { ast.Identifier(span: sp, name: n) }
   let bool_lit = fn(b) { ast.BooleanLiteral(span: sp, value: b) }
@@ -1373,7 +1373,7 @@ fn lower_try(
     None, None -> Error(Unsupported("try without catch"))
     None, Some(ast.CatchClause(param:, body: cbody)) -> {
       use e_name <- result_try(case param {
-        None -> Ok("$exn")
+        None -> Ok("%exn")
         Some(ast.IdentifierPattern(name:, ..)) -> Ok(name)
         Some(_) -> Error(Unsupported("destructuring catch binding"))
       })
@@ -2458,19 +2458,45 @@ fn lower_super_call(
         None -> parent <> "$constructor"
         Some(m) -> parent <> "$" <> m
       }
-      // fit args to the target's arity (constructor arity is known; a method's is
-      // padded generously via the closure convention, so pass args through).
+      // Fit args to the target's declared arity: the lifted `parent$m` /
+      // `parent$constructor` takes exactly `this` plus its declared parameters,
+      // and `CallDirect` is arity-strict, so under-/over-applied `super` calls
+      // must be padded with `undefined` / truncated (JS defaults missing args to
+      // undefined). The method's param count comes from the parent's ClassInfo
+      // (walking the super chain for an inherited method).
       let target_args = case member {
         None ->
           case dict.get(ctx.classes, parent) {
             Ok(info) -> fit_args(argvals, info.ctor_arity)
             Error(Nil) -> argvals
           }
-        Some(_) -> argvals
+        Some(m) ->
+          case super_method_arity(ctx, parent, m) {
+            Some(n) -> fit_args(argvals, n)
+            None -> argvals
+          }
       }
       Ok(bind_after(ba, ir.CallDirect(fn_name, [this_v, ..target_args]), ctr))
     }
     _, _ -> Error(Unsupported("`super` outside a derived class method"))
+  }
+}
+
+/// The declared parameter count of method `method` as seen from class `class`,
+/// walking up the `extends` chain for an inherited method. `None` if no ancestor
+/// declares it. Used to arity-fit `super.method(...)` calls.
+fn super_method_arity(ctx: Ctx, class: String, method: String) -> Option(Int) {
+  case dict.get(ctx.classes, class) {
+    Ok(info) ->
+      case list.key_find(info.methods, method) {
+        Ok(n) -> Some(n)
+        Error(Nil) ->
+          case info.super_class {
+            Some(p) -> super_method_arity(ctx, p, method)
+            None -> None
+          }
+      }
+    Error(Nil) -> None
   }
 }
 
@@ -3882,8 +3908,17 @@ fn bind1(expr: ir.Expr, ctr: Int) -> #(List(Bind), ir.Value, Int) {
   bind_after([], expr, ctr)
 }
 
+/// Mint a fresh SSA temporary name from the counter `ctr`, returning the name
+/// and the advanced counter.
+///
+/// The `%` prefix is deliberate: `%` (byte 0x25) can never appear in a JS
+/// identifier, so a compiler temp can never collide with a user variable,
+/// parameter, capture, or loop-carried name (all of which enter the IR under
+/// their raw JS spelling). `core_printer.legalize_var` is injective per byte, so
+/// `%v0` legalizes to `V_25v0` — disjoint from a user `v0` (`Vv0`). Every
+/// synthetic *variable* name in this module carries a `%` for the same reason.
 fn fresh(ctr: Int) -> #(String, Int) {
-  #("v" <> int.to_string(ctr), ctr + 1)
+  #("%v" <> int.to_string(ctr), ctr + 1)
 }
 
 fn fresh_n(n: Int, ctr: Int) -> #(List(String), Int) {
@@ -3898,7 +3933,7 @@ fn fresh_n(n: Int, ctr: Int) -> #(List(String), Int) {
 }
 
 fn fresh_label(ctr: Int) -> #(String, Int) {
-  #("L" <> int.to_string(ctr), ctr + 1)
+  #("%L" <> int.to_string(ctr), ctr + 1)
 }
 
 fn result_try(r: Result(a, e), k: fn(a) -> Result(b, e)) -> Result(b, e) {
