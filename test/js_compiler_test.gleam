@@ -1884,6 +1884,25 @@ pub fn object_rest_destructure_test() {
   |> should.equal(7.0)
 }
 
+pub fn new_spread_test() {
+  let cls =
+    "class Point { constructor(x, y) { this.x = x; this.y = y; } sum() { return this.x + this.y; } } "
+  // new C(...args) spreads the array as constructor arguments.
+  let m =
+    compile(
+      cls
+      <> "function f() { let args = [3, 4]; let p = new Point(...args); return p.sum(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+  // mixed: new C(a, ...rest).
+  let n =
+    compile(
+      cls
+      <> "function f() { let rest = [10]; let p = new Point(1, ...rest); return p.sum(); }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(11.0)
+}
+
 pub fn try_finally_normal_test() {
   // finally runs on normal completion; its effect is visible afterward.
   num(

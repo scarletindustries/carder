@@ -33,7 +33,7 @@
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
 //// & fields, static methods, static fields (`static x = …`, read/written as
 //// `C.x`), instance getters/setters `get x()`/`set x(v)` (inherited and
-//// overridable), `new`, `this`, method calls, `extends`/`super`
+//// overridable), `new` (incl. `new C(...args)` spread), `this`, method calls, `extends`/`super`
 //// inheritance); `console.log`. Control flow threads mutated variables as loop-carried params /
 //// phi-merged `If`s.
 ////
@@ -3686,20 +3686,76 @@ fn lower_new(
                 #(b2, ctr)
               },
             )
-          use #(ba, argvals, ctr) <- result_try(lower_args(
-            arguments,
-            env,
-            ctx,
-            ctr,
-          ))
-          let fitted = fit_args(argvals, info.ctor_arity)
-          let #(binds2, _r, ctr) =
-            bind_after(
-              list.append(binds, ba),
-              ir.CallDirect(cname <> "$constructor", [this_v, ..fitted]),
-              ctr,
-            )
-          Ok(#(binds2, this_v, ctr))
+          let has_spread =
+            list.any(arguments, fn(a) {
+              case a {
+                ast.SpreadElement(..) -> True
+                _ -> False
+              }
+            })
+          case has_spread {
+            // `new C(a, b)` — the fixed-arity direct call.
+            False -> {
+              use #(ba, argvals, ctr) <- result_try(lower_args(
+                arguments,
+                env,
+                ctx,
+                ctr,
+              ))
+              let fitted = fit_args(argvals, info.ctor_arity)
+              let #(binds2, _r, ctr) =
+                bind_after(
+                  list.append(binds, ba),
+                  ir.CallDirect(cname <> "$constructor", [this_v, ..fitted]),
+                  ctr,
+                )
+              Ok(#(binds2, this_v, ctr))
+            }
+            // `new C(...args)` — build the args as an array, flatten to a list,
+            // fit it to the constructor's arity, prepend `this`, and apply the
+            // constructor as a closure.
+            True -> {
+              use #(barr, arr, ctr) <- result_try(lower_array(
+                list.map(arguments, Some),
+                env,
+                ctx,
+                ctr,
+              ))
+              let #(bl, listv, ctr) =
+                bind_after(
+                  list.append(binds, barr),
+                  ir.CallHost("js", "array_to_list", [arr]),
+                  ctr,
+                )
+              let #(bn, arityv, ctr) =
+                number_literal(int.to_float(info.ctor_arity), ctr)
+              let #(bf, fitted, ctr) =
+                bind_after(
+                  list.append(bl, bn),
+                  ir.CallHost("js", "fit_list", [listv, arityv]),
+                  ctr,
+                )
+              let #(bcons, full, ctr) =
+                bind_after(bf, ir.TermOp(ir.MakeCons, [this_v, fitted]), ctr)
+              let #(bclos, closure, ctr) =
+                bind_after(
+                  bcons,
+                  ir.MakeClosure(
+                    cname <> "$constructor",
+                    [],
+                    info.ctor_arity + 1,
+                  ),
+                  ctr,
+                )
+              let #(binds2, _r, ctr) =
+                bind_after(
+                  bclos,
+                  ir.CallHost("js", "apply_fn", [closure, full]),
+                  ctr,
+                )
+              Ok(#(binds2, this_v, ctr))
+            }
+          }
         }
       }
     _ -> Error(Unsupported("new of a non-identifier callee"))

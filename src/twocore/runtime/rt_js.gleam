@@ -309,6 +309,11 @@ pub fn array_spread_into(target: Dynamic, value: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "apply_fn")
 pub fn apply_fn(f: Dynamic, args: Dynamic) -> Dynamic
 
+/// Pad (with undefined) or truncate an argument list to exactly `n` elements, so a
+/// spread `new C(...args)` can call the fixed-arity constructor.
+@external(erlang, "twocore_rt_js_ffi", "fit_list")
+pub fn fit_list(args: Dynamic, n: Dynamic) -> Dynamic
+
 /// The array's elements as a plain BEAM list (behind spread into a variadic sink).
 @external(erlang, "twocore_rt_js_ffi", "array_to_list")
 pub fn array_to_list(arr: Dynamic) -> Dynamic

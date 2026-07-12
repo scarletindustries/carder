@@ -67,7 +67,7 @@
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
-    apply_fn/2, array_to_list/1,
+    apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
@@ -1478,6 +1478,12 @@ repl_scan(<<>>) -> [].
 %% `f(...args)`); arity-adaptive like a callback.
 apply_fn(F, Args) when is_function(F) -> call_cb(F, Args);
 apply_fn(F, _Args) -> not_callable(F).
+
+%% Pad (with `undefined`) or truncate an argument list to exactly N elements —
+%% so a runtime `new C(...args)` can call the fixed-arity `C$constructor`.
+fit_list(_L, N) when N =< 0 -> [];
+fit_list([], N) -> [undefined | fit_list([], N - 1)];
+fit_list([X | Xs], N) -> [X | fit_list(Xs, N - 1)].
 
 %% The array's elements as a plain Erlang list (behind call spread into a variadic
 %% sink like `console.log(...xs)` or building a spread argument list).
