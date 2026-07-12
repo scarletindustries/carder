@@ -2058,7 +2058,13 @@ to_string_dispatch(Recv) when is_reference(Recv) ->
 to_string_dispatch(Recv) ->
     to_string(Recv).
 
-%% num.toString(radix) — base-`radix` (2..36) integer string; else default ToString.
+%% num.toString(radix) — base-`radix` (2..36) string; radix 10 (or an out-of-range
+%% radix, which the spec would RangeError but this v1 tolerates) falls back to the
+%% default ToString. Integer-valued numbers render as the base-R integer whether
+%% they are held as an Erlang integer or an integral float (e.g. 510/2 = 255.0 →
+%% "ff", not the base-10 "255"); genuine fractions render "<int>.<frac>" with the
+%% fraction expanded digit by digit — terminating exactly for dyadic fractions
+%% (0.5 → "0.1") and bounded otherwise. NaN / ±Infinity stringify as usual.
 num_to_string_radix(N, Radix) ->
     R =
         case coerce_num(Radix) of
@@ -2071,11 +2077,54 @@ num_to_string_radix(N, Radix) ->
         true ->
             case coerce_num(N) of
                 Num when is_integer(Num) ->
-                    list_to_binary(string:lowercase(integer_to_list(Num, R)));
+                    radix_int_str(Num, R);
+                Num when is_float(Num) ->
+                    radix_float_str(Num, R);
                 _ ->
                     to_string(N)
             end
     end.
+
+%% Signed base-R rendering of an integer, lowercased ("-ff", "10000").
+radix_int_str(Num, R) ->
+    list_to_binary(string:lowercase(integer_to_list(Num, R))).
+
+%% Signed base-R rendering of a float: integral floats reuse the integer path,
+%% otherwise "<int>.<frac>". ±0.0 → "0".
+radix_float_str(F, _R) when F == 0.0 ->
+    <<"0">>;
+radix_float_str(F, R) when F < 0 ->
+    <<"-", (radix_float_str(-F, R))/binary>>;
+radix_float_str(F, R) ->
+    IntPart = trunc(F),
+    Frac = F - IntPart,
+    case Frac == 0.0 of
+        true ->
+            radix_int_str(IntPart, R);
+        false ->
+            IntStr = radix_int_str(IntPart, R),
+            FracStr = radix_frac_digits(Frac, R, 1100, <<>>),
+            <<IntStr/binary, ".", FracStr/binary>>
+    end.
+
+%% Base-R digits of a fraction in [0,1): multiply by R, emit the integer part as
+%% the next digit, repeat until the remainder is exactly 0 (dyadic fractions
+%% terminate) or `Max` digits have been emitted (the bound for repeating ones).
+radix_frac_digits(_Frac, _R, 0, Acc) ->
+    Acc;
+radix_frac_digits(Frac, R, Max, Acc) ->
+    Scaled = Frac * R,
+    D = trunc(Scaled),
+    Rem = Scaled - D,
+    Acc2 = <<Acc/binary, (radix_digit(D))>>,
+    case Rem == 0.0 of
+        true -> Acc2;
+        false -> radix_frac_digits(Rem, R, Max - 1, Acc2)
+    end.
+
+%% A single base-36 digit value (0..35) as its lowercase character (0-9, a-z).
+radix_digit(D) when D >= 0, D =< 9 -> $0 + D;
+radix_digit(D) when D >= 10, D =< 35 -> $a + (D - 10).
 
 %% num.toExponential(d) — exponential notation with `d` fraction digits (undefined
 %% → as many digits as needed to represent the value uniquely). Erlang's scientific

@@ -2774,3 +2774,20 @@ pub fn number_is_safe_integer_test() {
   let m = compile("function f() { return Number.isSafeInteger(NaN); }")
   call(m, "f", []) |> should.equal(dyn(False))
 }
+
+pub fn number_tostring_radix_test() {
+  // Integer-valued numbers render in the requested base whether they are held as
+  // an Erlang integer (a literal) or an integral float (e.g. a division result).
+  val("(255).toString(16)") |> should.equal(dyn(<<"ff">>))
+  val("(510 / 2).toString(16)") |> should.equal(dyn(<<"ff">>))
+  val("(1024 / 64).toString(2)") |> should.equal(dyn(<<"10000">>))
+  // Dyadic fractions terminate exactly (0.5₁₀ = 0.1₂, 3.5₁₀ = 11.1₂).
+  val("(3.5).toString(2)") |> should.equal(dyn(<<"11.1">>))
+  val("(0.5).toString(2)") |> should.equal(dyn(<<"0.1">>))
+  val("(0.25).toString(2)") |> should.equal(dyn(<<"0.01">>))
+  val("(-3.5).toString(2)") |> should.equal(dyn(<<"-11.1">>))
+  // Radix 10, and NaN / ±Infinity, use the default ToString.
+  val("(255).toString(10)") |> should.equal(dyn(<<"255">>))
+  val("(0 / 0).toString(2)") |> should.equal(dyn(<<"NaN">>))
+  val("(1 / 0).toString(2)") |> should.equal(dyn(<<"Infinity">>))
+}
