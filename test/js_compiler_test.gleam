@@ -1006,6 +1006,94 @@ pub fn string_trim_repeat_test() {
   call(r, "f", []) |> should.equal(dyn(<<"ababab">>))
 }
 
+pub fn string_trim_whitespace_set_test() {
+  // ECMAScript §12.2/12.3: the trim whitespace set includes NBSP (U+00A0) and
+  // the ZWNBSP/BOM (U+FEFF), which Erlang's default `string:trim` does not
+  // treat as whitespace. Leading/trailing runs of these must be removed.
+  let a = compile("function f() { return '\\u00A0\\u00A0abc\\uFEFF'.trim(); }")
+  call(a, "f", []) |> should.equal(dyn(<<"abc">>))
+  let b = compile("function f() { return '\\uFEFF\\u00A0'.trim(); }")
+  call(b, "f", []) |> should.equal(dyn(<<"">>))
+  // trimStart / trimEnd only strip one side.
+  let s = compile("function f() { return '\\u00A0x\\u00A0'.trimStart(); }")
+  call(s, "f", []) |> should.equal(dyn(<<"x\u{00A0}">>))
+  let e = compile("function f() { return '\\u00A0x\\u00A0'.trimEnd(); }")
+  call(e, "f", []) |> should.equal(dyn(<<"\u{00A0}x">>))
+  // An interior NBSP is preserved (code-point length stays 3).
+  num("'a\\u00A0b'.trim().length") |> should.equal(3.0)
+}
+
+pub fn string_index_of_position_test() {
+  // indexOf(sub, position): position is ToIntegerOrInfinity, clamped to
+  // [0, len]; the empty string is found at the clamped start.
+  num("\"aaaa\".indexOf(\"aa\", 0)") |> should.equal(0.0)
+  num("\"aaaa\".indexOf(\"aa\", 1)") |> should.equal(1.0)
+  num("\"aaaa\".indexOf(\"aa\", 2)") |> should.equal(2.0)
+  num("\"aaaa\".indexOf(\"aa\", 3)") |> should.equal(-1.0)
+  // truncate toward zero
+  num("\"aaaa\".indexOf(\"aa\", 1.9)") |> should.equal(1.0)
+  num("\"aaaa\".indexOf(\"aa\", -0.9)") |> should.equal(0.0)
+  // NaN => 0, +Infinity => len (no match)
+  num("\"aaaa\".indexOf(\"aa\", NaN)") |> should.equal(0.0)
+  num("\"aaaa\".indexOf(\"aa\", Infinity)") |> should.equal(-1.0)
+  // empty search string: min(position, len)
+  num("\"abc\".indexOf(\"\", 2)") |> should.equal(2.0)
+  num("\"abc\".indexOf(\"\", 10)") |> should.equal(3.0)
+}
+
+pub fn string_last_index_of_test() {
+  // lastIndexOf must be able to return -1.
+  num("\"abc\".lastIndexOf(\"d\")") |> should.equal(-1.0)
+  // Default position is +Infinity: search the whole string.
+  num("\"canal\".lastIndexOf(\"a\")") |> should.equal(3.0)
+  // Overlapping matches count.
+  num("\"aaa\".lastIndexOf(\"aa\")") |> should.equal(1.0)
+  num("\"abcabc\".lastIndexOf(\"abc\")") |> should.equal(3.0)
+  // position bounds the START of the match.
+  num("\"canal\".lastIndexOf(\"a\", 2)") |> should.equal(1.0)
+  num("\"aaa\".lastIndexOf(\"aa\", 0)") |> should.equal(0.0)
+  // empty search string is found at min(position, len).
+  num("\"abc\".lastIndexOf(\"\")") |> should.equal(3.0)
+  num("\"abc\".lastIndexOf(\"\", 1)") |> should.equal(1.0)
+}
+
+pub fn string_includes_position_test() {
+  // includes(sub, position): search only at or after `position`.
+  num("\"The future is cool!\".includes(\"The future\", 1) ? 1 : 0")
+  |> should.equal(0.0)
+  num("\"The future is cool!\".includes(\"future\", 4) ? 1 : 0")
+  |> should.equal(1.0)
+  // out-of-bounds position never matches.
+  num("\"abc\".includes(\"c\", 3) ? 1 : 0") |> should.equal(0.0)
+  num("\"abc\".includes(\"c\", 100) ? 1 : 0") |> should.equal(0.0)
+  num("\"abc\".includes(\"c\", Infinity) ? 1 : 0") |> should.equal(0.0)
+}
+
+pub fn string_starts_with_position_test() {
+  // startsWith(prefix, position): matches only when `prefix` starts exactly at
+  // the clamped `position`.
+  num("\"The future\".startsWith(\"future\", 4) ? 1 : 0") |> should.equal(1.0)
+  num("\"abc\".startsWith(\"b\", 1) ? 1 : 0") |> should.equal(1.0)
+  num("\"abc\".startsWith(\"a\", 1) ? 1 : 0") |> should.equal(0.0)
+  // NaN / undefined position coerce to 0.
+  num("\"abc\".startsWith(\"a\", NaN) ? 1 : 0") |> should.equal(1.0)
+  num("\"abc\".startsWith(\"a\") ? 1 : 0") |> should.equal(1.0)
+  // 1.4 truncates to 1.
+  num("\"abc\".startsWith(\"a\", 1.4) ? 1 : 0") |> should.equal(0.0)
+}
+
+pub fn string_ends_with_position_test() {
+  // endsWith(suffix, endPosition): the string is treated as if it ended at
+  // `endPosition` (default: its length).
+  num("\"word\".endsWith(\"r\", 3) ? 1 : 0") |> should.equal(1.0)
+  num("\"word\".endsWith(\"d\", 3) ? 1 : 0") |> should.equal(0.0)
+  num("\"The future is cool!\".endsWith(\"future\", 10) ? 1 : 0")
+  |> should.equal(1.0)
+  // no endPosition: default to the full length.
+  num("\"hello\".endsWith(\"lo\") ? 1 : 0") |> should.equal(1.0)
+  num("\"hello\".endsWith(\"he\") ? 1 : 0") |> should.equal(0.0)
+}
+
 pub fn string_replace_test() {
   let m = compile("function f() { return \"a-b-c\".replace(\"-\", \"+\"); }")
   call(m, "f", []) |> should.equal(dyn(<<"a+b-c">>))

@@ -85,7 +85,7 @@
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
     str_upper/1, str_lower/1,
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
-    str_trim_end/1, str_repeat/2, str_starts_with/2, str_ends_with/2,
+    str_trim_end/1, str_repeat/2, str_starts_with/3, str_ends_with/3,
     str_replace/3, str_replace_all/3,
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
@@ -2019,6 +2019,8 @@ afind_last_i(Fn, Arr, [{X, I} | Rest], Acc) ->
 %% arr.lastIndexOf(x) — last strict-equal index, or -1.
 %% lastIndexOf(searchElement, fromIndex) — the highest === index at or before
 %% `fromIndex` (default len-1; ToIntegerOrInfinity, negatives from the end), else -1.
+array_last_index_of(Recv, X, From) when is_binary(Recv) ->
+    str_last_index_of(Recv, X, From);
 array_last_index_of(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Cap = last_idx_from(From, Len),
@@ -2189,8 +2191,8 @@ num_to_fixed(N, D) ->
 
 %% indexOf(searchElement, fromIndex) — first === index at or after `fromIndex`
 %% (ToIntegerOrInfinity, negatives from the end, clamped), else -1. A string
-%% receiver does a substring search (its position argument is not yet honoured).
-array_index_of(Recv, X, _From) when is_binary(Recv) -> str_index_of(Recv, X);
+%% receiver does a substring search honouring the `position` argument.
+array_index_of(Recv, X, From) when is_binary(Recv) -> str_index_of(Recv, X, From);
 array_index_of(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Start = idx_from(From, Len),
@@ -2221,8 +2223,8 @@ aidx([E | Es], I, X) ->
 %% includes(searchElement, fromIndex) — SameValueZero search from `fromIndex`
 %% (ToIntegerOrInfinity, negatives from the end, clamped). A string receiver does a
 %% substring test (its position argument is not yet honoured).
-array_includes(Recv, X, _From) when is_binary(Recv) ->
-    array_index_of(Recv, X, undefined) =/= -1;
+array_includes(Recv, X, From) when is_binary(Recv) ->
+    str_index_of(Recv, X, From) =/= -1;
 array_includes(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Start =
@@ -2441,17 +2443,69 @@ norm_form(<<"NFKC">>) -> nfkc;
 norm_form(<<"NFKD">>) -> nfkd;
 norm_form(_) -> error.
 
-%% str.indexOf(sub) → first code-point index of `sub`, or -1 ("" → 0).
-str_index_of(Str, Sub) ->
+%% str.indexOf(sub, position) — first code-point index of `sub` at or after
+%% `position`, else -1. `position` is ToIntegerOrInfinity clamped to [0, len]
+%% (NaN/undefined → 0, +Infinity → len). The empty search string is found at
+%% min(position, len) (== the clamped start). `sub` is coerced with ToString.
+str_index_of(Str, Sub, Pos) ->
     SubBin = to_string(Sub),
+    Cps = cps(Str),
+    Len = length(Cps),
+    Start = str_pos_clamp(Pos, Len),
     case SubBin of
         <<>> ->
-            0;
+            Start;
         _ ->
-            case binary:match(Str, SubBin) of
+            StartByte = byte_size(from_cps(lists:sublist(Cps, 1, Start))),
+            Tail = binary:part(Str, StartByte, byte_size(Str) - StartByte),
+            case binary:match(Tail, SubBin) of
                 nomatch -> -1;
-                {Pos, _} -> length(cps(binary:part(Str, 0, Pos)))
+                {Pos1, _} -> Start + length(cps(binary:part(Tail, 0, Pos1)))
             end
+    end.
+
+%% str.lastIndexOf(sub, position) — the greatest code-point index `i` in
+%% [0, start] at which `sub` occurs (overlapping matches count), else -1.
+%% Per spec a NaN position (e.g. omitted / undefined) means +Infinity, so the
+%% whole string is searched; otherwise `position` is ToIntegerOrInfinity. The
+%% start bound is clamped to [0, len]. The empty search string matches at the
+%% clamped start. `sub` is coerced with ToString.
+str_last_index_of(Str, Sub, Pos) ->
+    SubBin = to_string(Sub),
+    Cps = cps(Str),
+    Len = length(Cps),
+    Start = str_last_pos_clamp(Pos, Len),
+    SubCps = cps(SubBin),
+    SubLen = length(SubCps),
+    str_lidx_from(min(Start, Len - SubLen), Cps, SubCps, SubLen).
+
+%% Scan candidate start indices downward from `I`, returning the first (highest)
+%% at which `Sub` (a code-point list of length `SubLen`) matches, else -1.
+str_lidx_from(I, _Cps, _Sub, _SubLen) when I < 0 -> -1;
+str_lidx_from(I, Cps, Sub, SubLen) ->
+    case lists:sublist(Cps, I + 1, SubLen) =:= Sub of
+        true -> I;
+        false -> str_lidx_from(I - 1, Cps, Sub, SubLen)
+    end.
+
+%% ToIntegerOrInfinity(V) clamped to the integer range [0, Max]. Used for the
+%% forward-search `position` of indexOf/includes/startsWith/endsWith.
+str_pos_clamp(V, Max) ->
+    case coerce_num(V) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> Max;
+        N -> min(max(trunc(as_float(N)), 0), Max)
+    end.
+
+%% Like str_pos_clamp but a NaN position means +Infinity (search the whole
+%% string), matching String.prototype.lastIndexOf's coercion of `position`.
+str_last_pos_clamp(V, Max) ->
+    case coerce_num(V) of
+        nan -> Max;
+        neg_inf -> 0;
+        inf -> Max;
+        N -> min(max(trunc(as_float(N)), 0), Max)
     end.
 
 %% str.slice(start?, end?) — negative-from-end code-point slice.
@@ -2500,9 +2554,44 @@ str_split(Str, Sep) ->
         SepBin -> new_array(binary:split(Str, SepBin, [global]))
     end.
 
-str_trim(Str) -> unicode:characters_to_binary(string:trim(Str)).
-str_trim_start(Str) -> unicode:characters_to_binary(string:trim(Str, leading)).
-str_trim_end(Str) -> unicode:characters_to_binary(string:trim(Str, trailing)).
+%% str.trim() / trimStart() / trimEnd() — remove leading and/or trailing runs
+%% of code points that are JS WhiteSpace or LineTerminator (see `is_js_ws/1`).
+%% The JS whitespace set differs from Erlang's `string:trim` default (it must
+%% include U+FEFF and U+00A0 and excludes non-WhiteSpace Unicode spaces), so we
+%% trim against the ECMAScript set explicitly.
+str_trim(Str) -> from_cps(trim_trailing(trim_leading(cps(Str)))).
+str_trim_start(Str) -> from_cps(trim_leading(cps(Str))).
+str_trim_end(Str) -> from_cps(trim_trailing(cps(Str))).
+
+trim_leading([C | Rest]) ->
+    case is_js_ws(C) of
+        true -> trim_leading(Rest);
+        false -> [C | Rest]
+    end;
+trim_leading([]) ->
+    [].
+
+trim_trailing(Cps) -> lists:reverse(trim_leading(lists:reverse(Cps))).
+
+%% True when the code point is ECMAScript WhiteSpace or a LineTerminator
+%% (per ECMAScript §12.2/§12.3): tab, LF, VT, FF, CR, space, NBSP, the Unicode
+%% "space separator" (Zs) code points, LS/PS, and the ZWNBSP/BOM (U+FEFF).
+is_js_ws(16#0009) -> true;
+is_js_ws(16#000A) -> true;
+is_js_ws(16#000B) -> true;
+is_js_ws(16#000C) -> true;
+is_js_ws(16#000D) -> true;
+is_js_ws(16#0020) -> true;
+is_js_ws(16#00A0) -> true;
+is_js_ws(16#1680) -> true;
+is_js_ws(C) when C >= 16#2000, C =< 16#200A -> true;
+is_js_ws(16#2028) -> true;
+is_js_ws(16#2029) -> true;
+is_js_ws(16#202F) -> true;
+is_js_ws(16#205F) -> true;
+is_js_ws(16#3000) -> true;
+is_js_ws(16#FEFF) -> true;
+is_js_ws(_) -> false.
 
 str_repeat(Str, N) ->
     Count =
@@ -2517,16 +2606,40 @@ str_repeat(Str, N) ->
         false -> binary:copy(Str, Count)
     end.
 
-str_starts_with(Str, Prefix) ->
+%% str.startsWith(prefix, position) — true when `prefix` (ToString) occurs in
+%% `str` starting exactly at code-point index `position`. `position` is
+%% ToIntegerOrInfinity clamped to [0, len] (undefined/NaN → 0). Returns false
+%% when `position` + prefix length would run past the end of the string.
+str_starts_with(Str, Prefix, Pos) ->
     P = to_string(Prefix),
-    PS = byte_size(P),
-    byte_size(Str) >= PS andalso binary:part(Str, 0, PS) =:= P.
+    Cps = cps(Str),
+    Len = length(Cps),
+    Start = str_pos_clamp(Pos, Len),
+    PLen = length(cps(P)),
+    case Start + PLen > Len of
+        true -> false;
+        false -> from_cps(lists:sublist(Cps, Start + 1, PLen)) =:= P
+    end.
 
-str_ends_with(Str, Suffix) ->
+%% str.endsWith(suffix, end_position) — true when `suffix` (ToString) occurs in
+%% `str` ending exactly at code-point index `end_position`. When `end_position`
+%% is undefined it defaults to len; otherwise it is ToIntegerOrInfinity clamped
+%% to [0, len]. Returns false when the suffix would start before index 0.
+str_ends_with(Str, Suffix, EndPos) ->
     S = to_string(Suffix),
-    SS = byte_size(S),
-    SZ = byte_size(Str),
-    SZ >= SS andalso binary:part(Str, SZ - SS, SS) =:= S.
+    Cps = cps(Str),
+    Len = length(Cps),
+    End =
+        case EndPos of
+            undefined -> Len;
+            _ -> str_pos_clamp(EndPos, Len)
+        end,
+    SLen = length(cps(S)),
+    Start = End - SLen,
+    case Start < 0 of
+        true -> false;
+        false -> from_cps(lists:sublist(Cps, Start + 1, SLen)) =:= S
+    end.
 
 %% str.replace(search, repl) — the FIRST occurrence (string search; no regex in v1).
 str_replace(Str, Search, Repl) when is_reference(Search) ->
