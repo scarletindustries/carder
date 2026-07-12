@@ -4797,6 +4797,12 @@ fn lower_instance_method(
     "fill", [v, s, e, ..] -> host("array_fill", [v, s, e])
     "fill", [v, s] -> host("array_fill", [v, s, undefined()])
     "fill", [v] -> host("array_fill", [v, undefined(), undefined()])
+    "copyWithin", [t, s, e, ..] -> host("array_copy_within", [t, s, e])
+    "copyWithin", [t, s] -> host("array_copy_within", [t, s, undefined()])
+    "copyWithin", [t] ->
+      host("array_copy_within", [t, undefined(), undefined()])
+    "copyWithin", [] ->
+      host("array_copy_within", [undefined(), undefined(), undefined()])
     "at", [i, ..] -> host("array_at", [i])
     "padStart", [n] -> host("str_pad_start", [n, ir.ConstBinary(<<" ">>)])
     "padStart", [n, p, ..] -> host("str_pad_start", [n, p])

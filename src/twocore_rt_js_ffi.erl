@@ -66,7 +66,7 @@
     new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
-    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_at/2,
+    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_at/2,
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
@@ -1383,6 +1383,36 @@ fill_clamp(I, Len, _Default) ->
 
 fill_range(Map, S, E, _V) when S >= E -> Map;
 fill_range(Map, S, E, V) -> fill_range(maps:put(S, V, Map), S + 1, E, V).
+
+%% arr.copyWithin(target, start, end) — copy the elements in [start, end) to the
+%% position `target`, in place, returning the array. Indices are ToIntegerOrInfinity
+%% clamped to [0, len] with negatives counting from the end. A source hole clears
+%% the target (delete), so holes propagate rather than becoming `undefined`.
+array_copy_within(Recv, Target, Start, End) ->
+    {Len, Map} = arr_content(Recv),
+    T = fill_clamp(Target, Len, 0),
+    S = fill_clamp(Start, Len, 0),
+    E = fill_clamp(End, Len, Len),
+    Count = min(E - S, Len - T),
+    case Count =< 0 of
+        true ->
+            Recv;
+        false ->
+            Src = [{maps:is_key(S + I, Map), maps:get(S + I, Map, undefined)}
+                   || I <- lists:seq(0, Count - 1)],
+            NewMap = lists:foldl(
+                fun({{HasKey, V}, I}, M) ->
+                    case HasKey of
+                        true -> maps:put(T + I, V, M);
+                        false -> maps:remove(T + I, M)
+                    end
+                end,
+                Map,
+                lists:zip(Src, lists:seq(0, Count - 1))
+            ),
+            erlang:put(?CELL_KEY(Recv), {js_array, Len, NewMap}),
+            Recv
+    end.
 
 %% arr.at(i) / str.at(i) — element at index i (negative counts from the end), else
 %% undefined.

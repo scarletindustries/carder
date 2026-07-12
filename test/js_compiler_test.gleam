@@ -1482,6 +1482,21 @@ pub fn array_from_flat_test() {
   num("[1, [2, 3], 4].flat()[2]") |> should.equal(3.0)
 }
 
+pub fn array_copy_within_test() {
+  // copyWithin(target, start, end): copies [start,end) to target, in place;
+  // negatives count from the end; omitted end is the length.
+  let m =
+    compile(
+      "function f() { let a = [1, 2, 3, 4, 5].copyWithin(0, 3); "
+      <> "let b = [1, 2, 3, 4, 5].copyWithin(1, 3, 4); "
+      <> "let c = [1, 2, 3, 4, 5].copyWithin(-2, -3, -1); "
+      <> "return a.join('') + '/' + b.join('') + '/' + c.join(''); }",
+    )
+  // a: copy [3,5)=[4,5] to 0 → [4,5,3,4,5]; b: copy [3,4)=[4] to 1 → [1,4,3,4,5];
+  // c: target 3, [2,4)=[3,4] → [1,2,3,3,4]
+  call(m, "f", []) |> should.equal(dyn(<<"45345/14345/12334">>))
+}
+
 pub fn array_flat_depth_test() {
   // flat honours a depth argument; Infinity fully flattens, and the default is 1.
   let m =

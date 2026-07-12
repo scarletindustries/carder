@@ -4219,6 +4219,7 @@ fn resolve_js(op: String) -> Option(String) {
     "array_from_map" -> Some("array_from_map")
     "array_flat" -> Some("array_flat")
     "array_fill" -> Some("array_fill")
+    "array_copy_within" -> Some("array_copy_within")
     "array_at" -> Some("array_at")
     "str_pad_start" -> Some("str_pad_start")
     "str_pad_end" -> Some("str_pad_end")

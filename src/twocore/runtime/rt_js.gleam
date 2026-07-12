@@ -358,6 +358,16 @@ pub fn array_fill(
   end: Dynamic,
 ) -> Dynamic
 
+/// `arr.copyWithin(target, start, end)` — copy `[start, end)` to `target` in place;
+/// returns the array.
+@external(erlang, "twocore_rt_js_ffi", "array_copy_within")
+pub fn array_copy_within(
+  arr: Dynamic,
+  target: Dynamic,
+  start: Dynamic,
+  end: Dynamic,
+) -> Dynamic
+
 /// `arr.at(i)` / `str.at(i)` — element at `i` (negative counts from the end), else
 /// `undefined`.
 @external(erlang, "twocore_rt_js_ffi", "array_at")
