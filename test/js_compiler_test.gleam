@@ -540,6 +540,59 @@ pub fn for_of_nested_test() {
   to_float(call(m, "f", [])) |> should.equal(90.0)
 }
 
+// ── switch ───────────────────────────────────────────────────────────────────
+
+pub fn switch_basic_test() {
+  let m =
+    compile(
+      "function f(x) { let r = 0; switch (x) { case 1: r = 10; break; case 2: r = 20; break; default: r = -1; } return r; }",
+    )
+  to_float(call(m, "f", [dyn(1)])) |> should.equal(10.0)
+  to_float(call(m, "f", [dyn(2)])) |> should.equal(20.0)
+  to_float(call(m, "f", [dyn(9)])) |> should.equal(-1.0)
+}
+
+pub fn switch_fallthrough_test() {
+  let m =
+    compile(
+      "function f(x) { let r = 0; switch (x) { case 1: r += 1; case 2: r += 10; break; case 3: r += 100; } return r; }",
+    )
+  // 1 falls through into 2 then breaks
+  to_float(call(m, "f", [dyn(1)])) |> should.equal(11.0)
+  to_float(call(m, "f", [dyn(2)])) |> should.equal(10.0)
+  to_float(call(m, "f", [dyn(3)])) |> should.equal(100.0)
+}
+
+pub fn switch_default_in_middle_test() {
+  let m =
+    compile(
+      "function f(x) { let r = 0; switch (x) { case 1: r = 1; break; default: r = 99; break; case 2: r = 2; break; } return r; }",
+    )
+  to_float(call(m, "f", [dyn(1)])) |> should.equal(1.0)
+  to_float(call(m, "f", [dyn(2)])) |> should.equal(2.0)
+  to_float(call(m, "f", [dyn(5)])) |> should.equal(99.0)
+}
+
+pub fn switch_in_loop_break_test() {
+  // `break` exits the switch, NOT the enclosing loop.
+  let m =
+    compile(
+      "function f() { let s = 0; for (let i = 0; i < 5; i++) { switch (i) { case 2: break; default: s += i; } } return s; }",
+    )
+  // default runs for i = 0,1,3,4 → 0+1+3+4 = 8 (i=2 breaks the switch)
+  to_float(call(m, "f", [])) |> should.equal(8.0)
+}
+
+pub fn switch_string_test() {
+  let m =
+    compile(
+      "function f(s) { switch (s) { case \"a\": return 1; case \"b\": return 2; default: return 0; } }",
+    )
+  to_float(call(m, "f", [dyn(<<"a">>)])) |> should.equal(1.0)
+  to_float(call(m, "f", [dyn(<<"b">>)])) |> should.equal(2.0)
+  to_float(call(m, "f", [dyn(<<"z">>)])) |> should.equal(0.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

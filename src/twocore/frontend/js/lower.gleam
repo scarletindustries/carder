@@ -22,10 +22,13 @@
 //// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
 //// Control flow threads mutated variables as loop-carried params / phi-merged `If`s.
 ////
+//// Control flow also includes `for-of` (over arrays) and `switch` (with fall-through,
+//// default in any position, and `break` that targets the switch).
+////
 //// Not yet (a clean `Unsupported` error / panic): classes, `try/catch/throw`,
-//// `switch`, `for-in/of`, regex, most String/Array/Math builtins, and `continue`
-//// inside a `do/while`. Scope is one flat function scope per JS function (block-scoped
-//// `let` is treated as function-scoped).
+//// `for-in`, regex, most String/Array/Math builtins, and `continue` inside a
+//// `do/while`. Scope is one flat function scope per JS function (block-scoped `let`
+//// is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -100,6 +103,7 @@ type Ctx {
   Ctx(
     funcs: List(String),
     loop: Option(Loop),
+    brk: Option(#(String, List(String))),
     lambdas: Dict(ast.Span, Lambda),
     scope_mutated: List(String),
   )
@@ -133,7 +137,8 @@ pub fn program(
       }),
     )
   use lambdas <- result_try(collect_lambdas(scan, fn_names))
-  let ctx = Ctx(funcs: fn_names, loop: None, lambdas:, scope_mutated: [])
+  let ctx =
+    Ctx(funcs: fn_names, loop: None, brk: None, lambdas:, scope_mutated: [])
 
   use funcs <- result_try(
     list.try_map(decls, fn(d) {
@@ -292,12 +297,15 @@ fn lower_stmt(
       lower_for(init, condition, update, body, env, ctx, ctr, k)
     ast.ForOfStatement(left:, right:, body:, ..) ->
       lower_for_of(left, right, body, env, ctx, ctr, k)
+    ast.SwitchStatement(discriminant:, cases:) ->
+      lower_switch(discriminant, cases, env, ctx, ctr, k)
 
     ast.BreakStatement(label: None) ->
-      case ctx.loop {
-        Some(Loop(label:, carried:, ..)) ->
+      case ctx.brk {
+        // break targets the innermost loop OR switch.
+        Some(#(label, carried)) ->
           Ok(#(ir.Break(label, carried_vals(env, carried)), ctr))
-        None -> Error(Unsupported("break outside a loop"))
+        None -> Error(Unsupported("break outside a loop or switch"))
       }
     ast.ContinueStatement(label: None) ->
       case ctx.loop {
@@ -671,6 +679,171 @@ fn lower_init_decls(
   }
 }
 
+/// A run-once labelled block that `break` can exit early — the substrate for `switch`.
+/// Unlike a loop it sets ONLY the break target (so a `continue` inside still targets the
+/// enclosing loop), and its body's fall-through `Break`s out rather than looping. `carried`
+/// are the variables mutated inside the block whose new values must escape it.
+fn lower_break_block(
+  carried: List(String),
+  build_body: fn(Env, Ctx, Cont, Int) -> Result(#(ir.Expr, Int), Error),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  let #(label, ctr) = fresh_label(ctr)
+  let inits = carried_vals(env, carried)
+  let params =
+    list.map2(carried, inits, fn(v, initv) { ir.LoopParam(v, ir.TTerm, initv) })
+  let loop_env =
+    list.fold(carried, env, fn(acc, v) { dict.insert(acc, v, ir.Var(v)) })
+  let blk_ctx = Ctx(..ctx, brk: Some(#(label, carried)))
+  // fall-through of the body → break out with the carried vars' current values.
+  let fallthrough: Cont = fn(env2, ctr2) {
+    Ok(#(ir.Break(label, carried_vals(env2, carried)), ctr2))
+  }
+  use #(body, ctr) <- result_try(build_body(loop_env, blk_ctx, fallthrough, ctr))
+  let tys = list.map(carried, fn(_) { ir.TTerm })
+  let #(after, ctr) = fresh_n(list.length(carried), ctr)
+  let env2 =
+    list.fold(list.zip(carried, after), env, fn(acc, p) {
+      dict.insert(acc, p.0, ir.Var(p.1))
+    })
+  use #(rest, ctr) <- result_try(k(env2, ctr))
+  Ok(#(ir.Let(after, ir.Loop(label:, params:, result: tys, body:), rest), ctr))
+}
+
+/// `switch (disc) { case v: … default: … }` with fall-through. Desugars to a
+/// break-block whose body sets a `$fell` flag on the first matching case (or the
+/// default, if none matches — computed via `$any`) and then runs each following
+/// consequent while `$fell` holds; a `break` exits the block, a `continue` still
+/// targets the enclosing loop.
+fn lower_switch(
+  disc: ast.Expression,
+  cases: List(ast.SwitchCase),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  let id = int.to_string(ctr)
+  let dv = "$sw_d_" <> id
+  let fell = "$sw_fell_" <> id
+  let any = "$sw_any_" <> id
+  let sp = ast.Span(0, 0)
+  let ident = fn(n) { ast.Identifier(span: sp, name: n) }
+  let bool_lit = fn(b) { ast.BooleanLiteral(span: sp, value: b) }
+  let wrap = fn(s) { ast.StmtWithLine(line: 0, statement: s) }
+  let decl = fn(n, init) {
+    ast.VariableDeclaration(kind: ast.Let, declarations: [
+      ast.VariableDeclarator(
+        id: ast.IdentifierPattern(name: n, span: sp),
+        init: Some(init),
+      ),
+    ])
+  }
+  let expr_stmt = fn(e) {
+    ast.ExpressionStatement(expression: e, directive: None)
+  }
+  let set_true = fn(n) {
+    expr_stmt(ast.AssignmentExpression(
+      span: sp,
+      operator: ast.Assign,
+      left: ident(n),
+      right: bool_lit(True),
+    ))
+  }
+  let not_ = fn(e) {
+    ast.UnaryExpression(
+      span: sp,
+      operator: ast.LogicalNot,
+      prefix: True,
+      argument: e,
+    )
+  }
+  let and_ = fn(l, r) {
+    ast.LogicalExpression(span: sp, operator: ast.LogicalAnd, left: l, right: r)
+  }
+  let eq_d = fn(t) {
+    ast.BinaryExpression(
+      span: sp,
+      operator: ast.StrictEqual,
+      left: ident(dv),
+      right: t,
+    )
+  }
+  let if_ = fn(c, body) {
+    ast.IfStatement(
+      condition: c,
+      consequent: ast.BlockStatement(body:),
+      alternate: None,
+    )
+  }
+
+  // $any = ($d === t0) || ($d === t1) || … over the non-default case tests.
+  let tests =
+    list.filter_map(cases, fn(c) {
+      case c.condition {
+        Some(t) -> Ok(eq_d(t))
+        None -> Error(Nil)
+      }
+    })
+  let any_expr = case tests {
+    [] -> bool_lit(False)
+    [first, ..rest] ->
+      list.fold(rest, first, fn(acc, t) {
+        ast.LogicalExpression(
+          span: sp,
+          operator: ast.LogicalOr,
+          left: acc,
+          right: t,
+        )
+      })
+  }
+
+  // Per case: enter it (set $fell) when it is the start point, then run its body
+  // whenever $fell holds (fall-through).
+  let case_stmts =
+    list.flat_map(cases, fn(c) {
+      let start_cond = case c.condition {
+        Some(t) -> and_(not_(ident(fell)), eq_d(t))
+        None -> and_(not_(ident(fell)), not_(ident(any)))
+      }
+      [
+        if_(start_cond, [wrap(set_true(fell))]),
+        if_(ident(fell), c.consequent),
+      ]
+    })
+
+  let desugared =
+    list.flatten([
+      [
+        decl(dv, disc),
+        decl(any, any_expr),
+        decl(fell, bool_lit(False)),
+      ],
+      case_stmts,
+    ])
+
+  let consequent_stmts =
+    list.flat_map(cases, fn(c) { list.map(c.consequent, fn(w) { w.statement }) })
+  let carried =
+    assigned_in(consequent_stmts)
+    |> list.unique
+    |> list.filter(dict.has_key(env, _))
+
+  lower_break_block(
+    carried,
+    fn(loop_env, blk_ctx, fallthrough, ctr) {
+      lower_stmts(desugared, loop_env, blk_ctx, ctr, fallthrough)
+    },
+    env,
+    ctx,
+    ctr,
+    k,
+  )
+}
+
 /// Shared loop skeleton: bind the carried vars' entry values, run the `Loop`, then
 /// rebind them and continue. `step` builds the per-iteration body in the loop env.
 fn lower_loop(
@@ -689,7 +862,12 @@ fn lower_loop(
     list.map2(carried, inits, fn(v, initv) { ir.LoopParam(v, ir.TTerm, initv) })
   let loop_env =
     list.fold(carried, env, fn(acc, v) { dict.insert(acc, v, ir.Var(v)) })
-  let loop_ctx = Ctx(..ctx, loop: Some(Loop(label, carried, update, do_while)))
+  let loop_ctx =
+    Ctx(
+      ..ctx,
+      loop: Some(Loop(label, carried, update, do_while)),
+      brk: Some(#(label, carried)),
+    )
   use #(body, ctr) <- result_try(step(loop_env, loop_ctx, ctr))
   let tys = list.map(carried, fn(_) { ir.TTerm })
 
@@ -1707,6 +1885,10 @@ fn assigned_in_stmt(s: ast.Statement) -> List(String) {
       })
     ast.ForOfStatement(body:, ..) -> assigned_in_stmt(body)
     ast.ForInStatement(body:, ..) -> assigned_in_stmt(body)
+    ast.SwitchStatement(cases:, ..) ->
+      list.flat_map(cases, fn(c) {
+        assigned_in(list.map(c.consequent, fn(w) { w.statement }))
+      })
     _ -> []
   }
 }
@@ -1833,6 +2015,10 @@ fn stmt_exprs(s: ast.Statement) -> List(ast.Expression) {
       ])
     ast.ForOfStatement(right:, ..) -> [right]
     ast.ForInStatement(right:, ..) -> [right]
+    ast.SwitchStatement(discriminant:, cases:) -> [
+      discriminant,
+      ..list.filter_map(cases, fn(c) { option.to_result(c.condition, Nil) })
+    ]
     _ -> []
   }
 }
@@ -1848,6 +2034,10 @@ fn child_stmts(s: ast.Statement) -> List(ast.Statement) {
     ast.ForStatement(body:, ..) -> [body]
     ast.ForOfStatement(body:, ..) -> [body]
     ast.ForInStatement(body:, ..) -> [body]
+    ast.SwitchStatement(cases:, ..) ->
+      list.flat_map(cases, fn(c) {
+        list.map(c.consequent, fn(w) { w.statement })
+      })
     _ -> []
   }
 }
