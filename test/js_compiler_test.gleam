@@ -1013,6 +1013,19 @@ pub fn number_string_whitespace_test() {
   num("Number('\\u00A0-3.5\\u00A0')") |> should.equal(-3.5)
 }
 
+pub fn number_string_radix_test() {
+  // ToNumber(String) parses 0x/0o/0b integer literals (no sign after the prefix).
+  num("Number('0x5')") |> should.equal(5.0)
+  num("Number('0X0')") |> should.equal(0.0)
+  num("Number('0xFF')") |> should.equal(255.0)
+  num("Number('0o17')") |> should.equal(15.0)
+  num("Number('0b101')") |> should.equal(5.0)
+  num("+('0xff')") |> should.equal(255.0)
+  // A sign after the prefix, or empty digits, is NaN.
+  num("Number('0x') !== Number('0x') ? 1 : 0") |> should.equal(1.0)
+  num("Number('0x-5') !== Number('0x-5') ? 1 : 0") |> should.equal(1.0)
+}
+
 pub fn array_static_test() {
   let a = compile("function f() { return Array.isArray([1, 2]); }")
   call(a, "f", []) |> should.equal(dyn(True))

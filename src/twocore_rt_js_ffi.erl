@@ -814,6 +814,13 @@ str_to_num(Bin) ->
         <<"Infinity">> -> inf;
         <<"+Infinity">> -> inf;
         <<"-Infinity">> -> neg_inf;
+        %% Non-decimal integer literals (NO sign is permitted after the prefix).
+        <<"0x", H/binary>> -> radix_int(H, 16);
+        <<"0X", H/binary>> -> radix_int(H, 16);
+        <<"0o", O/binary>> -> radix_int(O, 8);
+        <<"0O", O/binary>> -> radix_int(O, 8);
+        <<"0b", B/binary>> -> radix_int(B, 2);
+        <<"0B", B/binary>> -> radix_int(B, 2);
         _ ->
             try
                 binary_to_integer(T)
@@ -825,6 +832,17 @@ str_to_num(Bin) ->
                         error:badarg -> nan
                     end
             end
+    end.
+
+%% Parse the digits after a 0x/0o/0b prefix in the given base; empty digits or a
+%% sign (both illegal after the prefix) or any out-of-base digit yields NaN.
+radix_int(<<>>, _Base) -> nan;
+radix_int(<<S, _/binary>>, _Base) when S =:= $+; S =:= $- -> nan;
+radix_int(Digits, Base) ->
+    try
+        binary_to_integer(Digits, Base)
+    catch
+        error:badarg -> nan
     end.
 
 %% binary_to_float demands a digit on BOTH sides of the dot and a dot before
