@@ -1063,6 +1063,56 @@ pub fn array_spread_test() {
   to_float(call(s, "f", [])) |> should.equal(3.0)
 }
 
+// ── classes ──────────────────────────────────────────────────────────────────
+
+pub fn class_basic_test() {
+  let m =
+    compile(
+      "class Point { constructor(x, y) { this.x = x; this.y = y; } } function f() { let p = new Point(3, 4); return p.x + p.y; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+}
+
+pub fn class_methods_test() {
+  let m =
+    compile(
+      "class Counter { constructor() { this.n = 0; } inc() { this.n = this.n + 1; } get() { return this.n; } } function f() { let c = new Counter(); c.inc(); c.inc(); c.inc(); return c.get(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
+pub fn class_method_args_test() {
+  let m =
+    compile(
+      "class Adder { constructor(base) { this.base = base; } add(x) { return this.base + x; } } function f() { let a = new Adder(10); return a.add(5); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(15.0)
+}
+
+pub fn class_field_test() {
+  let m =
+    compile(
+      "class C { count = 5; get() { return this.count; } } function f() { let c = new C(); return c.get(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(5.0)
+}
+
+pub fn class_method_calls_method_test() {
+  let m =
+    compile(
+      "class C { constructor() { this.n = 5; } double() { return this.n * 2; } quad() { return this.double() * 2; } } function f() { let c = new C(); return c.quad(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(20.0)
+}
+
+pub fn class_this_in_closure_test() {
+  let m =
+    compile(
+      "class C { constructor() { this.n = 10; } compute() { return [1, 2, 3].map(x => x + this.n); } } function f() { let c = new C(); return c.compute()[1]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

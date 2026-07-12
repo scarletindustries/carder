@@ -22,9 +22,10 @@
 //// `for-in`, `break/continue`,
 //// `return`, blocks; flat array/object destructuring in `let`/`const`/`var`; objects
 //// `{}` with `.prop`/`[k]` get/set; arrays `[…]` with indexing, `.length`, spread
-//// `[...a]`; first-class functions — function expressions,
-//// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
-//// Control flow threads mutated variables as loop-carried params / phi-merged `If`s.
+//// `[...a]`; first-class functions — function expressions, arrow functions, closures
+//// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
+//// & fields, `new`, `this`, method calls — no inheritance); `console.log`. Control
+//// flow threads mutated variables as loop-carried params / phi-merged `If`s.
 ////
 //// Control flow also includes `for-of` (over arrays/strings), `switch` (with
 //// fall-through, default in any position, and `break` that targets the switch), and
@@ -40,9 +41,11 @@
 //// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`.
 ////
-//// Not yet (a clean `Unsupported` error / panic): classes, nested/defaulted
-//// destructuring, object/call spread, rest params, regex, `JSON`, `try`/`finally`,
-//// and `continue` inside a `do/while`.
+//// Not yet (a clean `Unsupported` error / panic): class inheritance (`extends`/
+//// `super`), static/getter/setter members, nested/defaulted destructuring, object/call
+//// spread, rest params, regex, `JSON`, `try`/`finally`, and `continue` inside a
+//// `do/while`. (A regular function EXPRESSION captures `this` lexically like an arrow,
+//// rather than binding it dynamically.)
 //// (A default value on an arrow/function-EXPRESSION param only applies when it is
 //// called with the full arity or through an array method, since a closure call site
 //// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
@@ -125,10 +128,17 @@ type Lambda {
 /// source span (so an arrow/function-expression node lowers to a `MakeClosure` of its
 /// lifted function); and the set of variables reassigned in the CURRENT function scope
 /// (a closure that captures one of these by value would be unsound, so it is rejected).
+/// A class's shape for `new C(…)`: how many args its constructor takes and each
+/// instance method's name + arity (its lifted function is `C$constructor` / `C$name`).
+type ClassInfo {
+  ClassInfo(ctor_arity: Int, methods: List(#(String, Int)))
+}
+
 type Ctx {
   Ctx(
     funcs: List(String),
     fn_arity: Dict(String, Int),
+    classes: Dict(String, ClassInfo),
     loop: Option(Loop),
     brk: Option(#(String, List(String))),
     lambdas: Dict(ast.Span, Lambda),
@@ -151,30 +161,30 @@ pub fn program(
   }
   let decls = list.filter_map(stmts, as_function_decl)
   let fn_names = list.map(decls, fn(d) { d.0 })
-  let top = list.filter(stmts, fn(s) { as_function_decl(s) == Error(Nil) })
+  let class_decls = list.filter_map(stmts, as_class_decl)
+  let classes =
+    dict.from_list(list.map(class_decls, fn(c) { #(c.0, class_info(c.1)) }))
+  let top =
+    list.filter(stmts, fn(s) {
+      as_function_decl(s) == Error(Nil) && as_class_decl(s) == Error(Nil)
+    })
 
   // Pre-pass: lift every function/arrow expression (in top-level code AND inside the
-  // declared functions) to a named IR function, keyed by span, with its captures.
+  // declared functions and class methods) to a named IR function, keyed by span.
   let scan =
-    list.append(
+    list.flatten([
       top,
-      list.flat_map(decls, fn(d) {
-        let #(_, _, body) = d
-        block_stmts(body)
-      }),
-    )
+      list.flat_map(decls, fn(d) { block_stmts(d.2) }),
+      list.flat_map(class_decls, fn(c) { class_scan_stmts(c.1) }),
+    ])
   use lambdas <- result_try(collect_lambdas(scan, fn_names))
   let fn_arity =
-    dict.from_list(
-      list.map(decls, fn(d) {
-        let #(n, params, _) = d
-        #(n, list.length(params))
-      }),
-    )
+    dict.from_list(list.map(decls, fn(d) { #(d.0, list.length(d.1)) }))
   let ctx =
     Ctx(
       funcs: fn_names,
       fn_arity:,
+      classes:,
       loop: None,
       brk: None,
       lambdas:,
@@ -191,10 +201,15 @@ pub fn program(
   use lambda_funcs <- result_try(
     list.try_map(dict.values(lambdas), fn(lam) { lower_lambda(lam, ctx) }),
   )
+  use class_fn_lists <- result_try(
+    list.try_map(class_decls, fn(c) { lower_class(c.0, c.1, ctx) }),
+  )
+  let class_funcs = list.flat_map(class_fn_lists, fn(x) { x.0 })
 
-  // The named JS functions (exported) plus the internal lifted lambdas (not exported).
+  // The named JS functions (exported) plus the internal lifted lambdas + class
+  // methods (not exported).
   let named = [main, ..funcs]
-  let functions = list.append(named, lambda_funcs)
+  let functions = list.flatten([named, lambda_funcs, class_funcs])
   Ok(ir.Module(
     name: module_name,
     uses_numerics: True,
@@ -214,6 +229,192 @@ pub fn program(
 
 /// The name of the module-level exception tag that transports a thrown JS value.
 const js_exn_tag = "js_exn"
+
+/// A class's constructor (params + body, if any), instance methods (name + params +
+/// body), and instance fields (name + optional initializer). Static members, getters/
+/// setters, computed keys, and inheritance are `Unsupported`.
+type ClassParts {
+  ClassParts(
+    ctor: Option(#(List(ast.Pattern), ast.Statement)),
+    methods: List(#(String, List(ast.Pattern), ast.Statement)),
+    fields: List(#(String, Option(ast.Expression))),
+  )
+}
+
+fn as_class_decl(s: ast.Statement) -> Result(#(String, ClassParts), Nil) {
+  case s {
+    ast.ClassDeclaration(name: Some(name), super_class: None, body:, ..) ->
+      case class_parts(body) {
+        Ok(parts) -> Ok(#(name, parts))
+        Error(_) -> Error(Nil)
+      }
+    _ -> Error(Nil)
+  }
+}
+
+fn class_parts(body: List(ast.ClassElement)) -> Result(ClassParts, Error) {
+  list.try_fold(body, ClassParts(None, [], []), fn(acc, el) {
+    case el {
+      ast.ClassMethod(value:, kind: ast.MethodConstructor, is_static: False, ..) -> {
+        use #(params, b) <- result_try(method_fn(value))
+        Ok(ClassParts(..acc, ctor: Some(#(params, b))))
+      }
+      ast.ClassMethod(
+        key: ast.Identifier(name:, ..),
+        value:,
+        kind: ast.MethodMethod,
+        is_static: False,
+        computed: False,
+      ) -> {
+        use #(params, b) <- result_try(method_fn(value))
+        Ok(
+          ClassParts(
+            ..acc,
+            methods: list.append(acc.methods, [#(name, params, b)]),
+          ),
+        )
+      }
+      ast.ClassField(
+        key: ast.Identifier(name:, ..),
+        value: init,
+        is_static: False,
+        computed: False,
+      ) ->
+        Ok(ClassParts(..acc, fields: list.append(acc.fields, [#(name, init)])))
+      _ ->
+        Error(Unsupported(
+          "class element (static/getter/setter/computed/extends)",
+        ))
+    }
+  })
+}
+
+fn method_fn(
+  value: ast.Expression,
+) -> Result(#(List(ast.Pattern), ast.Statement), Error) {
+  case value {
+    ast.FunctionExpression(params:, body:, ..) -> Ok(#(params, body))
+    _ -> Error(Unsupported("class method value"))
+  }
+}
+
+/// `this.name = init;` — a field-initializer statement prepended to the constructor.
+fn field_init_stmt(
+  name: String,
+  init: Option(ast.Expression),
+) -> ast.Statement {
+  let sp = ast.Span(0, 0)
+  let value = case init {
+    Some(e) -> e
+    None -> ast.UndefinedExpression(span: sp)
+  }
+  ast.ExpressionStatement(
+    expression: ast.AssignmentExpression(
+      span: sp,
+      operator: ast.Assign,
+      left: ast.MemberExpression(
+        span: sp,
+        object: ast.ThisExpression(span: sp),
+        property: ast.Identifier(span: sp, name: name),
+        computed: False,
+      ),
+      right: value,
+    ),
+    directive: None,
+  )
+}
+
+/// The constructor's statement list: instance field initializers first, then the
+/// explicit constructor body (if any).
+fn ctor_body_stmts(parts: ClassParts) -> List(ast.Statement) {
+  let inits = list.map(parts.fields, fn(f) { field_init_stmt(f.0, f.1) })
+  let body = case parts.ctor {
+    Some(#(_, b)) -> block_stmts(b)
+    None -> []
+  }
+  list.append(inits, body)
+}
+
+/// Every statement list belonging to a class (constructor + method bodies) — used to
+/// feed the lambda pre-pass so closures inside methods are collected.
+fn class_scan_stmts(parts: ClassParts) -> List(ast.Statement) {
+  list.append(
+    ctor_body_stmts(parts),
+    list.flat_map(parts.methods, fn(m) { block_stmts(m.2) }),
+  )
+}
+
+/// Lower a class constructor/method to an IR function whose FIRST parameter is `this`.
+fn lower_class_method(
+  fn_name: String,
+  params: List(ast.Pattern),
+  body_stmts: List(ast.Statement),
+  ctx: Ctx,
+) -> Result(ir.Function, Error) {
+  use #(pnames, defaults) <- result_try(param_info(params))
+  let all = ["this", ..pnames]
+  let env =
+    list.fold(all, dict.new(), fn(acc, n) { dict.insert(acc, n, ir.Var(n)) })
+  let stmts = list.append(default_prologue(defaults), body_stmts)
+  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
+  use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
+  Ok(ir.Function(
+    name: fn_name,
+    params: list.map(all, fn(n) { ir.Local(n, ir.TTerm) }),
+    result: [ir.TTerm],
+    locals: [],
+    body: body_expr,
+  ))
+}
+
+/// A class's `ClassInfo` (constructor arity + method arities) computed from its parts,
+/// without lowering — so `new C(…)` can resolve before the methods are lowered.
+fn class_info(parts: ClassParts) -> ClassInfo {
+  let ctor_arity = case parts.ctor {
+    Some(#(p, _)) -> list.length(p)
+    None -> 0
+  }
+  ClassInfo(
+    ctor_arity: ctor_arity,
+    methods: list.map(parts.methods, fn(m) { #(m.0, list.length(m.1)) }),
+  )
+}
+
+/// Generate the IR functions for one class: `C$constructor(this, …)` plus
+/// `C$name(this, …)` per method. Returns the functions and the `ClassInfo`.
+fn lower_class(
+  cname: String,
+  parts: ClassParts,
+  ctx: Ctx,
+) -> Result(#(List(ir.Function), ClassInfo), Error) {
+  let ctor_params = case parts.ctor {
+    Some(#(p, _)) -> p
+    None -> []
+  }
+  use ctor_fn <- result_try(lower_class_method(
+    cname <> "$constructor",
+    ctor_params,
+    ctor_body_stmts(parts),
+    ctx,
+  ))
+  use method_fns <- result_try(
+    list.try_map(parts.methods, fn(m) {
+      let #(mname, mparams, mbody) = m
+      lower_class_method(
+        cname <> "$" <> mname,
+        mparams,
+        block_stmts(mbody),
+        ctx,
+      )
+    }),
+  )
+  let info =
+    ClassInfo(
+      ctor_arity: list.length(ctor_params),
+      methods: list.map(parts.methods, fn(m) { #(m.0, list.length(m.1)) }),
+    )
+  Ok(#([ctor_fn, ..method_fns], info))
+}
 
 fn as_function_decl(
   s: ast.Statement,
@@ -1277,6 +1478,13 @@ fn lower_expr(
 
     ast.CallExpression(callee:, arguments:, ..) ->
       lower_call(callee, arguments, env, ctx, ctr)
+    ast.NewExpression(callee:, arguments:, ..) ->
+      lower_new(callee, arguments, env, ctx, ctr)
+    ast.ThisExpression(..) ->
+      case dict.get(env, "this") {
+        Ok(v) -> Ok(#([], v, ctr))
+        Error(Nil) -> Error(Unsupported("`this` outside a method"))
+      }
     ast.MemberExpression(object:, property:, computed:, ..) ->
       lower_member(object, property, computed, env, ctx, ctr)
     ast.OptionalMemberExpression(object:, property:, computed:, ..) ->
@@ -2009,9 +2217,70 @@ fn math_const(name: String) -> Option(ir.Value) {
   }
 }
 
-/// `recv.method(args)` — a method call. For v1 this dispatches the array-mutating
-/// methods (`push`, `pop`) to their `rt_js` ops; other method names are `Unsupported`
-/// (string/Array/Math builtins come later). The receiver is evaluated once.
+/// `new C(args)` — construct a class instance: a fresh object, each method installed
+/// as a `this`-bound closure property, then `C$constructor(this, args)` (which runs the
+/// field initializers and the constructor body). Yields the new object.
+fn lower_new(
+  callee: ast.Expression,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case callee {
+    ast.Identifier(name: cname, ..) ->
+      case dict.get(ctx.classes, cname) {
+        Error(Nil) ->
+          Error(Unsupported("new " <> cname <> "(…) (unknown class)"))
+        Ok(info) -> {
+          let #(binds, this_v, ctr) =
+            bind_after([], ir.CallHost("js", "new_object", []), ctr)
+          // install each method as a closure over `this`.
+          let #(binds, ctr) =
+            list.fold(info.methods, #(binds, ctr), fn(acc, m) {
+              let #(binds, ctr) = acc
+              let #(mname, marity) = m
+              let #(bc, closure_v, ctr) =
+                bind_after(
+                  binds,
+                  ir.MakeClosure(cname <> "$" <> mname, [this_v], marity),
+                  ctr,
+                )
+              let #(bs, _r, ctr) =
+                bind_after(
+                  bc,
+                  ir.CallHost("js", "set_prop", [
+                    this_v,
+                    ir.ConstBinary(<<mname:utf8>>),
+                    closure_v,
+                  ]),
+                  ctr,
+                )
+              #(bs, ctr)
+            })
+          use #(ba, argvals, ctr) <- result_try(lower_args(
+            arguments,
+            env,
+            ctx,
+            ctr,
+          ))
+          let fitted = fit_args(argvals, info.ctor_arity)
+          let #(binds2, _r, ctr) =
+            bind_after(
+              list.append(binds, ba),
+              ir.CallDirect(cname <> "$constructor", [this_v, ..fitted]),
+              ctr,
+            )
+          Ok(#(binds2, this_v, ctr))
+        }
+      }
+    _ -> Error(Unsupported("new of a non-identifier callee"))
+  }
+}
+
+/// `recv.method(args)` — a method call. Dispatches the built-in array/string methods
+/// by name to their `rt_js` ops; an unknown method name is a property-lookup-and-call
+/// (object/class instance methods). The receiver is evaluated once.
 fn lower_method(
   object: ast.Expression,
   method: String,
@@ -2091,7 +2360,18 @@ fn lower_method(
     "endsWith", [s, ..] -> host("str_ends_with", [s])
     "replace", [a, b, ..] -> host("str_replace", [a, b])
     "replaceAll", [a, b, ..] -> host("str_replace_all", [a, b])
-    _, _ -> Error(Unsupported("method ." <> method <> "()"))
+    // An unknown method name → look the property up and apply it. This is how a
+    // method stored on an object/class instance (a function-valued property) is
+    // called; `recv.m` that isn't a function is `undefined` → a runtime bad-call.
+    _, _ -> {
+      let #(bg, fnv, ctr) =
+        bind_after(
+          pre,
+          ir.CallHost("js", "get_prop", [recv, ir.ConstBinary(<<method:utf8>>)]),
+          ctr,
+        )
+      Ok(bind_after(bg, ir.CallClosure(fnv, argvals), ctr))
+    }
   }
 }
 
@@ -2652,6 +2932,7 @@ fn child_exprs(e: ast.Expression) -> List(ast.Expression) {
         False -> [object]
       }
     ast.OptionalCallExpression(callee:, arguments:, ..) -> [callee, ..arguments]
+    ast.NewExpression(callee:, arguments:, ..) -> [callee, ..arguments]
     ast.SpreadElement(argument:, ..) -> [argument]
     ast.ObjectExpression(properties:, ..) ->
       list.flat_map(properties, fn(p) {
@@ -2675,6 +2956,8 @@ fn child_exprs(e: ast.Expression) -> List(ast.Expression) {
 fn reads(e: ast.Expression) -> List(String) {
   case e {
     ast.Identifier(name:, ..) -> [name]
+    // `this` reads the enclosing method's binding — a nested arrow captures it.
+    ast.ThisExpression(..) -> ["this"]
     ast.ArrowFunctionExpression(params:, body:, ..) ->
       fv_lambda(pattern_names_lax(params), arrow_body_stmts(body))
     ast.FunctionExpression(params:, body:, ..) ->
