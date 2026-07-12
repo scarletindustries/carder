@@ -342,6 +342,65 @@ pub fn array_unshift(arr: Dynamic, vals: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_sort")
 pub fn array_sort(arr: Dynamic, cmp: Dynamic) -> Dynamic
 
+// ───────────────────────── strings ─────────────────────────
+// Strings are UTF-8 binaries. `.length`, indexing, `charAt`, `slice`, `substring` are
+// code-point based (BMP-correct; astral chars count as 1 not 2 — a v1 deviation from
+// JS's UTF-16 units). `indexOf`/`includes`/`slice`/`concat` are polymorphic over
+// arrays and strings (see those declarations above).
+
+/// `str.charAt(i)` → the 1-char string, or "" out of range.
+@external(erlang, "twocore_rt_js_ffi", "str_char_at")
+pub fn str_char_at(str: Dynamic, i: Dynamic) -> Dynamic
+
+/// `str.charCodeAt(i)` → the code point as a number, or NaN out of range.
+@external(erlang, "twocore_rt_js_ffi", "str_char_code_at")
+pub fn str_char_code_at(str: Dynamic, i: Dynamic) -> Dynamic
+
+/// `str.toUpperCase()`.
+@external(erlang, "twocore_rt_js_ffi", "str_upper")
+pub fn str_upper(str: Dynamic) -> Dynamic
+
+/// `str.toLowerCase()`.
+@external(erlang, "twocore_rt_js_ffi", "str_lower")
+pub fn str_lower(str: Dynamic) -> Dynamic
+
+/// `str.substring(start?, end?)` — clamps negatives to 0 and swaps if start > end.
+@external(erlang, "twocore_rt_js_ffi", "str_substring")
+pub fn str_substring(str: Dynamic, start: Dynamic, end: Dynamic) -> Dynamic
+
+/// `str.split(sep?)` → an array of substrings (no arg → `[str]`; "" → the characters).
+@external(erlang, "twocore_rt_js_ffi", "str_split")
+pub fn str_split(str: Dynamic, sep: Dynamic) -> Dynamic
+
+/// `str.trim()` / `trimStart()` / `trimEnd()`.
+@external(erlang, "twocore_rt_js_ffi", "str_trim")
+pub fn str_trim(str: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "str_trim_start")
+pub fn str_trim_start(str: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "str_trim_end")
+pub fn str_trim_end(str: Dynamic) -> Dynamic
+
+/// `str.repeat(n)` — `n` copies (negative → RangeError/type_error).
+@external(erlang, "twocore_rt_js_ffi", "str_repeat")
+pub fn str_repeat(str: Dynamic, n: Dynamic) -> Dynamic
+
+/// `str.startsWith(prefix)` / `endsWith(suffix)` → JS boolean.
+@external(erlang, "twocore_rt_js_ffi", "str_starts_with")
+pub fn str_starts_with(str: Dynamic, prefix: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "str_ends_with")
+pub fn str_ends_with(str: Dynamic, suffix: Dynamic) -> Dynamic
+
+/// `str.replace(search, repl)` — the first occurrence (string search, no regex in v1).
+@external(erlang, "twocore_rt_js_ffi", "str_replace")
+pub fn str_replace(str: Dynamic, search: Dynamic, repl: Dynamic) -> Dynamic
+
+/// `str.replaceAll(search, repl)` — every occurrence.
+@external(erlang, "twocore_rt_js_ffi", "str_replace_all")
+pub fn str_replace_all(str: Dynamic, search: Dynamic, repl: Dynamic) -> Dynamic
+
 // ───────────────────────── lists / console / misc ─────────────────────────
 
 /// The empty BEAM list `[]` (arity 0) — the nil tail an args-cons-list build starts from.

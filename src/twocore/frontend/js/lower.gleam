@@ -22,11 +22,17 @@
 //// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
 //// Control flow threads mutated variables as loop-carried params / phi-merged `If`s.
 ////
-//// Control flow also includes `for-of` (over arrays) and `switch` (with fall-through,
-//// default in any position, and `break` that targets the switch).
+//// Control flow also includes `for-of` (over arrays/strings) and `switch` (with
+//// fall-through, default in any position, and `break` that targets the switch).
+////
+//// Builtins: the `Math` namespace (functions + constants); array methods (push/pop/
+//// shift/unshift, map/filter/forEach/reduce/some/every/find/findIndex, indexOf/
+//// includes/join/slice/concat/reverse/sort); string `.length`, indexing, and methods
+//// (charAt/charCodeAt, toUpperCase/toLowerCase, indexOf/includes/slice/substring,
+//// split/trim/repeat/startsWith/endsWith/replace/replaceAll).
 ////
 //// Not yet (a clean `Unsupported` error / panic): classes, `try/catch/throw`,
-//// `for-in`, regex, most String/Array/Math builtins, and `continue` inside a
+//// `for-in`, regex, `JSON`/`Object`/`Number` statics, and `continue` inside a
 //// `do/while`. Scope is one flat function scope per JS function (block-scoped `let`
 //// is treated as function-scoped).
 ////
@@ -46,6 +52,9 @@
 ////     variable that is REASSIGNED in its scope (or by the closure) is rejected with a typed
 ////     error rather than silently diverging from JS's capture-by-reference; capturing a
 ////     mutable OBJECT/array is fine (the shared reference is what's captured).
+////   * String `.length`/indexing/`charAt`/`slice`/`substring` count Unicode CODE POINTS,
+////     not UTF-16 code units, so an astral-plane character counts as 1 (JS counts it as 2).
+////     BMP text (the common case) is exact.
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -1730,6 +1739,25 @@ fn lower_method(
         ctr,
       ))
     }
+    // string methods (charAt/slice/indexOf/includes/concat overlap with arrays and
+    // dispatch polymorphically in the runtime).
+    "charAt", [i, ..] -> host("str_char_at", [i])
+    "charCodeAt", [i, ..] -> host("str_char_code_at", [i])
+    "toUpperCase", _ -> host("str_upper", [])
+    "toLowerCase", _ -> host("str_lower", [])
+    "substring", [] -> host("str_substring", [undefined(), undefined()])
+    "substring", [s] -> host("str_substring", [s, undefined()])
+    "substring", [s, e, ..] -> host("str_substring", [s, e])
+    "split", [] -> host("str_split", [undefined()])
+    "split", [sep, ..] -> host("str_split", [sep])
+    "trim", _ -> host("str_trim", [])
+    "trimStart", _ -> host("str_trim_start", [])
+    "trimEnd", _ -> host("str_trim_end", [])
+    "repeat", [n, ..] -> host("str_repeat", [n])
+    "startsWith", [p, ..] -> host("str_starts_with", [p])
+    "endsWith", [s, ..] -> host("str_ends_with", [s])
+    "replace", [a, b, ..] -> host("str_replace", [a, b])
+    "replaceAll", [a, b, ..] -> host("str_replace_all", [a, b])
     _, _ -> Error(Unsupported("method ." <> method <> "()"))
   }
 }

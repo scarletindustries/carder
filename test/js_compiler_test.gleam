@@ -708,6 +708,77 @@ pub fn array_foreach_test() {
   to_float(call(m, "f", [])) |> should.equal(3.0)
 }
 
+// ── string methods ───────────────────────────────────────────────────────────
+
+pub fn string_length_index_test() {
+  num("\"hello\".length") |> should.equal(5.0)
+  let m = compile("function f() { return \"hello\"[1]; }")
+  call(m, "f", []) |> should.equal(dyn(<<"e">>))
+}
+
+pub fn string_case_test() {
+  let u = compile("function f() { return \"abc\".toUpperCase(); }")
+  call(u, "f", []) |> should.equal(dyn(<<"ABC">>))
+  let l = compile("function f() { return \"ABC\".toLowerCase(); }")
+  call(l, "f", []) |> should.equal(dyn(<<"abc">>))
+}
+
+pub fn string_search_test() {
+  num("\"hello\".indexOf(\"ll\")") |> should.equal(2.0)
+  num("\"hello\".indexOf(\"z\")") |> should.equal(-1.0)
+  let m = compile("function f() { return \"hello\".includes(\"ell\"); }")
+  call(m, "f", []) |> should.equal(dyn(True))
+  let s = compile("function f() { return \"hello\".startsWith(\"he\"); }")
+  call(s, "f", []) |> should.equal(dyn(True))
+  let e = compile("function f() { return \"hello\".endsWith(\"lo\"); }")
+  call(e, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn string_slice_substring_test() {
+  let m = compile("function f() { return \"hello\".slice(1, 3); }")
+  call(m, "f", []) |> should.equal(dyn(<<"el">>))
+  let n = compile("function f() { return \"hello\".slice(-2); }")
+  call(n, "f", []) |> should.equal(dyn(<<"lo">>))
+  // substring swaps args when start > end
+  let s = compile("function f() { return \"hello\".substring(3, 1); }")
+  call(s, "f", []) |> should.equal(dyn(<<"el">>))
+}
+
+pub fn string_split_test() {
+  num("\"a,b,c\".split(\",\").length") |> should.equal(3.0)
+  let j = compile("function f() { return \"a,b,c\".split(\",\")[1]; }")
+  call(j, "f", []) |> should.equal(dyn(<<"b">>))
+}
+
+pub fn string_trim_repeat_test() {
+  let t = compile("function f() { return \"  hi  \".trim(); }")
+  call(t, "f", []) |> should.equal(dyn(<<"hi">>))
+  let r = compile("function f() { return \"ab\".repeat(3); }")
+  call(r, "f", []) |> should.equal(dyn(<<"ababab">>))
+}
+
+pub fn string_replace_test() {
+  let m = compile("function f() { return \"a-b-c\".replace(\"-\", \"+\"); }")
+  call(m, "f", []) |> should.equal(dyn(<<"a+b-c">>))
+  let a = compile("function f() { return \"a-b-c\".replaceAll(\"-\", \"+\"); }")
+  call(a, "f", []) |> should.equal(dyn(<<"a+b+c">>))
+}
+
+pub fn string_charcode_test() {
+  num("\"A\".charCodeAt(0)") |> should.equal(65.0)
+  let c = compile("function f() { return \"hi\".charAt(1); }")
+  call(c, "f", []) |> should.equal(dyn(<<"i">>))
+}
+
+pub fn string_for_of_test() {
+  // for-of over a string iterates its characters (via .length + indexing)
+  let m =
+    compile(
+      "function f() { let out = \"\"; for (let c of \"abc\") { out = out + c + \".\"; } return out; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"a.b.c.">>))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

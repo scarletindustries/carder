@@ -70,6 +70,10 @@
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
+    str_char_at/2, str_char_code_at/2, str_upper/1, str_lower/1,
+    str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
+    str_trim_end/1, str_repeat/2, str_starts_with/2, str_ends_with/2,
+    str_replace/3, str_replace_all/3,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -802,6 +806,8 @@ get_prop(Recv, Key) when is_reference(Recv) ->
         M when is_map(M) -> maps:get(prop_key(Key), M, undefined);
         _ -> type_error(Recv)
     end;
+get_prop(Recv, Key) when is_binary(Recv) ->
+    string_prop(Recv, Key);
 get_prop(Recv, _Key) ->
     type_error(Recv).
 
@@ -1058,6 +1064,7 @@ afindi(Fn, Arr, [X | Xs], I) ->
 
 %% ── array value methods ──────────────────────────────────
 
+array_index_of(Recv, X) when is_binary(Recv) -> str_index_of(Recv, X);
 array_index_of(Recv, X) ->
     {Len, Map} = arr_content(Recv),
     aidx(arr_list(Len, Map), 0, X).
@@ -1079,6 +1086,7 @@ array_join(Recv, Sep) ->
     iolist_to_binary(lists:join(SepBin, Parts)).
 
 %% slice(start?, end?) with negative-from-end indices; `undefined` = defaulted.
+array_slice(Recv, Start, End) when is_binary(Recv) -> str_slice(Recv, Start, End);
 array_slice(Recv, Start, End) ->
     {Len, Map} = arr_content(Recv),
     S = slice_index(Start, Len, 0),
@@ -1099,7 +1107,10 @@ slice_index(V, Len, _Default) ->
         false -> min(N, Len)
     end.
 
-%% concat(...items) — spreads array items, appends others as single elements.
+%% concat(...items) — spreads array items, appends others as single elements. On a
+%% string receiver it is string concatenation (each item ToString'd).
+array_concat(Recv, Others) when is_binary(Recv) ->
+    iolist_to_binary([Recv | [to_string(O) || O <- Others]]);
 array_concat(Recv, Others) ->
     {Len, Map} = arr_content(Recv),
     new_array(arr_list(Len, Map) ++ lists:flatmap(fun concat_part/1, Others)).
@@ -1149,6 +1160,177 @@ sort_lte(V) ->
         neg_inf -> true;
         inf -> false;
         N -> N =< 0
+    end.
+
+%% ── strings ──────────────────────────────────────────────
+%% Strings are UTF-8 binaries. `.length`, indexing, `charAt`, `slice`, `substring` use
+%% Unicode CODE POINTS (correct for the BMP; astral chars count as 1, not the 2 UTF-16
+%% units JS uses — a documented v1 deviation). Substring search (indexOf/includes/
+%% split/replace/starts/ends) is exact (UTF-8 is prefix-free).
+
+cps(Bin) -> unicode:characters_to_list(Bin).
+from_cps(L) -> unicode:characters_to_binary(L).
+
+%% str.length or str[i].
+string_prop(Str, <<"length">>) ->
+    length(cps(Str));
+string_prop(Str, Key) ->
+    case str_to_index(Key) of
+        {ok, I} -> nth_char(cps(Str), I, undefined);
+        error -> undefined
+    end.
+
+str_to_index(K) when is_integer(K) -> {ok, K};
+str_to_index(K) when is_float(K) ->
+    case K == trunc(K) of
+        true -> {ok, trunc(K)};
+        false -> error
+    end;
+str_to_index(K) when is_binary(K) ->
+    try
+        {ok, binary_to_integer(K)}
+    catch
+        error:badarg -> error
+    end;
+str_to_index(_) -> error.
+
+%% The 1-char string at code-point index I, or `OutOfRange` when absent.
+nth_char(Cps, I, OutOfRange) when I >= 0 ->
+    case I < length(Cps) of
+        true -> from_cps([lists:nth(I + 1, Cps)]);
+        false -> OutOfRange
+    end;
+nth_char(_, _, OutOfRange) ->
+    OutOfRange.
+
+%% str.charAt(i) → the 1-char string, or "" out of range.
+str_char_at(Str, I) ->
+    case str_to_index(I) of
+        {ok, Idx} -> nth_char(cps(Str), Idx, <<>>);
+        error -> nth_char(cps(Str), 0, <<>>)
+    end.
+
+%% str.charCodeAt(i) → the code point as a number, or NaN out of range.
+str_char_code_at(Str, I) ->
+    case str_to_index(I) of
+        {ok, Idx} ->
+            Cps = cps(Str),
+            case Idx >= 0 andalso Idx < length(Cps) of
+                true -> lists:nth(Idx + 1, Cps);
+                false -> js_nan
+            end;
+        error ->
+            js_nan
+    end.
+
+str_upper(Str) -> unicode:characters_to_binary(string:uppercase(Str)).
+str_lower(Str) -> unicode:characters_to_binary(string:lowercase(Str)).
+
+%% str.indexOf(sub) → first code-point index of `sub`, or -1 ("" → 0).
+str_index_of(Str, Sub) ->
+    SubBin = to_string(Sub),
+    case SubBin of
+        <<>> ->
+            0;
+        _ ->
+            case binary:match(Str, SubBin) of
+                nomatch -> -1;
+                {Pos, _} -> length(cps(binary:part(Str, 0, Pos)))
+            end
+    end.
+
+%% str.slice(start?, end?) — negative-from-end code-point slice.
+str_slice(Str, Start, End) ->
+    Cps = cps(Str),
+    Len = length(Cps),
+    S = slice_index(Start, Len, 0),
+    E = slice_index(End, Len, Len),
+    from_cps(lists:sublist(Cps, S + 1, max(0, E - S))).
+
+%% str.substring(start?, end?) — clamps negatives to 0 and swaps if start > end.
+str_substring(Str, Start, End) ->
+    Cps = cps(Str),
+    Len = length(Cps),
+    S0 = sub_index(Start, Len, 0),
+    E0 = sub_index(End, Len, Len),
+    {S, E} =
+        case S0 =< E0 of
+            true -> {S0, E0};
+            false -> {E0, S0}
+        end,
+    from_cps(lists:sublist(Cps, S + 1, max(0, E - S))).
+
+sub_index(undefined, _Len, Default) -> Default;
+sub_index(V, Len, _Default) ->
+    N =
+        case coerce_num(V) of
+            nan -> 0;
+            inf -> Len;
+            neg_inf -> 0;
+            Num -> trunc(as_float(Num))
+        end,
+    min(max(N, 0), Len).
+
+%% str.split(sep?) → array. No arg → [str]; "" → the characters; else split on `sep`.
+str_split(Str, undefined) ->
+    new_array([Str]);
+str_split(Str, Sep) ->
+    case to_string(Sep) of
+        <<>> -> new_array([from_cps([C]) || C <- cps(Str)]);
+        SepBin -> new_array(binary:split(Str, SepBin, [global]))
+    end.
+
+str_trim(Str) -> unicode:characters_to_binary(string:trim(Str)).
+str_trim_start(Str) -> unicode:characters_to_binary(string:trim(Str, leading)).
+str_trim_end(Str) -> unicode:characters_to_binary(string:trim(Str, trailing)).
+
+str_repeat(Str, N) ->
+    Count =
+        case coerce_num(N) of
+            nan -> 0;
+            inf -> type_error(N);
+            neg_inf -> type_error(N);
+            Num -> trunc(as_float(Num))
+        end,
+    case Count < 0 of
+        true -> type_error(N);
+        false -> binary:copy(Str, Count)
+    end.
+
+str_starts_with(Str, Prefix) ->
+    P = to_string(Prefix),
+    PS = byte_size(P),
+    byte_size(Str) >= PS andalso binary:part(Str, 0, PS) =:= P.
+
+str_ends_with(Str, Suffix) ->
+    S = to_string(Suffix),
+    SS = byte_size(S),
+    SZ = byte_size(Str),
+    SZ >= SS andalso binary:part(Str, SZ - SS, SS) =:= S.
+
+%% str.replace(search, repl) — the FIRST occurrence (string search; no regex in v1).
+str_replace(Str, Search, Repl) ->
+    ReplBin = to_string(Repl),
+    case to_string(Search) of
+        <<>> ->
+            <<ReplBin/binary, Str/binary>>;
+        SearchBin ->
+            case binary:match(Str, SearchBin) of
+                nomatch ->
+                    Str;
+                {Pos, Len} ->
+                    Before = binary:part(Str, 0, Pos),
+                    After = binary:part(Str, Pos + Len, byte_size(Str) - Pos - Len),
+                    <<Before/binary, ReplBin/binary, After/binary>>
+            end
+    end.
+
+%% str.replaceAll(search, repl) — every occurrence.
+str_replace_all(Str, Search, Repl) ->
+    ReplBin = to_string(Repl),
+    case to_string(Search) of
+        <<>> -> Str;
+        SearchBin -> binary:replace(Str, SearchBin, ReplBin, [global])
     end.
 
 %% ───────────────────────── lists / console / misc ─────────────────────────
