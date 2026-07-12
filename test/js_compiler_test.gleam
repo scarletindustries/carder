@@ -1262,6 +1262,18 @@ pub fn to_fixed_test() {
   call(m, "f", []) |> should.equal(dyn(<<"3.14">>))
 }
 
+// ── Object.assign / fromEntries ──────────────────────────────────────────────
+
+pub fn object_assign_test() {
+  num("Object.assign({ a: 1 }, { b: 2 }, { a: 9 }).a") |> should.equal(9.0)
+  num("Object.assign({ a: 1 }, { b: 2 }).b") |> should.equal(2.0)
+}
+
+pub fn object_from_entries_test() {
+  num("Object.fromEntries([[\"a\", 1], [\"b\", 2]]).a") |> should.equal(1.0)
+  num("Object.fromEntries(Object.entries({ x: 5 })).x") |> should.equal(5.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

@@ -81,6 +81,7 @@
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
+    object_from_entries/1,
     json_stringify/1, json_parse/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
@@ -1632,6 +1633,26 @@ is_nullish(_) -> 0.
 object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
 object_values(O) -> new_array([V || {_, V} <- obj_pairs(O)]).
 object_entries(O) -> new_array([new_array([K, V]) || {K, V} <- obj_pairs(O)]).
+
+%% Object.fromEntries(pairs) — build an object from an array of [key, value] arrays.
+object_from_entries(Entries) when is_reference(Entries) ->
+    {Len, Map} = arr_content(Entries),
+    O = new_object(),
+    lists:foreach(
+        fun(Pair) ->
+            case is_array(Pair) of
+                1 ->
+                    {_, M} = arr_content(Pair),
+                    set_prop(O, to_string(maps:get(0, M, undefined)), maps:get(1, M, undefined));
+                0 ->
+                    ok
+            end
+        end,
+        arr_list(Len, Map)
+    ),
+    O;
+object_from_entries(_) ->
+    new_object().
 
 %% Copy `source`'s own properties into `target` (in place); behind object spread
 %% `{...o}` and `Object.assign`. A null/undefined/primitive source is a no-op.

@@ -508,6 +508,10 @@ pub fn object_entries(o: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_assign_into")
 pub fn object_assign_into(target: Dynamic, source: Dynamic) -> Dynamic
 
+/// `Object.fromEntries(pairs)` — build an object from an array of `[key, value]` arrays.
+@external(erlang, "twocore_rt_js_ffi", "object_from_entries")
+pub fn object_from_entries(entries: Dynamic) -> Dynamic
+
 /// `JSON.stringify(v)` → a JSON string (undefined/function → `undefined`).
 @external(erlang, "twocore_rt_js_ffi", "json_stringify")
 pub fn json_stringify(v: Dynamic) -> Dynamic

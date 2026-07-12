@@ -41,8 +41,9 @@
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
 //// `String`/`Number`/`Boolean`; and the statics `Array.isArray`/`of`/`from`,
-//// `Object.keys`/`values`/`entries`, `Number.isInteger`/`isNaN`/`isFinite`,
-//// `JSON.stringify`/`parse`, `String.fromCharCode`, and `Date.now`.
+//// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
+//// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
+//// `String.fromCharCode`, and `Date.now`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): static/getter/setter class members,
 //// nested/defaulted destructuring, call spread `f(...a)`, rest params, regex,
@@ -2222,6 +2223,22 @@ fn lower_static_call(
     "Object", "keys", [o, ..] -> host("object_keys", [o])
     "Object", "values", [o, ..] -> host("object_values", [o])
     "Object", "entries", [o, ..] -> host("object_entries", [o])
+    "Object", "fromEntries", [e, ..] -> host("object_from_entries", [e])
+    // Object.assign(target, ...sources) — copy each source into target, return target.
+    "Object", "assign", [target, ..sources] -> {
+      let #(binds2, ctr) =
+        list.fold(sources, #(binds, ctr), fn(acc, src) {
+          let #(binds, ctr) = acc
+          let #(b2, _r, ctr) =
+            bind_after(
+              binds,
+              ir.CallHost("js", "object_assign_into", [target, src]),
+              ctr,
+            )
+          #(b2, ctr)
+        })
+      Ok(#(binds2, target, ctr))
+    }
     "Number", "isInteger", [x, ..] -> host("number_is_integer", [x])
     "Number", "isNaN", [x, ..] -> host("number_is_nan", [x])
     "Number", "isFinite", [x, ..] -> host("number_is_finite", [x])
