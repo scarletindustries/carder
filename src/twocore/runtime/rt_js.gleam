@@ -405,6 +405,11 @@ pub fn num_to_fixed(n: Dynamic, d: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "num_to_exponential")
 pub fn num_to_exponential(n: Dynamic, d: Dynamic) -> Dynamic
 
+/// `num.toPrecision(p)` — `p` significant digits (fixed or exponential per spec);
+/// undefined precision is ToString.
+@external(erlang, "twocore_rt_js_ffi", "num_to_precision")
+pub fn num_to_precision(n: Dynamic, p: Dynamic) -> Dynamic
+
 /// `recv.toString()` — a user `toString` method wins, else the default ToString.
 @external(erlang, "twocore_rt_js_ffi", "to_string_dispatch")
 pub fn to_string_dispatch(recv: Dynamic) -> Dynamic

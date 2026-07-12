@@ -71,7 +71,7 @@
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
-    array_last_index_of/2, num_to_fixed/2, num_to_exponential/2,
+    array_last_index_of/2, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
     to_string_dispatch/1, num_to_string_radix/2,
     new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
@@ -1992,6 +1992,41 @@ fix_exp(Bin) ->
 
 strip_leading_zeros(<<"0", R/binary>>) when R =/= <<>> -> strip_leading_zeros(R);
 strip_leading_zeros(D) -> D.
+
+%% num.toPrecision(p) — `p` significant digits, in fixed or exponential notation
+%% per the spec (exponential when the decimal exponent e is < -6 or >= p, else
+%% fixed). With no precision it is ToString. Reuses toFixed/scientific formatting.
+num_to_precision(N, P) ->
+    case coerce_num(P) of
+        nan ->
+            to_string(N);
+        Pn ->
+            case coerce_num(N) of
+                nan -> <<"NaN">>;
+                inf -> <<"Infinity">>;
+                neg_inf -> <<"-Infinity">>;
+                Num -> precision_go(as_float(Num), max(1, trunc(as_float(Pn))))
+            end
+    end.
+
+precision_go(F, P) when F == 0 ->
+    num_to_fixed(0.0, P - 1);
+precision_go(F, P) ->
+    Sci = float_to_binary(F, [{scientific, P - 1}]),
+    E = sci_exponent(Sci),
+    case E < -6 orelse E >= P of
+        true -> fix_exp(Sci);
+        false -> num_to_fixed(F, P - 1 - E)
+    end.
+
+%% The decimal exponent encoded in an Erlang scientific literal ("1.2e+05" → 5).
+sci_exponent(Sci) ->
+    [_, <<Sign, Digits/binary>>] = binary:split(Sci, <<"e">>),
+    N = binary_to_integer(Digits),
+    case Sign of
+        $- -> -N;
+        _ -> N
+    end.
 
 %% num.toFixed(d) — fixed-point string with `d` decimals.
 num_to_fixed(N, D) ->

@@ -4232,6 +4232,7 @@ fn resolve_js(op: String) -> Option(String) {
     "array_last_index_of" -> Some("array_last_index_of")
     "num_to_fixed" -> Some("num_to_fixed")
     "num_to_exponential" -> Some("num_to_exponential")
+    "num_to_precision" -> Some("num_to_precision")
     "to_string_dispatch" -> Some("to_string_dispatch")
     "num_to_string_radix" -> Some("num_to_string_radix")
     // regex

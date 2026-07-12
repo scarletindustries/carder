@@ -1024,6 +1024,17 @@ pub fn number_to_exponential_test() {
   |> should.equal(dyn(<<"1.23e+2|1e+2|-1.2e+2|4.20e-4|1.23456e+2">>))
 }
 
+pub fn number_to_precision_test() {
+  // Significant-digit formatting: fixed when the exponent is in [-6, p), else
+  // exponential; no argument is ToString.
+  let m =
+    compile(
+      "function f() { return (123.456).toPrecision(5) + '|' + (123.456).toPrecision(2) + '|' + (0.0042).toPrecision(2) + '|' + (123456).toPrecision(3) + '|' + (123.456).toPrecision(); }",
+    )
+  call(m, "f", [])
+  |> should.equal(dyn(<<"123.46|1.2e+2|0.0042|1.23e+5|123.456">>))
+}
+
 pub fn number_string_radix_test() {
   // ToNumber(String) parses 0x/0o/0b integer literals (no sign after the prefix).
   num("Number('0x5')") |> should.equal(5.0)

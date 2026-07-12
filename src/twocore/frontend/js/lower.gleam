@@ -4826,6 +4826,8 @@ fn lower_instance_method(
     "toFixed", [] -> host("num_to_fixed", [undefined()])
     "toExponential", [d, ..] -> host("num_to_exponential", [d])
     "toExponential", [] -> host("num_to_exponential", [undefined()])
+    "toPrecision", [p, ..] -> host("num_to_precision", [p])
+    "toPrecision", [] -> host("num_to_precision", [undefined()])
     "toString", [] -> host("to_string_dispatch", [])
     "toString", [radix, ..] -> host("num_to_string_radix", [radix])
     // regex: `re.test(str)` and `str.match(re)`.
