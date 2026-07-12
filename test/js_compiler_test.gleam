@@ -1594,6 +1594,24 @@ pub fn ssa_name_collision_test() {
   to_float(call(d, "f", [])) |> should.equal(5.0)
 }
 
+pub fn global_constants_test() {
+  // NaN and Infinity are number-typed global constants.
+  val("typeof NaN") |> should.equal(dyn(<<"number">>))
+  val("typeof Infinity") |> should.equal(dyn(<<"number">>))
+  // NaN is not equal to itself.
+  val("NaN === NaN") |> should.equal(dyn(False))
+  val("NaN !== NaN") |> should.equal(dyn(True))
+  // Infinity is the value of 1/0 and exceeds any finite double.
+  val("Infinity === 1 / 0") |> should.equal(dyn(True))
+  val("Infinity > 1e308") |> should.equal(dyn(True))
+  val("isNaN(NaN)") |> should.equal(dyn(True))
+  val("isFinite(Infinity)") |> should.equal(dyn(False))
+  // NaN is now usable as a literal in expressions.
+  val("[NaN, 1].includes(NaN)") |> should.equal(dyn(True))
+  // A local binding shadows the global.
+  num("(function(){ let NaN = 5; return NaN + 1; })()") |> should.equal(6.0)
+}
+
 pub fn super_method_arity_test() {
   // super.pick(10) where the parent method takes (a, b): b defaults to undefined
   // and is unused, so the result is 10. Regression: an under-applied super call

@@ -42,7 +42,8 @@
 //// and methods (charAt/charCodeAt, toUpperCase/toLowerCase, indexOf/includes/slice/
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
-//// `String`/`Number`/`Boolean`; and the statics `Array.isArray`/`of`/`from`,
+//// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
+//// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
 //// `String.fromCharCode`, and `Date.now`. Regex literals `/pat/flags` (backed by
@@ -88,6 +89,17 @@
 ////     BMP text (the common case) is exact.
 ////   * `Object.keys`/`values`/`entries` return keys in the backing map's iteration order,
 ////     not JS property-insertion order.
+////   * A class instance method whose name matches a builtin ARRAY/STRING method
+////     (`push`/`pop`/`map`/`filter`/`slice`/`indexOf`/…) is shadowed by the builtin at a
+////     `obj.method(…)` call site. The collection names `get`/`set`/`has`/`add`/`delete`/
+////     `clear`/`forEach` (Map/Set) DO delegate to a same-named user method; the array
+////     names do not. Name such methods differently to avoid the collision.
+////   * `switch` case-test expressions are evaluated eagerly (all of them, top-to-bottom)
+////     to pick the entry point, rather than lazily in order stopping at the first `===`
+////     match. Pure/literal tests (the common case) are unaffected; a side-effecting or
+////     non-deterministic case test may run when JS would not have reached it.
+////   * A `break`/`continue` to a label attached to a `switch` or a plain block that is
+////     nested OUTSIDE a loop targets the wrong construct; labels on loops work correctly.
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -1612,11 +1624,18 @@ fn lower_expr(
     ast.Identifier(name: x, ..) ->
       case dict.get(env, x) {
         Ok(v) -> Ok(#([], v, ctr))
-        // A bare reference to a top-level function is that function as a value.
+        // A local binding shadows a global; the fallbacks below apply only when
+        // the name is free in this scope.
         Error(_) ->
-          case list.contains(ctx.funcs, x) {
-            True -> Ok(bind1(ir.MakeClosure(x, [], fn_arity_unknown(x)), ctr))
-            False -> Error(Unsupported("unbound identifier '" <> x <> "'"))
+          case global_const(x) {
+            Some(v) -> Ok(#([], v, ctr))
+            // A bare reference to a top-level function is that function as a value.
+            None ->
+              case list.contains(ctx.funcs, x) {
+                True ->
+                  Ok(bind1(ir.MakeClosure(x, [], fn_arity_unknown(x)), ctr))
+                False -> Error(Unsupported("unbound identifier '" <> x <> "'"))
+              }
           }
       }
 
@@ -3333,6 +3352,20 @@ fn is_integral(v: Float) -> Bool {
 /// The JS `undefined` value — the `rt_js` sentinel atom.
 fn undefined() -> ir.Value {
   ir.ConstAtom("undefined")
+}
+
+/// The value of a free identifier that names a global constant of the JS runtime
+/// (`NaN`, `Infinity`, `undefined`), or `None` if `name` is not one. `NaN` and
+/// `Infinity` are the `rt_js` numeric sentinels `js_nan` / `js_inf`, which the
+/// runtime accepts as number inputs (`num_of`, `js_type`). A local binding of
+/// the same name shadows these (checked before this fallback).
+fn global_const(name: String) -> Option(ir.Value) {
+  case name {
+    "NaN" -> Some(ir.ConstAtom("js_nan"))
+    "Infinity" -> Some(ir.ConstAtom("js_inf"))
+    "undefined" -> Some(undefined())
+    _ -> None
+  }
 }
 
 fn bool_to_string(b: Bool) -> String {
