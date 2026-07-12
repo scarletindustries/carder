@@ -67,7 +67,8 @@
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, array_to_list/1,
-    str_pad_start/3, str_pad_end/3, string_from_char_code/1, string_raw/2, date_now/0,
+    str_pad_start/3, str_pad_end/3, string_from_char_code/1,
+    string_from_code_point/1, string_raw/2, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/2, num_to_fixed/2,
     to_string_dispatch/1, num_to_string_radix/2,
@@ -75,7 +76,8 @@
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
-    array_reduce1/2, array_some/2, array_every/2, array_find/2,
+    array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
+    array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
@@ -1107,6 +1109,11 @@ take_cps(All, [C | Rest], Count) -> [C | take_cps(All, Rest, Count - 1)].
 string_from_char_code(Codes) ->
     from_cps([(trunc(as_float(coerce_num(C))) band 16#FFFF) || C <- Codes]).
 
+%% String.fromCodePoint(...points) — build a string from full Unicode code
+%% points (unlike fromCharCode, no ToUint16 masking).
+string_from_code_point(Codes) ->
+    from_cps([trunc(as_float(coerce_num(C))) || C <- Codes]).
+
 %% String.raw(template, ...substitutions) — the default tagged-template tag
 %% (§22.1.2.4): concatenate the RAW literal segments (template.raw), inserting
 %% ToString(substitution[i]) after each segment except the last. A missing
@@ -1480,6 +1487,27 @@ array_reduce1(Recv, Fn) ->
         [] -> type_error(Recv);
         [First | Rest] -> areduce(Fn, Recv, Rest, 1, First)
     end.
+
+%% reduceRight(fn, init?) — fold from the last element to the first; the callback
+%% receives (acc, element, index, array) with the true descending index.
+array_reduce_right(Recv, Fn, Init) ->
+    {Len, Map} = arr_content(Recv),
+    arredr(Fn, Recv, redr_pairs(Len, Map), Init).
+array_reduce_right1(Recv, Fn) ->
+    {Len, Map} = arr_content(Recv),
+    case redr_pairs(Len, Map) of
+        [] -> type_error(Recv);
+        [{_, First} | Rest] -> arredr(Fn, Recv, Rest, First)
+    end.
+
+%% {index, element} pairs from the last index down to 0.
+redr_pairs(0, _Map) -> [];
+redr_pairs(Len, Map) ->
+    [{I, maps:get(I, Map, undefined)} || I <- lists:seq(Len - 1, 0, -1)].
+
+arredr(_, _, [], Acc) -> Acc;
+arredr(Fn, Arr, [{I, X} | Rest], Acc) ->
+    arredr(Fn, Arr, Rest, call_cb(Fn, [Acc, X, I, Arr])).
 
 array_some(Recv, Fn) ->
     {Len, Map} = arr_content(Recv),

@@ -1672,6 +1672,30 @@ pub fn string_raw_test() {
   call(n, "f", []) |> should.equal(dyn(<<"v=5\\t!">>))
 }
 
+pub fn reduce_right_test() {
+  // reduceRight folds from the right; order matters for subtraction.
+  // no init: ((4 - 3) - 2) - 1 = -2
+  num("[1, 2, 3, 4].reduceRight(function(a, b) { return a - b; })")
+  |> should.equal(-2.0)
+  // with init: ((10 - 3) - 2) - 1 = 4
+  num("[1, 2, 3].reduceRight(function(a, b) { return a - b; }, 10)")
+  |> should.equal(4.0)
+  // builds a string right-to-left.
+  val("['a', 'b', 'c'].reduceRight(function(a, b) { return a + b; })")
+  |> should.equal(dyn(<<"cba">>))
+}
+
+pub fn code_point_at_test() {
+  num("'ABC'.codePointAt(0)") |> should.equal(65.0)
+  num("'ABC'.codePointAt(2)") |> should.equal(67.0)
+}
+
+pub fn from_code_point_test() {
+  val("String.fromCodePoint(65, 66, 67)") |> should.equal(dyn(<<"ABC">>))
+  // fromCodePoint does NOT mask to 16 bits (unlike fromCharCode): astral char.
+  num("String.fromCodePoint(128512).length") |> should.equal(1.0)
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {

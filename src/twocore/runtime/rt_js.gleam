@@ -312,6 +312,10 @@ pub fn str_pad_end(str: Dynamic, n: Dynamic, pad: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "string_from_char_code")
 pub fn string_from_char_code(codes: Dynamic) -> Dynamic
 
+/// `String.fromCodePoint(...points)` — build a string from full code points (no mask).
+@external(erlang, "twocore_rt_js_ffi", "string_from_code_point")
+pub fn string_from_code_point(points: Dynamic) -> Dynamic
+
 /// `String.raw(template, ...subs)` — the default tagged-template tag: raw literal
 /// segments interleaved with the stringified substitutions (`subs` a cons list).
 @external(erlang, "twocore_rt_js_ffi", "string_raw")
@@ -432,6 +436,14 @@ pub fn array_reduce(arr: Dynamic, fn_: Dynamic, init: Dynamic) -> Dynamic
 /// `arr.reduce(fn)` — left fold seeded by the first element (empty → TypeError).
 @external(erlang, "twocore_rt_js_ffi", "array_reduce1")
 pub fn array_reduce1(arr: Dynamic, fn_: Dynamic) -> Dynamic
+
+/// `arr.reduceRight(fn, init)` — right fold with `fn(acc, x, i, arr)`.
+@external(erlang, "twocore_rt_js_ffi", "array_reduce_right")
+pub fn array_reduce_right(arr: Dynamic, fn_: Dynamic, init: Dynamic) -> Dynamic
+
+/// `arr.reduceRight(fn)` — right fold seeded by the last element (empty → TypeError).
+@external(erlang, "twocore_rt_js_ffi", "array_reduce_right1")
+pub fn array_reduce_right1(arr: Dynamic, fn_: Dynamic) -> Dynamic
 
 /// `arr.some(fn)` → JS boolean: any element satisfies `fn`.
 @external(erlang, "twocore_rt_js_ffi", "array_some")

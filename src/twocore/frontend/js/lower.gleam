@@ -37,16 +37,16 @@
 //// tag; `return`/`break`/`continue` inside a try body transfer out correctly).
 ////
 //// Builtins: the `Math` namespace (functions + constants); array methods (push/pop/
-//// shift/unshift, map/filter/forEach/reduce/some/every/find/findIndex, indexOf/
-//// includes/join/slice/concat/reverse/sort, flat/fill/at); string `.length`, indexing,
-//// and methods (charAt/charCodeAt, toUpperCase/toLowerCase, indexOf/includes/slice/
+//// shift/unshift, map/filter/forEach/reduce/reduceRight/some/every/find/findIndex,
+//// indexOf/includes/join/slice/concat/reverse/sort, flat/fill/at); string `.length`,
+//// indexing, and methods (charAt/charCodeAt/codePointAt, toUpperCase/toLowerCase, indexOf/includes/slice/
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
 //// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
 //// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
-//// `String.fromCharCode`/`String.raw`, and `Date.now`. Tagged templates
+//// `String.fromCharCode`/`fromCodePoint`/`String.raw`, and `Date.now`. Tagged templates
 //// `` tag`…${e}…` `` (the tag receives the cooked strings array with a `.raw`
 //// property, then the substitutions). Regex literals `/pat/flags` (backed by
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
@@ -2632,6 +2632,14 @@ fn lower_static_call(
         ctr,
       ))
     }
+    "String", "fromCodePoint", _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+      Ok(bind_after(
+        binds2,
+        ir.CallHost("js", "string_from_code_point", [listv]),
+        ctr,
+      ))
+    }
     // String.raw(template, ...substitutions) — the default tagged-template tag.
     "String", "raw", [template, ..subs] -> {
       let #(binds2, listv, ctr) = build_list(subs, binds, ctr)
@@ -2961,6 +2969,8 @@ fn lower_instance_method(
     "match", [re, ..] -> host("str_match", [re])
     "reduce", [f] -> host("array_reduce1", [f])
     "reduce", [f, init, ..] -> host("array_reduce", [f, init])
+    "reduceRight", [f] -> host("array_reduce_right1", [f])
+    "reduceRight", [f, init, ..] -> host("array_reduce_right", [f, init])
     "sort", [] -> host("array_sort", [undefined()])
     "sort", [cmp, ..] -> host("array_sort", [cmp])
     // queries
@@ -2983,6 +2993,8 @@ fn lower_instance_method(
     // dispatch polymorphically in the runtime).
     "charAt", [i, ..] -> host("str_char_at", [i])
     "charCodeAt", [i, ..] -> host("str_char_code_at", [i])
+    // Strings count code POINTS in this model, so codePointAt == charCodeAt.
+    "codePointAt", [i, ..] -> host("str_char_code_at", [i])
     "toUpperCase", _ -> host("str_upper", [])
     "toLowerCase", _ -> host("str_lower", [])
     "substring", [] -> host("str_substring", [undefined(), undefined()])
