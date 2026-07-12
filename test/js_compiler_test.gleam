@@ -1274,6 +1274,47 @@ pub fn object_from_entries_test() {
   num("Object.fromEntries(Object.entries({ x: 5 })).x") |> should.equal(5.0)
 }
 
+// ── integration: many features combined ──────────────────────────────────────
+
+pub fn integration_store_test() {
+  // class + method chaining + this + push + object literals + reduce/filter/map
+  // closures (capturing a method param) + join + string length
+  let m =
+    compile(
+      "class Store { constructor() { this.items = []; } add(name, price) { this.items.push({ name: name, price: price }); return this; } total() { return this.items.reduce((sum, it) => sum + it.price, 0); } names(threshold) { return this.items.filter(it => it.price > threshold).map(it => it.name).join(\",\"); } } function run() { let s = new Store(); s.add(\"apple\", 3).add(\"laptop\", 1000).add(\"book\", 15); return s.total() * 10000 + s.names(10).length; }",
+    )
+  // total = 1018 → 10180000; names = "laptop,book" (length 11) → 10180011
+  to_float(call(m, "run", [])) |> should.equal(10_180_011.0)
+}
+
+pub fn integration_pipeline_test() {
+  // for-loop + array building + filter/map/reduce chain with closures
+  let m =
+    compile(
+      "function run() { let nums = []; for (let i = 1; i <= 10; i++) { nums.push(i); } return nums.filter(n => n % 2 === 0).map(n => n * n).reduce((a, b) => a + b, 0); }",
+    )
+  // evens 2,4,6,8,10 → squares → 4+16+36+64+100 = 220
+  to_float(call(m, "run", [])) |> should.equal(220.0)
+}
+
+pub fn integration_closure_object_test() {
+  // a factory returning an object of arrows sharing a captured mutable object
+  let m =
+    compile(
+      "function makeCounter() { let state = { n: 0 }; return { inc: () => { state.n = state.n + 1; return state.n; }, get: () => state.n }; } function run() { let c = makeCounter(); c.inc(); c.inc(); c.inc(); return c.get(); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(3.0)
+}
+
+pub fn integration_json_roundtrip_test() {
+  // build data, stringify, parse back, and read through it
+  let m =
+    compile(
+      "function run() { let people = [{ name: \"Ann\", age: 30 }, { name: \"Bob\", age: 25 }]; let json = JSON.stringify(people); let back = JSON.parse(json); return back[0].age + back[1].age; }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(55.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {
