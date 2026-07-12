@@ -1571,24 +1571,44 @@ code_point_of(C) ->
 %% ToString(substitution[i]) after each segment except the last. A missing
 %% substitution is `undefined` ("undefined"). `Subs` is the cons-list of args.
 string_raw(Template, Subs) ->
+    %% `raw` may be ANY object (§22.1.2.4 treats it as an array-like, not a
+    %% dense array): read `raw.length` via ToLength and each segment via
+    %% Get(raw, ToString(i)). Reads dispatch through get_prop, so a genuine
+    %% array (the tagged-template case) and a plain object both work.
     Raw = get_prop(Template, <<"raw">>),
-    {Len, Map} = arr_content(Raw),
-    raw_join(arr_list(Len, Map), Subs, <<>>).
+    Len = to_length(get_prop(Raw, <<"length">>)),
+    raw_join(Raw, Subs, Len, 0, <<>>).
 
-raw_join([], _Subs, Acc) ->
+%% ToLength(§7.1.20): ToIntegerOrInfinity clamped into [0, 2^53 - 1]. A missing
+%% or NaN length → 0; a negative or -Infinity length → 0.
+to_length(V) ->
+    case coerce_num(V) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> 16#1FFFFFFFFFFFFF;
+        N -> min(max(trunc(as_float(N)), 0), 16#1FFFFFFFFFFFFF)
+    end.
+
+%% Concatenate ToString(Get(raw, "0..Len-1")), inserting ToString(Subs[i])
+%% between consecutive segments. `Len =< 0` yields "" (the guard below). A
+%% missing substitution contributes the empty string, not "undefined"
+%% (§22.1.2.4 appends a substitution only when index+1 < Len).
+raw_join(_Raw, _Subs, Len, Idx, Acc) when Idx >= Len ->
     Acc;
-raw_join([Seg], _Subs, Acc) ->
-    <<Acc/binary, (to_string(Seg))/binary>>;
-raw_join([Seg | Rest], Subs, Acc) ->
-    Acc1 = <<Acc/binary, (to_string(Seg))/binary>>,
-    %% A missing substitution contributes the empty string, not "undefined"
-    %% (§22.1.3.4 appends a substitution only when one is present).
-    {Sub, Subs1} =
-        case Subs of
-            [S | R] -> {S, R};
-            [] -> {<<>>, []}
-        end,
-    raw_join(Rest, Subs1, <<Acc1/binary, (to_string(Sub))/binary>>).
+raw_join(Raw, Subs, Len, Idx, Acc) ->
+    Seg = to_string(get_prop(Raw, integer_to_binary(Idx))),
+    Acc1 = <<Acc/binary, Seg/binary>>,
+    case Idx + 1 >= Len of
+        true ->
+            Acc1;
+        false ->
+            {Sub, Subs1} =
+                case Subs of
+                    [S | R] -> {to_string(S), R};
+                    [] -> {<<>>, []}
+                end,
+            raw_join(Raw, Subs1, Len, Idx + 1, <<Acc1/binary, Sub/binary>>)
+    end.
 
 %% ── Date ─────────────────────────────────────────────────
 %% A Date value is a cell `{js_date, Ms}` where `Ms` is an INTEGER count of

@@ -3033,6 +3033,26 @@ pub fn string_from_code_point_range_test() {
   |> should.equal(dyn(<<0, "B">>))
 }
 
+pub fn string_raw_arraylike_test() {
+  // §22.1.2.4: `raw` is treated as an array-LIKE, not a dense array — read
+  // raw.length via ToLength and each segment via Get(raw, ToString(i)). A plain
+  // object with a `length` and integer-string keys must work, segments beyond
+  // `length` are ignored, and non-string segments are ToString'd.
+  val(
+    "String.raw({ raw: { length: 5, 0: 'e', 1: '', 2: null, 3: undefined, 4: 123, 5: 'over' } })",
+  )
+  |> should.equal(dyn(<<"enullundefined123">>))
+  // ToLength(length) <= 0 (missing, -Infinity, NaN, 0) → the empty string.
+  val("String.raw({ raw: {} })") |> should.equal(dyn(<<"">>))
+  val("String.raw({ raw: { length: -Infinity } })")
+  |> should.equal(dyn(<<"">>))
+  val("String.raw({ raw: { length: NaN, 0: 'a' } })")
+  |> should.equal(dyn(<<"">>))
+  // Substitutions are inserted between array-like segments and ToString'd.
+  val("String.raw({ raw: { length: 2, 0: 'a', 1: 'b' } }, 42)")
+  |> should.equal(dyn(<<"a42b">>))
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {
