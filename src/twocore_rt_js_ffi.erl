@@ -70,6 +70,7 @@
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
+    date_new/1, date_utc/1, date_parse/1, date_call/3,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/3, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
     to_string_dispatch/1, num_to_string_radix/2,
@@ -803,6 +804,7 @@ to_string(V) when is_reference(V) ->
     case erlang:get(?CELL_KEY(V)) of
         {js_array, Len, Map} -> array_to_string(Len, Map);
         {js_regex, _, Flags, Src} -> <<"/", Src/binary, "/", Flags/binary>>;
+        {js_date, Ms} -> date_to_string(Ms);
         _ -> <<"[object Object]">>
     end;
 %% any internal repr (tuple/map/list/…).
@@ -1583,9 +1585,342 @@ raw_join([Seg | Rest], Subs, Acc) ->
         end,
     raw_join(Rest, Subs1, <<Acc1/binary, (to_string(Sub))/binary>>).
 
+%% ── Date ─────────────────────────────────────────────────
+%% A Date value is a cell `{js_date, Ms}` where `Ms` is an INTEGER count of
+%% milliseconds since the Unix epoch (UTC), or the atom `nan` for an Invalid Date.
+%% Only the time-value is stored; every getter derives its component on demand via
+%% a civil<->days conversion (Howard Hinnant's algorithm), which is exact across the
+%% whole ±8.64e15 ms TimeClip range including proleptic (negative) years — unlike
+%% `calendar`, whose gregorian-seconds domain excludes years before 0.
+%%
+%% DEVIATION (documented, deterministic): local time is treated as identical to UTC.
+%% So `getFullYear`==`getUTCFullYear` (and likewise for every field), the component
+%% form `new Date(y, m, …)` and `Date.UTC(…)` both build a UTC instant,
+%% `getTimezoneOffset()` is 0, and an ISO string with no timezone is read as UTC.
+%% This removes any host-timezone dependence from compiled programs.
+%% NOT implemented (v1 gaps): the setter family (setUTCFullYear/…), the locale/long
+%% string forms (toString renders ISO, not the JS long local form), Symbol.toPrimitive,
+%% and parsing of the non-ISO `toString`/`toUTCString` layouts.
+
+%% Milliseconds per day — the fundamental Date day boundary.
+-define(MS_PER_DAY, 86400000).
+%% The maximum absolute time value a Date may hold (TimeClip): 100,000,000 days.
+-define(MAX_TIME, 8640000000000000).
+
 %% Date.now() — milliseconds since the Unix epoch.
 date_now() ->
     erlang:system_time(millisecond).
+
+%% `new Date(...)` — build a Date cell from the constructor arguments (a cons list):
+%%   []            → the current instant (like `Date.now()`).
+%%   [v]           → a Date is copied; a string is parsed as ISO 8601 (§21.4.1.15);
+%%                   anything else is `ToNumber`'d then TimeClip'd.
+%%   [y, m | more] → the component form (year, month, [date, hours, min, sec, ms]),
+%%                   interpreted as UTC (see the module deviation note).
+%% Always returns a fresh `{js_date, Ms}` cell (Ms an integer or `nan`).
+date_new([]) ->
+    cell_new({js_date, erlang:system_time(millisecond)});
+date_new([V]) ->
+    Ms =
+        case cell_tag(V) of
+            {js_date, M} -> M;
+            _ ->
+                case js_type(V) of
+                    string -> parse_iso(V);
+                    _ -> time_clip(coerce_num(V))
+                end
+        end,
+    cell_new({js_date, Ms});
+date_new(Args) ->
+    cell_new({js_date, make_time_value(Args)}).
+
+%% `Date.UTC(year [, month [, date [, hours [, minutes [, seconds [, ms]]]]]])`
+%% (§21.4.3.4) — the time value (a NUMBER: ms since epoch, or NaN), NOT a Date.
+date_utc(Args) ->
+    out_ms(make_time_value(Args)).
+
+%% `Date.parse(string)` (§21.4.3.2) — `ToString` then parse as ISO 8601; the time
+%% value (ms) or NaN when unparseable.
+date_parse(V) ->
+    out_ms(parse_iso(to_string(V))).
+
+%% A Date instance method dispatched on the receiver's tag. When `Recv` is a Date
+%% cell the field/derived value is computed from its ms; otherwise the call DELEGATES
+%% to a same-named user method (so `getTime`/`valueOf`/… never clobber a user object's
+%% own method). `Name` is the JS method name (a binary); `Args` the full argument list.
+date_call(Recv, Name, Args) ->
+    case cell_tag(Recv) of
+        {js_date, Ms} -> date_field(Name, Ms, Args);
+        _ -> delegate(Recv, Name, Args)
+    end.
+
+%% Resolve one Date method against a time value `Ms` (integer or `nan`).
+%% `getTime`/`valueOf` return the raw time value; `toISOString` throws a RangeError on
+%% an Invalid Date (§21.4.4.36); `toJSON` yields `null` there; every other getter
+%% yields NaN. All fields are UTC (module deviation).
+date_field(<<"getTime">>, Ms, _) -> out_ms(Ms);
+date_field(<<"valueOf">>, Ms, _) -> out_ms(Ms);
+date_field(<<"getTimezoneOffset">>, nan, _) -> js_nan;
+date_field(<<"getTimezoneOffset">>, _Ms, _) -> 0;
+date_field(<<"toISOString">>, nan, _) -> range_error(<<"Invalid time value">>);
+date_field(<<"toISOString">>, Ms, _) -> to_iso_string(Ms);
+date_field(<<"toJSON">>, nan, _) -> null;
+date_field(<<"toJSON">>, Ms, _) -> to_iso_string(Ms);
+date_field(_Name, nan, _) -> js_nan;
+date_field(Name, Ms, _) -> date_component(Name, Ms).
+
+%% The value of a per-field getter (`Ms` is a valid integer time value). Month is
+%% 0-based (§21.4.1.5); day-of-week is 0=Sunday (1970-01-01 was a Thursday, day 4).
+%% Local and UTC variants coincide (module deviation).
+date_component(Name, Ms) ->
+    MsOfDay = floor_mod(Ms, ?MS_PER_DAY),
+    Days = (Ms - MsOfDay) div ?MS_PER_DAY,
+    case Name of
+        <<"getFullYear">> -> element(1, civil_from_days(Days));
+        <<"getUTCFullYear">> -> element(1, civil_from_days(Days));
+        <<"getMonth">> -> element(2, civil_from_days(Days)) - 1;
+        <<"getUTCMonth">> -> element(2, civil_from_days(Days)) - 1;
+        <<"getDate">> -> element(3, civil_from_days(Days));
+        <<"getUTCDate">> -> element(3, civil_from_days(Days));
+        <<"getDay">> -> floor_mod(Days + 4, 7);
+        <<"getUTCDay">> -> floor_mod(Days + 4, 7);
+        <<"getHours">> -> MsOfDay div 3600000;
+        <<"getUTCHours">> -> MsOfDay div 3600000;
+        <<"getMinutes">> -> (MsOfDay div 60000) rem 60;
+        <<"getUTCMinutes">> -> (MsOfDay div 60000) rem 60;
+        <<"getSeconds">> -> (MsOfDay div 1000) rem 60;
+        <<"getUTCSeconds">> -> (MsOfDay div 1000) rem 60;
+        <<"getMilliseconds">> -> MsOfDay rem 1000;
+        <<"getUTCMilliseconds">> -> MsOfDay rem 1000;
+        _ -> type_error(Name)
+    end.
+
+%% Build a time value (ms integer or `nan`) from a component argument list, shared by
+%% the component-form `new Date(y, m, …)` and `Date.UTC(…)`. Defaults per spec: month
+%% +0, date 1, hours/minutes/seconds/ms 0. Any non-finite component ⇒ NaN. The
+%% two-digit-year rule (an integer year in 0..99 ⇒ 1900+year) is applied. UTC (deviation).
+make_time_value(Args) ->
+    Y0 = to_finite_int(arg(Args, 0)),
+    Mo = component(Args, 1, 0),
+    D = component(Args, 2, 1),
+    H = component(Args, 3, 0),
+    Mi = component(Args, 4, 0),
+    S = component(Args, 5, 0),
+    MilS = component(Args, 6, 0),
+    case lists:member(nan, [Y0, Mo, D, H, Mi, S, MilS]) of
+        true ->
+            nan;
+        false ->
+            Yr =
+                case Y0 >= 0 andalso Y0 =< 99 of
+                    true -> 1900 + Y0;
+                    false -> Y0
+                end,
+            Day = make_day(Yr, Mo, D),
+            Time = H * 3600000 + Mi * 60000 + S * 1000 + MilS,
+            time_clip(Day * ?MS_PER_DAY + Time)
+    end.
+
+%% `ToNumber(arg[I])` reduced to a finite integer, or the default when the argument is
+%% absent. A NaN/±Infinity component becomes the atom `nan` (its presence makes the
+%% whole time value NaN, per MakeDay/MakeTime).
+component(Args, I, Default) ->
+    case length(Args) > I of
+        true -> to_finite_int(arg(Args, I));
+        false -> Default
+    end.
+
+%% `ToNumber` then `ToInteger` (truncate toward zero), or the atom `nan` for a
+%% non-finite result (NaN / ±Infinity).
+to_finite_int(V) ->
+    case coerce_num(V) of
+        N when is_integer(N) -> N;
+        N when is_float(N) -> trunc(N);
+        _ -> nan
+    end.
+
+%% MakeDay (§21.4.1.11): the day number (days since epoch) for (year, month0, date),
+%% normalizing month overflow into the year and adding `date-1` days to the 1st of
+%% the resulting month (so day 0, day 32, month 13, negative days all roll correctly).
+make_day(Y, M, D) ->
+    YM = Y + floor_div(M, 12),
+    MN = floor_mod(M, 12),
+    days_from_civil(YM, MN + 1, 1) + (D - 1).
+
+%% TimeClip (§21.4.1.31): a non-finite value or one whose magnitude exceeds 8.64e15
+%% clips to NaN; otherwise ToInteger (a -0 collapses to +0). Accepts the internal
+%% numeric domain (integer | float | nan | inf | neg_inf) and yields an integer or `nan`.
+time_clip(nan) -> nan;
+time_clip(inf) -> nan;
+time_clip(neg_inf) -> nan;
+time_clip(N) when is_integer(N) -> clip_int(N);
+time_clip(N) when is_float(N) -> clip_int(trunc(N)).
+
+clip_int(N) ->
+    case abs(N) =< ?MAX_TIME of
+        true -> N;
+        false -> nan
+    end.
+
+%% Internal time value → external JS number (the `nan` atom becomes the `js_nan` sentinel).
+out_ms(nan) -> js_nan;
+out_ms(N) -> N.
+
+%% `Date.prototype.toISOString`-format string for a valid integer time value:
+%% `YYYY-MM-DDTHH:mm:ss.sssZ`, with the expanded `±YYYYYY` year form outside 0..9999
+%% (§21.4.4.36 / §21.4.1.33).
+to_iso_string(Ms) ->
+    MsOfDay = floor_mod(Ms, ?MS_PER_DAY),
+    Days = (Ms - MsOfDay) div ?MS_PER_DAY,
+    {Y, Mo, D} = civil_from_days(Days),
+    H = MsOfDay div 3600000,
+    Mi = (MsOfDay div 60000) rem 60,
+    S = (MsOfDay div 1000) rem 60,
+    MilS = MsOfDay rem 1000,
+    iolist_to_binary(
+        io_lib:format(
+            "~s-~2..0B-~2..0BT~2..0B:~2..0B:~2..0B.~3..0BZ",
+            [iso_year(Y), Mo, D, H, Mi, S, MilS]
+        )
+    ).
+
+%% The ISO year field: 4 digits in 0..9999, otherwise a signed 6-digit expanded year.
+iso_year(Y) when Y >= 0, Y =< 9999 -> io_lib:format("~4..0B", [Y]);
+iso_year(Y) when Y < 0 -> io_lib:format("-~6..0B", [-Y]);
+iso_year(Y) -> io_lib:format("+~6..0B", [Y]).
+
+%% A Date's string form (used by `to_string`): ISO for a valid date, "Invalid Date"
+%% for NaN. DEVIATION: real `Date.prototype.toString` renders the long LOCAL form; we
+%% emit the ISO (UTC) string so the result is deterministic and timezone-free.
+date_to_string(nan) -> <<"Invalid Date">>;
+date_to_string(Ms) -> to_iso_string(Ms).
+
+%% Parse an ISO 8601 Date Time String (§21.4.1.15) into an integer time value or `nan`.
+%% Supported: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, and any of those followed by
+%% `THH:mm`, `THH:mm:ss`, `THH:mm:ss.sss`, each optionally with a `Z` or `±HH:mm`
+%% timezone; the expanded `±YYYYYY` year is accepted. A date with no time, or a
+%% time with no timezone, is read as UTC (module deviation). Unrecognised ⇒ `nan`.
+parse_iso(Bin) ->
+    RE =
+        "^([+-][0-9]{6}|[0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2}))?)?"
+        "(?:T([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\\.([0-9]{3}))?)?"
+        "(Z|[+-][0-9]{2}:[0-9]{2})?)?$",
+    case re:run(Bin, RE, [{capture, all_but_first, binary}]) of
+        %% `re` truncates trailing non-participating groups, so a date-only string
+        %% yields fewer than 8 captures — pad the absent (time/zone) fields with `<<>>`.
+        {match, Parts} -> iso_parts_to_ms(pad_to(Parts, 8));
+        nomatch -> nan
+    end.
+
+%% Right-pad `L` with empty binaries until it has at least `N` elements.
+pad_to(L, N) when length(L) >= N -> L;
+pad_to(L, N) -> pad_to(L ++ [<<>>], N).
+
+iso_parts_to_ms([Ys, Mos, Ds, Hs, Mis, Ss, MilSs, Tz]) ->
+    Y = signed_int(Ys),
+    Mo = default_int(Mos, 1),
+    D = default_int(Ds, 1),
+    H = default_int(Hs, 0),
+    Mi = default_int(Mis, 0),
+    S = default_int(Ss, 0),
+    MilS = default_int(MilSs, 0),
+    %% Year 0 is positive and must be written `+000000`; the extended form `-000000`
+    %% (negative zero) is explicitly invalid (§21.4.1.15.1).
+    NegZeroYear = Y =:= 0 andalso is_negative_year(Ys),
+    case NegZeroYear orelse not valid_iso(Mo, D, H, Mi, S) of
+        true ->
+            nan;
+        false ->
+            Day = days_from_civil(Y, Mo, D),
+            Local = Day * ?MS_PER_DAY + H * 3600000 + Mi * 60000 + S * 1000 + MilS,
+            %% Subtract the parsed offset to reach UTC; an absent offset means UTC here.
+            time_clip(Local - tz_offset_ms(Tz))
+    end.
+
+%% Basic field-range validation (a stricter per-month day check is a v1 gap); an
+%% out-of-range field makes the whole string unparseable (NaN).
+valid_iso(Mo, D, H, Mi, S) ->
+    Mo >= 1 andalso Mo =< 12 andalso
+        D >= 1 andalso D =< 31 andalso
+        H >= 0 andalso H =< 24 andalso
+        Mi >= 0 andalso Mi =< 59 andalso
+        S >= 0 andalso S =< 59.
+
+%% Milliseconds to SUBTRACT from a parsed local time to reach UTC. `Z` and an absent
+%% offset are both 0 (absent time zones are treated as UTC — deviation).
+tz_offset_ms(<<>>) -> 0;
+tz_offset_ms(<<"Z">>) -> 0;
+tz_offset_ms(<<Sign, H1, H0, $:, M1, M0>>) ->
+    Mins = (H1 - $0) * 600 + (H0 - $0) * 60 + (M1 - $0) * 10 + (M0 - $0),
+    case Sign of
+        $- -> -Mins * 60000;
+        _ -> Mins * 60000
+    end.
+
+%% An ISO integer field, or `Default` when the capture is absent (empty binary).
+default_int(<<>>, Default) -> Default;
+default_int(Bin, _) -> binary_to_integer(Bin).
+
+%% Parse a possibly `+`-signed integer (`binary_to_integer` rejects a leading `+`).
+signed_int(<<"+", Rest/binary>>) -> binary_to_integer(Rest);
+signed_int(Bin) -> binary_to_integer(Bin).
+
+%% Whether an ISO year field carried an explicit minus sign (to reject `-000000`).
+is_negative_year(<<"-", _/binary>>) -> true;
+is_negative_year(_) -> false.
+
+%% Floored integer division / modulo (Erlang `div`/`rem` truncate toward zero; Date
+%% arithmetic needs flooring so negative times land in the right day/field bucket).
+floor_div(A, B) -> (A - floor_mod(A, B)) div B.
+floor_mod(A, B) -> ((A rem B) + B) rem B.
+
+%% days_from_civil / civil_from_days — Howard Hinnant's proleptic-Gregorian
+%% calendar algorithm (public domain). `days_from_civil(Y, M, D)` returns the day
+%% number (days since 1970-01-01) for a 1-based month `M` (1..12) and day `D`;
+%% `civil_from_days(Z)` inverts it to `{Year, Month1, Day}` with a 1-based month.
+%% Both are exact for any integer year, so they cover the full Date range.
+days_from_civil(Y0, M, D) ->
+    Y = case M =< 2 of
+        true -> Y0 - 1;
+        false -> Y0
+    end,
+    Era = case Y >= 0 of
+        true -> Y;
+        false -> Y - 399
+    end div 400,
+    Yoe = Y - Era * 400,
+    MP = case M > 2 of
+        true -> M - 3;
+        false -> M + 9
+    end,
+    Doy = (153 * MP + 2) div 5 + D - 1,
+    Doe = Yoe * 365 + Yoe div 4 - Yoe div 100 + Doy,
+    Era * 146097 + Doe - 719468.
+
+civil_from_days(Z0) ->
+    Z = Z0 + 719468,
+    Era = case Z >= 0 of
+        true -> Z;
+        false -> Z - 146096
+    end div 146097,
+    Doe = Z - Era * 146097,
+    Yoe = (Doe - Doe div 1460 + Doe div 36524 - Doe div 146096) div 365,
+    Y = Yoe + Era * 400,
+    Doy = Doe - (365 * Yoe + Yoe div 4 - Yoe div 100),
+    MP = (5 * Doy + 2) div 153,
+    D = Doy - (153 * MP + 2) div 5 + 1,
+    M = case MP < 10 of
+        true -> MP + 3;
+        false -> MP - 9
+    end,
+    Year = case M =< 2 of
+        true -> Y + 1;
+        false -> Y
+    end,
+    {Year, M, D}.
+
+%% A JS RangeError (§21.4.4.36 throws this for an out-of-range Date on toISOString).
+range_error(Detail) -> erlang:error({js_error, range_error, Detail}).
 
 %% ── Map / Set ────────────────────────────────────────────
 %% A Map is a cell `{js_map, Data}` (Erlang map: JS-value key → value); a Set is

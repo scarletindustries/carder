@@ -4380,6 +4380,14 @@ fn lower_static_call(
       ))
     }
     "Date", "now", _ -> host("date_now", [])
+    // Date.UTC(year, month, …) — the component list as a cons list → a time value.
+    "Date", "UTC", _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+      Ok(bind_after(binds2, ir.CallHost("js", "date_utc", [listv]), ctr))
+    }
+    // Date.parse(string) — ToString then ISO-parse to a time value (or NaN).
+    "Date", "parse", [s, ..] -> host("date_parse", [s])
+    "Date", "parse", [] -> host("date_parse", [undefined()])
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }
@@ -4486,6 +4494,9 @@ fn lower_new(
       lower_builtin_new("new_map", arguments, env, ctx, ctr)
     ast.Identifier(name: "Set", ..) ->
       lower_builtin_new("new_set", arguments, env, ctx, ctr)
+    // `new Date(...)` — a built-in Date (all argument forms; see `date_new`). Not a
+    // class: no prototype machinery, just a `{js_date, Ms}` cell from the runtime.
+    ast.Identifier(name: "Date", ..) -> lower_date_new(arguments, env, ctx, ctr)
     // `new Array(n)` (length) / `new Array(a, b, …)` (elements).
     ast.Identifier(name: "Array", ..) ->
       lower_array_construct(arguments, env, ctx, ctr)
@@ -4710,6 +4721,21 @@ fn lower_builtin_new(
   Ok(bind_after(binds, ir.CallHost("js", op, [init]), ctr))
 }
 
+/// `new Date(...)` — pass ALL arguments as a cons list to the runtime `date_new`,
+/// which selects the constructor form (now / ms / string / copy / components) at
+/// runtime. Mirrors `lower_builtin_new` but keeps every argument (Date has variadic
+/// forms), so no `class` machinery is involved.
+fn lower_date_new(
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+  Ok(bind_after(binds2, ir.CallHost("js", "date_new", [listv]), ctr))
+}
+
 /// `recv.method(args)` — a method call. Dispatches the built-in array/string/Map/Set
 /// methods by name to their `rt_js` ops (Map/Set methods delegate to a same-named user
 /// method on a plain object); an unknown method name is a property-lookup-and-call
@@ -4812,6 +4838,21 @@ fn lower_instance_method(
   let coll = fn(name) {
     let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
     Ok(bind_after(binds2, ir.CallHost("js", name, [recv, listv]), ctr))
+  }
+  // A Date instance method: dispatch in the runtime (`date_call`) on the receiver's
+  // tag, passing the JS method name (so a non-Date receiver delegates to a same-named
+  // user method) and the full argument list.
+  let date = fn(name: String) {
+    let #(binds2, listv, ctr) = build_list(argvals, pre, ctr)
+    Ok(bind_after(
+      binds2,
+      ir.CallHost("js", "date_call", [
+        recv,
+        ir.ConstBinary(<<name:utf8>>),
+        listv,
+      ]),
+      ctr,
+    ))
   }
   case method, argvals {
     // mutators / stack ops
@@ -4937,6 +4978,31 @@ fn lower_instance_method(
     "endsWith", [s] -> host("str_ends_with", [s, undefined()])
     "replace", [a, b, ..] -> host("str_replace", [a, b])
     "replaceAll", [a, b, ..] -> host("str_replace_all", [a, b])
+    // Date instance methods — dispatched in the runtime on the receiver's tag.
+    // All fields are UTC (local == UTC deviation), so the `get*`/`getUTC*` pairs
+    // share one runtime path. `valueOf`/`toISOString`/`toJSON`/`getTimezoneOffset`
+    // included. A non-Date receiver delegates to a same-named user method.
+    "getTime", _ -> date("getTime")
+    "valueOf", _ -> date("valueOf")
+    "getTimezoneOffset", _ -> date("getTimezoneOffset")
+    "toISOString", _ -> date("toISOString")
+    "toJSON", _ -> date("toJSON")
+    "getFullYear", _ -> date("getFullYear")
+    "getUTCFullYear", _ -> date("getUTCFullYear")
+    "getMonth", _ -> date("getMonth")
+    "getUTCMonth", _ -> date("getUTCMonth")
+    "getDate", _ -> date("getDate")
+    "getUTCDate", _ -> date("getUTCDate")
+    "getDay", _ -> date("getDay")
+    "getUTCDay", _ -> date("getUTCDay")
+    "getHours", _ -> date("getHours")
+    "getUTCHours", _ -> date("getUTCHours")
+    "getMinutes", _ -> date("getMinutes")
+    "getUTCMinutes", _ -> date("getUTCMinutes")
+    "getSeconds", _ -> date("getSeconds")
+    "getUTCSeconds", _ -> date("getUTCSeconds")
+    "getMilliseconds", _ -> date("getMilliseconds")
+    "getUTCMilliseconds", _ -> date("getUTCMilliseconds")
     // An unknown method name → look the property up and apply it. This is how a
     // method stored on an object/class instance (a function-valued property) is
     // called; `recv.m` that isn't a function is `undefined` → a runtime bad-call.
