@@ -1799,6 +1799,30 @@ pub fn getter_only_assign_test() {
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
 
+pub fn logical_assign_no_rebind_test() {
+  // A short-circuited nested assignment must NOT rebind its target.
+  // x truthy → `y = 5` never runs → y stays 0.
+  num("(function(){ let x = 1, y = 0; x ||= y = 5; return y; })()")
+  |> should.equal(0.0)
+  // x falsy → `y = 5` never runs (&&=) → y stays 9.
+  num("(function(){ let x = 0, y = 9; x &&= y = 5; return y; })()")
+  |> should.equal(9.0)
+  // x non-nullish → `y = 5` never runs (??=) → y stays 7.
+  num("(function(){ let x = 1, y = 7; x ??= y = 5; return y; })()")
+  |> should.equal(7.0)
+  // sanity: a plain chain still rebinds both targets.
+  num("(function(){ let x = 0, y = 0; x = y = 3; return x + y; })()")
+  |> should.equal(6.0)
+}
+
+pub fn string_raw_missing_sub_test() {
+  // A direct String.raw with fewer substitutions than gaps: a missing
+  // substitution is the empty string, not "undefined".
+  val("String.raw({ raw: [\"a\", \"b\"] })") |> should.equal(dyn(<<"ab">>))
+  val("String.raw({ raw: [\"a\", \"b\", \"c\"] }, \"X\")")
+  |> should.equal(dyn(<<"aXbc">>))
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {

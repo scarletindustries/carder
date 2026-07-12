@@ -1168,10 +1168,12 @@ raw_join([Seg], _Subs, Acc) ->
     <<Acc/binary, (to_string(Seg))/binary>>;
 raw_join([Seg | Rest], Subs, Acc) ->
     Acc1 = <<Acc/binary, (to_string(Seg))/binary>>,
+    %% A missing substitution contributes the empty string, not "undefined"
+    %% (§22.1.3.4 appends a substitution only when one is present).
     {Sub, Subs1} =
         case Subs of
             [S | R] -> {S, R};
-            [] -> {undefined, []}
+            [] -> {<<>>, []}
         end,
     raw_join(Rest, Subs1, <<Acc1/binary, (to_string(Sub))/binary>>).
 

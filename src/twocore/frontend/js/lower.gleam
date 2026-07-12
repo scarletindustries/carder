@@ -1033,8 +1033,20 @@ fn desugar_destructure(
 /// rebind is not threaded here, so a later read of that target sees the old value.
 fn env_after_effect(e: ast.Expression, v: ir.Value, env: Env) -> Env {
   case e {
-    ast.AssignmentExpression(left: ast.Identifier(name: x, ..), right: rhs, ..) ->
-      env_after_effect(rhs, v, dict.insert(env, x, v))
+    // A plain `x = y = e` chain: `v` is the shared assigned value, so rebind `x`
+    // AND recurse into the rhs so `y` is rebound too.
+    ast.AssignmentExpression(
+      operator: ast.Assign,
+      left: ast.Identifier(name: x, ..),
+      right: rhs,
+      ..,
+    ) -> env_after_effect(rhs, v, dict.insert(env, x, v))
+    // A compound/logical assignment (`x += e`, `x ||= e`): rebind `x`, but do NOT
+    // recurse into the rhs — `v` is the whole expression's value (not the rhs's),
+    // and for `||=`/`&&=`/`??=` the rhs may have been short-circuited, so an
+    // assignment nested there must not rebind its target.
+    ast.AssignmentExpression(left: ast.Identifier(name: x, ..), ..) ->
+      dict.insert(env, x, v)
     // `x++` / `++x` (and `--`): `v` is the new value, so rebind `x` to it.
     ast.UpdateExpression(argument: ast.Identifier(name: x, ..), ..) ->
       dict.insert(env, x, v)
