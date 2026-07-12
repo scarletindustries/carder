@@ -2394,15 +2394,28 @@ array_unshift(Recv, Vals) ->
 
 %% sort(cmp?) — in place. Default order is by ToString (JS default); a comparator
 %% orders A before B when cmp(A, B) <= 0.
+%% arr.sort(cmp?) — sort in place, returning the array. Per SortIndexedProperties
+%% + SortCompare (ES2023 23.1.3.30): only *present* elements are sorted; holes are
+%% moved to the very end. `undefined` elements are never handed to a comparator and
+%% always sort after every non-undefined element (but before holes). With no `cmp`,
+%% elements are ordered by ToString; with a `cmp`, by the sign of `cmp(a, b)` (a NaN
+%% comparator result is treated as 0, i.e. keep order). The sort is stable.
 array_sort(Recv, Cmp) ->
     {Len, Map} = arr_content(Recv),
-    L = arr_list(Len, Map),
+    %% Present elements in index order (holes skipped via the own-key check).
+    Present = [maps:get(I, Map) || I <- lists:seq(0, Len - 1), maps:is_key(I, Map)],
+    {Undef, Defined} = lists:partition(fun(V) -> V =:= undefined end, Present),
     Sorted =
         case Cmp of
-            undefined -> lists:sort(fun(A, B) -> to_string(A) =< to_string(B) end, L);
-            _ -> lists:sort(fun(A, B) -> sort_lte(call_cb(Cmp, [A, B])) end, L)
+            undefined -> lists:sort(fun(A, B) -> to_string(A) =< to_string(B) end, Defined);
+            _ -> lists:sort(fun(A, B) -> sort_lte(call_cb(Cmp, [A, B])) end, Defined)
         end,
-    arr_store(Recv, Sorted).
+    %% Non-undefined (sorted), then the undefined run; the remaining tail
+    %% [length(Ordered)..Len-1] is left as holes (absent keys), preserving Len.
+    Ordered = Sorted ++ Undef,
+    NewMap = maps:from_list(lists:zip(lists:seq(0, length(Ordered) - 1), Ordered)),
+    erlang:put(?CELL_KEY(Recv), {js_array, Len, NewMap}),
+    Recv.
 
 sort_lte(V) ->
     case coerce_num(V) of

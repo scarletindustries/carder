@@ -1020,6 +1020,31 @@ pub fn array_find_spec_test() {
   to_float(call(fl, "f", [])) |> should.equal(7.0)
 }
 
+pub fn array_sort_undefined_spec_test() {
+  // sort moves `undefined` to the end regardless of order (SortCompare: an
+  // undefined x sorts after everything) and never passes it to a comparator
+  // (ES 23.1.3.30). Default (ToString) order.
+  let d =
+    compile(
+      "function f() { return [\"z\", undefined, \"a\"].sort().join(\",\"); }",
+    )
+  call(d, "f", []) |> should.equal(dyn(<<"a,z,">>))
+
+  // With a comparator, undefined still sorts last and is not compared.
+  let c =
+    compile(
+      "function f() { return [3, undefined, 1].sort((a, b) => a - b).join(\",\"); }",
+    )
+  call(c, "f", []) |> should.equal(dyn(<<"1,3,">>))
+
+  // Holes sort after every present element; the trailing slots stay holes.
+  let h =
+    compile(
+      "function f() { let a = new Array(4); a[0] = 3; a[1] = 1; return a.sort().join(\",\"); }",
+    )
+  call(h, "f", []) |> should.equal(dyn(<<"1,3,,">>))
+}
+
 // ── string methods ───────────────────────────────────────────────────────────
 
 pub fn string_length_index_test() {
