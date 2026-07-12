@@ -4803,6 +4803,8 @@ fn lower_instance_method(
       host("array_copy_within", [t, undefined(), undefined()])
     "copyWithin", [] ->
       host("array_copy_within", [undefined(), undefined(), undefined()])
+    // splice(start, deleteCount, ...items) — all args as a cons list.
+    "splice", _ -> coll("array_splice")
     "at", [i, ..] -> host("array_at", [i])
     "padStart", [n] -> host("str_pad_start", [n, ir.ConstBinary(<<" ">>)])
     "padStart", [n, p, ..] -> host("str_pad_start", [n, p])

@@ -1482,6 +1482,20 @@ pub fn array_from_flat_test() {
   num("[1, [2, 3], 4].flat()[2]") |> should.equal(3.0)
 }
 
+pub fn array_splice_test() {
+  // splice removes deleteCount elements at start, inserts items, returns the
+  // removed elements; it mutates the array in place.
+  let m =
+    compile(
+      "function f() { let a = ['a', 'b', 'c', 'd']; let removed = a.splice(1, 2, 'x', 'y', 'z'); "
+      <> "let b = ['first', 'second', 'third']; let r2 = b.splice(1); "
+      <> "return a.join('') + '/' + removed.join('') + '/' + b.join('') + '/' + r2.join('') + '/' + r2.length; }",
+    )
+  // a → [a,x,y,z,d]="axyzd", removed=[b,c]="bc"; b → ["first"], r2=["second","third"] len 2
+  call(m, "f", [])
+  |> should.equal(dyn(<<"axyzd/bc/first/secondthird/2">>))
+}
+
 pub fn array_copy_within_test() {
   // copyWithin(target, start, end): copies [start,end) to target, in place;
   // negatives count from the end; omitted end is the length.

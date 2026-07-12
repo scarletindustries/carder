@@ -368,6 +368,11 @@ pub fn array_copy_within(
   end: Dynamic,
 ) -> Dynamic
 
+/// `arr.splice(start, deleteCount, ...items)` — remove/insert in place (args as a
+/// cons list); returns a new array of the removed elements.
+@external(erlang, "twocore_rt_js_ffi", "array_splice")
+pub fn array_splice(arr: Dynamic, args: Dynamic) -> Dynamic
+
 /// `arr.at(i)` / `str.at(i)` — element at `i` (negative counts from the end), else
 /// `undefined`.
 @external(erlang, "twocore_rt_js_ffi", "array_at")

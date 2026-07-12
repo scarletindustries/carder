@@ -66,7 +66,7 @@
     new_object/0, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
-    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_at/2,
+    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2,
     apply_fn/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
@@ -1413,6 +1413,37 @@ array_copy_within(Recv, Target, Start, End) ->
             erlang:put(?CELL_KEY(Recv), {js_array, Len, NewMap}),
             Recv
     end.
+
+%% arr.splice(start, deleteCount, ...items) — remove `deleteCount` elements at
+%% `start`, insert `items` in their place (in place), and return the removed
+%% elements as a new array. start is ToIntegerOrInfinity clamped to [0, len]
+%% (negatives from the end); with only `start` given, everything from `start` is
+%% removed; deleteCount is clamped to [0, len - start].
+array_splice(Recv, Args) ->
+    {Len, Map} = arr_content(Recv),
+    List = arr_list(Len, Map),
+    {Start, DelCount, Items} = splice_args(Args, Len),
+    Removed = lists:sublist(List, Start + 1, DelCount),
+    Prefix = lists:sublist(List, Start),
+    Suffix = lists:nthtail(min(Start + DelCount, Len), List),
+    arr_store(Recv, Prefix ++ Items ++ Suffix),
+    new_array(Removed).
+
+splice_args([], _Len) ->
+    {0, 0, []};
+splice_args([StartArg], Len) ->
+    S = fill_clamp(StartArg, Len, 0),
+    {S, Len - S, []};
+splice_args([StartArg, DelArg | Items], Len) ->
+    S = fill_clamp(StartArg, Len, 0),
+    D =
+        case coerce_num(DelArg) of
+            nan -> 0;
+            neg_inf -> 0;
+            inf -> Len - S;
+            N -> max(0, min(trunc(as_float(N)), Len - S))
+        end,
+    {S, D, Items}.
 
 %% arr.at(i) / str.at(i) — element at index i (negative counts from the end), else
 %% undefined.
