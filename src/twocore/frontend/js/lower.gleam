@@ -88,6 +88,10 @@
 ////     `x = y = e` chain) — e.g. `f(x = 1)`, `(x = 1) + 1`, `while ((l = next()) != null)`
 ////     — computes the right value but does not rebind its target in the env, so a later
 ////     read of that target sees the old value. Top-level and chained assignments are fine.
+////     COROLLARY: a loop whose PROGRESS variable is mutated only inside the loop CONDITION
+////     (e.g. `do { … } while (++i < n)`, `while (i++ < n) { … }`) can INFINITE-LOOP, because
+////     the condition's mutation is not threaded across iterations. Put the increment in the
+////     loop body or use a `for` loop (whose update clause IS threaded).
 ////   * A POSTFIX `x++`/`x--` yields the NEW value (not the pre-increment value) when its
 ////     result is used inside a larger expression. As a statement or a `for` update — where
 ////     the value is discarded — it is exact.
@@ -1139,16 +1143,25 @@ fn desugar_destructure(
             )
           case el {
             None -> Ok(acc)
-            // `[a = default]` — the element with `undefined` falls back to default.
-            Some(ast.AssignmentPattern(left: pat, right: default)) ->
+            // `[a = default]` — the element with `undefined` falls back to
+            // default. The element is read into a temp first so a side-effecting
+            // source (an array with a getter) is not evaluated twice.
+            Some(ast.AssignmentPattern(left: pat, right: default)) -> {
+              let dv = tmp <> "_dv" <> int.to_string(i)
+              let dv_id = ast.Identifier(span: sp, name: dv)
               Ok(
                 list.append(acc, [
                   ast.VariableDeclarator(
+                    id: ast.IdentifierPattern(name: dv, span: sp),
+                    init: Some(access),
+                  ),
+                  ast.VariableDeclarator(
                     id: pat,
-                    init: Some(defaulted(access, default)),
+                    init: Some(defaulted(dv_id, default)),
                   ),
                 ]),
               )
+            }
             // `[a, ...rest]` — rest binds the remaining elements: `tmp.slice(i)`.
             Some(ast.RestElement(argument: pat)) -> {
               let rest =
@@ -1184,33 +1197,38 @@ fn desugar_destructure(
       Ok(#([temp, ..decls], ctr))
     }
     ast.ObjectPattern(properties:) -> {
-      // The statically-known key names bound by non-rest properties — these are
-      // excluded from an object-rest `...rest`.
-      let excluded_keys =
+      // The keys bound by non-rest properties, as expressions to exclude from an
+      // object-rest `...rest`: a non-computed key contributes its static string;
+      // a computed key `[e]` contributes the expression `e` (excluded by its
+      // runtime value). A key access on the temp is idempotent, but a
+      // side-effecting COMPUTED key runs once here and once for its value binding.
+      let excluded_key_exprs =
         list.filter_map(properties, fn(p) {
           case p {
+            ast.PatternProperty(key:, computed: True, ..) -> Ok(key)
             ast.PatternProperty(
               key: ast.Identifier(name:, ..),
               computed: False,
               ..,
-            ) -> Ok(name)
+            ) -> Ok(ast.StringExpression(span: sp, value: name))
             ast.PatternProperty(
               key: ast.StringExpression(value:, ..),
               computed: False,
               ..,
-            ) -> Ok(value)
+            ) -> Ok(ast.StringExpression(span: sp, value: value))
             ast.PatternProperty(
               key: ast.NumberLiteral(value:, ..),
               computed: False,
               ..,
-            ) -> Ok(num_key(value))
+            ) -> Ok(ast.StringExpression(span: sp, value: num_key(value)))
             _ -> Error(Nil)
           }
         })
-      use decls <- result_try(
+      use decl_lists <- result_try(
         list.try_map(properties, fn(p) {
           case p {
             // `{ k: a = default }` — the property with `undefined` falls back.
+            // Read into a temp first so a side-effecting source runs once.
             ast.PatternProperty(
               key:,
               value: ast.AssignmentPattern(left: pat, right: default),
@@ -1224,10 +1242,24 @@ fn desugar_destructure(
                   property: key,
                   computed: computed,
                 )
-              Ok(ast.VariableDeclarator(
-                id: pat,
-                init: Some(defaulted(access, default)),
-              ))
+              let dv =
+                tmp
+                <> "_dvk_"
+                <> option.unwrap(
+                  option.from_result(accessor_key_name(key)),
+                  "k",
+                )
+              let dv_id = ast.Identifier(span: sp, name: dv)
+              Ok([
+                ast.VariableDeclarator(
+                  id: ast.IdentifierPattern(name: dv, span: sp),
+                  init: Some(access),
+                ),
+                ast.VariableDeclarator(
+                  id: pat,
+                  init: Some(defaulted(dv_id, default)),
+                ),
+              ])
             }
             // any binding pattern for the value — a nested one re-desugars.
             ast.PatternProperty(key:, value: valpat, computed:, ..) -> {
@@ -1238,7 +1270,7 @@ fn desugar_destructure(
                   property: key,
                   computed: computed,
                 )
-              Ok(ast.VariableDeclarator(id: valpat, init: Some(access)))
+              Ok([ast.VariableDeclarator(id: valpat, init: Some(access))])
             }
             // `{ a, ...rest }` — rest is `obj` minus the named keys, via the
             // internal `Object.__rest(tmp, [excluded…])` helper.
@@ -1246,9 +1278,7 @@ fn desugar_destructure(
               let keys_arr =
                 ast.ArrayExpression(
                   span: sp,
-                  elements: list.map(excluded_keys, fn(k) {
-                    Some(ast.StringExpression(span: sp, value: k))
-                  }),
+                  elements: list.map(excluded_key_exprs, Some),
                 )
               let rest_call =
                 ast.CallExpression(
@@ -1261,12 +1291,12 @@ fn desugar_destructure(
                   ),
                   arguments: [d_id, keys_arr],
                 )
-              Ok(ast.VariableDeclarator(id: pat, init: Some(rest_call)))
+              Ok([ast.VariableDeclarator(id: pat, init: Some(rest_call))])
             }
           }
         }),
       )
-      Ok(#([temp, ..decls], ctr))
+      Ok(#([temp, ..list.flatten(decl_lists)], ctr))
     }
     _ -> Error(Unsupported("destructuring pattern"))
   }
@@ -4070,20 +4100,16 @@ fn install_obj_accessors(
     })
   list.try_fold(keys, #(binds, ctr), fn(acc, kname) {
     let #(binds, ctr) = acc
-    let getter_span =
-      list.find_map(entries, fn(e) {
-        case e.0 == kname && e.1 {
-          True -> Ok(e.2)
-          False -> Error(Nil)
-        }
-      })
-    let setter_span =
-      list.find_map(entries, fn(e) {
-        case e.0 == kname && !e.1 {
-          True -> Ok(e.2)
-          False -> Error(Nil)
-        }
-      })
+    // The LAST getter/setter for a key wins (a later property definition
+    // overrides an earlier one, per object-literal evaluation order).
+    let last_span = fn(is_get) {
+      entries
+      |> list.filter(fn(e) { e.0 == kname && e.1 == is_get })
+      |> list.last
+      |> entry_span
+    }
+    let getter_span = last_span(True)
+    let setter_span = last_span(False)
     use #(gbinds, getter_v, ctr) <- result_try(case getter_span {
       Ok(sp) -> lower_obj_accessor_closure(sp, obj, env, ctx, ctr)
       Error(Nil) -> Ok(#([], undefined(), ctr))
@@ -4521,6 +4547,30 @@ fn reads(e: ast.Expression) -> List(String) {
       fv_lambda(pattern_names_lax(params), arrow_body_stmts(body))
     ast.FunctionExpression(params:, body:, ..) ->
       fv_lambda(pattern_names_lax(params), block_stmts(body))
+    // An object literal: a getter/setter's `this` is the object (dynamic), not a
+    // lexical capture, so it must NOT propagate to the enclosing scope's captures
+    // (the accessor lambda's OWN captures still include `this`, filled with the
+    // object at install). Everything else contributes reads normally.
+    ast.ObjectExpression(properties:, ..) ->
+      list.flat_map(properties, fn(p) {
+        case p {
+          ast.Property(value:, computed:, key:, kind: ast.Get, ..)
+          | ast.Property(value:, computed:, key:, kind: ast.Set, ..) -> {
+            let key_reads = case computed {
+              True -> reads(key)
+              False -> []
+            }
+            list.append(
+              key_reads,
+              list.filter(reads(value), fn(n) { n != "this" }),
+            )
+          }
+          ast.Property(value:, computed: True, key:, ..) ->
+            list.append(reads(key), reads(value))
+          ast.Property(value:, ..) -> reads(value)
+          ast.SpreadProperty(argument:) -> reads(argument)
+        }
+      })
     _ -> list.flat_map(child_exprs(e), reads)
   }
 }
@@ -4765,6 +4815,17 @@ fn lower_obj_accessor_closure(
         }
       }
     }
+  }
+}
+
+/// Extract the accessor-function span from a matched (name, is_getter, span)
+/// entry, discarding the rest — maps `Result(entry) -> Result(span)`.
+fn entry_span(
+  r: Result(#(String, Bool, ast.Span), Nil),
+) -> Result(ast.Span, Nil) {
+  case r {
+    Ok(#(_, _, span)) -> Ok(span)
+    Error(Nil) -> Error(Nil)
   }
 }
 

@@ -1884,6 +1884,35 @@ pub fn object_rest_destructure_test() {
   |> should.equal(7.0)
 }
 
+pub fn object_rest_computed_key_test() {
+  // A computed key is excluded from the rest object (by its runtime value).
+  val(
+    "(function(){ let k = \"x\"; let { [k]: a, ...rest } = { x: 1, y: 2 }; return \"x\" in rest; })()",
+  )
+  |> should.equal(dyn(False))
+  num(
+    "(function(){ let k = \"x\"; let { [k]: a, ...rest } = { x: 1, y: 2 }; return a + rest.y; })()",
+  )
+  |> should.equal(3.0)
+}
+
+pub fn object_default_reads_source_once_test() {
+  // A destructuring default reads the source property ONCE, so a side-effecting
+  // getter on that key runs a single time.
+  num(
+    "(function(){ let obj = { _n: 0, get x() { this._n = this._n + 1; return 0; } }; let { x = 99 } = obj; return x + obj._n; })()",
+  )
+  |> should.equal(1.0)
+}
+
+pub fn duplicate_object_getter_test() {
+  // When a key has two getters, the last one wins.
+  num(
+    "(function(){ let o = { get v() { return 1; }, get v() { return 2; } }; return o.v; })()",
+  )
+  |> should.equal(2.0)
+}
+
 pub fn object_getter_test() {
   // An object-literal getter computes on access with dynamic `this` = the object.
   let m =
