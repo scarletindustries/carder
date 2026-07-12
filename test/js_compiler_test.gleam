@@ -593,6 +593,42 @@ pub fn switch_string_test() {
   to_float(call(m, "f", [dyn(<<"z">>)])) |> should.equal(0.0)
 }
 
+// ── Math builtins ────────────────────────────────────────────────────────────
+
+pub fn math_rounding_test() {
+  num("Math.floor(3.7)") |> should.equal(3.0)
+  num("Math.ceil(3.2)") |> should.equal(4.0)
+  num("Math.trunc(-3.7)") |> should.equal(-3.0)
+  // JS Math.round is round-half-toward-+Infinity (differs from Erlang's round/1).
+  num("Math.round(2.5)") |> should.equal(3.0)
+  num("Math.round(-2.5)") |> should.equal(-2.0)
+}
+
+pub fn math_functions_test() {
+  num("Math.abs(-5)") |> should.equal(5.0)
+  num("Math.sign(-3)") |> should.equal(-1.0)
+  num("Math.sqrt(16)") |> should.equal(4.0)
+  num("Math.cbrt(27)") |> should.equal(3.0)
+  num("Math.pow(2, 10)") |> should.equal(1024.0)
+}
+
+pub fn math_variadic_test() {
+  num("Math.max(1, 5, 3)") |> should.equal(5.0)
+  num("Math.min(1, 5, 3)") |> should.equal(1.0)
+  num("Math.hypot(3, 4)") |> should.equal(5.0)
+}
+
+pub fn math_constants_test() {
+  num("Math.PI") |> should.equal(3.141592653589793)
+  num("Math.E") |> should.equal(2.718281828459045)
+}
+
+pub fn math_random_test() {
+  let m =
+    compile("function f() { let r = Math.random(); return r >= 0 && r < 1; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

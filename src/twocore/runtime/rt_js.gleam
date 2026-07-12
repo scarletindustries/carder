@@ -168,6 +168,27 @@ pub fn ushr(a: Dynamic, b: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "pow")
 pub fn pow(a: Dynamic, b: Dynamic) -> Dynamic
 
+// ───────────────────────── Math ─────────────────────────
+// `Math.method(args)`; the method is an atom. Each coerces with ToNumber and returns a
+// JS number. `Math.PI`/`Math.E`/… constants are inlined at compile time.
+
+/// Unary `Math` function (`floor`, `ceil`, `round`, `trunc`, `abs`, `sign`, `sqrt`,
+/// `cbrt`, `exp`, `log`/`log2`/`log10`, `sin`/`cos`/`tan`/`asin`/`acos`/`atan`).
+@external(erlang, "twocore_rt_js_ffi", "math_unary")
+pub fn math_unary(method: Dynamic, x: Dynamic) -> Dynamic
+
+/// Binary `Math` function: `pow(a, b)` or `atan2(y, x)`.
+@external(erlang, "twocore_rt_js_ffi", "math_binary")
+pub fn math_binary(method: Dynamic, a: Dynamic, b: Dynamic) -> Dynamic
+
+/// Variadic `Math` function over a cons list of args: `min`, `max`, `hypot`.
+@external(erlang, "twocore_rt_js_ffi", "math_reduce")
+pub fn math_reduce(method: Dynamic, args: Dynamic) -> Dynamic
+
+/// `Math.random()` → a float in (0, 1).
+@external(erlang, "twocore_rt_js_ffi", "math_random")
+pub fn math_random() -> Dynamic
+
 /// JS ToString → a binary. Strings pass through; integral floats < 1e21 print integer-style
 /// (`String(5.0)` is `"5"`); other floats print shortest-round-trip (`[short]` — exponent
 /// FORMATTING diverges from Number::toString at the extremes, FFI header note); sentinels are

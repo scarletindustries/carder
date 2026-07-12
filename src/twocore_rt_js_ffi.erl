@@ -61,6 +61,7 @@
     lt/2, le/2, gt/2, ge/2, strict_eq/2, eq/2,
     truthy/1, to_number/1, to_string/1, type_of/1,
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
+    math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1,
@@ -502,6 +503,146 @@ int_pow(B, E, Acc) ->
             _ -> Acc
         end,
     int_pow(B * B, E bsr 1, Acc2).
+
+%% ── Math ──────────────────────────────────────────────────
+%% `Math.method(...)`. The method name is passed as an atom; each function coerces its
+%% argument(s) with ToNumber, operates over the internal `number|nan|inf|neg_inf`
+%% domain, and `out`s a JS number. `Math.PI`/`Math.E`/… constants are inlined by the
+%% frontend, not routed here.
+
+%% Math.random() → a float in (0,1).
+math_random() -> rand:uniform().
+
+%% Unary Math functions.
+math_unary(Method, X) ->
+    out(munary(Method, coerce_num(X))).
+
+munary(Method, nan) ->
+    %% floor/ceil/round/trunc/abs/… of NaN are all NaN.
+    case Method of
+        _ -> nan
+    end;
+munary(Method, inf) -> munary_inf(Method, 1);
+munary(Method, neg_inf) -> munary_inf(Method, -1);
+munary(Method, N) -> munary_finite(Method, N).
+
+munary_inf(abs, _) -> inf;
+munary_inf(sign, S) -> S;
+munary_inf(floor, S) -> inf_of(S);
+munary_inf(ceil, S) -> inf_of(S);
+munary_inf(round, S) -> inf_of(S);
+munary_inf(trunc, S) -> inf_of(S);
+munary_inf(sqrt, 1) -> inf;
+munary_inf(cbrt, S) -> inf_of(S);
+munary_inf(exp, 1) -> inf;
+munary_inf(exp, -1) -> 0;
+munary_inf(log, 1) -> inf;
+munary_inf(log2, 1) -> inf;
+munary_inf(log10, 1) -> inf;
+munary_inf(_, _) -> nan.
+
+inf_of(1) -> inf;
+inf_of(-1) -> neg_inf.
+
+munary_finite(floor, N) -> floor(as_float(N));
+munary_finite(ceil, N) -> ceil(as_float(N));
+%% JS Math.round is round-half-toward-+Infinity: floor(x + 0.5).
+munary_finite(round, N) -> floor(as_float(N) + 0.5);
+munary_finite(trunc, N) -> trunc(as_float(N));
+munary_finite(abs, N) -> abs(N);
+munary_finite(sign, N) ->
+    if
+        N > 0 -> 1;
+        N < 0 -> -1;
+        true -> 0
+    end;
+munary_finite(sqrt, N) when N < 0 -> nan;
+munary_finite(sqrt, N) -> math:sqrt(as_float(N));
+munary_finite(cbrt, N) -> math:pow(as_float(N), 1.0 / 3.0) * cbrt_sign(N);
+munary_finite(exp, N) -> guard_inf(fun() -> math:exp(as_float(N)) end);
+munary_finite(log, N) when N < 0 -> nan;
+munary_finite(log, N) when N == 0 -> neg_inf;
+munary_finite(log, N) -> math:log(as_float(N));
+munary_finite(log2, N) when N < 0 -> nan;
+munary_finite(log2, N) when N == 0 -> neg_inf;
+munary_finite(log2, N) -> math:log2(as_float(N));
+munary_finite(log10, N) when N < 0 -> nan;
+munary_finite(log10, N) when N == 0 -> neg_inf;
+munary_finite(log10, N) -> math:log10(as_float(N));
+munary_finite(sin, N) -> math:sin(as_float(N));
+munary_finite(cos, N) -> math:cos(as_float(N));
+munary_finite(tan, N) -> math:tan(as_float(N));
+munary_finite(asin, N) when N < -1; N > 1 -> nan;
+munary_finite(asin, N) -> math:asin(as_float(N));
+munary_finite(acos, N) when N < -1; N > 1 -> nan;
+munary_finite(acos, N) -> math:acos(as_float(N));
+munary_finite(atan, N) -> math:atan(as_float(N));
+munary_finite(_, _) -> nan.
+
+%% cbrt of a negative base uses the real (negative) root.
+cbrt_sign(N) when N < 0 -> -1.0;
+cbrt_sign(_) -> 1.0.
+
+as_float(N) when is_integer(N) -> float(N);
+as_float(N) -> N.
+
+%% Evaluate a float computation, mapping an overflow (badarith) to +Infinity.
+guard_inf(F) ->
+    try
+        F()
+    catch
+        error:badarith -> inf
+    end.
+
+%% Binary Math functions: Math.pow(a,b), Math.atan2(y,x).
+math_binary(pow, A, B) -> pow(A, B);
+math_binary(atan2, A, B) ->
+    out(matan2(coerce_num(A), coerce_num(B))).
+
+matan2(nan, _) -> nan;
+matan2(_, nan) -> nan;
+matan2(Y, X) -> math:atan2(inf_to_num(Y), inf_to_num(X)).
+
+inf_to_num(inf) -> 1.7976931348623157e308;
+inf_to_num(neg_inf) -> -1.7976931348623157e308;
+inf_to_num(N) -> as_float(N).
+
+%% Variadic Math.min / Math.max / Math.hypot over the emitter's cons list of args.
+math_reduce(Method, Args) ->
+    out(mreduce(Method, [coerce_num(A) || A <- Args])).
+
+mreduce(min, []) -> inf;
+mreduce(max, []) -> neg_inf;
+mreduce(hypot, []) -> 0;
+mreduce(Method, Nums) ->
+    case lists:member(nan, Nums) of
+        true when Method =/= hypot -> nan;
+        _ -> mreduce_go(Method, Nums)
+    end.
+
+mreduce_go(min, Nums) -> lists:foldl(fun mmin/2, hd(Nums), tl(Nums));
+mreduce_go(max, Nums) -> lists:foldl(fun mmax/2, hd(Nums), tl(Nums));
+mreduce_go(hypot, Nums) ->
+    Sum = lists:foldl(fun(N, A) -> A + hypot_sq(N) end, 0.0, Nums),
+    math:sqrt(Sum).
+
+hypot_sq(inf) -> inf_to_num(inf);
+hypot_sq(neg_inf) -> inf_to_num(inf);
+hypot_sq(N) -> as_float(N) * as_float(N).
+
+mmin(inf, B) -> B;
+mmin(A, inf) -> A;
+mmin(neg_inf, _) -> neg_inf;
+mmin(_, neg_inf) -> neg_inf;
+mmin(A, B) when A =< B -> A;
+mmin(_, B) -> B.
+
+mmax(neg_inf, B) -> B;
+mmax(A, neg_inf) -> A;
+mmax(inf, _) -> inf;
+mmax(_, inf) -> inf;
+mmax(A, B) when A >= B -> A;
+mmax(_, B) -> B.
 
 %% JS ToString → a binary. Strings pass through; integral floats < 1e21 print
 %% integer-style (String(5.0) = "5"); other floats use [short] (shortest

@@ -4176,6 +4176,11 @@ fn resolve_js(op: String) -> Option(String) {
     "shr" -> Some("shr")
     "ushr" -> Some("ushr")
     "pow" -> Some("pow")
+    // Math
+    "math_unary" -> Some("math_unary")
+    "math_binary" -> Some("math_binary")
+    "math_reduce" -> Some("math_reduce")
+    "math_random" -> Some("math_random")
     // truthiness / coercion
     "truthy" -> Some("truthy")
     "to_number" -> Some("to_number")

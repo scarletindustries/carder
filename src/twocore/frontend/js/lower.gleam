@@ -1540,6 +1540,13 @@ fn lower_call(
       let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
       Ok(bind_after(binds2, ir.CallHost("js", "console_log", [listv]), ctr))
     }
+    // Math.method(...) → a dedicated rt_js Math op (Math is not a value).
+    ast.MemberExpression(
+      object: ast.Identifier(name: "Math", ..),
+      property: ast.Identifier(name: method, ..),
+      computed: False,
+      ..,
+    ) -> lower_math_call(method, arguments, env, ctx, ctr)
     // recv.method(args) — method dispatch (array methods for now).
     ast.MemberExpression(
       object:,
@@ -1581,6 +1588,82 @@ fn lower_call(
       use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
       Ok(bind_after(list.append(bc, ba), ir.CallClosure(fv, argvals), ctr))
     }
+  }
+}
+
+/// `Math.method(args)` — dispatch to the appropriate `rt_js` Math op. The method name
+/// is passed as an atom; unary/binary/variadic forms differ in arity.
+fn lower_math_call(
+  method: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let m = ir.ConstAtom(method)
+  case math_arity(method), argvals {
+    Some(MathUnary), [x] ->
+      Ok(bind_after(binds, ir.CallHost("js", "math_unary", [m, x]), ctr))
+    Some(MathBinary), [a, b] ->
+      Ok(bind_after(binds, ir.CallHost("js", "math_binary", [m, a, b]), ctr))
+    Some(MathReduce), _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+      Ok(bind_after(binds2, ir.CallHost("js", "math_reduce", [m, listv]), ctr))
+    }
+    Some(MathRandom), [] ->
+      Ok(bind_after(binds, ir.CallHost("js", "math_random", []), ctr))
+    _, _ -> Error(Unsupported("Math." <> method <> "(…)"))
+  }
+}
+
+/// How a `Math` method takes its arguments (`None` = not a supported Math method).
+type MathArity {
+  MathUnary
+  MathBinary
+  MathReduce
+  MathRandom
+}
+
+fn math_arity(method: String) -> Option(MathArity) {
+  case method {
+    "floor"
+    | "ceil"
+    | "round"
+    | "trunc"
+    | "abs"
+    | "sign"
+    | "sqrt"
+    | "cbrt"
+    | "exp"
+    | "log"
+    | "log2"
+    | "log10"
+    | "sin"
+    | "cos"
+    | "tan"
+    | "asin"
+    | "acos"
+    | "atan" -> Some(MathUnary)
+    "pow" | "atan2" -> Some(MathBinary)
+    "min" | "max" | "hypot" -> Some(MathReduce)
+    "random" -> Some(MathRandom)
+    _ -> None
+  }
+}
+
+/// A `Math` numeric constant (`Math.PI`, `Math.E`, …), inlined at compile time.
+fn math_const(name: String) -> Option(ir.Value) {
+  case name {
+    "PI" -> Some(ir.ConstFloatTerm(3.141592653589793))
+    "E" -> Some(ir.ConstFloatTerm(2.718281828459045))
+    "LN2" -> Some(ir.ConstFloatTerm(0.6931471805599453))
+    "LN10" -> Some(ir.ConstFloatTerm(2.302585092994046))
+    "LOG2E" -> Some(ir.ConstFloatTerm(1.4426950408889634))
+    "LOG10E" -> Some(ir.ConstFloatTerm(0.4342944819032518))
+    "SQRT2" -> Some(ir.ConstFloatTerm(1.4142135623730951))
+    "SQRT1_2" -> Some(ir.ConstFloatTerm(0.7071067811865476))
+    _ -> None
   }
 }
 
@@ -1660,6 +1743,25 @@ fn build_list(
 }
 
 fn lower_member(
+  object: ast.Expression,
+  property: ast.Expression,
+  computed: Bool,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case object, property, computed {
+    // Math.PI / Math.E / … — a compile-time numeric constant (Math is not a value).
+    ast.Identifier(name: "Math", ..), ast.Identifier(name: c, ..), False ->
+      case math_const(c) {
+        Some(v) -> Ok(#([], v, ctr))
+        None -> Error(Unsupported("Math." <> c))
+      }
+    _, _, _ -> lower_member_get(object, property, computed, env, ctx, ctr)
+  }
+}
+
+fn lower_member_get(
   object: ast.Expression,
   property: ast.Expression,
   computed: Bool,
