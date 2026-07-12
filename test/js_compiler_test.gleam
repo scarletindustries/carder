@@ -1144,6 +1144,36 @@ pub fn json_roundtrip_test() {
   to_float(call(m, "f", [])) |> should.equal(7.0)
 }
 
+// ── object spread + object methods ───────────────────────────────────────────
+
+pub fn object_spread_test() {
+  let m =
+    compile(
+      "function f() { let o = { a: 1, b: 2 }; let p = { ...o, c: 3 }; return p.a + p.b + p.c; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(6.0)
+  // a later property overrides the spread
+  let ov =
+    compile(
+      "function f() { let o = { a: 1 }; let p = { ...o, a: 99 }; return p.a; }",
+    )
+  to_float(call(ov, "f", [])) |> should.equal(99.0)
+  // a spread overrides an earlier property
+  let sp =
+    compile(
+      "function f() { let o = { a: 5 }; let p = { a: 1, ...o }; return p.a; }",
+    )
+  to_float(call(sp, "f", [])) |> should.equal(5.0)
+}
+
+pub fn object_method_test() {
+  let m =
+    compile(
+      "function f() { let o = { double(x) { return x * 2; } }; return o.double(21); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

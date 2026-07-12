@@ -4247,6 +4247,7 @@ fn resolve_js(op: String) -> Option(String) {
     "object_keys" -> Some("object_keys")
     "object_values" -> Some("object_values")
     "object_entries" -> Some("object_entries")
+    "object_assign_into" -> Some("object_assign_into")
     "json_stringify" -> Some("json_stringify")
     "json_parse" -> Some("json_parse")
     // lists / console / misc

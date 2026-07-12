@@ -21,8 +21,9 @@
 //// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue`,
 //// `return`, blocks; flat array/object destructuring in `let`/`const`/`var`; objects
-//// `{}` with `.prop`/`[k]` get/set; arrays `[…]` with indexing, `.length`, spread
-//// `[...a]`; first-class functions — function expressions, arrow functions, closures
+//// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, and method shorthand; arrays `[…]`
+//// with indexing, `.length`, spread `[...a]`; first-class functions — function
+//// expressions, arrow functions, closures
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
 //// & fields, `new`, `this`, method calls — no inheritance); `console.log`. Control
 //// flow threads mutated variables as loop-carried params / phi-merged `If`s.
@@ -42,8 +43,8 @@
 //// `Number.isInteger`/`isNaN`/`isFinite`, and `JSON.stringify`/`JSON.parse`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): class inheritance (`extends`/
-//// `super`), static/getter/setter members, nested/defaulted destructuring, object/call
-//// spread, rest params, regex, `try`/`finally`, generators/async, and `continue`
+//// `super`), static/getter/setter members, nested/defaulted destructuring, call spread
+//// `f(...a)`, rest params, regex, `try`/`finally`, generators/async, and `continue`
 //// inside a `do/while`. (A regular function EXPRESSION captures `this` lexically like
 //// an arrow, rather than binding it dynamically. `JSON`/`Object.keys` key order follows
 //// the backing map, not insertion order.)
@@ -2631,7 +2632,17 @@ fn lower_object(
           bind_after(pre, ir.CallHost("js", "set_prop", [obj, key, v]), ctr)
         Ok(#(binds2, obj, ctr))
       }
-      _ -> Error(Unsupported("object spread / getter / setter"))
+      // `{...src}` — copy src's own properties in (later keys override earlier ones).
+      ast.SpreadProperty(argument:) -> {
+        use #(bs, sv, ctr) <- result_try(lower_expr(argument, env, ctx, ctr))
+        let #(binds2, _r, ctr) =
+          bind_after(
+            list.append(binds, bs),
+            ir.CallHost("js", "object_assign_into", [obj, sv]),
+            ctr,
+          )
+        Ok(#(binds2, obj, ctr))
+      }
     }
   })
 }
@@ -2942,7 +2953,7 @@ fn child_exprs(e: ast.Expression) -> List(ast.Expression) {
         case p {
           ast.Property(key:, value:, computed: True, ..) -> [key, value]
           ast.Property(value:, ..) -> [value]
-          _ -> []
+          ast.SpreadProperty(argument:) -> [argument]
         }
       })
     ast.ArrayExpression(elements:, ..) ->

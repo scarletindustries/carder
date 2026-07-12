@@ -452,6 +452,11 @@ pub fn object_values(o: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_entries")
 pub fn object_entries(o: Dynamic) -> Dynamic
 
+/// Copy `source`'s own properties into `target` in place; behind object spread
+/// `{...o}` (and would back `Object.assign`).
+@external(erlang, "twocore_rt_js_ffi", "object_assign_into")
+pub fn object_assign_into(target: Dynamic, source: Dynamic) -> Dynamic
+
 /// `JSON.stringify(v)` → a JSON string (undefined/function → `undefined`).
 @external(erlang, "twocore_rt_js_ffi", "json_stringify")
 pub fn json_stringify(v: Dynamic) -> Dynamic

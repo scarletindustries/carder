@@ -76,7 +76,7 @@
     str_replace/3, str_replace_all/3,
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
-    object_keys/1, object_values/1, object_entries/1,
+    object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
     json_stringify/1, json_parse/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
@@ -1468,6 +1468,14 @@ is_nullish(_) -> 0.
 object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
 object_values(O) -> new_array([V || {_, V} <- obj_pairs(O)]).
 object_entries(O) -> new_array([new_array([K, V]) || {K, V} <- obj_pairs(O)]).
+
+%% Copy `source`'s own properties into `target` (in place); behind object spread
+%% `{...o}` and `Object.assign`. A null/undefined/primitive source is a no-op.
+object_assign_into(Target, Source) when is_reference(Source) ->
+    lists:foreach(fun({K, V}) -> set_prop(Target, K, V) end, obj_pairs(Source)),
+    Target;
+object_assign_into(Target, _Source) ->
+    Target.
 
 %% ── JSON ─────────────────────────────────────────────────
 
