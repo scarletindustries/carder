@@ -62,8 +62,8 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): `try`/`finally`,
-//// generators/async, and `continue` inside a `do/while`. Static
+//// Not yet (a clean `Unsupported` error / panic): `try`/`finally` and
+//// generators/async. Static
 //// field initializers run when the module's `main/0` runs (like any top-level
 //// state), so `C.x` reads `undefined` until then. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
@@ -968,7 +968,7 @@ fn lower_stmt(
     ast.WhileStatement(condition:, body:) ->
       lower_while(condition, body, False, env, ctx, ctr, k)
     ast.DoWhileStatement(condition:, body:) ->
-      lower_while(condition, body, True, env, ctx, ctr, k)
+      lower_do_while(condition, body, env, ctx, ctr, k)
     ast.ForStatement(init:, condition:, update:, body:) ->
       lower_for(init, condition, update, body, env, ctx, ctr, k)
     ast.ForOfStatement(left:, right:, body:, ..) ->
@@ -1021,20 +1021,15 @@ fn lower_stmt(
       }
     ast.ContinueStatement(label: None) ->
       case ctx.loop {
-        // A do/while back-edge re-tests the condition; our loop's `Continue` re-enters
-        // the top of the body, which can't express that for an explicit `continue`.
-        Some(Loop(do_while: True, ..)) ->
-          Error(Unsupported("`continue` inside a do/while loop"))
-        // `for`-loop `continue` must run the update; `continue_edge` handles both it
-        // and the plain `while` case.
+        // `for`-loop `continue` must run the update; `continue_edge` handles both
+        // it and the plain `while` case. (A do/while desugars to a while, so its
+        // `continue` re-tests the condition via the normal while back-edge.)
         Some(loop) -> continue_edge(loop, env, ctx, ctr)
         None -> Error(Unsupported("continue outside a loop"))
       }
     // `continue outer` — re-enter the labeled loop.
     ast.ContinueStatement(label: Some(name)) ->
       case dict.get(ctx.labels, name) {
-        Ok(#(_brk, Loop(do_while: True, ..))) ->
-          Error(Unsupported("labeled `continue` into a do/while loop"))
         Ok(#(_brk, loop)) -> continue_edge(loop, env, ctx, ctr)
         Error(Nil) ->
           Error(Unsupported("continue to unknown label '" <> name <> "'"))
@@ -1387,6 +1382,54 @@ fn lower_branch(
 }
 
 // ── loops (loop-carried mutated variables) ───────────────────────────────────
+
+/// `do { body } while (cond)` desugars to `{ let %dw = true; while (%dw || cond)
+/// { %dw = false; body } }`. The flag forces the first iteration; thereafter the
+/// while test is `cond`. This gives a `continue` in the body the correct target
+/// — the loop condition — for free (it jumps to the top, where `%dw` is already
+/// false, so `cond` is re-tested), which the body-first native shape could not.
+fn lower_do_while(
+  cond: ast.Expression,
+  body: ast.Statement,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  let sp = ast.Span(0, 0)
+  let flag = "%dw_" <> int.to_string(ctr)
+  let ctr = ctr + 1
+  let flag_id = ast.Identifier(span: sp, name: flag)
+  let wrap = fn(s) { ast.StmtWithLine(line: 0, statement: s) }
+  let decl =
+    ast.VariableDeclaration(kind: ast.Let, declarations: [
+      ast.VariableDeclarator(
+        id: ast.IdentifierPattern(name: flag, span: sp),
+        init: Some(ast.BooleanLiteral(span: sp, value: True)),
+      ),
+    ])
+  let set_false =
+    ast.ExpressionStatement(
+      directive: None,
+      expression: ast.AssignmentExpression(
+        span: sp,
+        operator: ast.Assign,
+        left: flag_id,
+        right: ast.BooleanLiteral(span: sp, value: False),
+      ),
+    )
+  let while_stmt =
+    ast.WhileStatement(
+      condition: ast.LogicalExpression(
+        span: sp,
+        operator: ast.LogicalOr,
+        left: flag_id,
+        right: cond,
+      ),
+      body: ast.BlockStatement(body: [wrap(set_false), wrap(body)]),
+    )
+  lower_stmts([decl, while_stmt], env, ctx, ctr, k)
+}
 
 fn lower_while(
   cond: ast.Expression,

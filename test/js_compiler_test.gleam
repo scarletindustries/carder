@@ -1820,6 +1820,20 @@ pub fn static_field_mutation_test() {
   to_float(call(n, "f", [])) |> should.equal(15.0)
 }
 
+pub fn do_while_continue_test() {
+  // `continue` in a do/while jumps to the condition test (skips the rest of the
+  // body but re-tests the loop condition). Sum the odd numbers 1..5.
+  num(
+    "(function(){ let i = 0, s = 0; do { i++; if (i % 2 === 0) continue; s += i; } while (i < 5); return s; })()",
+  )
+  |> should.equal(9.0)
+  // A continue on the final iteration still exits when the condition is false.
+  num(
+    "(function(){ let i = 0, n = 0; do { i++; if (i === 3) continue; n++; } while (i < 3); return n; })()",
+  )
+  |> should.equal(2.0)
+}
+
 pub fn defaulted_destructure_test() {
   // A missing array element falls back to its default.
   num("(function(){ let [a, b = 9] = [1]; return a + b; })()")
