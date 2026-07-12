@@ -4277,6 +4277,10 @@ fn resolve_js(op: String) -> Option(String) {
     "array_shift" -> Some("array_shift")
     "array_unshift" -> Some("array_unshift")
     "array_sort" -> Some("array_sort")
+    "array_to_reversed" -> Some("array_to_reversed")
+    "array_to_sorted" -> Some("array_to_sorted")
+    "array_with" -> Some("array_with")
+    "array_to_spliced" -> Some("array_to_spliced")
     // strings
     "str_char_at" -> Some("str_char_at")
     "str_char_code_at" -> Some("str_char_code_at")

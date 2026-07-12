@@ -83,6 +83,7 @@
     array_find_index/2, array_index_of/3, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
+    array_to_reversed/1, array_to_sorted/2, array_with/3, array_to_spliced/2,
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
     str_upper/1, str_lower/1,
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
@@ -2891,6 +2892,67 @@ sort_lte(V) ->
         inf -> false;
         N -> N =< 0
     end.
+
+%% arr.toReversed() (ES2023 23.1.3.33) — a NEW array with the elements of `arr`
+%% in reverse index order. `arr` is not mutated; holes read through as `undefined`
+%% so the result is dense with the same length.
+array_to_reversed(Recv) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(lists:reverse(arr_list(Len, Map))).
+
+%% arr.toSorted(cmp?) (ES2023 23.1.3.34) — a NEW sorted array, leaving `arr`
+%% unchanged. Unlike `sort`, holes are read THROUGH as `undefined` values (not
+%% skipped): every `undefined` sorts after all non-`undefined` elements and the
+%% result is dense with the same length. Default order is by ToString; with `cmp`,
+%% by the sign of `cmp(a, b)` (a NaN result keeps order). The sort is stable.
+array_to_sorted(Recv, Cmp) ->
+    {Len, Map} = arr_content(Recv),
+    {Undef, Defined} =
+        lists:partition(fun(V) -> V =:= undefined end, arr_list(Len, Map)),
+    Sorted =
+        case Cmp of
+            undefined ->
+                lists:sort(fun(A, B) -> to_string(A) =< to_string(B) end, Defined);
+            _ ->
+                lists:sort(fun(A, B) -> sort_lte(call_cb(Cmp, [A, B])) end, Defined)
+        end,
+    new_array(Sorted ++ Undef).
+
+%% arr.with(index, value) (ES2023 23.1.3.39) — a NEW array equal to `arr` but with
+%% the element at `index` replaced by `value`; `arr` is not mutated. `index` is
+%% ToIntegerOrInfinity and, when negative, counts from the end (len + index). A
+%% resulting index outside [0, len) — including ±Infinity — raises a RangeError.
+array_with(Recv, Index, Value) ->
+    {Len, Map} = arr_content(Recv),
+    Actual =
+        case to_int_or_inf(Index) of
+            inf -> Len;
+            neg_inf -> -1;
+            N when N < 0 -> Len + N;
+            N -> N
+        end,
+    case Actual >= 0 andalso Actual < Len of
+        true -> new_array(list_replace(arr_list(Len, Map), Actual, Value));
+        false -> range_error(<<"Invalid index">>)
+    end.
+
+%% Replace the element at 0-based Idx (assumed in range) of List with Value.
+list_replace(List, Idx, Value) ->
+    {Prefix, [_Old | Rest]} = lists:split(Idx, List),
+    Prefix ++ [Value | Rest].
+
+%% arr.toSpliced(start, skipCount, ...items) (ES2023 23.1.3.35) — the array that
+%% `splice` would leave the receiver AS, without mutating `arr`: a NEW array with
+%% `skipCount` elements removed at `start` and `items` inserted there. `start` and
+%% `skipCount` are clamped exactly as for `splice` (see splice_args). `Args` is the
+%% cons list of all call arguments.
+array_to_spliced(Recv, Args) ->
+    {Len, Map} = arr_content(Recv),
+    List = arr_list(Len, Map),
+    {Start, DelCount, Items} = splice_args(Args, Len),
+    Prefix = lists:sublist(List, Start),
+    Suffix = lists:nthtail(min(Start + DelCount, Len), List),
+    new_array(Prefix ++ Items ++ Suffix).
 
 %% ── strings ──────────────────────────────────────────────
 %% Strings are UTF-8 binaries. `.length`, indexing, `charAt`, `slice`, `substring` use

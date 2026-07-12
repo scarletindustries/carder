@@ -1426,6 +1426,88 @@ pub fn instanceof_array_test() {
   call(n, "f", []) |> should.equal(dyn(False))
 }
 
+// ── ES2023 immutable (change-array-by-copy) methods ──────────────────────────
+
+pub fn array_to_reversed_test() {
+  // Returns a new reversed array; the receiver is unchanged.
+  let m =
+    compile(
+      "function f() { var a = [1, 2, 3]; var r = a.toReversed(); return r.join(\",\") + \"|\" + a.join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"3,2,1|1,2,3">>))
+  // Holes read through as undefined (dense result).
+  let h = compile("function f() { return [1, , 3].toReversed().join(\",\"); }")
+  call(h, "f", []) |> should.equal(dyn(<<"3,,1">>))
+}
+
+pub fn array_to_sorted_test() {
+  // Default order is by ToString; the receiver is unchanged.
+  let d =
+    compile(
+      "function f() { var a = [3, 1, 2]; var s = a.toSorted(); return s.join(\",\") + \"|\" + a.join(\",\"); }",
+    )
+  call(d, "f", []) |> should.equal(dyn(<<"1,2,3|3,1,2">>))
+  // Default (lexicographic) vs numeric comparator differ for multi-digit numbers.
+  let lex =
+    compile("function f() { return [10, 2, 1].toSorted().join(\",\"); }")
+  call(lex, "f", []) |> should.equal(dyn(<<"1,10,2">>))
+  let cmp =
+    compile(
+      "function f() { return [10, 2, 1].toSorted(function(a, b) { return a - b; }).join(\",\"); }",
+    )
+  call(cmp, "f", []) |> should.equal(dyn(<<"1,2,10">>))
+  // Holes read through as undefined and sort after every defined element.
+  let h = compile("function f() { return [3, , 1].toSorted().join(\",\"); }")
+  call(h, "f", []) |> should.equal(dyn(<<"1,3,">>))
+}
+
+pub fn array_with_test() {
+  // Replace at a positive index; the receiver is unchanged.
+  let m =
+    compile(
+      "function f() { var a = [1, 2, 3]; var w = a.with(1, 9); return w.join(\",\") + \"|\" + a.join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"1,9,3|1,2,3">>))
+  // A negative index counts from the end.
+  let neg =
+    compile("function f() { return [1, 2, 3].with(-1, 9).join(\",\"); }")
+  call(neg, "f", []) |> should.equal(dyn(<<"1,2,9">>))
+  // Index is ToIntegerOrInfinity: 1.2 truncates to 1.
+  let co =
+    compile("function f() { return [0, 4, 16].with(1.2, 7).join(\",\"); }")
+  call(co, "f", []) |> should.equal(dyn(<<"0,7,16">>))
+  // An out-of-range index raises a RangeError (surfaces as an Error).
+  let oob = compile("function f() { return [1, 2, 3].with(5, 0); }")
+  let threw = case catch_apply(oob, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw |> should.equal(True)
+}
+
+pub fn array_to_spliced_test() {
+  // Insert without deleting; the receiver is unchanged.
+  let ins =
+    compile(
+      "function f() { var a = [1, 2, 3]; var s = a.toSpliced(1, 0, 9); return s.join(\",\") + \"|\" + a.join(\",\"); }",
+    )
+  call(ins, "f", []) |> should.equal(dyn(<<"1,9,2,3|1,2,3">>))
+  // A missing deleteCount deletes through the end.
+  let del =
+    compile(
+      "function f() { return [\"a\", \"b\", \"c\"].toSpliced(1).join(\",\"); }",
+    )
+  call(del, "f", []) |> should.equal(dyn(<<"a">>))
+  // No arguments → a full copy.
+  num("[1, 2, 3].toSpliced().length") |> should.equal(3.0)
+  // A start past the end clamps to length (the items are appended).
+  let big =
+    compile(
+      "function f() { return [0, 1].toSpliced(10, 1, 5, 6).join(\",\"); }",
+    )
+  call(big, "f", []) |> should.equal(dyn(<<"0,1,5,6">>))
+}
+
 pub fn object_static_test() {
   num("Object.keys({ a: 1, b: 2 }).length") |> should.equal(2.0)
   num("Object.values({ a: 1, b: 2, c: 3 }).length") |> should.equal(3.0)

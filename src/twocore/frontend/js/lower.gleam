@@ -4897,6 +4897,16 @@ fn lower_instance_method(
       host("array_copy_within", [undefined(), undefined(), undefined()])
     // splice(start, deleteCount, ...items) — all args as a cons list.
     "splice", _ -> coll("array_splice")
+    // ES2023 immutable (change-array-by-copy) methods — each returns a NEW array
+    // and leaves the receiver unchanged.
+    "toReversed", _ -> host("array_to_reversed", [])
+    "toSorted", [] -> host("array_to_sorted", [undefined()])
+    "toSorted", [cmp, ..] -> host("array_to_sorted", [cmp])
+    "with", [i, v, ..] -> host("array_with", [i, v])
+    "with", [i] -> host("array_with", [i, undefined()])
+    "with", [] -> host("array_with", [undefined(), undefined()])
+    // toSpliced(start, deleteCount, ...items) — all args as a cons list.
+    "toSpliced", _ -> coll("array_to_spliced")
     "at", [i, ..] -> host("array_at", [i])
     "padStart", [n] -> host("str_pad_start", [n, ir.ConstBinary(<<" ">>)])
     "padStart", [n, p, ..] -> host("str_pad_start", [n, p])
