@@ -3967,3 +3967,33 @@ pub fn uri_round_trip_test() {
   val("encodeURIComponent(123)") |> should.equal(dyn(<<"123">>))
   val("encodeURI(true)") |> should.equal(dyn(<<"true">>))
 }
+
+// ── negative zero (IEEE -0.0; §6.1.6.1.1 unary minus, §7.2.11 SameValue) ──────
+
+pub fn negative_zero_object_is_test() {
+  // Unary `-` on a zero yields the distinct IEEE value -0. SameValue (Object.is)
+  // distinguishes -0 from +0 (§7.2.11), unlike Strict Equality which collapses
+  // them.
+  num("Object.is(-0, 0) ? 1 : 0") |> should.equal(0.0)
+  num("Object.is(-0, -0) ? 1 : 0") |> should.equal(1.0)
+  num("Object.is(0, 0) ? 1 : 0") |> should.equal(1.0)
+  // Negating -0 restores +0; negating +0 gives -0.
+  num("Object.is(-(-0), 0) ? 1 : 0") |> should.equal(1.0)
+  num("Object.is(-(0), -0) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn negative_zero_equality_and_coercion_test() {
+  // Strict/loose equality collapse the signs (§7.2.15); -0 is falsy; ToString(-0)
+  // is "0", not "-0" (§6.1.6.1.20 Number::toString).
+  num("(-0 === 0) ? 1 : 0") |> should.equal(1.0)
+  num("(-0 == 0) ? 1 : 0") |> should.equal(1.0)
+  num("(-0) ? 1 : 0") |> should.equal(0.0)
+  val("String(-0)") |> should.equal(dyn(<<"0">>))
+}
+
+pub fn negative_zero_division_sign_test() {
+  // The sign bit of -0 propagates through division (§6.1.6.1.5): 1 / -0 is
+  // -Infinity, whereas 1 / +0 is +Infinity.
+  num("1 / -0 === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / 0 === Infinity ? 1 : 0") |> should.equal(1.0)
+}

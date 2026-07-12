@@ -260,6 +260,12 @@ neg(A) ->
 nneg(nan) -> nan;
 nneg(inf) -> neg_inf;
 nneg(neg_inf) -> inf;
+%% A zero must negate to the OTHER signed zero: -(+0) is IEEE -0.0 and -(-0.0) is
+%% +0.0 (§6.1.6.1.1 / unary `-`). Erlang integer negation of 0 yields the integer
+%% +0 (the BEAM has no integer -0), which would silently drop the sign bit that
+%% Object.is, `1 / -0`, and Math rounding observe. Routing any zero through a
+%% float multiply carries the sign correctly for all three cases.
+nneg(N) when N == 0 -> N * -1.0;
 nneg(N) -> -N.
 
 %% JS `/`. Always real division (7/2 is 3.5). x/±0 is ±Infinity by the signs
