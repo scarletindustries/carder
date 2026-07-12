@@ -71,7 +71,7 @@
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
-    array_last_index_of/2, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
+    array_last_index_of/3, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
     to_string_dispatch/1, num_to_string_radix/2,
     new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
@@ -79,7 +79,7 @@
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
     array_some/2, array_every/2, array_find/2, array_includes/3,
-    array_find_index/2, array_index_of/2, array_join/2,
+    array_find_index/2, array_index_of/3, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
@@ -2017,9 +2017,29 @@ afind_last_i(Fn, Arr, [{X, I} | Rest], Acc) ->
     end.
 
 %% arr.lastIndexOf(x) — last strict-equal index, or -1.
-array_last_index_of(Recv, X) ->
+%% lastIndexOf(searchElement, fromIndex) — the highest === index at or before
+%% `fromIndex` (default len-1; ToIntegerOrInfinity, negatives from the end), else -1.
+array_last_index_of(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
-    alast_idx(index_pairs(arr_list(Len, Map)), X, -1).
+    Cap = last_idx_from(From, Len),
+    Pairs = [P || {_E, I} = P <- index_pairs(arr_list(Len, Map)), I =< Cap],
+    alast_idx(Pairs, X, -1).
+
+last_idx_from(undefined, Len) ->
+    Len - 1;
+last_idx_from(From, Len) ->
+    case coerce_num(From) of
+        nan -> 0;
+        neg_inf -> -1;
+        inf -> Len - 1;
+        N ->
+            V = trunc(as_float(N)),
+            case V >= 0 of
+                true -> min(V, Len - 1);
+                false -> Len + V
+            end
+    end.
+
 alast_idx([], _, Acc) -> Acc;
 alast_idx([{E, I} | Rest], X, Acc) ->
     case strict_eq(E, X) of
@@ -2167,10 +2187,28 @@ num_to_fixed(N, D) ->
 
 %% ── array value methods ──────────────────────────────────
 
-array_index_of(Recv, X) when is_binary(Recv) -> str_index_of(Recv, X);
-array_index_of(Recv, X) ->
+%% indexOf(searchElement, fromIndex) — first === index at or after `fromIndex`
+%% (ToIntegerOrInfinity, negatives from the end, clamped), else -1. A string
+%% receiver does a substring search (its position argument is not yet honoured).
+array_index_of(Recv, X, _From) when is_binary(Recv) -> str_index_of(Recv, X);
+array_index_of(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
-    aidx(arr_list(Len, Map), 0, X).
+    Start = idx_from(From, Len),
+    aidx(lists:nthtail(min(Start, Len), arr_list(Len, Map)), Start, X).
+
+idx_from(From, Len) ->
+    case coerce_num(From) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> Len;
+        N ->
+            V = trunc(as_float(N)),
+            case V < 0 of
+                true -> max(Len + V, 0);
+                false -> V
+            end
+    end.
+
 aidx([], _, _) -> -1;
 aidx([E | Es], I, X) ->
     case strict_eq(E, X) of
@@ -2184,7 +2222,7 @@ aidx([E | Es], I, X) ->
 %% (ToIntegerOrInfinity, negatives from the end, clamped). A string receiver does a
 %% substring test (its position argument is not yet honoured).
 array_includes(Recv, X, _From) when is_binary(Recv) ->
-    array_index_of(Recv, X) =/= -1;
+    array_index_of(Recv, X, undefined) =/= -1;
 array_includes(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Start =

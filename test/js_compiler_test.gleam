@@ -851,6 +851,18 @@ pub fn array_query_test() {
   call(c, "f", []) |> should.equal(dyn(True))
 }
 
+pub fn array_index_of_from_index_test() {
+  // indexOf(x, fromIndex) searches forward from fromIndex; lastIndexOf(x, fromIndex)
+  // searches backward from it. Negatives count from the end.
+  num("[1, 2, 3, 2, 1].indexOf(2)") |> should.equal(1.0)
+  num("[1, 2, 3, 2, 1].indexOf(2, 2)") |> should.equal(3.0)
+  num("[1, 2, 3, 2, 1].indexOf(1, -2)") |> should.equal(4.0)
+  num("[1, 2, 3].indexOf(1, 5)") |> should.equal(-1.0)
+  num("[1, 2, 3, 2, 1].lastIndexOf(2)") |> should.equal(3.0)
+  num("[1, 2, 3, 2, 1].lastIndexOf(2, 2)") |> should.equal(1.0)
+  num("[1, 2, 3, 2, 1].lastIndexOf(1, -3)") |> should.equal(0.0)
+}
+
 pub fn array_includes_from_index_test() {
   // includes(element, fromIndex): searches from fromIndex (negatives from the end);
   // no argument searches for undefined.

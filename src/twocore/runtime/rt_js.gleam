@@ -415,7 +415,7 @@ pub fn array_find_last_index(arr: Dynamic, fn_: Dynamic) -> Dynamic
 
 /// `arr.lastIndexOf(x)` — last strict-equal index, or `-1`.
 @external(erlang, "twocore_rt_js_ffi", "array_last_index_of")
-pub fn array_last_index_of(arr: Dynamic, x: Dynamic) -> Dynamic
+pub fn array_last_index_of(arr: Dynamic, x: Dynamic, from: Dynamic) -> Dynamic
 
 /// `num.toFixed(d)` — a fixed-point string with `d` decimals.
 @external(erlang, "twocore_rt_js_ffi", "num_to_fixed")
@@ -550,7 +550,7 @@ pub fn array_find_index(arr: Dynamic, fn_: Dynamic) -> Dynamic
 
 /// `arr.indexOf(x)` → the first strict-equal index, else `-1`.
 @external(erlang, "twocore_rt_js_ffi", "array_index_of")
-pub fn array_index_of(arr: Dynamic, x: Dynamic) -> Dynamic
+pub fn array_index_of(arr: Dynamic, x: Dynamic, from: Dynamic) -> Dynamic
 
 /// `arr.includes(x)` → JS boolean (strict equality).
 @external(erlang, "twocore_rt_js_ffi", "array_includes")
