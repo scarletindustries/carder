@@ -89,6 +89,7 @@
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
+    object_rest/2,
     object_from_entries/1,
     json_stringify/1, json_parse/1,
     empty_list/0, console_log/1, not_callable/1
@@ -2295,6 +2296,31 @@ object_assign_into(Target, Source) when is_reference(Source) ->
     Target;
 object_assign_into(Target, _Source) ->
     Target.
+
+%% Object-rest destructuring `{ a, ...rest } = obj`: a NEW object with `obj`'s own
+%% enumerable properties except those named in `Excluded` (an array of key
+%% strings). Getters are invoked (the copied value is a data property).
+object_rest(Obj, Excluded) when is_reference(Obj) ->
+    ExKeys = excluded_keys(Excluded),
+    Rest = new_object(),
+    lists:foreach(
+        fun({K, V}) ->
+            case lists:member(K, ExKeys) of
+                true -> ok;
+                false -> set_prop(Rest, K, resolve_get(V))
+            end
+        end,
+        obj_pairs(Obj)
+    ),
+    Rest;
+object_rest(_Obj, _Excluded) ->
+    new_object().
+
+excluded_keys(Excluded) when is_reference(Excluded) ->
+    {Len, Map} = arr_content(Excluded),
+    [to_string(K) || K <- arr_list(Len, Map)];
+excluded_keys(_) ->
+    [].
 
 %% ── JSON ─────────────────────────────────────────────────
 

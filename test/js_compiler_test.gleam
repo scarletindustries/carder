@@ -1852,6 +1852,24 @@ pub fn rest_destructure_test() {
   |> should.equal(0.0)
 }
 
+pub fn object_rest_destructure_test() {
+  // Object rest binds the remaining own properties as a fresh object.
+  num(
+    "(function(){ let { a, ...rest } = { a: 1, b: 2, c: 3 }; return a + rest.b + rest.c; })()",
+  )
+  |> should.equal(6.0)
+  // The destructured (excluded) key is absent from rest.
+  val(
+    "(function(){ let { a, ...rest } = { a: 1, b: 2 }; return typeof rest.a; })()",
+  )
+  |> should.equal(dyn(<<"undefined">>))
+  // Several named properties are excluded.
+  num(
+    "(function(){ let { a, b, ...rest } = { a: 1, b: 2, c: 3, d: 4 }; return rest.c + rest.d; })()",
+  )
+  |> should.equal(7.0)
+}
+
 pub fn object_getter_test() {
   // An object-literal getter computes on access with dynamic `this` = the object.
   let m =

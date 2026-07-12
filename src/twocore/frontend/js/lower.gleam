@@ -23,7 +23,8 @@
 //// `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue` (incl. labeled `break outer`/`continue outer`),
 //// `return`, blocks; array/object destructuring in `let`/`const`/`var` — nested,
-//// defaults (`[a = 1]`, `{ k: a = 1 }`), and array rest (`[a, ...rest]`);
+//// defaults (`[a = 1]`, `{ k: a = 1 }`), array rest (`[a, ...rest]`), and object
+//// rest (`{ a, ...rest }`);
 //// objects
 //// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, method shorthand, and
 //// getters/setters (`get x()`/`set x(v)`, `this`-bound to the object); arrays `[…]`
@@ -61,9 +62,8 @@
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
-//// Not yet (a clean `Unsupported` error / panic): object-REST destructuring
-//// (`{ a, ...rest }`; array rest and all defaults ARE supported),
-//// `try`/`finally`, generators/async, and `continue` inside a `do/while`. Static
+//// Not yet (a clean `Unsupported` error / panic): `try`/`finally`,
+//// generators/async, and `continue` inside a `do/while`. Static
 //// field initializers run when the module's `main/0` runs (like any top-level
 //// state), so `C.x` reads `undefined` until then. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
@@ -1189,6 +1189,29 @@ fn desugar_destructure(
       Ok(#([temp, ..decls], ctr))
     }
     ast.ObjectPattern(properties:) -> {
+      // The statically-known key names bound by non-rest properties — these are
+      // excluded from an object-rest `...rest`.
+      let excluded_keys =
+        list.filter_map(properties, fn(p) {
+          case p {
+            ast.PatternProperty(
+              key: ast.Identifier(name:, ..),
+              computed: False,
+              ..,
+            ) -> Ok(name)
+            ast.PatternProperty(
+              key: ast.StringExpression(value:, ..),
+              computed: False,
+              ..,
+            ) -> Ok(value)
+            ast.PatternProperty(
+              key: ast.NumberLiteral(value:, ..),
+              computed: False,
+              ..,
+            ) -> Ok(num_key(value))
+            _ -> Error(Nil)
+          }
+        })
       use decls <- result_try(
         list.try_map(properties, fn(p) {
           case p {
@@ -1222,8 +1245,29 @@ fn desugar_destructure(
                 )
               Ok(ast.VariableDeclarator(id: valpat, init: Some(access)))
             }
-            ast.RestProperty(..) ->
-              Error(Unsupported("rest element in object destructuring"))
+            // `{ a, ...rest }` — rest is `obj` minus the named keys, via the
+            // internal `Object.__rest(tmp, [excluded…])` helper.
+            ast.RestProperty(argument: pat) -> {
+              let keys_arr =
+                ast.ArrayExpression(
+                  span: sp,
+                  elements: list.map(excluded_keys, fn(k) {
+                    Some(ast.StringExpression(span: sp, value: k))
+                  }),
+                )
+              let rest_call =
+                ast.CallExpression(
+                  span: sp,
+                  callee: ast.MemberExpression(
+                    span: sp,
+                    object: ast.Identifier(span: sp, name: "Object"),
+                    property: ast.Identifier(span: sp, name: "__rest"),
+                    computed: False,
+                  ),
+                  arguments: [d_id, keys_arr],
+                )
+              Ok(ast.VariableDeclarator(id: pat, init: Some(rest_call)))
+            }
           }
         }),
       )
@@ -3103,6 +3147,8 @@ fn lower_static_call(
       let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
       Ok(bind_after(binds2, ir.CallHost("js", "new_array", [listv]), ctr))
     }
+    // internal helper the destructuring desugar emits for `{ a, ...rest }`.
+    "Object", "__rest", [o, excluded] -> host("object_rest", [o, excluded])
     "Object", "keys", [o, ..] -> host("object_keys", [o])
     "Object", "values", [o, ..] -> host("object_values", [o])
     "Object", "entries", [o, ..] -> host("object_entries", [o])

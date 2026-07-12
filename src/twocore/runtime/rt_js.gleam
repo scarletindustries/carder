@@ -637,6 +637,11 @@ pub fn object_entries(o: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_assign_into")
 pub fn object_assign_into(target: Dynamic, source: Dynamic) -> Dynamic
 
+/// A new object with `obj`'s own properties except those named in `excluded` (a
+/// key-string array) — object-rest destructuring `{ a, ...rest }`.
+@external(erlang, "twocore_rt_js_ffi", "object_rest")
+pub fn object_rest(obj: Dynamic, excluded: Dynamic) -> Dynamic
+
 /// `Object.fromEntries(pairs)` — build an object from an array of `[key, value]` arrays.
 @external(erlang, "twocore_rt_js_ffi", "object_from_entries")
 pub fn object_from_entries(entries: Dynamic) -> Dynamic
