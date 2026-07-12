@@ -635,6 +635,46 @@ pub fn math_variadic_test() {
   num("Math.hypot(3, 4)") |> should.equal(5.0)
 }
 
+pub fn math_hypot_special_values_test() {
+  // Per spec: any ±Infinity argument → +Infinity (even alongside NaN); otherwise a
+  // NaN argument → NaN. (Regression: these inputs used to crash with badarith.)
+  num("Math.hypot(Infinity, NaN) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("Math.hypot(-Infinity, 5) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("Number.isNaN(Math.hypot(NaN, 3)) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn math_hyperbolic_test() {
+  // ES2015 hyperbolics and inverses.
+  num("Math.sinh(0)") |> should.equal(0.0)
+  num("Math.cosh(0)") |> should.equal(1.0)
+  num("Math.tanh(0)") |> should.equal(0.0)
+  num("Math.asinh(0)") |> should.equal(0.0)
+  num("Math.acosh(1)") |> should.equal(0.0)
+  num("Math.atanh(0)") |> should.equal(0.0)
+  // acosh's domain is [1, ∞); atanh's is (-1, 1) with ±1 → ±∞.
+  num("Number.isNaN(Math.acosh(0)) ? 1 : 0") |> should.equal(1.0)
+  num("Math.atanh(1) === Infinity ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn math_fround_clz32_test() {
+  // fround rounds to single precision; 1.1 is not representable in float32.
+  num("Math.fround(1)") |> should.equal(1.0)
+  num("Math.fround(0)") |> should.equal(0.0)
+  num("Math.fround(1.1) === 1.1 ? 1 : 0") |> should.equal(0.0)
+  // clz32: ToUint32 then count 32-bit leading zeros. clz32(1)=31, clz32(0)=32.
+  num("Math.clz32(1)") |> should.equal(31.0)
+  num("Math.clz32(0)") |> should.equal(32.0)
+  num("Math.clz32(1000)") |> should.equal(22.0)
+  num("Math.clz32(NaN)") |> should.equal(32.0)
+}
+
+pub fn math_expm1_log1p_test() {
+  num("Math.expm1(0)") |> should.equal(0.0)
+  num("Math.log1p(0)") |> should.equal(0.0)
+  num("Math.log1p(-1) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("Number.isNaN(Math.log1p(-2)) ? 1 : 0") |> should.equal(1.0)
+}
+
 pub fn math_constants_test() {
   num("Math.PI") |> should.equal(3.141592653589793)
   num("Math.E") |> should.equal(2.718281828459045)

@@ -4283,7 +4283,17 @@ fn math_arity(method: String) -> Option(MathArity) {
     | "tan"
     | "asin"
     | "acos"
-    | "atan" -> Some(MathUnary)
+    | "atan"
+    | "sinh"
+    | "cosh"
+    | "tanh"
+    | "asinh"
+    | "acosh"
+    | "atanh"
+    | "expm1"
+    | "log1p"
+    | "fround"
+    | "clz32" -> Some(MathUnary)
     "pow" | "atan2" -> Some(MathBinary)
     "min" | "max" | "hypot" -> Some(MathReduce)
     "random" -> Some(MathRandom)

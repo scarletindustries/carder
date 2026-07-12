@@ -541,6 +541,14 @@ int_pow(B, E, Acc) ->
 math_random() -> rand:uniform().
 
 %% Unary Math functions.
+%% Math.clz32 coerces with ToUint32 (not the sentinel float path): NaN/Infinity
+%% → 0 → 32 leading zeros. clz32(0) = 32, else 32 minus the number of binary digits.
+math_unary(clz32, X) ->
+    U = js_to_uint32(X),
+    case U of
+        0 -> 32;
+        _ -> 32 - length(integer_to_list(U, 2))
+    end;
 math_unary(Method, X) ->
     out(munary(Method, coerce_num(X))).
 
@@ -563,9 +571,20 @@ munary_inf(sqrt, 1) -> inf;
 munary_inf(cbrt, S) -> inf_of(S);
 munary_inf(exp, 1) -> inf;
 munary_inf(exp, -1) -> 0;
+munary_inf(expm1, 1) -> inf;
+munary_inf(expm1, -1) -> -1;
 munary_inf(log, 1) -> inf;
 munary_inf(log2, 1) -> inf;
 munary_inf(log10, 1) -> inf;
+munary_inf(log1p, 1) -> inf;
+munary_inf(fround, S) -> inf_of(S);
+%% hyperbolics: sinh(±∞)=±∞, cosh(±∞)=+∞, tanh(±∞)=±1.
+munary_inf(sinh, S) -> inf_of(S);
+munary_inf(cosh, _) -> inf;
+munary_inf(tanh, S) -> S;
+%% inverse hyperbolics: asinh(±∞)=±∞, acosh(+∞)=+∞ (−∞ → NaN), atanh(±∞)=NaN.
+munary_inf(asinh, S) -> inf_of(S);
+munary_inf(acosh, 1) -> inf;
 munary_inf(_, _) -> nan.
 
 inf_of(1) -> inf;
@@ -615,6 +634,37 @@ munary_finite(asin, N) -> math:asin(as_float(N));
 munary_finite(acos, N) when N < -1; N > 1 -> nan;
 munary_finite(acos, N) -> math:acos(as_float(N));
 munary_finite(atan, N) -> math:atan(as_float(N));
+%% ES2015 hyperbolics and their inverses (Erlang's math module provides all six).
+munary_finite(sinh, N) -> guard_inf(fun() -> math:sinh(as_float(N)) end);
+munary_finite(cosh, N) -> guard_inf(fun() -> math:cosh(as_float(N)) end);
+munary_finite(tanh, N) -> math:tanh(as_float(N));
+munary_finite(asinh, N) -> math:asinh(as_float(N));
+%% acosh domain is [1, ∞); atanh domain is (-1, 1) with ±1 → ±∞.
+munary_finite(acosh, N) when N < 1 -> nan;
+munary_finite(acosh, N) -> math:acosh(as_float(N));
+munary_finite(atanh, N) when N < -1; N > 1 -> nan;
+munary_finite(atanh, N) when N == 1 -> inf;
+munary_finite(atanh, N) when N == -1 -> neg_inf;
+munary_finite(atanh, N) -> math:atanh(as_float(N));
+%% expm1(x) = eˣ − 1 and log1p(x) = ln(1 + x), the accurate-near-zero variants.
+munary_finite(expm1, N) -> guard_inf(fun() -> math:exp(as_float(N)) - 1 end);
+munary_finite(log1p, N) when N < -1 -> nan;
+munary_finite(log1p, N) when N == -1 -> neg_inf;
+munary_finite(log1p, N) -> math:log(1 + as_float(N));
+%% Math.fround rounds to the nearest single-precision float (round-trip via a
+%% 32-bit binary); a magnitude beyond float32's range overflows to ±Infinity.
+munary_finite(fround, N) ->
+    F = as_float(N),
+    try
+        <<R:32/float>> = <<F:32/float>>,
+        R
+    catch
+        error:badarg ->
+            case F < 0 of
+                true -> neg_inf;
+                false -> inf
+            end
+    end;
 munary_finite(_, _) -> nan.
 
 %% cbrt of a negative base uses the real (negative) root.
@@ -652,21 +702,32 @@ math_reduce(Method, Args) ->
 mreduce(min, []) -> inf;
 mreduce(max, []) -> neg_inf;
 mreduce(hypot, []) -> 0;
+%% Math.hypot: per spec, if ANY argument is ±Infinity the result is +Infinity
+%% (even when another argument is NaN); otherwise a NaN argument yields NaN;
+%% otherwise sqrt of the sum of squares. (The old code multiplied the NaN atom and
+%% crashed with badarith on hypot(Infinity, NaN) / hypot(NaN, x).)
+mreduce(hypot, Nums) ->
+    case lists:member(inf, Nums) orelse lists:member(neg_inf, Nums) of
+        true ->
+            inf;
+        false ->
+            case lists:member(nan, Nums) of
+                true ->
+                    nan;
+                false ->
+                    Sum = lists:foldl(
+                        fun(N, A) -> F = as_float(N), A + F * F end, 0.0, Nums),
+                    math:sqrt(Sum)
+            end
+    end;
 mreduce(Method, Nums) ->
     case lists:member(nan, Nums) of
-        true when Method =/= hypot -> nan;
+        true -> nan;
         _ -> mreduce_go(Method, Nums)
     end.
 
 mreduce_go(min, Nums) -> lists:foldl(fun mmin/2, hd(Nums), tl(Nums));
-mreduce_go(max, Nums) -> lists:foldl(fun mmax/2, hd(Nums), tl(Nums));
-mreduce_go(hypot, Nums) ->
-    Sum = lists:foldl(fun(N, A) -> A + hypot_sq(N) end, 0.0, Nums),
-    math:sqrt(Sum).
-
-hypot_sq(inf) -> inf_to_num(inf);
-hypot_sq(neg_inf) -> inf_to_num(inf);
-hypot_sq(N) -> as_float(N) * as_float(N).
+mreduce_go(max, Nums) -> lists:foldl(fun mmax/2, hd(Nums), tl(Nums)).
 
 mmin(inf, B) -> B;
 mmin(A, inf) -> A;
