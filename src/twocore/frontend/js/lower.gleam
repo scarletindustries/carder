@@ -13,7 +13,9 @@
 //// guarded arithmetic).
 ////
 //// Supported subset (v1): top-level `function` declarations (recursion, mutual
-//// recursion, calls); number/string/boolean/null/undefined/template literals;
+//// recursion, calls, default parameters, and under-/over-application — a missing
+//// argument arrives as `undefined`); number/string/boolean/null/undefined/template
+//// literals;
 //// `+ - * / %`, all comparisons, `&& || ! ??`, bitwise/shift `& | ^ ~ << >> >>>`, unary
 //// `- + ! ~ typeof void`, `?:`, optional chaining `?.`; `let/const/var`, `= += -= *= /=
 //// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
@@ -38,8 +40,10 @@
 //// `Number.isInteger`/`isNaN`/`isFinite`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): classes, destructuring, spread,
-//// default parameters, regex, `JSON`, `try`/`finally`, and `continue` inside a
-//// `do/while`. Only an explicit `throw` is
+//// rest params, regex, `JSON`, `try`/`finally`, and `continue` inside a `do/while`.
+//// (A default value on an arrow/function-EXPRESSION param only applies when it is
+//// called with the full arity or through an array method, since a closure call site
+//// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
 //// caught (a runtime type error propagates), and a variable mutated in a try body
 //// before a throw keeps its pre-try value in the handler. Scope is one flat function
 //// scope per JS function (block-scoped `let` is treated as function-scoped).
@@ -108,6 +112,7 @@ type Lambda {
   Lambda(
     name: String,
     params: List(String),
+    defaults: List(#(String, ast.Expression)),
     body: List(ast.Statement),
     captures: List(String),
   )
@@ -121,6 +126,7 @@ type Lambda {
 type Ctx {
   Ctx(
     funcs: List(String),
+    fn_arity: Dict(String, Int),
     loop: Option(Loop),
     brk: Option(#(String, List(String))),
     lambdas: Dict(ast.Span, Lambda),
@@ -156,8 +162,22 @@ pub fn program(
       }),
     )
   use lambdas <- result_try(collect_lambdas(scan, fn_names))
+  let fn_arity =
+    dict.from_list(
+      list.map(decls, fn(d) {
+        let #(n, params, _) = d
+        #(n, list.length(params))
+      }),
+    )
   let ctx =
-    Ctx(funcs: fn_names, loop: None, brk: None, lambdas:, scope_mutated: [])
+    Ctx(
+      funcs: fn_names,
+      fn_arity:,
+      loop: None,
+      brk: None,
+      lambdas:,
+      scope_mutated: [],
+    )
 
   use funcs <- result_try(
     list.try_map(decls, fn(d) {
@@ -209,10 +229,10 @@ fn lower_function(
   body: ast.Statement,
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  use pnames <- result_try(param_names(params))
+  use #(pnames, defaults) <- result_try(param_info(params))
   let env =
     list.fold(pnames, dict.new(), fn(acc, n) { dict.insert(acc, n, ir.Var(n)) })
-  let stmts = block_stmts(body)
+  let stmts = list.append(default_prologue(defaults), block_stmts(body))
   let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
   use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
   Ok(ir.Function(
@@ -1697,7 +1717,14 @@ fn lower_call(
             ctx,
             ctr,
           ))
-          Ok(bind_after(binds, ir.CallDirect(fname, argvals), ctr))
+          // BEAM funs are arity-strict; JS is not. Pad missing args with `undefined`
+          // (so defaults apply) and drop extras, matching the callee's declared arity.
+          let arity = case dict.get(ctx.fn_arity, fname) {
+            Ok(a) -> a
+            Error(Nil) -> list.length(argvals)
+          }
+          let fitted = fit_args(argvals, arity)
+          Ok(bind_after(binds, ir.CallDirect(fname, fitted), ctr))
         }
         // f is a value (a closure in a variable) → CallClosure.
         False ->
@@ -1998,6 +2025,20 @@ fn lower_array(
   )
   let #(binds2, listv, ctr) = build_list(vals, binds, ctr)
   Ok(bind_after(binds2, ir.CallHost("js", "new_array", [listv]), ctr))
+}
+
+/// Fit an argument list to `arity`: pad with `undefined` (so defaults apply) or drop
+/// extras. BEAM funs are arity-strict; JS tolerates over-/under-application.
+fn fit_args(args: List(ir.Value), arity: Int) -> List(ir.Value) {
+  let n = list.length(args)
+  case n < arity {
+    True -> list.append(args, list.repeat(undefined(), arity - n))
+    False ->
+      case n > arity {
+        True -> list.take(args, arity)
+        False -> args
+      }
+  }
 }
 
 fn lower_args(
@@ -2380,24 +2421,72 @@ fn arrow_body_stmts(body: ast.ArrowBody) -> List(ast.Statement) {
   }
 }
 
-/// Parameter identifier names, skipping non-identifier patterns (used only by the
-/// capture analysis, which tolerates unsupported params — lowering rejects them).
+/// Parameter identifier names, skipping unsupported patterns (used only by the capture
+/// analysis, which tolerates them — lowering rejects them). A defaulted param `x = e`
+/// contributes its name `x`.
 fn pattern_names_lax(params: List(ast.Pattern)) -> List(String) {
   list.filter_map(params, fn(p) {
     case p {
       ast.IdentifierPattern(name:, ..) -> Ok(name)
+      ast.AssignmentPattern(left: ast.IdentifierPattern(name:, ..), ..) ->
+        Ok(name)
       _ -> Error(Nil)
     }
   })
 }
 
-/// Strict parameter names for lowering: every parameter must be a plain identifier.
-fn param_names(params: List(ast.Pattern)) -> Result(List(String), Error) {
-  list.try_map(params, fn(p) {
+/// Parameter names plus any defaults (`function f(x, y = 5)`). Each parameter must be
+/// a plain identifier, optionally with a default; rest params and destructuring
+/// patterns are `Unsupported`.
+fn param_info(
+  params: List(ast.Pattern),
+) -> Result(#(List(String), List(#(String, ast.Expression))), Error) {
+  list.try_fold(params, #([], []), fn(acc, p) {
+    let #(names, defaults) = acc
     case p {
-      ast.IdentifierPattern(name:, ..) -> Ok(name)
-      _ -> Error(Unsupported("non-identifier parameter pattern"))
+      ast.IdentifierPattern(name:, ..) ->
+        Ok(#(list.append(names, [name]), defaults))
+      ast.AssignmentPattern(left: ast.IdentifierPattern(name:, ..), right: d) ->
+        Ok(#(list.append(names, [name]), list.append(defaults, [#(name, d)])))
+      _ -> Error(Unsupported("parameter pattern (rest/destructuring)"))
     }
+  })
+}
+
+/// The synthetic prologue statements that apply default parameter values:
+/// `if (name === undefined) { name = default; }` for each defaulted param. Combined
+/// with call-site arity padding (a missing arg arrives as `undefined`), this gives JS
+/// default-parameter semantics.
+fn default_prologue(
+  defaults: List(#(String, ast.Expression)),
+) -> List(ast.Statement) {
+  let sp = ast.Span(0, 0)
+  list.map(defaults, fn(d) {
+    let #(name, expr) = d
+    let is_undef =
+      ast.BinaryExpression(
+        span: sp,
+        operator: ast.StrictEqual,
+        left: ast.Identifier(span: sp, name: name),
+        right: ast.UndefinedExpression(span: sp),
+      )
+    let assign =
+      ast.ExpressionStatement(
+        expression: ast.AssignmentExpression(
+          span: sp,
+          operator: ast.Assign,
+          left: ast.Identifier(span: sp, name: name),
+          right: expr,
+        ),
+        directive: None,
+      )
+    ast.IfStatement(
+      condition: is_undef,
+      consequent: ast.BlockStatement(body: [
+        ast.StmtWithLine(line: 0, statement: assign),
+      ]),
+      alternate: None,
+    )
   })
 }
 
@@ -2634,11 +2723,15 @@ fn collect_lambdas(
   use #(lambdas, _) <- result_try(
     list.try_fold(raws, #(dict.new(), 0), fn(acc, raw) {
       let #(acc_lambdas, i) = acc
-      use pnames <- result_try(param_names(raw.params))
+      use #(pnames, defaults) <- result_try(param_info(raw.params))
       let name = "lambda$" <> int.to_string(i)
       let caps = lambda_captures(pnames, raw.body, globals)
       Ok(#(
-        dict.insert(acc_lambdas, raw.span, Lambda(name, pnames, raw.body, caps)),
+        dict.insert(
+          acc_lambdas,
+          raw.span,
+          Lambda(name, pnames, defaults, raw.body, caps),
+        ),
         i + 1,
       ))
     }),
@@ -2654,8 +2747,9 @@ fn lower_lambda(lam: Lambda, ctx: Ctx) -> Result(ir.Function, Error) {
     list.fold(all_params, dict.new(), fn(acc, n) {
       dict.insert(acc, n, ir.Var(n))
     })
-  let ctx2 = Ctx(..ctx, loop: None, scope_mutated: assigned_in(lam.body))
-  use #(body_expr, _ctr) <- result_try(lower_body(lam.body, env, ctx2, 0))
+  let stmts = list.append(default_prologue(lam.defaults), lam.body)
+  let ctx2 = Ctx(..ctx, loop: None, scope_mutated: assigned_in(stmts))
+  use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
   Ok(ir.Function(
     name: lam.name,
     params: list.map(all_params, fn(n) { ir.Local(n, ir.TTerm) }),

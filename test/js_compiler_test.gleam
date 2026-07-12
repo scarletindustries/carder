@@ -968,6 +968,52 @@ pub fn optional_with_nullish_test() {
   call(m, "f", []) |> should.equal(dyn(<<"default">>))
 }
 
+// ── default parameters + arity fitting ───────────────────────────────────────
+
+pub fn default_params_test() {
+  let m =
+    compile(
+      "function greet(name = \"world\") { return \"hi \" + name; } function run0() { return greet(); }",
+    )
+  // explicit arg
+  call(m, "greet", [dyn(<<"bob">>)]) |> should.equal(dyn(<<"hi bob">>))
+  // omitted arg → default (internal under-application, padded with undefined)
+  call(m, "run0", []) |> should.equal(dyn(<<"hi world">>))
+}
+
+pub fn default_params_second_test() {
+  let m =
+    compile(
+      "function add(a, b = 10) { return a + b; } function run1(a) { return add(a); }",
+    )
+  to_float(call(m, "run1", [dyn(5)])) |> should.equal(15.0)
+  to_float(call(m, "add", [dyn(5), dyn(2)])) |> should.equal(7.0)
+}
+
+pub fn default_refs_earlier_param_test() {
+  let m =
+    compile(
+      "function f(a, b = a * 2) { return b; } function run(a) { return f(a); }",
+    )
+  to_float(call(m, "run", [dyn(3)])) |> should.equal(6.0)
+  to_float(call(m, "f", [dyn(3), dyn(100)])) |> should.equal(100.0)
+}
+
+pub fn under_over_application_test() {
+  // missing arg arrives as undefined
+  let u =
+    compile(
+      "function f(a, b) { return b === undefined; } function run(a) { return f(a); }",
+    )
+  call(u, "run", [dyn(5)]) |> should.equal(dyn(True))
+  // extra args are dropped
+  let o =
+    compile(
+      "function f(a) { return a; } function run(a) { return f(a, 99, 99); }",
+    )
+  to_float(call(o, "run", [dyn(1)])) |> should.equal(1.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {
