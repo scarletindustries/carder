@@ -613,6 +613,25 @@ pub fn array_unshift(arr: Dynamic, vals: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_sort")
 pub fn array_sort(arr: Dynamic, cmp: Dynamic) -> Dynamic
 
+/// `arr.toReversed()` (ES2023) — a new reversed array; `arr` is not mutated.
+@external(erlang, "twocore_rt_js_ffi", "array_to_reversed")
+pub fn array_to_reversed(arr: Dynamic) -> Dynamic
+
+/// `arr.toSorted(cmp)` (ES2023) — a new sorted array; `arr` is not mutated. Holes
+/// are read through as `undefined` (unlike `sort`, which skips them).
+@external(erlang, "twocore_rt_js_ffi", "array_to_sorted")
+pub fn array_to_sorted(arr: Dynamic, cmp: Dynamic) -> Dynamic
+
+/// `arr.with(index, value)` (ES2023) — a new array with `index` replaced by
+/// `value`; `arr` is not mutated. An out-of-range `index` raises a RangeError.
+@external(erlang, "twocore_rt_js_ffi", "array_with")
+pub fn array_with(arr: Dynamic, index: Dynamic, value: Dynamic) -> Dynamic
+
+/// `arr.toSpliced(start, deleteCount, ...items)` (ES2023) — a new array with the
+/// splice applied; `arr` is not mutated (`args` a cons list of all arguments).
+@external(erlang, "twocore_rt_js_ffi", "array_to_spliced")
+pub fn array_to_spliced(arr: Dynamic, args: Dynamic) -> Dynamic
+
 // ───────────────────────── strings ─────────────────────────
 // Strings are UTF-8 binaries. `.length`, indexing, `charAt`, `slice`, `substring` are
 // code-point based (BMP-correct; astral chars count as 1 not 2 — a v1 deviation from

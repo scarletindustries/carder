@@ -83,6 +83,7 @@
     array_find_index/2, array_index_of/3, array_join/2,
     array_slice/3, array_concat/2, array_reverse/1, array_shift/1,
     array_unshift/2, array_sort/2,
+    array_to_reversed/1, array_to_sorted/2, array_with/3, array_to_spliced/2,
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
     str_upper/1, str_lower/1,
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
@@ -1291,6 +1292,10 @@ array_set(Recv, Len, Map, Key, V) ->
     erlang:put(?CELL_KEY(Recv), {js_array, NewLen, maps:put(K, V, Map)}),
     V.
 
+%% Every array IS an Array instance, so `x instanceof Array` (compiled to a
+%% has_prop for the `@@is_Array` brand) is true for any array cell — arrays carry
+%% no explicit brand key, so recognise it here.
+array_has(_Map, <<"@@is_Array">>) -> 1;
 array_has(_Map, <<"length">>) -> 1;
 array_has(Map, Key) -> bool_int(maps:is_key(array_key(Key), Map)).
 
@@ -1328,26 +1333,82 @@ array_pop(Recv) when is_reference(Recv) ->
 array_pop(Recv) ->
     type_error(Recv).
 
-%% Array.from(x) — a new array from an array (copy), a string (its chars), or an
-%% array-like; a non-iterable yields an empty array.
-array_from(X) when is_reference(X) ->
-    case erlang:get(?CELL_KEY(X)) of
-        {js_array, Len, Map} -> new_array(arr_list(Len, Map));
-        _ -> new_array([])
-    end;
-array_from(X) when is_binary(X) ->
-    new_array([from_cps([C]) || C <- cps(X)]);
-array_from(_X) ->
-    new_array([]).
+%% Array.from(x) / Array.from(x, mapFn) — a NEW array built from an array (copy),
+%% a string (its code points), or an array-like object (any object carrying a
+%% `length` property plus 0-based index properties). Elements are read one at a
+%% time in index order via a fresh Get, so a `mapFn` that mutates the source array
+%% observes its own writes (the array-iterator / per-index Get of §23.1.2.1); the
+%% element count is fixed once at entry — an array's live length, a string's
+%% code-point count, or ToLength(Get(obj,"length")) for an array-like. Holes and
+%% absent indices read as `undefined`. Any other value yields an empty array.
+array_from(X) ->
+    new_array(array_from_elems(X, undefined)).
 
-%% Array.from(x, mapFn) — like array_from, then apply mapFn(element, index) to
-%% each element (§23.1.2.1 step 7).
+%% Array.from(x, mapFn) — as array_from, with mapFn(element, index) applied to each
+%% element as it is read (§23.1.2.1 step 7); a mapFn of `undefined` means no mapping.
 array_from_map(X, Fn) ->
-    {Len, Map} = arr_content(array_from(X)),
-    new_array(amap_from(Fn, arr_list(Len, Map), 0)).
+    new_array(array_from_elems(X, Fn)).
 
-amap_from(_Fn, [], _I) -> [];
-amap_from(Fn, [E | Es], I) -> [call_cb(Fn, [E, I]) | amap_from(Fn, Es, I + 1)].
+array_from_elems(X, Fn) when is_binary(X) ->
+    from_map_list([from_cps([C]) || C <- cps(X)], Fn, 0);
+array_from_elems(X, Fn) when is_reference(X) ->
+    from_map_index(X, Fn, 0, arr_from_length(X));
+array_from_elems(_X, _Fn) ->
+    [].
+
+%% The number of elements Array.from reads from a cell: an array's live length,
+%% ToLength(Get(obj,"length")) for an array-like object, or 0 for any other cell
+%% (Map/Set/RegExp/Date/generator — not iterated here, a v1 gap).
+arr_from_length(X) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_array, Len, _} -> Len;
+        M when is_map(M) -> to_length(resolve_get(maps:get(<<"length">>, M, undefined)));
+        _ -> 0
+    end.
+
+%% Build [f(x_K,K), …, f(x_{N-1},N-1)] reading each x_k FRESH from cell X (so a
+%% mapping callback sees writes it makes to later indices), f being `Fn` or the
+%% identity when Fn is `undefined`.
+from_map_index(_X, _Fn, K, N) when K >= N -> [];
+from_map_index(X, Fn, K, N) ->
+    [from_apply(Fn, arr_from_get(X, K), K) | from_map_index(X, Fn, K + 1, N)].
+
+%% As from_map_index but over an already-materialized element list (the string case).
+from_map_list([], _Fn, _I) -> [];
+from_map_list([E | Es], Fn, I) ->
+    [from_apply(Fn, E, I) | from_map_list(Es, Fn, I + 1)].
+
+from_apply(undefined, E, _I) -> E;
+from_apply(Fn, E, I) -> call_cb(Fn, [E, I]).
+
+%% Read index K (0-based) fresh from an array or array-like object cell; a hole /
+%% absent index reads as `undefined`.
+arr_from_get(X, K) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_array, _Len, Map} -> maps:get(K, Map, undefined);
+        M when is_map(M) -> resolve_get(maps:get(to_string(K), M, undefined));
+        _ -> undefined
+    end.
+
+%% ToLength(v) (§7.1.20): ToIntegerOrInfinity clamped to the array-index range
+%% [0, 2^53-1]. NaN / -Infinity → 0; +Infinity → 2^53-1.
+to_length(V) ->
+    case coerce_num(V) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> 16#1FFFFFFFFFFFFF;
+        N -> min(max(trunc(as_float(N)), 0), 16#1FFFFFFFFFFFFF)
+    end.
+
+%% ToIntegerOrInfinity(v) (§7.1.5): NaN → 0, ±Infinity pass through as inf/neg_inf,
+%% otherwise truncate toward zero.
+to_int_or_inf(V) ->
+    case coerce_num(V) of
+        nan -> 0;
+        inf -> inf;
+        neg_inf -> neg_inf;
+        N -> trunc(as_float(N))
+    end.
 
 %% arr.flat() — flatten one level (array elements are spread in).
 %% arr.flat(depth) — flatten nested arrays up to `depth` levels. Depth defaults to
@@ -2858,6 +2919,67 @@ sort_lte(V) ->
         inf -> false;
         N -> N =< 0
     end.
+
+%% arr.toReversed() (ES2023 23.1.3.33) — a NEW array with the elements of `arr`
+%% in reverse index order. `arr` is not mutated; holes read through as `undefined`
+%% so the result is dense with the same length.
+array_to_reversed(Recv) ->
+    {Len, Map} = arr_content(Recv),
+    new_array(lists:reverse(arr_list(Len, Map))).
+
+%% arr.toSorted(cmp?) (ES2023 23.1.3.34) — a NEW sorted array, leaving `arr`
+%% unchanged. Unlike `sort`, holes are read THROUGH as `undefined` values (not
+%% skipped): every `undefined` sorts after all non-`undefined` elements and the
+%% result is dense with the same length. Default order is by ToString; with `cmp`,
+%% by the sign of `cmp(a, b)` (a NaN result keeps order). The sort is stable.
+array_to_sorted(Recv, Cmp) ->
+    {Len, Map} = arr_content(Recv),
+    {Undef, Defined} =
+        lists:partition(fun(V) -> V =:= undefined end, arr_list(Len, Map)),
+    Sorted =
+        case Cmp of
+            undefined ->
+                lists:sort(fun(A, B) -> to_string(A) =< to_string(B) end, Defined);
+            _ ->
+                lists:sort(fun(A, B) -> sort_lte(call_cb(Cmp, [A, B])) end, Defined)
+        end,
+    new_array(Sorted ++ Undef).
+
+%% arr.with(index, value) (ES2023 23.1.3.39) — a NEW array equal to `arr` but with
+%% the element at `index` replaced by `value`; `arr` is not mutated. `index` is
+%% ToIntegerOrInfinity and, when negative, counts from the end (len + index). A
+%% resulting index outside [0, len) — including ±Infinity — raises a RangeError.
+array_with(Recv, Index, Value) ->
+    {Len, Map} = arr_content(Recv),
+    Actual =
+        case to_int_or_inf(Index) of
+            inf -> Len;
+            neg_inf -> -1;
+            N when N < 0 -> Len + N;
+            N -> N
+        end,
+    case Actual >= 0 andalso Actual < Len of
+        true -> new_array(list_replace(arr_list(Len, Map), Actual, Value));
+        false -> range_error(<<"Invalid index">>)
+    end.
+
+%% Replace the element at 0-based Idx (assumed in range) of List with Value.
+list_replace(List, Idx, Value) ->
+    {Prefix, [_Old | Rest]} = lists:split(Idx, List),
+    Prefix ++ [Value | Rest].
+
+%% arr.toSpliced(start, skipCount, ...items) (ES2023 23.1.3.35) — the array that
+%% `splice` would leave the receiver AS, without mutating `arr`: a NEW array with
+%% `skipCount` elements removed at `start` and `items` inserted there. `start` and
+%% `skipCount` are clamped exactly as for `splice` (see splice_args). `Args` is the
+%% cons list of all call arguments.
+array_to_spliced(Recv, Args) ->
+    {Len, Map} = arr_content(Recv),
+    List = arr_list(Len, Map),
+    {Start, DelCount, Items} = splice_args(Args, Len),
+    Prefix = lists:sublist(List, Start),
+    Suffix = lists:nthtail(min(Start + DelCount, Len), List),
+    new_array(Prefix ++ Items ++ Suffix).
 
 %% ── strings ──────────────────────────────────────────────
 %% Strings are UTF-8 binaries. `.length`, indexing, `charAt`, `slice`, `substring` use
