@@ -46,15 +46,17 @@
 //// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
-//// `String.fromCharCode`, and `Date.now`. Regex literals `/pat/flags` (backed by
+//// `String.fromCharCode`/`String.raw`, and `Date.now`. Tagged templates
+//// `` tag`…${e}…` `` (the tag receives the cooked strings array with a `.raw`
+//// property, then the substitutions). Regex literals `/pat/flags` (backed by
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
 //// `Map`/`Set` (`new Map()`/`new Set()`, `.set`/`.get`/`.add`/`.has`/`.delete`/`.clear`/
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
 //// plain object).
 ////
 //// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
-//// members, defaulted/rest destructuring, `try`/`finally`, generators/async, tagged
-//// templates, and `continue` inside a `do/while`. (Rest params and call spread apply to
+//// members, defaulted/rest destructuring, `try`/`finally`, generators/async,
+//// and `continue` inside a `do/while`. (Rest params and call spread apply to
 //// top-level functions; a rest param on an arrow/method, or a spread INTO a rest
 //// function, is a v1 limitation. A derived
 //// class needs an explicit constructor that calls `super(…)`; field initializers run
@@ -1620,6 +1622,8 @@ fn lower_expr(
     ast.UndefinedExpression(..) -> Ok(#([], undefined(), ctr))
     ast.TemplateLiteral(quasis:, expressions:, ..) ->
       lower_template(quasis, expressions, env, ctx, ctr)
+    ast.TaggedTemplateExpression(tag:, cooked:, raw:, expressions:, ..) ->
+      lower_tagged_template(tag, cooked, raw, expressions, env, ctx, ctr)
 
     ast.Identifier(name: x, ..) ->
       case dict.get(env, x) {
@@ -2628,6 +2632,15 @@ fn lower_static_call(
         ctr,
       ))
     }
+    // String.raw(template, ...substitutions) — the default tagged-template tag.
+    "String", "raw", [template, ..subs] -> {
+      let #(binds2, listv, ctr) = build_list(subs, binds, ctr)
+      Ok(bind_after(
+        binds2,
+        ir.CallHost("js", "string_raw", [template, listv]),
+        ctr,
+      ))
+    }
     "Date", "now", _ -> host("date_now", [])
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
@@ -3285,6 +3298,66 @@ fn object_key(
       Ok(#([], ir.ConstBinary(<<num_key(v):utf8>>), ctr))
     _, _ -> Error(Unsupported("object key"))
   }
+}
+
+/// Lower a tagged template `` tag`c0${e0}c1…` `` to the call
+/// `tag(templateObject, e0, e1, …)` (§13.2.8, GetTemplateObject).
+///
+/// The template object is an array of the COOKED quasi strings (a quasi with an
+/// invalid escape cooks to `undefined`) carrying a `raw` property that is the
+/// array of the RAW quasi strings. It is built directly in IR (`new_array` +
+/// `set_prop`), bound to a synthetic env name, then handed to the ordinary call
+/// path as the leading argument — so the tag can be a top-level function
+/// (including one with a rest param), a closure, or a method, exactly like any
+/// other call.
+///
+/// v1 deviation: a fresh template object is produced per evaluation rather than
+/// one cached per call site, so a tag that keys a Map/WeakMap on the `strings`
+/// object's identity across calls will not see the same object; the array is
+/// also not frozen. Tags that read `strings`/`strings.raw` and the substitutions
+/// (the overwhelming majority, incl. String.raw-style tags) are unaffected.
+fn lower_tagged_template(
+  tag: ast.Expression,
+  cooked: List(Option(String)),
+  raw: List(String),
+  expressions: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  let cooked_vals =
+    list.map(cooked, fn(c) {
+      case c {
+        Some(s) -> ir.ConstBinary(<<s:utf8>>)
+        None -> undefined()
+      }
+    })
+  let raw_vals = list.map(raw, fn(s) { ir.ConstBinary(<<s:utf8>>) })
+  // strings = new_array(cooked); strings.raw = new_array(raw)
+  let #(b1, cooked_list, ctr) = build_list(cooked_vals, [], ctr)
+  let #(b2, strings, ctr) =
+    bind_after(b1, ir.CallHost("js", "new_array", [cooked_list]), ctr)
+  let #(b3, raw_list, ctr) = build_list(raw_vals, b2, ctr)
+  let #(b4, raw_arr, ctr) =
+    bind_after(b3, ir.CallHost("js", "new_array", [raw_list]), ctr)
+  let #(b5, _, ctr) =
+    bind_after(
+      b4,
+      ir.CallHost("js", "set_prop", [
+        strings,
+        ir.ConstBinary(<<"raw">>),
+        raw_arr,
+      ]),
+      ctr,
+    )
+  // Bind the template object under a `%`-prefixed name (collision-proof) and
+  // reuse the normal call path with it as the leading argument.
+  let tname = "%tt_" <> int.to_string(ctr)
+  let env2 = dict.insert(env, tname, strings)
+  let sp = ast.Span(0, 0)
+  let args = [ast.Identifier(span: sp, name: tname), ..expressions]
+  use #(cb, callv, ctr) <- result_try(lower_call(tag, args, env2, ctx, ctr))
+  Ok(#(list.append(b5, cb), callv, ctr))
 }
 
 fn lower_template(

@@ -312,6 +312,11 @@ pub fn str_pad_end(str: Dynamic, n: Dynamic, pad: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "string_from_char_code")
 pub fn string_from_char_code(codes: Dynamic) -> Dynamic
 
+/// `String.raw(template, ...subs)` — the default tagged-template tag: raw literal
+/// segments interleaved with the stringified substitutions (`subs` a cons list).
+@external(erlang, "twocore_rt_js_ffi", "string_raw")
+pub fn string_raw(template: Dynamic, subs: Dynamic) -> Dynamic
+
 /// `Date.now()` — milliseconds since the Unix epoch.
 @external(erlang, "twocore_rt_js_ffi", "date_now")
 pub fn date_now() -> Dynamic

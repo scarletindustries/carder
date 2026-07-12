@@ -1634,6 +1634,44 @@ pub fn super_method_arity_test() {
   to_float(call(n, "f", [])) |> should.equal(3.0)
 }
 
+pub fn tagged_template_test() {
+  // The tag receives the cooked strings array plus the substitutions in order.
+  let m =
+    compile(
+      "function tag(s, a, b) { return s[0] + a + s[1] + b + s[2]; } "
+      <> "function f() { let x = 2, y = 3; return tag`sum ${x} and ${y}!`; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"sum 2 and 3!">>))
+
+  // s.raw is the verbatim source of each quasi (keeps the backslash).
+  let n =
+    compile(
+      "function tag(s) { return s.raw[0]; } function f() { return tag`line\\n`; }",
+    )
+  call(n, "f", []) |> should.equal(dyn(<<"line\\n">>))
+
+  // Cooked decodes the \n escape (5 code points); raw keeps the backslash (6).
+  let c =
+    compile(
+      "function tag(s) { return s[0].length + \",\" + s.raw[0].length; } function f() { return tag`line\\n`; }",
+    )
+  call(c, "f", []) |> should.equal(dyn(<<"5,6">>))
+
+  // A tag can be a local closure, and a no-substitution template works.
+  let d =
+    compile("function f() { let t = (s) => s[0].toUpperCase(); return t`hi`; }")
+  call(d, "f", []) |> should.equal(dyn(<<"HI">>))
+}
+
+pub fn string_raw_test() {
+  // String.raw is the default tag: it keeps the backslash escapes verbatim.
+  let m = compile("function f() { return String.raw`a\\nb`; }")
+  call(m, "f", []) |> should.equal(dyn(<<"a\\nb">>))
+  // Substitutions are interleaved between the raw segments.
+  let n = compile("function f() { let x = 5; return String.raw`v=${x}\\t!`; }")
+  call(n, "f", []) |> should.equal(dyn(<<"v=5\\t!">>))
+}
+
 // ── runtime correctness (spec regressions) ──────────────────────────────────
 
 pub fn math_round_half_test() {

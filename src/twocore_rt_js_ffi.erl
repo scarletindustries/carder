@@ -67,7 +67,7 @@
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     apply_fn/2, array_to_list/1,
-    str_pad_start/3, str_pad_end/3, string_from_char_code/1, date_now/0,
+    str_pad_start/3, str_pad_end/3, string_from_char_code/1, string_raw/2, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/2, num_to_fixed/2,
     to_string_dispatch/1, num_to_string_radix/2,
@@ -1106,6 +1106,28 @@ take_cps(All, [C | Rest], Count) -> [C | take_cps(All, Rest, Count - 1)].
 %% e.g. fromCharCode(65601) === fromCharCode(65) === "A".
 string_from_char_code(Codes) ->
     from_cps([(trunc(as_float(coerce_num(C))) band 16#FFFF) || C <- Codes]).
+
+%% String.raw(template, ...substitutions) — the default tagged-template tag
+%% (§22.1.2.4): concatenate the RAW literal segments (template.raw), inserting
+%% ToString(substitution[i]) after each segment except the last. A missing
+%% substitution is `undefined` ("undefined"). `Subs` is the cons-list of args.
+string_raw(Template, Subs) ->
+    Raw = get_prop(Template, <<"raw">>),
+    {Len, Map} = arr_content(Raw),
+    raw_join(arr_list(Len, Map), Subs, <<>>).
+
+raw_join([], _Subs, Acc) ->
+    Acc;
+raw_join([Seg], _Subs, Acc) ->
+    <<Acc/binary, (to_string(Seg))/binary>>;
+raw_join([Seg | Rest], Subs, Acc) ->
+    Acc1 = <<Acc/binary, (to_string(Seg))/binary>>,
+    {Sub, Subs1} =
+        case Subs of
+            [S | R] -> {S, R};
+            [] -> {undefined, []}
+        end,
+    raw_join(Rest, Subs1, <<Acc1/binary, (to_string(Sub))/binary>>).
 
 %% Date.now() — milliseconds since the Unix epoch.
 date_now() ->

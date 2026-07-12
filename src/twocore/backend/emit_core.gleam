@@ -4212,6 +4212,7 @@ fn resolve_js(op: String) -> Option(String) {
     "str_pad_start" -> Some("str_pad_start")
     "str_pad_end" -> Some("str_pad_end")
     "string_from_char_code" -> Some("string_from_char_code")
+    "string_raw" -> Some("string_raw")
     "date_now" -> Some("date_now")
     "array_flat_map" -> Some("array_flat_map")
     "array_find_last" -> Some("array_find_last")
