@@ -44,11 +44,13 @@
 //// `String`/`Number`/`Boolean`; and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`, `JSON.stringify`/`parse`,
-//// `String.fromCharCode`, and `Date.now`.
+//// `String.fromCharCode`, and `Date.now`. Regex literals `/pat/flags` (backed by
+//// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): getter/setter and static-field class
-//// members, nested/defaulted destructuring, call spread `f(...a)`, rest params, regex,
-//// `try`/`finally`, generators/async, and `continue` inside a `do/while`. (A derived
+//// members, nested/defaulted destructuring, call spread `f(...a)`, rest params,
+//// `Map`/`Set`, `try`/`finally`, generators/async, and `continue` inside a `do/while`.
+//// (A derived
 //// class needs an explicit constructor that calls `super(…)`; field initializers run
 //// before `super()` rather than after — v1 ordering simplifications. A regular function
 //// EXPRESSION captures `this` lexically like an arrow. `JSON`/`Object.keys` key order
@@ -1623,6 +1625,15 @@ fn lower_expr(
     ast.ObjectExpression(properties:, ..) ->
       lower_object(properties, env, ctx, ctr)
     ast.ArrayExpression(elements:, ..) -> lower_array(elements, env, ctx, ctr)
+    // `/pattern/flags` — compile a regex object.
+    ast.RegExpLiteral(pattern:, flags:, ..) ->
+      Ok(bind1(
+        ir.CallHost("js", "new_regex", [
+          ir.ConstBinary(<<pattern:utf8>>),
+          ir.ConstBinary(<<flags:utf8>>),
+        ]),
+        ctr,
+      ))
     ast.FunctionExpression(span:, ..) -> lower_closure(span, env, ctx, ctr)
     ast.ArrowFunctionExpression(span:, ..) -> lower_closure(span, env, ctx, ctr)
 
@@ -2705,6 +2716,9 @@ fn lower_instance_method(
     "toFixed", [] -> host("num_to_fixed", [undefined()])
     "toString", [] -> host("to_string_dispatch", [])
     "toString", [radix, ..] -> host("num_to_string_radix", [radix])
+    // regex: `re.test(str)` and `str.match(re)`.
+    "test", [s, ..] -> host("regex_test", [s])
+    "match", [re, ..] -> host("str_match", [re])
     "reduce", [f] -> host("array_reduce1", [f])
     "reduce", [f, init, ..] -> host("array_reduce", [f, init])
     "sort", [] -> host("array_sort", [undefined()])

@@ -4218,6 +4218,12 @@ fn resolve_js(op: String) -> Option(String) {
     "num_to_fixed" -> Some("num_to_fixed")
     "to_string_dispatch" -> Some("to_string_dispatch")
     "num_to_string_radix" -> Some("num_to_string_radix")
+    // regex
+    "new_regex" -> Some("new_regex")
+    "regex_test" -> Some("regex_test")
+    "regex_source" -> Some("regex_source")
+    "regex_flags" -> Some("regex_flags")
+    "str_match" -> Some("str_match")
     "array_map" -> Some("array_map")
     "array_filter" -> Some("array_filter")
     "array_foreach" -> Some("array_foreach")

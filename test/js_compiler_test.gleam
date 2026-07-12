@@ -1405,6 +1405,35 @@ pub fn to_string_test() {
   call(c, "f", []) |> should.equal(dyn(<<"custom">>))
 }
 
+// ── regex ────────────────────────────────────────────────────────────────────
+
+pub fn regex_test_test() {
+  let m = compile("function f() { return /\\d+/.test(\"abc123\"); }")
+  call(m, "f", []) |> should.equal(dyn(True))
+  let n = compile("function f() { return /\\d+/.test(\"abc\"); }")
+  call(n, "f", []) |> should.equal(dyn(False))
+  // caseless flag
+  let i = compile("function f() { return /foo/i.test(\"A FOO B\"); }")
+  call(i, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn regex_replace_test() {
+  let m =
+    compile("function f() { return \"hello world\".replace(/o/g, \"0\"); }")
+  call(m, "f", []) |> should.equal(dyn(<<"hell0 w0rld">>))
+  // backreference $1
+  let b =
+    compile(
+      "function f() { return \"John Smith\".replace(/(\\w+) (\\w+)/, \"$2 $1\"); }",
+    )
+  call(b, "f", []) |> should.equal(dyn(<<"Smith John">>))
+}
+
+pub fn regex_match_split_test() {
+  num("\"a1b2c3\".match(/\\d/g).length") |> should.equal(3.0)
+  num("\"a,b;c\".split(/[,;]/).length") |> should.equal(3.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

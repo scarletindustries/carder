@@ -334,6 +334,29 @@ pub fn to_string_dispatch(recv: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "num_to_string_radix")
 pub fn num_to_string_radix(n: Dynamic, radix: Dynamic) -> Dynamic
 
+// ───────────────────────── regex ─────────────────────────
+// A `/pat/flags` literal compiles to an Erlang `re` (PCRE). `str.replace`/`str.split`
+// above dispatch to the regex path when the pattern argument is a regex.
+
+/// `/pattern/flags` — compile a regex (flags i/m/s map to caseless/multiline/dotall).
+@external(erlang, "twocore_rt_js_ffi", "new_regex")
+pub fn new_regex(pattern: Dynamic, flags: Dynamic) -> Dynamic
+
+/// `re.test(str)` → JS boolean.
+@external(erlang, "twocore_rt_js_ffi", "regex_test")
+pub fn regex_test(re: Dynamic, str: Dynamic) -> Dynamic
+
+/// `re.source` / `re.flags`.
+@external(erlang, "twocore_rt_js_ffi", "regex_source")
+pub fn regex_source(re: Dynamic) -> Dynamic
+
+@external(erlang, "twocore_rt_js_ffi", "regex_flags")
+pub fn regex_flags(re: Dynamic) -> Dynamic
+
+/// `str.match(re)` → array of matches (global) or `[full, groups…]`, else null.
+@external(erlang, "twocore_rt_js_ffi", "str_match")
+pub fn str_match(str: Dynamic, re: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 

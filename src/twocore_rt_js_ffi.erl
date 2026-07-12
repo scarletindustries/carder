@@ -70,6 +70,7 @@
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/2, num_to_fixed/2,
     to_string_dispatch/1, num_to_string_radix/2,
+    new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
@@ -687,6 +688,7 @@ to_string(V) when is_function(V) -> <<"function">>;
 to_string(V) when is_reference(V) ->
     case erlang:get(?CELL_KEY(V)) of
         {js_array, Len, Map} -> array_to_string(Len, Map);
+        {js_regex, _, Flags, Src} -> <<"/", Src/binary, "/", Flags/binary>>;
         _ -> <<"[object Object]">>
     end;
 %% any internal repr (tuple/map/list/…).
@@ -812,9 +814,21 @@ prop_key(K) ->
 %% map is a plain object. No prototype chain yet (v1: own properties only).
 get_prop(Recv, Key) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
-        {js_array, Len, Map} -> array_get(Len, Map, Key);
-        M when is_map(M) -> maps:get(prop_key(Key), M, undefined);
-        _ -> type_error(Recv)
+        {js_array, Len, Map} ->
+            array_get(Len, Map, Key);
+        {js_regex, _, Flags, Src} ->
+            case Key of
+                <<"source">> -> Src;
+                <<"flags">> -> Flags;
+                <<"global">> -> has_flag(Flags, $g);
+                <<"ignoreCase">> -> has_flag(Flags, $i);
+                <<"multiline">> -> has_flag(Flags, $m);
+                _ -> undefined
+            end;
+        M when is_map(M) ->
+            maps:get(prop_key(Key), M, undefined);
+        _ ->
+            type_error(Recv)
     end;
 get_prop(Recv, Key) when is_binary(Recv) ->
     string_prop(Recv, Key);
@@ -1054,6 +1068,104 @@ string_from_char_code(Codes) ->
 %% Date.now() — milliseconds since the Unix epoch.
 date_now() ->
     erlang:system_time(millisecond).
+
+%% ── regex ────────────────────────────────────────────────
+%% A regex `/pat/flags` is a cell holding `{js_regex, CompiledMP, Flags, Source}`.
+%% Backed by Erlang's `re` (PCRE), which is largely JS-compatible.
+
+new_regex(Pattern, Flags) ->
+    P = to_string(Pattern),
+    F = to_string(Flags),
+    case re:compile(P, re_opts(F)) of
+        {ok, MP} -> cell_new({js_regex, MP, F, P});
+        {error, _} -> type_error(Pattern)
+    end.
+
+re_opts(Flags) ->
+    Base = [unicode],
+    lists:foldl(
+        fun({Ch, Opt}, Acc) ->
+            case has_flag(Flags, Ch) of
+                true -> [Opt | Acc];
+                false -> Acc
+            end
+        end,
+        Base,
+        [{$i, caseless}, {$m, multiline}, {$s, dotall}]
+    ).
+
+has_flag(Flags, Ch) -> binary:match(Flags, <<Ch>>) =/= nomatch.
+
+is_regex(X) when is_reference(X) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_regex, _, _, _} -> true;
+        _ -> false
+    end;
+is_regex(_) ->
+    false.
+
+regex_content(Re) ->
+    case erlang:get(?CELL_KEY(Re)) of
+        {js_regex, MP, Flags, Src} -> {MP, Flags, Src};
+        _ -> type_error(Re)
+    end.
+
+%% re.test(str) → boolean.
+regex_test(Re, Str) ->
+    {MP, _F, _S} = regex_content(Re),
+    case re:run(to_string(Str), MP, [{capture, none}]) of
+        match -> true;
+        nomatch -> false
+    end.
+
+%% re.source / re.flags.
+regex_source(Re) ->
+    {_MP, _F, S} = regex_content(Re),
+    S.
+regex_flags(Re) ->
+    {_MP, F, _S} = regex_content(Re),
+    F.
+
+%% str.match(re) → array of matches (global) or [full, groups…] (non-global), else null.
+str_match(Str, Re) ->
+    {MP, Flags, _S} = regex_content(Re),
+    S = to_string(Str),
+    case has_flag(Flags, $g) of
+        true ->
+            case re:run(S, MP, [global, {capture, first, binary}]) of
+                {match, Ms} -> new_array([M || [M] <- Ms]);
+                match -> new_array([]);
+                nomatch -> null
+            end;
+        false ->
+            case re:run(S, MP, [{capture, all, binary}]) of
+                {match, Groups} -> new_array(Groups);
+                nomatch -> null
+            end
+    end.
+
+%% str.replace / str.split when the pattern is a regex.
+str_replace_regex(Str, Re, Repl) ->
+    {MP, Flags, _S} = regex_content(Re),
+    ReplErl = js_repl_to_erl(to_string(Repl)),
+    Opts =
+        case has_flag(Flags, $g) of
+            true -> [global, {return, binary}];
+            false -> [{return, binary}]
+        end,
+    re:replace(to_string(Str), MP, ReplErl, Opts).
+
+str_split_regex(Str, Re) ->
+    {MP, _Flags, _S} = regex_content(Re),
+    new_array(re:split(to_string(Str), MP, [{return, binary}])).
+
+%% Translate a JS replacement string's `$1`/`$&`/`$$` into `re:replace`'s `\1`/`\0`/`$`.
+js_repl_to_erl(Bin) -> iolist_to_binary(repl_scan(Bin)).
+repl_scan(<<"$$", R/binary>>) -> [$$ | repl_scan(R)];
+repl_scan(<<"$&", R/binary>>) -> [<<"\\0">> | repl_scan(R)];
+repl_scan(<<$$, D, R/binary>>) when D >= $0, D =< $9 -> [$\\, D | repl_scan(R)];
+repl_scan(<<C, R/binary>>) -> [C | repl_scan(R)];
+repl_scan(<<>>) -> [].
 
 %% Spread `...value` into `target` (in place): an array contributes its elements, a
 %% string its characters. Behind array-literal spread `[...a]`.
@@ -1500,6 +1612,11 @@ sub_index(V, Len, _Default) ->
 %% str.split(sep?) → array. No arg → [str]; "" → the characters; else split on `sep`.
 str_split(Str, undefined) ->
     new_array([Str]);
+str_split(Str, Sep) when is_reference(Sep) ->
+    case is_regex(Sep) of
+        true -> str_split_regex(Str, Sep);
+        false -> new_array([Str])
+    end;
 str_split(Str, Sep) ->
     case to_string(Sep) of
         <<>> -> new_array([from_cps([C]) || C <- cps(Str)]);
@@ -1535,7 +1652,15 @@ str_ends_with(Str, Suffix) ->
     SZ >= SS andalso binary:part(Str, SZ - SS, SS) =:= S.
 
 %% str.replace(search, repl) — the FIRST occurrence (string search; no regex in v1).
+str_replace(Str, Search, Repl) when is_reference(Search) ->
+    case is_regex(Search) of
+        true -> str_replace_regex(Str, Search, Repl);
+        false -> str_replace_plain(Str, Search, Repl)
+    end;
 str_replace(Str, Search, Repl) ->
+    str_replace_plain(Str, Search, Repl).
+
+str_replace_plain(Str, Search, Repl) ->
     ReplBin = to_string(Repl),
     case to_string(Search) of
         <<>> ->
