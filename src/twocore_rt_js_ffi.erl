@@ -596,6 +596,9 @@ munary_inf(tanh, S) -> S;
 %% inverse hyperbolics: asinh(±∞)=±∞, acosh(+∞)=+∞ (−∞ → NaN), atanh(±∞)=NaN.
 munary_inf(asinh, S) -> inf_of(S);
 munary_inf(acosh, 1) -> inf;
+%% atan approaches a right angle at the infinities: atan(±∞) = ±π/2. (sin/cos/
+%% tan/asin/acos are all NaN there and fall through to the catch-all below.)
+munary_inf(atan, S) -> S * math:pi() / 2;
 munary_inf(_, _) -> nan.
 
 inf_of(1) -> inf;
@@ -702,13 +705,30 @@ math_binary(atan2, A, B) ->
 math_binary(imul, A, B) ->
     wrap_int32(js_to_uint32(A) * js_to_uint32(B)).
 
+%% Math.atan2(y, x) — the polar angle of the point (x, y). The infinite cases
+%% have EXACT results per the ECMAScript spec table (approximating ±∞ with the
+%% largest double is wrong: e.g. atan2(finite, +∞) must be an exact ±0, not the
+%% tiny denormal a huge-but-finite x would yield).
 matan2(nan, _) -> nan;
 matan2(_, nan) -> nan;
-matan2(Y, X) -> math:atan2(inf_to_num(Y), inf_to_num(X)).
-
-inf_to_num(inf) -> 1.7976931348623157e308;
-inf_to_num(neg_inf) -> -1.7976931348623157e308;
-inf_to_num(N) -> as_float(N).
+%% y = +∞: +π/4 when x = +∞, +3π/4 when x = −∞, else +π/2 (x finite).
+matan2(inf, inf) -> math:pi() / 4;
+matan2(inf, neg_inf) -> 3 * math:pi() / 4;
+matan2(inf, _) -> math:pi() / 2;
+%% y = −∞: the mirror image of the +∞ block.
+matan2(neg_inf, inf) -> -math:pi() / 4;
+matan2(neg_inf, neg_inf) -> -3 * math:pi() / 4;
+matan2(neg_inf, _) -> -math:pi() / 2;
+%% finite y, x = +∞: a signed zero taking y's sign (y>0 → +0, y<0 → −0).
+matan2(Y, inf) -> signed_zero(zero_aware_sign(Y));
+%% finite y, x = −∞: ±π taking y's sign.
+matan2(Y, neg_inf) ->
+    case zero_aware_sign(Y) of
+        -1 -> -math:pi();
+        _ -> math:pi()
+    end;
+%% both finite (including signed zeros): the library atan2 is already correct.
+matan2(Y, X) -> math:atan2(as_float(Y), as_float(X)).
 
 %% Variadic Math.min / Math.max / Math.hypot over the emitter's cons list of args.
 math_reduce(Method, Args) ->
