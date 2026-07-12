@@ -4297,6 +4297,8 @@ fn resolve_js(op: String) -> Option(String) {
     "object_entries" -> Some("object_entries")
     "object_assign_into" -> Some("object_assign_into")
     "object_rest" -> Some("object_rest")
+    "object_freeze" -> Some("object_freeze")
+    "object_is_frozen" -> Some("object_is_frozen")
     "object_from_entries" -> Some("object_from_entries")
     "json_stringify" -> Some("json_stringify")
     "json_parse" -> Some("json_parse")

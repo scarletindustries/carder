@@ -54,7 +54,9 @@
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
 //// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
 //// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
-//// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`,
+//// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`/`freeze`/`isFrozen`
+//// (freeze makes direct property/element writes and `delete` non-strict no-ops;
+//// mutating array METHODS like `push` are NOT blocked — a v1 limitation),
 //// `Number.isInteger`/`isNaN`/`isFinite` and the constants
 //// `Number.MAX_SAFE_INTEGER`/`MIN_SAFE_INTEGER`/`MAX_VALUE`/`MIN_VALUE`/`EPSILON`/
 //// `POSITIVE_INFINITY`/`NEGATIVE_INFINITY`/`NaN`, `JSON.stringify`/`parse`,
@@ -4167,6 +4169,8 @@ fn lower_static_call(
     "Object", "values", [o, ..] -> host("object_values", [o])
     "Object", "entries", [o, ..] -> host("object_entries", [o])
     "Object", "fromEntries", [e, ..] -> host("object_from_entries", [e])
+    "Object", "freeze", [o, ..] -> host("object_freeze", [o])
+    "Object", "isFrozen", [o, ..] -> host("object_is_frozen", [o])
     // Object.assign(target, ...sources) — copy each source into target, return target.
     "Object", "assign", [target, ..sources] -> {
       let #(binds2, ctr) =

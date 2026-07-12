@@ -89,7 +89,7 @@
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
-    object_rest/2,
+    object_rest/2, object_freeze/1, object_is_frozen/1,
     object_from_entries/1,
     json_stringify/1, json_parse/1,
     empty_list/0, console_log/1, not_callable/1
@@ -947,8 +947,19 @@ resolve_get({js_accessor, G, _}) when is_function(G) -> call_cb(G, []);
 resolve_get({js_accessor, _, _}) -> undefined;
 resolve_get(V) -> V.
 
-%% recv[key] = v — stores and returns v (the value of a JS assignment).
+%% recv[key] = v — stores and returns v (the value of a JS assignment). A FROZEN
+%% object/array (Object.freeze) silently ignores the write in non-strict mode.
 set_prop(Recv, Key, V) when is_reference(Recv) ->
+    case erlang:get({js_frozen, Recv}) of
+        true ->
+            V;
+        _ ->
+            set_prop_live(Recv, Key, V)
+    end;
+set_prop(Recv, _Key, _V) ->
+    type_error(Recv).
+
+set_prop_live(Recv, Key, V) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, Len, Map} ->
             array_set(Recv, Len, Map, Key, V);
@@ -968,9 +979,24 @@ set_prop(Recv, Key, V) when is_reference(Recv) ->
             end;
         _ ->
             type_error(Recv)
-    end;
-set_prop(Recv, _Key, _V) ->
-    type_error(Recv).
+    end.
+
+%% Object.freeze(o): mark o immutable — subsequent own-property writes/deletes are
+%% no-ops (non-strict mode) — and return o. Frozen-ness is tracked in a SEPARATE
+%% process-dictionary entry keyed by the cell ref, so it never appears among the
+%% object's keys. A non-object primitive is returned unchanged (already immutable).
+object_freeze(O) when is_reference(O) ->
+    erlang:put({js_frozen, O}, true),
+    O;
+object_freeze(O) ->
+    O.
+
+%% Object.isFrozen(o) -> JS boolean. A non-object primitive is frozen (true) per
+%% spec.
+object_is_frozen(O) when is_reference(O) ->
+    erlang:get({js_frozen, O}) =:= true;
+object_is_frozen(_) ->
+    true.
 
 %% Define an own DATA property `Key = V` on `Obj`, storing directly and
 %% unconditionally — bypassing set_prop's accessor check so it overwrites any
@@ -1007,6 +1033,17 @@ define_accessor(Obj, _, _, _) ->
 
 %% delete recv[key] — remove the property; always returns `true` (non-strict).
 delete_prop(Recv, Key) when is_reference(Recv) ->
+    case erlang:get({js_frozen, Recv}) of
+        true ->
+            %% frozen: delete is a no-op in non-strict mode, and reports false.
+            false;
+        _ ->
+            delete_prop_live(Recv, Key)
+    end;
+delete_prop(_Recv, _Key) ->
+    true.
+
+delete_prop_live(Recv, Key) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, Len, Map} ->
             erlang:put(?CELL_KEY(Recv), {js_array, Len, maps:remove(array_key(Key), Map)}),
@@ -1016,9 +1053,7 @@ delete_prop(Recv, Key) when is_reference(Recv) ->
             true;
         _ ->
             true
-    end;
-delete_prop(_Recv, _Key) ->
-    true.
+    end.
 
 %% key in recv → 1|0 (own properties only, like get_prop).
 has_prop(Recv, Key) when is_reference(Recv) ->

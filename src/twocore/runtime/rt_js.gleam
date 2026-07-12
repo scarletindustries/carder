@@ -664,6 +664,16 @@ pub fn object_assign_into(target: Dynamic, source: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_rest")
 pub fn object_rest(obj: Dynamic, excluded: Dynamic) -> Dynamic
 
+/// `Object.freeze(o)` — mark `o` immutable (own-property writes/deletes become
+/// non-strict no-ops) and return it; a non-object primitive is returned unchanged.
+@external(erlang, "twocore_rt_js_ffi", "object_freeze")
+pub fn object_freeze(obj: Dynamic) -> Dynamic
+
+/// `Object.isFrozen(o)` → JS boolean (`true`/`false`); a non-object primitive is
+/// frozen (`true`).
+@external(erlang, "twocore_rt_js_ffi", "object_is_frozen")
+pub fn object_is_frozen(obj: Dynamic) -> Dynamic
+
 /// `Object.fromEntries(pairs)` — build an object from an array of `[key, value]` arrays.
 @external(erlang, "twocore_rt_js_ffi", "object_from_entries")
 pub fn object_from_entries(entries: Dynamic) -> Dynamic

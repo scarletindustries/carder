@@ -1291,6 +1291,43 @@ pub fn object_from_entries_test() {
   num("Object.fromEntries(Object.entries({ x: 5 })).x") |> should.equal(5.0)
 }
 
+pub fn object_freeze_returns_object_test() {
+  // Object.freeze(o) returns the SAME object (identity), still readable.
+  let m =
+    compile(
+      "function f() { let o = { a: 1 }; let p = Object.freeze(o); return p.a + (o === p ? 100 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(101.0)
+}
+
+pub fn object_freeze_blocks_write_test() {
+  // A frozen object silently ignores property writes (non-strict mode): the
+  // existing prop keeps its value and a new prop is never added.
+  let m =
+    compile(
+      "function f() { let o = Object.freeze({ a: 1 }); o.a = 99; o.b = 5; return o.a * 10 + (o.b === undefined ? 7 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(17.0)
+}
+
+pub fn object_freeze_blocks_array_and_delete_test() {
+  // A frozen array ignores element writes; delete of a frozen prop is a no-op.
+  let m =
+    compile(
+      "function f() { let a = Object.freeze([1, 2, 3]); a[0] = 9; let o = Object.freeze({ a: 1 }); delete o.a; return a[0] * 10 + o.a; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(11.0)
+}
+
+pub fn object_is_frozen_test() {
+  // isFrozen reflects freeze state and returns a real boolean; a primitive is frozen.
+  let m =
+    compile(
+      "function f() { let o = { a: 1 }; let before = Object.isFrozen(o) === false ? 100 : 0; Object.freeze(o); let after = Object.isFrozen(o) === true ? 10 : 0; let prim = Object.isFrozen(5) === true ? 1 : 0; return before + after + prim; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(111.0)
+}
+
 // ── integration: many features combined ──────────────────────────────────────
 
 pub fn integration_store_test() {
