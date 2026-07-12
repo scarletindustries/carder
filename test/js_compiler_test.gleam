@@ -1013,6 +1013,17 @@ pub fn number_string_whitespace_test() {
   num("Number('\\u00A0-3.5\\u00A0')") |> should.equal(-3.5)
 }
 
+pub fn number_to_exponential_test() {
+  // Exponential notation with a given fraction-digit count; JS uses a minimal
+  // exponent ("e+2", not "e+02").
+  let m =
+    compile(
+      "function f() { return (123.456).toExponential(2) + '|' + (123.456).toExponential(0) + '|' + (-123.456).toExponential(1) + '|' + (0.00042).toExponential(2) + '|' + (123.456).toExponential(); }",
+    )
+  call(m, "f", [])
+  |> should.equal(dyn(<<"1.23e+2|1e+2|-1.2e+2|4.20e-4|1.23456e+2">>))
+}
+
 pub fn number_string_radix_test() {
   // ToNumber(String) parses 0x/0o/0b integer literals (no sign after the prefix).
   num("Number('0x5')") |> should.equal(5.0)

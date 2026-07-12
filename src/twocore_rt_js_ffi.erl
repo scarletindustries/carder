@@ -71,7 +71,7 @@
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
-    array_last_index_of/2, num_to_fixed/2,
+    array_last_index_of/2, num_to_fixed/2, num_to_exponential/2,
     to_string_dispatch/1, num_to_string_radix/2,
     new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
@@ -1932,6 +1932,66 @@ num_to_string_radix(N, Radix) ->
                     to_string(N)
             end
     end.
+
+%% num.toExponential(d) — exponential notation with `d` fraction digits (undefined
+%% → as many digits as needed to represent the value uniquely). Erlang's scientific
+%% format zero-pads the exponent to two digits (`e+02`); JS uses the minimal
+%% exponent (`e+2`), so the exponent is de-padded afterwards.
+num_to_exponential(N, D) ->
+    case coerce_num(N) of
+        nan ->
+            <<"NaN">>;
+        inf ->
+            <<"Infinity">>;
+        neg_inf ->
+            <<"-Infinity">>;
+        Num ->
+            F = as_float(Num),
+            Raw =
+                case coerce_num(D) of
+                    nan -> exp_shortest(F, 0);
+                    Dn -> float_to_binary(F, [{scientific, max(0, trunc(as_float(Dn)))}])
+                end,
+            fix_exp(Raw)
+    end.
+
+%% The fewest fraction digits whose scientific rendering of `F` round-trips to `F`.
+exp_shortest(F, D) when D >= 17 ->
+    float_to_binary(F, [{scientific, 17}]);
+exp_shortest(F, D) ->
+    B = float_to_binary(F, [{scientific, D}]),
+    case reparse_sci(B) =:= F of
+        true -> B;
+        false -> exp_shortest(F, D + 1)
+    end.
+
+%% Parse an Erlang scientific literal back to a float. binary_to_float REQUIRES a
+%% decimal point, but the 0-fraction-digit form ("1e+02") has none — insert ".0"
+%% before the exponent for the reparse only.
+reparse_sci(B) ->
+    case binary:split(B, <<"e">>) of
+        [M, E] ->
+            M2 =
+                case binary:match(M, <<".">>) of
+                    nomatch -> <<M/binary, ".0">>;
+                    _ -> M
+                end,
+            binary_to_float(<<M2/binary, "e", E/binary>>);
+        _ ->
+            binary_to_float(B)
+    end.
+
+%% De-pad the exponent of an Erlang scientific literal: `1.23e+02` → `1.23e+2`.
+fix_exp(Bin) ->
+    case binary:split(Bin, <<"e">>) of
+        [Mant, <<Sign, Digits/binary>>] ->
+            <<Mant/binary, "e", Sign, (strip_leading_zeros(Digits))/binary>>;
+        _ ->
+            Bin
+    end.
+
+strip_leading_zeros(<<"0", R/binary>>) when R =/= <<>> -> strip_leading_zeros(R);
+strip_leading_zeros(D) -> D.
 
 %% num.toFixed(d) — fixed-point string with `d` decimals.
 num_to_fixed(N, D) ->

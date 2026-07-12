@@ -4824,6 +4824,8 @@ fn lower_instance_method(
     "lastIndexOf", [x, ..] -> host("array_last_index_of", [x])
     "toFixed", [d, ..] -> host("num_to_fixed", [d])
     "toFixed", [] -> host("num_to_fixed", [undefined()])
+    "toExponential", [d, ..] -> host("num_to_exponential", [d])
+    "toExponential", [] -> host("num_to_exponential", [undefined()])
     "toString", [] -> host("to_string_dispatch", [])
     "toString", [radix, ..] -> host("num_to_string_radix", [radix])
     // regex: `re.test(str)` and `str.match(re)`.
