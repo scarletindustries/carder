@@ -2019,6 +2019,8 @@ afind_last_i(Fn, Arr, [{X, I} | Rest], Acc) ->
 %% arr.lastIndexOf(x) — last strict-equal index, or -1.
 %% lastIndexOf(searchElement, fromIndex) — the highest === index at or before
 %% `fromIndex` (default len-1; ToIntegerOrInfinity, negatives from the end), else -1.
+array_last_index_of(Recv, X, From) when is_binary(Recv) ->
+    str_last_index_of(Recv, X, From);
 array_last_index_of(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Cap = last_idx_from(From, Len),
@@ -2189,8 +2191,8 @@ num_to_fixed(N, D) ->
 
 %% indexOf(searchElement, fromIndex) — first === index at or after `fromIndex`
 %% (ToIntegerOrInfinity, negatives from the end, clamped), else -1. A string
-%% receiver does a substring search (its position argument is not yet honoured).
-array_index_of(Recv, X, _From) when is_binary(Recv) -> str_index_of(Recv, X);
+%% receiver does a substring search honouring the `position` argument.
+array_index_of(Recv, X, From) when is_binary(Recv) -> str_index_of(Recv, X, From);
 array_index_of(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Start = idx_from(From, Len),
@@ -2221,8 +2223,8 @@ aidx([E | Es], I, X) ->
 %% includes(searchElement, fromIndex) — SameValueZero search from `fromIndex`
 %% (ToIntegerOrInfinity, negatives from the end, clamped). A string receiver does a
 %% substring test (its position argument is not yet honoured).
-array_includes(Recv, X, _From) when is_binary(Recv) ->
-    array_index_of(Recv, X, undefined) =/= -1;
+array_includes(Recv, X, From) when is_binary(Recv) ->
+    str_index_of(Recv, X, From) =/= -1;
 array_includes(Recv, X, From) ->
     {Len, Map} = arr_content(Recv),
     Start =
@@ -2441,17 +2443,69 @@ norm_form(<<"NFKC">>) -> nfkc;
 norm_form(<<"NFKD">>) -> nfkd;
 norm_form(_) -> error.
 
-%% str.indexOf(sub) → first code-point index of `sub`, or -1 ("" → 0).
-str_index_of(Str, Sub) ->
+%% str.indexOf(sub, position) — first code-point index of `sub` at or after
+%% `position`, else -1. `position` is ToIntegerOrInfinity clamped to [0, len]
+%% (NaN/undefined → 0, +Infinity → len). The empty search string is found at
+%% min(position, len) (== the clamped start). `sub` is coerced with ToString.
+str_index_of(Str, Sub, Pos) ->
     SubBin = to_string(Sub),
+    Cps = cps(Str),
+    Len = length(Cps),
+    Start = str_pos_clamp(Pos, Len),
     case SubBin of
         <<>> ->
-            0;
+            Start;
         _ ->
-            case binary:match(Str, SubBin) of
+            StartByte = byte_size(from_cps(lists:sublist(Cps, 1, Start))),
+            Tail = binary:part(Str, StartByte, byte_size(Str) - StartByte),
+            case binary:match(Tail, SubBin) of
                 nomatch -> -1;
-                {Pos, _} -> length(cps(binary:part(Str, 0, Pos)))
+                {Pos1, _} -> Start + length(cps(binary:part(Tail, 0, Pos1)))
             end
+    end.
+
+%% str.lastIndexOf(sub, position) — the greatest code-point index `i` in
+%% [0, start] at which `sub` occurs (overlapping matches count), else -1.
+%% Per spec a NaN position (e.g. omitted / undefined) means +Infinity, so the
+%% whole string is searched; otherwise `position` is ToIntegerOrInfinity. The
+%% start bound is clamped to [0, len]. The empty search string matches at the
+%% clamped start. `sub` is coerced with ToString.
+str_last_index_of(Str, Sub, Pos) ->
+    SubBin = to_string(Sub),
+    Cps = cps(Str),
+    Len = length(Cps),
+    Start = str_last_pos_clamp(Pos, Len),
+    SubCps = cps(SubBin),
+    SubLen = length(SubCps),
+    str_lidx_from(min(Start, Len - SubLen), Cps, SubCps, SubLen).
+
+%% Scan candidate start indices downward from `I`, returning the first (highest)
+%% at which `Sub` (a code-point list of length `SubLen`) matches, else -1.
+str_lidx_from(I, _Cps, _Sub, _SubLen) when I < 0 -> -1;
+str_lidx_from(I, Cps, Sub, SubLen) ->
+    case lists:sublist(Cps, I + 1, SubLen) =:= Sub of
+        true -> I;
+        false -> str_lidx_from(I - 1, Cps, Sub, SubLen)
+    end.
+
+%% ToIntegerOrInfinity(V) clamped to the integer range [0, Max]. Used for the
+%% forward-search `position` of indexOf/includes/startsWith/endsWith.
+str_pos_clamp(V, Max) ->
+    case coerce_num(V) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> Max;
+        N -> min(max(trunc(as_float(N)), 0), Max)
+    end.
+
+%% Like str_pos_clamp but a NaN position means +Infinity (search the whole
+%% string), matching String.prototype.lastIndexOf's coercion of `position`.
+str_last_pos_clamp(V, Max) ->
+    case coerce_num(V) of
+        nan -> Max;
+        neg_inf -> 0;
+        inf -> Max;
+        N -> min(max(trunc(as_float(N)), 0), Max)
     end.
 
 %% str.slice(start?, end?) — negative-from-end code-point slice.
