@@ -92,9 +92,9 @@
 ////     (e.g. `do { … } while (++i < n)`, `while (i++ < n) { … }`) can INFINITE-LOOP, because
 ////     the condition's mutation is not threaded across iterations. Put the increment in the
 ////     loop body or use a `for` loop (whose update clause IS threaded).
-////   * A POSTFIX `x++`/`x--` yields the NEW value (not the pre-increment value) when its
-////     result is used inside a larger expression. As a statement or a `for` update — where
-////     the value is discarded — it is exact.
+////   * A POSTFIX `x++`/`x--` (on a variable OR a member `obj.p++`) yields the NEW value
+////     (not the pre-increment value) when its result is used inside a larger expression. As
+////     a statement or a `for` update — where the value is discarded — it is exact.
 ////   * Closures capture enclosing variables BY VALUE (a snapshot at creation). Capturing a
 ////     variable that is REASSIGNED in its scope (or by the closure) is rejected with a typed
 ////     error rather than silently diverging from JS's capture-by-reference; capturing a
@@ -2144,7 +2144,7 @@ fn lower_expr(
     ast.AssignmentExpression(operator: op, left:, right:, ..) ->
       lower_assign(op, left, right, env, ctx, ctr)
     ast.UpdateExpression(operator: uop, argument:, ..) ->
-      lower_update(uop, argument, env, ctr)
+      lower_update(uop, argument, env, ctx, ctr)
 
     ast.CallExpression(callee:, arguments:, ..) ->
       lower_call(callee, arguments, env, ctx, ctr)
@@ -2453,8 +2453,13 @@ fn lower_update(
   uop: ast.UpdateOp,
   argument: ast.Expression,
   env: Env,
+  ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  let #(js_op, nop) = case uop {
+    ast.Increment -> #("add", ir.NAdd)
+    ast.Decrement -> #("sub", ir.NSub)
+  }
   case argument {
     ast.Identifier(name: x, ..) ->
       case dict.get(env, x) {
@@ -2462,14 +2467,33 @@ fn lower_update(
           Error(Unsupported("update of unbound identifier '" <> x <> "'"))
         Ok(cur) -> {
           let #(bone, one, ctr) = number_literal(1.0, ctr)
-          let #(js_op, nop) = case uop {
-            ast.Increment -> #("add", ir.NAdd)
-            ast.Decrement -> #("sub", ir.NSub)
-          }
           Ok(guarded_arith(js_op, nop, cur, one, bone, ctr))
         }
       }
-    _ -> Error(Unsupported("update of a non-identifier target"))
+    // `obj.p++` / `++obj.p` (and `[k]`): read obj.p once, write obj.p ± 1. As
+    // with an identifier update the NEW value is yielded (the documented v1
+    // deviation), which is exact when the result is discarded (a statement).
+    ast.MemberExpression(object:, property:, computed:, ..) -> {
+      use #(bo, o, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+      use #(bk, key, ctr) <- result_try(member_key(
+        property,
+        computed,
+        env,
+        ctx,
+        ctr,
+      ))
+      let #(bcur, cur, ctr) =
+        bind_after(
+          list.flatten([bo, bk]),
+          ir.CallHost("js", "get_prop", [o, key]),
+          ctr,
+        )
+      let #(bone, one, ctr) = number_literal(1.0, ctr)
+      let #(bnew, newv, ctr) =
+        guarded_arith(js_op, nop, cur, one, list.append(bcur, bone), ctr)
+      Ok(bind_after(bnew, ir.CallHost("js", "set_prop", [o, key, newv]), ctr))
+    }
+    _ -> Error(Unsupported("update of this target"))
   }
 }
 

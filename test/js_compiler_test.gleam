@@ -1884,6 +1884,21 @@ pub fn object_rest_destructure_test() {
   |> should.equal(7.0)
 }
 
+pub fn member_update_test() {
+  // obj.p++ reads and writes the property.
+  num("(function(){ let o = { n: 5 }; o.n++; o.n++; return o.n; })()")
+  |> should.equal(7.0)
+  // computed member update a[i]++.
+  num("(function(){ let a = [1, 2, 3]; a[1]++; return a[1]; })()")
+  |> should.equal(3.0)
+  // prefix decrement.
+  num("(function(){ let o = { n: 5 }; --o.n; return o.n; })()")
+  |> should.equal(4.0)
+  // an update expression yields a value (the new value, per the deviation).
+  num("(function(){ let o = { n: 5 }; return ++o.n; })()")
+  |> should.equal(6.0)
+}
+
 pub fn object_rest_computed_key_test() {
   // A computed key is excluded from the rest object (by its runtime value).
   val(
