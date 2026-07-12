@@ -925,6 +925,101 @@ pub fn array_foreach_test() {
   to_float(call(m, "f", [])) |> should.equal(3.0)
 }
 
+// ── Array iteration methods: live re-read + hole semantics (spec-driven) ──────
+// These encode ES2023 23.1.3 rules that a mid-iteration callback observes:
+//   * the range of indices is fixed at entry (LengthOfArrayLike is read once);
+//   * each step re-reads the live object (Get) — so element writes are seen;
+//   * reduce/reduceRight/some/every/flatMap skip holes (per-step HasProperty)
+//     but visit an explicit `undefined`;
+//   * find/findIndex/findLast/findLastIndex visit EVERY index (a hole reads as
+//     undefined).
+// Mirrored from test262 built-ins/Array/prototype/{reduce,some,every,find,...}.
+
+pub fn array_reduce_spec_test() {
+  // Live re-read (test262 15.4.4.21-9-2): the callback overwrites later elements
+  // and the fold observes them → [1,2,3,4,5].reduce(cb) === 3.
+  let live =
+    compile(
+      "var ra = []; function racb(p, c) { ra[3] = -2; ra[4] = -1; return p + c; } "
+      <> "function f() { ra = [1, 2, 3, 4, 5]; return ra.reduce(racb); }",
+    )
+  to_float(call(live, "f", [])) |> should.equal(3.0)
+
+  // Holes are skipped, a hole the callback FILLS is visited, and an element
+  // appended beyond the starting length is not (range fixed at entry).
+  // (test262 15.4.4.21-9-1 / 9-10 shape.)
+  let holes =
+    compile(
+      "var ha = []; function hacb(p, c) { ha[5] = 100; ha[2] = 3; return p + c; } "
+      <> "function f() { ha = [1, 2, 3, 4, 5]; delete ha[2]; return ha.reduce(hacb, 0); }",
+    )
+  // 0 +1 +2 +3(filled) +4 +5 = 15; index 5 (≥ len 5) is never visited.
+  to_float(call(holes, "f", [])) |> should.equal(15.0)
+
+  // An all-holes array WITH an initial value returns the initial value and never
+  // calls the callback (test262 15.4.4.21-9-b-1).
+  num("new Array(10).reduce((a, b) => a + b, 5)") |> should.equal(5.0)
+
+  // No initial value and no present element → TypeError (ES 23.1.3.24 step 8.c).
+  let empty =
+    compile("function f() { return new Array(3).reduce((a, b) => a + b); }")
+  let threw = case catch_apply(empty, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw |> should.equal(True)
+
+  // reduceRight folds right-to-left, skipping holes and re-reading live: deleting
+  // a not-yet-visited index removes it from the fold (test262 15.4.4.22-9-3 shape).
+  let rr =
+    compile(
+      "var rr = []; function rrcb(p, c) { delete rr[0]; return p + c; } "
+      <> "function f() { rr = [1, 2, 3, 4]; return rr.reduceRight(rrcb); }",
+    )
+  // seed 4 (k=3), +3, +2, then k=0 was deleted → skipped ⇒ 4+3+2 = 9.
+  to_float(call(rr, "f", [])) |> should.equal(9.0)
+}
+
+pub fn array_some_every_spec_test() {
+  // some/every skip holes but visit an explicit `undefined`: a `new Array(10)`
+  // with only index 1 assigned calls the callback exactly once
+  // (test262 15.4.4.17-7-b-1 / 15.4.4.16-7-b-1).
+  let holes =
+    compile(
+      "var sc = 0; function scb(v) { sc = sc + 1; return false; } "
+      <> "function f() { sc = 0; let a = new Array(10); a[1] = undefined; a.some(scb); return sc; }",
+    )
+  to_float(call(holes, "f", [])) |> should.equal(1.0)
+
+  // some re-reads the live array: writing a later index is observed
+  // (test262 15.4.4.17-7-2).
+  let live =
+    compile(
+      "var la = []; function lcb(v) { la[4] = 6; return v >= 6; } "
+      <> "function f() { la = [1, 2, 3, 4, 5]; return la.some(lcb) ? 1 : 0; }",
+    )
+  to_float(call(live, "f", [])) |> should.equal(1.0)
+}
+
+pub fn array_find_spec_test() {
+  // find/findIndex visit EVERY index and re-read live: reassigning a not-yet-
+  // visited index changes what the next step sees (find/array-altered-during-loop).
+  let fi =
+    compile(
+      "var ga = []; function gcb(kv) { if (ga[1] !== 9) { ga[1] = 9; } return kv === 9; } "
+      <> "function f() { ga = [1, 2, 3]; return ga.findIndex(gcb); }",
+    )
+  to_float(call(fi, "f", [])) |> should.equal(1.0)
+
+  // findLast walks from the end, likewise visiting every index and reading live.
+  let fl =
+    compile(
+      "var da = []; function dcb(kv) { if (da[0] !== 7) { da[0] = 7; } return kv === 7; } "
+      <> "function f() { da = [1, 2, 3]; return da.findLast(dcb); }",
+    )
+  to_float(call(fl, "f", [])) |> should.equal(7.0)
+}
+
 // ── string methods ───────────────────────────────────────────────────────────
 
 pub fn string_length_index_test() {

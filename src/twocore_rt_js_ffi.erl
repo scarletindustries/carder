@@ -1906,114 +1906,186 @@ aforeach(Fn, Arr, [X | Xs], I) ->
     call_cb(Fn, [X, I, Arr]),
     aforeach(Fn, Arr, Xs, I + 1).
 
-%% reduce with an explicit initial accumulator.
+%% Live own-element read at integer index `I` of the array cell `Recv`.
+%% Returns `{ok, Value}` when index `I` currently holds an own element, or
+%% `error` for a hole / out-of-range index. The cell is re-read on every call
+%% so that a callback which mutates the array mid-iteration is observed — this
+%% is the per-step HasProperty + Get against the live object the spec requires.
+arr_index(Recv, I) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, _Len, Map} -> maps:find(I, Map);
+        _ -> error
+    end;
+arr_index(_Recv, _I) ->
+    error.
+
+%% Live `Get(Recv, I)`: the element at index `I`, or `undefined` for a hole /
+%% out-of-range index. Used by find/findIndex/findLast/findLastIndex, which
+%% visit every index in range without a HasProperty (present-element) check.
+arr_get_live(Recv, I) ->
+    case arr_index(Recv, I) of
+        {ok, V} -> V;
+        error -> undefined
+    end.
+
+%% reduce(fn, init) — left fold seeded by `init`. Skips holes (per-step
+%% present-element check) and re-reads the live array each step; the iteration
+%% bound `Len` is fixed at entry so elements the callback appends beyond the
+%% original length are never visited. Callback: (accumulator, element, index, array).
 array_reduce(Recv, Fn, Init) ->
-    {Len, Map} = arr_content(Recv),
-    areduce(Fn, Recv, arr_list(Len, Map), 0, Init).
-areduce(_, _, [], _, Acc) -> Acc;
-areduce(Fn, Arr, [X | Xs], I, Acc) ->
-    areduce(Fn, Arr, Xs, I + 1, call_cb(Fn, [Acc, X, I, Arr])).
+    {Len, _Map} = arr_content(Recv),
+    areduce(Fn, Recv, 0, Len, Init).
+areduce(_, _, K, Len, Acc) when K >= Len -> Acc;
+areduce(Fn, Arr, K, Len, Acc) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> areduce(Fn, Arr, K + 1, Len, call_cb(Fn, [Acc, X, K, Arr]));
+        error -> areduce(Fn, Arr, K + 1, Len, Acc)
+    end.
 
-%% reduce with no initial accumulator (first element seeds it; empty → TypeError).
+%% reduce(fn) — no seed: the first present element seeds the accumulator and the
+%% fold continues after it. An array with no present element in range → TypeError.
 array_reduce1(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    case arr_list(Len, Map) of
-        [] -> type_error(Recv);
-        [First | Rest] -> areduce(Fn, Recv, Rest, 1, First)
+    {Len, _Map} = arr_content(Recv),
+    case reduce_seed_l(Recv, 0, Len) of
+        error -> type_error(Recv);
+        {ok, K0, Seed} -> areduce(Fn, Recv, K0 + 1, Len, Seed)
     end.
 
-%% reduceRight(fn, init?) — fold from the last element to the first; the callback
-%% receives (acc, element, index, array) with the true descending index.
+%% First present index at/after `K` (below `Len`); `{ok, Index, Value}` or `error`.
+reduce_seed_l(_Arr, K, Len) when K >= Len -> error;
+reduce_seed_l(Arr, K, Len) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> {ok, K, X};
+        error -> reduce_seed_l(Arr, K + 1, Len)
+    end.
+
+%% reduceRight(fn, init?) — right fold (last index down to 0), mirroring reduce:
+%% holes skipped, live re-read, callback gets (accumulator, element, index, array).
 array_reduce_right(Recv, Fn, Init) ->
-    {Len, Map} = arr_content(Recv),
-    arredr(Fn, Recv, redr_pairs(Len, Map), Init).
+    {Len, _Map} = arr_content(Recv),
+    arredr(Fn, Recv, Len - 1, Init).
+arredr(_, _, K, Acc) when K < 0 -> Acc;
+arredr(Fn, Arr, K, Acc) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> arredr(Fn, Arr, K - 1, call_cb(Fn, [Acc, X, K, Arr]));
+        error -> arredr(Fn, Arr, K - 1, Acc)
+    end.
+
+%% reduceRight(fn) — no seed: the last present element seeds it; all-holes → TypeError.
 array_reduce_right1(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    case redr_pairs(Len, Map) of
-        [] -> type_error(Recv);
-        [{_, First} | Rest] -> arredr(Fn, Recv, Rest, First)
+    {Len, _Map} = arr_content(Recv),
+    case reduce_seed_r(Recv, Len - 1) of
+        error -> type_error(Recv);
+        {ok, K0, Seed} -> arredr(Fn, Recv, K0 - 1, Seed)
     end.
 
-%% {index, element} pairs from the last index down to 0.
-redr_pairs(0, _Map) -> [];
-redr_pairs(Len, Map) ->
-    [{I, maps:get(I, Map, undefined)} || I <- lists:seq(Len - 1, 0, -1)].
+%% First present index at/below `K` (down to 0); `{ok, Index, Value}` or `error`.
+reduce_seed_r(_Arr, K) when K < 0 -> error;
+reduce_seed_r(Arr, K) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> {ok, K, X};
+        error -> reduce_seed_r(Arr, K - 1)
+    end.
 
-arredr(_, _, [], Acc) -> Acc;
-arredr(Fn, Arr, [{I, X} | Rest], Acc) ->
-    arredr(Fn, Arr, Rest, call_cb(Fn, [Acc, X, I, Arr])).
-
+%% some(fn) — true if the callback is truthy for any present element. Skips holes,
+%% re-reads the live array, and bounds iteration by the length captured at entry.
 array_some(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    asome(Fn, Recv, arr_list(Len, Map), 0).
-asome(_, _, [], _) -> false;
-asome(Fn, Arr, [X | Xs], I) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
-        1 -> true;
-        0 -> asome(Fn, Arr, Xs, I + 1)
+    {Len, _Map} = arr_content(Recv),
+    asome(Fn, Recv, 0, Len).
+asome(_, _, K, Len) when K >= Len -> false;
+asome(Fn, Arr, K, Len) ->
+    case arr_index(Arr, K) of
+        {ok, X} ->
+            case truthy(call_cb(Fn, [X, K, Arr])) of
+                1 -> true;
+                0 -> asome(Fn, Arr, K + 1, Len)
+            end;
+        error ->
+            asome(Fn, Arr, K + 1, Len)
     end.
 
+%% every(fn) — true unless the callback is falsy for some present element. Skips
+%% holes, re-reads the live array, bounds iteration by the entry length.
 array_every(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    aevery(Fn, Recv, arr_list(Len, Map), 0).
-aevery(_, _, [], _) -> true;
-aevery(Fn, Arr, [X | Xs], I) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
-        0 -> false;
-        1 -> aevery(Fn, Arr, Xs, I + 1)
+    {Len, _Map} = arr_content(Recv),
+    aevery(Fn, Recv, 0, Len).
+aevery(_, _, K, Len) when K >= Len -> true;
+aevery(Fn, Arr, K, Len) ->
+    case arr_index(Arr, K) of
+        {ok, X} ->
+            case truthy(call_cb(Fn, [X, K, Arr])) of
+                0 -> false;
+                1 -> aevery(Fn, Arr, K + 1, Len)
+            end;
+        error ->
+            aevery(Fn, Arr, K + 1, Len)
     end.
 
+%% find(fn) — the first element for which the callback is truthy, else undefined.
+%% Visits EVERY index in [0, Len) (no hole skip; a hole reads as undefined) and
+%% re-reads the live array each step.
 array_find(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    afind(Fn, Recv, arr_list(Len, Map), 0).
-afind(_, _, [], _) -> undefined;
-afind(Fn, Arr, [X | Xs], I) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
+    {Len, _Map} = arr_content(Recv),
+    afind(Fn, Recv, 0, Len).
+afind(_, _, K, Len) when K >= Len -> undefined;
+afind(Fn, Arr, K, Len) ->
+    X = arr_get_live(Arr, K),
+    case truthy(call_cb(Fn, [X, K, Arr])) of
         1 -> X;
-        0 -> afind(Fn, Arr, Xs, I + 1)
+        0 -> afind(Fn, Arr, K + 1, Len)
     end.
 
+%% findIndex(fn) — the first index for which the callback is truthy, else -1.
+%% Same visiting rule as find: every index in range, live re-read.
 array_find_index(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    afindi(Fn, Recv, arr_list(Len, Map), 0).
-afindi(_, _, [], _) -> -1;
-afindi(Fn, Arr, [X | Xs], I) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
-        1 -> I;
-        0 -> afindi(Fn, Arr, Xs, I + 1)
+    {Len, _Map} = arr_content(Recv),
+    afindi(Fn, Recv, 0, Len).
+afindi(_, _, K, Len) when K >= Len -> -1;
+afindi(Fn, Arr, K, Len) ->
+    X = arr_get_live(Arr, K),
+    case truthy(call_cb(Fn, [X, K, Arr])) of
+        1 -> K;
+        0 -> afindi(Fn, Arr, K + 1, Len)
     end.
 
-%% arr.flatMap(fn) — map then flatten one level.
+%% arr.flatMap(fn) — map then flatten one level. Skips holes (present-element
+%% check), re-reads the live array, and bounds iteration by the entry length.
 array_flat_map(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    new_array(lists:flatmap(
-        fun({X, I}) -> flat_one(call_cb(Fn, [X, I, Recv])) end,
-        index_pairs(arr_list(Len, Map))
-    )).
+    {Len, _Map} = arr_content(Recv),
+    new_array(aflatmap(Fn, Recv, 0, Len)).
+aflatmap(_, _, K, Len) when K >= Len -> [];
+aflatmap(Fn, Arr, K, Len) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> flat_one(call_cb(Fn, [X, K, Arr])) ++ aflatmap(Fn, Arr, K + 1, Len);
+        error -> aflatmap(Fn, Arr, K + 1, Len)
+    end.
 
 index_pairs(L) -> index_pairs(L, 0).
 index_pairs([], _) -> [];
 index_pairs([X | Xs], I) -> [{X, I} | index_pairs(Xs, I + 1)].
 
-%% arr.findLast(fn) / findLastIndex(fn) — like find/findIndex, from the end.
+%% arr.findLast(fn) / findLastIndex(fn) — like find/findIndex from the end:
+%% visit every index from Len-1 down to 0 (a hole reads as undefined), live re-read.
 array_find_last(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    afind_last(Fn, Recv, index_pairs(arr_list(Len, Map)), undefined).
-afind_last(_, _, [], Acc) -> Acc;
-afind_last(Fn, Arr, [{X, I} | Rest], Acc) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
-        1 -> afind_last(Fn, Arr, Rest, X);
-        0 -> afind_last(Fn, Arr, Rest, Acc)
+    {Len, _Map} = arr_content(Recv),
+    afind_last(Fn, Recv, Len - 1).
+afind_last(_, _, K) when K < 0 -> undefined;
+afind_last(Fn, Arr, K) ->
+    X = arr_get_live(Arr, K),
+    case truthy(call_cb(Fn, [X, K, Arr])) of
+        1 -> X;
+        0 -> afind_last(Fn, Arr, K - 1)
     end.
 
 array_find_last_index(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    afind_last_i(Fn, Recv, index_pairs(arr_list(Len, Map)), -1).
-afind_last_i(_, _, [], Acc) -> Acc;
-afind_last_i(Fn, Arr, [{X, I} | Rest], Acc) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
-        1 -> afind_last_i(Fn, Arr, Rest, I);
-        0 -> afind_last_i(Fn, Arr, Rest, Acc)
+    {Len, _Map} = arr_content(Recv),
+    afind_last_i(Fn, Recv, Len - 1).
+afind_last_i(_, _, K) when K < 0 -> -1;
+afind_last_i(Fn, Arr, K) ->
+    X = arr_get_live(Arr, K),
+    case truthy(call_cb(Fn, [X, K, Arr])) of
+        1 -> K;
+        0 -> afind_last_i(Fn, Arr, K - 1)
     end.
 
 %% arr.lastIndexOf(x) — last strict-equal index, or -1.
