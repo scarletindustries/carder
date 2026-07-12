@@ -245,6 +245,10 @@ pub fn set_prop(obj: Dynamic, key: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "has_prop")
 pub fn has_prop(obj: Dynamic, key: Dynamic) -> Int
 
+/// `delete obj[key]` — remove the property; returns `true` (non-strict).
+@external(erlang, "twocore_rt_js_ffi", "delete_prop")
+pub fn delete_prop(obj: Dynamic, key: Dynamic) -> Dynamic
+
 // ───────────────────────── arrays ─────────────────────────
 // A JS array is a cell holding `{js_array, Length, Map}`. `typeof` is "object";
 // `get_prop`/`set_prop`/`has_prop` above are array-aware (integer indices + `length`).

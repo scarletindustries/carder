@@ -1333,6 +1333,43 @@ pub fn class_static_calls_static_test() {
   to_float(call(m, "f", [])) |> should.equal(15.0)
 }
 
+// ── comma / in / delete / instanceof ─────────────────────────────────────────
+
+pub fn comma_operator_test() {
+  num("(1, 2, 3)") |> should.equal(3.0)
+}
+
+pub fn in_operator_test() {
+  let m = compile("function f() { let o = { a: 1 }; return \"a\" in o; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+  let n = compile("function f() { let o = { a: 1 }; return \"b\" in o; }")
+  call(n, "f", []) |> should.equal(dyn(False))
+}
+
+pub fn delete_test() {
+  let m =
+    compile(
+      "function f() { let o = { a: 1, b: 2 }; delete o.a; return \"a\" in o; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(False))
+}
+
+const ab_src = "class A { constructor() {} } class B extends A { constructor() { super(); } } "
+
+pub fn instanceof_test() {
+  let b =
+    compile(
+      ab_src <> "function f() { let x = new B(); return x instanceof B; }",
+    )
+  call(b, "f", []) |> should.equal(dyn(True))
+  // instanceof a superclass is true
+  let a =
+    compile(
+      ab_src <> "function f() { let x = new B(); return x instanceof A; }",
+    )
+  call(a, "f", []) |> should.equal(dyn(True))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

@@ -17,7 +17,8 @@
 //// argument arrives as `undefined`); number/string/boolean/null/undefined/template
 //// literals;
 //// `+ - * / %`, all comparisons, `&& || ! ??`, bitwise/shift `& | ^ ~ << >> >>>`, unary
-//// `- + ! ~ typeof void`, `?:`, optional chaining `?.`; `let/const/var`, `= += -= *= /=
+//// `- + ! ~ typeof void delete`, `in`, `instanceof`, comma `,`, `?:`, optional chaining
+//// `?.`; `let/const/var`, `= += -= *= /=
 //// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue`,
 //// `return`, blocks; flat array/object destructuring in `let`/`const`/`var`; objects
@@ -472,6 +473,21 @@ fn lower_class(
 
 /// The instance methods to install for `new C(…)`, ancestors-first (so an overriding
 /// child method, installed later, wins): `(defining_class, method_name, arity)`.
+/// The class names in `cname`'s inheritance chain (self first, then ancestors) — used
+/// to tag an instance for `instanceof`.
+fn class_chain(
+  cname: String,
+  classes: Dict(String, ClassInfo),
+) -> List(String) {
+  case dict.get(classes, cname) {
+    Ok(ClassInfo(super_class: Some(p), ..)) -> [
+      cname,
+      ..class_chain(p, classes)
+    ]
+    _ -> [cname]
+  }
+}
+
 fn chain_methods(
   cname: String,
   classes: Dict(String, ClassInfo),
@@ -1539,8 +1555,12 @@ fn lower_expr(
       lower_binary(op, left, right, env, ctx, ctr)
     ast.LogicalExpression(operator: op, left:, right:, ..) ->
       lower_logical(op, left, right, env, ctx, ctr)
+    ast.UnaryExpression(operator: ast.Delete, argument:, ..) ->
+      lower_delete(argument, env, ctx, ctr)
     ast.UnaryExpression(operator: op, argument:, ..) ->
       lower_unary(op, argument, env, ctx, ctr)
+    ast.SequenceExpression(expressions:, ..) ->
+      lower_sequence(expressions, env, ctx, ctr)
     ast.ConditionalExpression(condition:, consequent:, alternate:, ..) ->
       lower_ternary(condition, consequent, alternate, env, ctx, ctr)
 
@@ -1620,10 +1640,31 @@ fn lower_binary(
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  // `x instanceof C` needs the class name from the RHS, not its value.
+  case op {
+    ast.InstanceOf -> lower_instanceof(left, right, env, ctx, ctr)
+    _ -> lower_binary_op(op, left, right, env, ctx, ctr)
+  }
+}
+
+fn lower_binary_op(
+  op: ast.BinaryOp,
+  left: ast.Expression,
+  right: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
   use #(bl, l, ctr) <- result_try(lower_expr(left, env, ctx, ctr))
   use #(br, r, ctr) <- result_try(lower_expr(right, env, ctx, ctr))
   let pre = list.append(bl, br)
   case op {
+    // `key in obj` → has_prop(obj, key) as a boolean term.
+    ast.In -> {
+      let #(binds, i32v, ctr) =
+        bind_after(pre, ir.CallHost("js", "has_prop", [r, l]), ctr)
+      Ok(bind_after(binds, bool_term(i32v), ctr))
+    }
     // `+ - *` — guarded native fast path, rt_js cold path (concat/coerce).
     ast.Add -> Ok(guarded_arith("add", ir.NAdd, l, r, pre, ctr))
     ast.Subtract -> Ok(guarded_arith("sub", ir.NSub, l, r, pre, ctr))
@@ -1876,6 +1917,73 @@ fn lower_unary(
       Ok(bind_after(binds, ir.CallHost("js", "bit_not", [v]), ctr))
     _ -> Error(Unsupported("unary operator"))
   }
+}
+
+/// `x instanceof C` — true when `x` carries the `@@is_C` tag installed by `new C(…)`
+/// (which tags the whole class chain, so it is true for subclasses too).
+fn lower_instanceof(
+  left: ast.Expression,
+  right: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case right {
+    ast.Identifier(name: cname, ..) -> {
+      use #(bl, l, ctr) <- result_try(lower_expr(left, env, ctx, ctr))
+      let tag = "@@is_" <> cname
+      let #(binds, i32v, ctr) =
+        bind_after(
+          bl,
+          ir.CallHost("js", "has_prop", [l, ir.ConstBinary(<<tag:utf8>>)]),
+          ctr,
+        )
+      Ok(bind_after(binds, bool_term(i32v), ctr))
+    }
+    _ -> Error(Unsupported("instanceof a non-identifier right-hand side"))
+  }
+}
+
+/// `delete obj.p` / `delete obj[k]` — remove the property; yields `true`. A non-member
+/// delete is a no-op that yields `true`.
+fn lower_delete(
+  argument: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case argument {
+    ast.MemberExpression(object:, property:, computed:, ..) -> {
+      use #(bo, o, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+      use #(bk, key, ctr) <- result_try(member_key(
+        property,
+        computed,
+        env,
+        ctx,
+        ctr,
+      ))
+      Ok(bind_after(
+        list.append(bo, bk),
+        ir.CallHost("js", "delete_prop", [o, key]),
+        ctr,
+      ))
+    }
+    _ -> Ok(#([], ir.ConstAtom("true"), ctr))
+  }
+}
+
+/// `(a, b, c)` — the comma/sequence operator: evaluate each in order, yield the last.
+fn lower_sequence(
+  exprs: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  list.try_fold(exprs, #([], undefined(), ctr), fn(acc, e) {
+    let #(binds, _v, ctr) = acc
+    use #(b, v, ctr) <- result_try(lower_expr(e, env, ctx, ctr))
+    Ok(#(list.append(binds, b), v, ctr))
+  })
 }
 
 fn lower_ternary(
@@ -2408,6 +2516,28 @@ fn lower_new(
                     ctr,
                   )
                 #(bs, ctr)
+              },
+            )
+          // tag the instance with `@@is_<Class>` for every class in the chain, so
+          // `instanceof` works (including subclasses).
+          let #(binds, ctr) =
+            list.fold(
+              class_chain(cname, ctx.classes),
+              #(binds, ctr),
+              fn(acc, k) {
+                let #(binds, ctr) = acc
+                let tag = "@@is_" <> k
+                let #(b2, _r, ctr) =
+                  bind_after(
+                    binds,
+                    ir.CallHost("js", "set_prop", [
+                      this_v,
+                      ir.ConstBinary(<<tag:utf8>>),
+                      ir.ConstAtom("true"),
+                    ]),
+                    ctr,
+                  )
+                #(b2, ctr)
               },
             )
           use #(ba, argvals, ctr) <- result_try(lower_args(

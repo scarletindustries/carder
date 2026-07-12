@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, get_prop/2, set_prop/3, has_prop/2,
+    new_object/0, get_prop/2, set_prop/3, has_prop/2, delete_prop/2,
     new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_flat/1, array_fill/2, array_at/2,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1, date_now/0,
@@ -831,6 +831,21 @@ set_prop(Recv, Key, V) when is_reference(Recv) ->
     end;
 set_prop(Recv, _Key, _V) ->
     type_error(Recv).
+
+%% delete recv[key] — remove the property; always returns `true` (non-strict).
+delete_prop(Recv, Key) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_array, Len, Map} ->
+            erlang:put(?CELL_KEY(Recv), {js_array, Len, maps:remove(array_key(Key), Map)}),
+            true;
+        M when is_map(M) ->
+            erlang:put(?CELL_KEY(Recv), maps:remove(prop_key(Key), M)),
+            true;
+        _ ->
+            true
+    end;
+delete_prop(_Recv, _Key) ->
+    true.
 
 %% key in recv → 1|0 (own properties only, like get_prop).
 has_prop(Recv, Key) when is_reference(Recv) ->
