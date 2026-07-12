@@ -5036,7 +5036,10 @@ fn lower_instance_method(
     // string methods (charAt/slice/indexOf/includes/concat overlap with arrays and
     // dispatch polymorphically in the runtime).
     "charAt", [i, ..] -> host("str_char_at", [i])
+    // No-arg charAt/charCodeAt: position defaults to ToIntegerOrInfinity(undefined) = 0.
+    "charAt", [] -> host("str_char_at", [undefined()])
     "charCodeAt", [i, ..] -> host("str_char_code_at", [i])
+    "charCodeAt", [] -> host("str_char_code_at", [undefined()])
     // Like charCodeAt in this code-point model, but `undefined` (not NaN) when the
     // index is out of range.
     "codePointAt", [i, ..] -> host("str_code_point_at", [i])

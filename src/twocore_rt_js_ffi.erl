@@ -1632,16 +1632,20 @@ string_from_char_code(Codes) ->
 string_from_code_point(Codes) ->
     from_cps([code_point_of(C) || C <- Codes]).
 
+%% Coerce one argument to a code point per §22.1.2.2 (steps 2a–2c): ToNumber,
+%% then a non-integral value, a value < 0, or a value > 0x10FFFF is a RangeError
+%% — NOT a TypeError. `nan`/±Infinity from coercion are non-integral, so they
+%% are RangeErrors too.
 code_point_of(C) ->
     case coerce_num(C) of
         N when is_number(N) ->
             I = trunc(N),
             case I == N andalso I >= 0 andalso I =< 16#10FFFF of
                 true -> I;
-                false -> type_error(C)
+                false -> erlang:error({js_error, range_error, <<"Invalid code point">>})
             end;
         _ ->
-            type_error(C)
+            erlang:error({js_error, range_error, <<"Invalid code point">>})
     end.
 
 %% String.raw(template, ...substitutions) — the default tagged-template tag
@@ -1649,24 +1653,34 @@ code_point_of(C) ->
 %% ToString(substitution[i]) after each segment except the last. A missing
 %% substitution is `undefined` ("undefined"). `Subs` is the cons-list of args.
 string_raw(Template, Subs) ->
+    %% `raw` may be ANY object (§22.1.2.4 treats it as an array-like, not a
+    %% dense array): read `raw.length` via ToLength and each segment via
+    %% Get(raw, ToString(i)). Reads dispatch through get_prop, so a genuine
+    %% array (the tagged-template case) and a plain object both work.
     Raw = get_prop(Template, <<"raw">>),
-    {Len, Map} = arr_content(Raw),
-    raw_join(arr_list(Len, Map), Subs, <<>>).
+    Len = to_length(get_prop(Raw, <<"length">>)),
+    raw_join(Raw, Subs, Len, 0, <<>>).
 
-raw_join([], _Subs, Acc) ->
+%% Concatenate ToString(Get(raw, "0..Len-1")), inserting ToString(Subs[i])
+%% between consecutive segments. `Len =< 0` yields "" (the guard below). A
+%% missing substitution contributes the empty string, not "undefined"
+%% (§22.1.2.4 appends a substitution only when index+1 < Len).
+raw_join(_Raw, _Subs, Len, Idx, Acc) when Idx >= Len ->
     Acc;
-raw_join([Seg], _Subs, Acc) ->
-    <<Acc/binary, (to_string(Seg))/binary>>;
-raw_join([Seg | Rest], Subs, Acc) ->
-    Acc1 = <<Acc/binary, (to_string(Seg))/binary>>,
-    %% A missing substitution contributes the empty string, not "undefined"
-    %% (§22.1.3.4 appends a substitution only when one is present).
-    {Sub, Subs1} =
-        case Subs of
-            [S | R] -> {S, R};
-            [] -> {<<>>, []}
-        end,
-    raw_join(Rest, Subs1, <<Acc1/binary, (to_string(Sub))/binary>>).
+raw_join(Raw, Subs, Len, Idx, Acc) ->
+    Seg = to_string(get_prop(Raw, integer_to_binary(Idx))),
+    Acc1 = <<Acc/binary, Seg/binary>>,
+    case Idx + 1 >= Len of
+        true ->
+            Acc1;
+        false ->
+            {Sub, Subs1} =
+                case Subs of
+                    [S | R] -> {to_string(S), R};
+                    [] -> {<<>>, []}
+                end,
+            raw_join(Raw, Subs1, Len, Idx + 1, <<Acc1/binary, Sub/binary>>)
+    end.
 
 %% ── Date ─────────────────────────────────────────────────
 %% A Date value is a cell `{js_date, Ms}` where `Ms` is an INTEGER count of
@@ -3024,25 +3038,43 @@ nth_char(Cps, I, OutOfRange) when I >= 0 ->
 nth_char(_, _, OutOfRange) ->
     OutOfRange.
 
-%% str.charAt(i) → the 1-char string, or "" out of range.
-str_char_at(Str, I) ->
-    case str_to_index(I) of
-        {ok, Idx} -> nth_char(cps(Str), Idx, <<>>);
-        error -> nth_char(cps(Str), 0, <<>>)
+%% str.charAt(pos) → the 1-char string at code-point index `pos`, or "" when
+%% out of range. Per §22.1.3.1, `pos` is ToIntegerOrInfinity: ToNumber then
+%% truncate toward zero, with NaN/undefined → 0 and ±Infinity out of range. So
+%% a non-numeric or fractional argument is coerced ('abcd'.charAt('2') → 'c',
+%% 'abc'.charAt(1.9) → 'b'), not silently treated as index 0.
+str_char_at(Str, Pos) ->
+    case char_at_index(Pos, cps(Str)) of
+        {ok, C} -> from_cps([C]);
+        error -> <<>>
     end.
 
-%% str.charCodeAt(i) → the code point as a number, or NaN out of range.
-str_char_code_at(Str, I) ->
-    case str_to_index(I) of
-        {ok, Idx} ->
-            Cps = cps(Str),
-            case Idx >= 0 andalso Idx < length(Cps) of
-                true -> lists:nth(Idx + 1, Cps);
-                false -> js_nan
-            end;
-        error ->
-            js_nan
+%% str.charCodeAt(pos) → the code point at index `pos` as a number, or NaN when
+%% out of range. `pos` is ToIntegerOrInfinity, exactly as in str_char_at.
+str_char_code_at(Str, Pos) ->
+    case char_at_index(Pos, cps(Str)) of
+        {ok, C} -> C;
+        error -> js_nan
     end.
+
+%% ToIntegerOrInfinity(Pos) → {ok, CodePoint} when the (truncated) index lands
+%% in [0, length), else `error`. NaN/undefined → 0; fractions truncate toward
+%% zero; ±Infinity are out of range. Shared by charAt and charCodeAt.
+char_at_index(Pos, Cps) ->
+    case coerce_num(Pos) of
+        nan -> nth_code(0, Cps);
+        inf -> error;
+        neg_inf -> error;
+        N -> nth_code(trunc(as_float(N)), Cps)
+    end.
+
+nth_code(Idx, Cps) when Idx >= 0 ->
+    case Idx < length(Cps) of
+        true -> {ok, lists:nth(Idx + 1, Cps)};
+        false -> error
+    end;
+nth_code(_, _) ->
+    error.
 
 %% str.codePointAt(i) — like charCodeAt but the position is ToIntegerOrInfinity
 %% (undefined/NaN → 0, fractions truncated) and an out-of-range index yields

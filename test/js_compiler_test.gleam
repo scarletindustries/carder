@@ -1152,6 +1152,31 @@ pub fn string_slice_substring_test() {
   call(s, "f", []) |> should.equal(dyn(<<"el">>))
 }
 
+pub fn string_char_at_coercion_test() {
+  // §22.1.3.1/§22.1.3.2: `pos` is ToIntegerOrInfinity — ToNumber then truncate
+  // toward zero. A numeric string is coerced (not treated as index 0), and a
+  // fraction is truncated toward zero.
+  val("'abcd'.charAt('   +00200.0000E-0002   ')")
+  |> should.equal(dyn(<<"c">>))
+  val("'abc'.charAt(1.99999)") |> should.equal(dyn(<<"b">>))
+  val("'abc'.charAt(0.99999)") |> should.equal(dyn(<<"a">>))
+  val("'abc'.charAt(-0.99999)") |> should.equal(dyn(<<"a">>))
+  // Out of range (negative, past the end, or ±Infinity) → "".
+  val("'abc'.charAt(-1)") |> should.equal(dyn(<<"">>))
+  val("'abc'.charAt(3)") |> should.equal(dyn(<<"">>))
+  val("'abc'.charAt(Infinity)") |> should.equal(dyn(<<"">>))
+  // Omitted argument → position 0.
+  val("'abc'.charAt()") |> should.equal(dyn(<<"a">>))
+
+  // charCodeAt shares the coercion; out of range is NaN (so x !== x).
+  num("'abcd'.charCodeAt('   +00200.0000E-0002   ')")
+  |> should.equal(99.0)
+  num("'abc'.charCodeAt(1.99999)") |> should.equal(98.0)
+  num("'abc'.charCodeAt()") |> should.equal(97.0)
+  val("'abc'.charCodeAt(5) !== 'abc'.charCodeAt(5)")
+  |> should.equal(dyn(True))
+}
+
 pub fn string_split_test() {
   num("\"a,b,c\".split(\",\").length") |> should.equal(3.0)
   let j = compile("function f() { return \"a,b,c\".split(\",\")[1]; }")
@@ -3166,6 +3191,46 @@ pub fn string_raw_missing_sub_test() {
   val("String.raw({ raw: [\"a\", \"b\"] })") |> should.equal(dyn(<<"ab">>))
   val("String.raw({ raw: [\"a\", \"b\", \"c\"] }, \"X\")")
   |> should.equal(dyn(<<"aXbc">>))
+}
+
+pub fn string_from_code_point_range_test() {
+  // §22.1.2.2 steps 2a–2c: a non-integral, negative, or > 0x10FFFF code point is
+  // a RangeError — not a TypeError. The runtime signals this as `range_error`.
+  let is_range_error = fn(src: String) -> Bool {
+    let m = compile("function f() { return " <> src <> "; }")
+    case catch_apply(m, atom.create("f"), []) {
+      Error(msg) -> string.contains(msg, "range_error")
+      Ok(_) -> False
+    }
+  }
+  is_range_error("String.fromCodePoint(1.5)") |> should.equal(True)
+  is_range_error("String.fromCodePoint(-1)") |> should.equal(True)
+  is_range_error("String.fromCodePoint(0x110000)") |> should.equal(True)
+  is_range_error("String.fromCodePoint('x')") |> should.equal(True)
+  // A valid code point still builds the string (0x41 = 'A', 0x1F600 astral).
+  val("String.fromCodePoint(65)") |> should.equal(dyn(<<"A">>))
+  val("String.fromCodePoint(0, 66)")
+  |> should.equal(dyn(<<0, "B">>))
+}
+
+pub fn string_raw_arraylike_test() {
+  // §22.1.2.4: `raw` is treated as an array-LIKE, not a dense array — read
+  // raw.length via ToLength and each segment via Get(raw, ToString(i)). A plain
+  // object with a `length` and integer-string keys must work, segments beyond
+  // `length` are ignored, and non-string segments are ToString'd.
+  val(
+    "String.raw({ raw: { length: 5, 0: 'e', 1: '', 2: null, 3: undefined, 4: 123, 5: 'over' } })",
+  )
+  |> should.equal(dyn(<<"enullundefined123">>))
+  // ToLength(length) <= 0 (missing, -Infinity, NaN, 0) → the empty string.
+  val("String.raw({ raw: {} })") |> should.equal(dyn(<<"">>))
+  val("String.raw({ raw: { length: -Infinity } })")
+  |> should.equal(dyn(<<"">>))
+  val("String.raw({ raw: { length: NaN, 0: 'a' } })")
+  |> should.equal(dyn(<<"">>))
+  // Substitutions are inserted between array-like segments and ToString'd.
+  val("String.raw({ raw: { length: 2, 0: 'a', 1: 'b' } }, 42)")
+  |> should.equal(dyn(<<"a42b">>))
 }
 
 // ── runtime correctness (spec regressions) ──────────────────────────────────
