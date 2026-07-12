@@ -45,6 +45,23 @@ fn num(expr: String) -> Float {
   to_float(call(m, "f", []))
 }
 
+/// Compile `function f(){ return <expr>; }` and return the raw BEAM term (for
+/// asserting string / boolean results against `dyn(...)`).
+fn val(expr: String) -> Dynamic {
+  let m = compile("function f() { return " <> expr <> "; }")
+  call(m, "f", [])
+}
+
+/// True when `a` and `b` are within 1e-7 — for asserting transcendental results
+/// (e.g. Math.cbrt) that are floating-point approximations.
+fn float_close(a: Float, b: Float) -> Bool {
+  let d = a -. b
+  case d <. 0.0 {
+    True -> 0.0 -. d <. 0.0000001
+    False -> d <. 0.0000001
+  }
+}
+
 // ── arithmetic + precedence ──────────────────────────────────────────────────
 
 pub fn arithmetic_test() {
@@ -1551,6 +1568,99 @@ pub fn nested_destructure_test() {
       "function f() { let { arr: [a, b] } = { arr: [10, 20] }; return a + b; }",
     )
   to_float(call(x, "f", [])) |> should.equal(30.0)
+}
+
+// ── runtime correctness (spec regressions) ──────────────────────────────────
+
+pub fn math_round_half_test() {
+  // floor(x + 0.5) is WRONG for the largest double below 0.5: it rounds to 1,
+  // but ECMAScript rounds x < 0.5 (and >= 0) down to 0.
+  num("Math.round(0.49999999999999994)") |> should.equal(0.0)
+  // ties round toward +Infinity, not toward zero.
+  num("Math.round(2.5)") |> should.equal(3.0)
+  num("Math.round(-2.5)") |> should.equal(-2.0)
+  num("Math.round(-0.5)") |> should.equal(0.0)
+  num("Math.round(2.4)") |> should.equal(2.0)
+}
+
+pub fn math_cbrt_negative_test() {
+  // Math.cbrt of a negative number must not raise; cbrt(-8) = -2.
+  float_close(num("Math.cbrt(-8)"), -2.0) |> should.equal(True)
+  float_close(num("Math.cbrt(27)"), 3.0) |> should.equal(True)
+}
+
+pub fn array_includes_nan_test() {
+  // Array.prototype.includes uses SameValueZero, so it finds NaN…
+  val("[1, Number('x'), 3].includes(Number('x'))") |> should.equal(dyn(True))
+  // …while indexOf uses === and does not.
+  num("[1, Number('x'), 3].indexOf(Number('x'))") |> should.equal(-1.0)
+  val("[1, 2, 3].includes(2)") |> should.equal(dyn(True))
+  val("[1, 2, 3].includes(5)") |> should.equal(dyn(False))
+}
+
+pub fn json_stringify_control_chars_test() {
+  // Control characters must be \u00XX-escaped so the output is valid JSON.
+  val("JSON.stringify(String.fromCharCode(0))")
+  |> should.equal(dyn(<<"\"\\u0000\"">>))
+  val("JSON.stringify(String.fromCharCode(8))")
+  |> should.equal(dyn(<<"\"\\b\"">>))
+  val("JSON.stringify(String.fromCharCode(12))")
+  |> should.equal(dyn(<<"\"\\f\"">>))
+  val("JSON.stringify(String.fromCharCode(31))")
+  |> should.equal(dyn(<<"\"\\u001f\"">>))
+}
+
+pub fn json_parse_exponent_test() {
+  // JSON numbers may use an exponent with no decimal point.
+  num("JSON.parse('1e3')") |> should.equal(1000.0)
+  num("JSON.parse('2.5e1')") |> should.equal(25.0)
+  num("JSON.parse('2E-2')") |> should.equal(0.02)
+}
+
+pub fn json_parse_escapes_test() {
+  // \b and \f are single control chars (length 3, not 4); a surrogate pair is
+  // one astral code point (length 1 under code-point counting).
+  num("JSON.parse('\"a\\\\bc\"').length") |> should.equal(3.0)
+  num("JSON.parse('\"\\\\uD83D\\\\uDE00\"').length") |> should.equal(1.0)
+}
+
+pub fn parse_float_forms_test() {
+  num("parseFloat('1e3')") |> should.equal(1000.0)
+  num("parseFloat('.5')") |> should.equal(0.5)
+  num("parseFloat('1.5e2')") |> should.equal(150.0)
+  num("parseFloat('3.14abc')") |> should.equal(3.14)
+  num("parseFloat('-2.5')") |> should.equal(-2.5)
+}
+
+pub fn from_char_code_mask_test() {
+  // Each code is truncated to 16 bits (ToUint16): 65601 mod 65536 = 65 = "A".
+  val("String.fromCharCode(65601)") |> should.equal(dyn(<<"A">>))
+  val("String.fromCharCode(65)") |> should.equal(dyn(<<"A">>))
+}
+
+pub fn pad_start_edge_test() {
+  // An empty pad string yields no filler; the default fill is a space.
+  val("'5'.padStart(3, '')") |> should.equal(dyn(<<"5">>))
+  val("'5'.padStart(3)") |> should.equal(dyn(<<"  5">>))
+  val("'5'.padStart(3, '0')") |> should.equal(dyn(<<"005">>))
+}
+
+pub fn replace_dollar_test() {
+  // $& is the match, $$ is a literal $, and $`/$' are the surrounding text.
+  val("'a-b'.replace('-', '$&')") |> should.equal(dyn(<<"a-b">>))
+  val("'a-b'.replace('-', '$$')") |> should.equal(dyn(<<"a$b">>))
+  val("'xax'.replaceAll('a', '[$&]')") |> should.equal(dyn(<<"x[a]x">>))
+  val("'abc'.replace('b', '<$`>')") |> should.equal(dyn(<<"a<a>c">>))
+  val("'abc'.replace('b', '<$\\'>')") |> should.equal(dyn(<<"a<c>c">>))
+}
+
+pub fn array_string_key_test() {
+  // A non-canonical numeric string ("01") is a property, not an index, so it
+  // must not affect `length` and must not overwrite element 1.
+  num("(function(){ let a = [1, 2]; a['01'] = 9; return a.length; })()")
+  |> should.equal(2.0)
+  num("(function(){ let a = [1, 2]; a['01'] = 9; return a[1]; })()")
+  |> should.equal(2.0)
 }
 
 // ── top-level main ───────────────────────────────────────────────────────────

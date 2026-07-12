@@ -569,8 +569,17 @@ inf_of(-1) -> neg_inf.
 
 munary_finite(floor, N) -> floor(as_float(N));
 munary_finite(ceil, N) -> ceil(as_float(N));
-%% JS Math.round is round-half-toward-+Infinity: floor(x + 0.5).
-munary_finite(round, N) -> floor(as_float(N) + 0.5);
+%% JS Math.round is round-half-toward-+Infinity. The naive floor(x + 0.5) is
+%% NOT equivalent: for the largest double below 0.5 (0.49999999999999994) the
+%% sum rounds up to 1.0, giving 1 instead of 0. Compare the fraction directly:
+%% frac >= 0.5 rounds up (ties to +Infinity), otherwise down.
+munary_finite(round, N) ->
+    F = as_float(N),
+    Fl = floor(F),
+    case F - Fl >= 0.5 of
+        true -> Fl + 1;
+        false -> Fl
+    end;
 munary_finite(trunc, N) -> trunc(as_float(N));
 munary_finite(abs, N) -> abs(N);
 munary_finite(sign, N) ->
@@ -581,7 +590,9 @@ munary_finite(sign, N) ->
     end;
 munary_finite(sqrt, N) when N < 0 -> nan;
 munary_finite(sqrt, N) -> math:sqrt(as_float(N));
-munary_finite(cbrt, N) -> math:pow(as_float(N), 1.0 / 3.0) * cbrt_sign(N);
+%% math:pow with a negative base and a non-integer exponent raises badarith, so
+%% cube the magnitude and restore the sign — Math.cbrt(-8) = -2.
+munary_finite(cbrt, N) -> math:pow(abs(as_float(N)), 1.0 / 3.0) * cbrt_sign(N);
 munary_finite(exp, N) -> guard_inf(fun() -> math:exp(as_float(N)) end);
 munary_finite(log, N) when N < 0 -> nan;
 munary_finite(log, N) when N == 0 -> neg_inf;
@@ -914,12 +925,25 @@ array_key(K) when is_float(K) ->
     end;
 array_key(<<"length">>) -> <<"length">>;
 array_key(K) when is_binary(K) ->
-    try
-        binary_to_integer(K)
-    catch
-        error:badarg -> K
+    case canonical_index(K) of
+        {ok, I} -> I;
+        error -> K
     end;
 array_key(K) -> prop_key(K).
+
+%% A binary key is an array index only if it is the canonical decimal form of an
+%% integer in [0, 2^32 - 1). "01", "-1", "1.0" and out-of-range values are plain
+%% string properties (they must NOT bump `length`).
+canonical_index(K) ->
+    try
+        I = binary_to_integer(K),
+        case I >= 0 andalso I < 4294967295 andalso integer_to_binary(I) =:= K of
+            true -> {ok, I};
+            false -> error
+        end
+    catch
+        error:badarg -> error
+    end.
 
 array_get(Len, _Map, <<"length">>) -> Len;
 array_get(_Len, Map, Key) -> maps:get(array_key(Key), Map, undefined).
@@ -1050,12 +1074,15 @@ do_pad(Str, N, Pad, Where) ->
         end,
     Cps = cps(Str),
     Cur = length(Cps),
+    %% `undefined` (an omitted argument passed explicitly) uses the default " ";
+    %% an empty pad string means "no filler available", so the string is
+    %% returned unchanged even when it is shorter than the target.
     PadStr =
-        case to_string(Pad) of
-            <<>> -> <<" ">>;
-            P -> P
+        case Pad of
+            undefined -> <<" ">>;
+            _ -> to_string(Pad)
         end,
-    case Cur >= Target of
+    case Cur >= Target orelse PadStr =:= <<>> of
         true ->
             Str;
         false ->
@@ -1074,9 +1101,11 @@ take_cps(_All, _Cur, 0) -> [];
 take_cps(All, [], Count) -> take_cps(All, All, Count);
 take_cps(All, [C | Rest], Count) -> [C | take_cps(All, Rest, Count - 1)].
 
-%% String.fromCharCode(...codes) — build a string from the emitter's cons list of codes.
+%% String.fromCharCode(...codes) — build a string from the emitter's cons list
+%% of codes. Each code is a UTF-16 code UNIT: JS applies ToUint16 (mod 2^16), so
+%% e.g. fromCharCode(65601) === fromCharCode(65) === "A".
 string_from_char_code(Codes) ->
-    from_cps([trunc(as_float(coerce_num(C))) || C <- Codes]).
+    from_cps([(trunc(as_float(coerce_num(C))) band 16#FFFF) || C <- Codes]).
 
 %% Date.now() — milliseconds since the Unix epoch.
 date_now() ->
@@ -1570,9 +1599,30 @@ aidx([E | Es], I, X) ->
         0 -> aidx(Es, I + 1, X)
     end.
 
-%% includes → a JS boolean atom.
+%% includes → a JS boolean atom. Unlike indexOf (which uses ===), Array.includes
+%% uses SameValueZero, so `[NaN].includes(NaN)` is true.
+array_includes(Recv, X) when is_binary(Recv) -> array_index_of(Recv, X) =/= -1;
 array_includes(Recv, X) ->
-    array_index_of(Recv, X) =/= -1.
+    {Len, Map} = arr_content(Recv),
+    a_incl(arr_list(Len, Map), X).
+a_incl([], _) -> false;
+a_incl([E | Es], X) ->
+    case same_value_zero(E, X) of
+        true -> true;
+        false -> a_incl(Es, X)
+    end.
+
+%% SameValueZero: like ===, except NaN equals NaN (+0/-0 already equate under
+%% strict_eq). Used by Array.prototype.includes.
+same_value_zero(A, B) ->
+    case is_nan_val(A) andalso is_nan_val(B) of
+        true -> true;
+        false -> strict_eq(A, B) =:= 1
+    end.
+
+is_nan_val(js_nan) -> true;
+is_nan_val(nan) -> true;
+is_nan_val(_) -> false.
 
 array_join(Recv, Sep) ->
     {Len, Map} = arr_content(Recv),
@@ -1821,24 +1871,71 @@ str_replace_plain(Str, Search, Repl) ->
     ReplBin = to_string(Repl),
     case to_string(Search) of
         <<>> ->
-            <<ReplBin/binary, Str/binary>>;
+            <<(expand_repl(ReplBin, <<>>, <<>>, Str))/binary, Str/binary>>;
         SearchBin ->
             case binary:match(Str, SearchBin) of
                 nomatch ->
                     Str;
                 {Pos, Len} ->
                     Before = binary:part(Str, 0, Pos),
+                    Match = binary:part(Str, Pos, Len),
                     After = binary:part(Str, Pos + Len, byte_size(Str) - Pos - Len),
-                    <<Before/binary, ReplBin/binary, After/binary>>
+                    Expanded = expand_repl(ReplBin, Match, Before, After),
+                    <<Before/binary, Expanded/binary, After/binary>>
             end
     end.
 
-%% str.replaceAll(search, repl) — every occurrence.
+%% Expand the `$` substitution patterns JS applies in a STRING replacement:
+%% `$$`→`$`, `$&`→the match, `` $` ``→text before the match, `$'`→text after.
+%% `$n` and any other `$x` are left literal (numbered groups need a regex).
+expand_repl(Repl, Match, Before, After) ->
+    expand_repl(Repl, Match, Before, After, <<>>).
+expand_repl(<<>>, _, _, _, Acc) ->
+    Acc;
+expand_repl(<<$$, C, R/binary>>, M, B, A, Acc) ->
+    Sub =
+        case C of
+            $$ -> <<$$>>;
+            $& -> M;
+            % `$\`` — text before the match
+            96 -> B;
+            $' -> A;
+            _ -> <<$$, C>>
+        end,
+    expand_repl(R, M, B, A, <<Acc/binary, Sub/binary>>);
+expand_repl(<<C, R/binary>>, M, B, A, Acc) ->
+    expand_repl(R, M, B, A, <<Acc/binary, C>>).
+
+%% str.replaceAll(search, repl) — every occurrence, with the same `$` expansion
+%% (`` $` ``/`$'` reference the whole original string, tracked via the offset).
 str_replace_all(Str, Search, Repl) ->
     ReplBin = to_string(Repl),
     case to_string(Search) of
         <<>> -> Str;
-        SearchBin -> binary:replace(Str, SearchBin, ReplBin, [global])
+        SearchBin -> ra_expand(Str, SearchBin, ReplBin, Str, 0, <<>>)
+    end.
+
+ra_expand(Rest, SearchBin, ReplBin, Full, Off, Acc) ->
+    case binary:match(Rest, SearchBin) of
+        nomatch ->
+            <<Acc/binary, Rest/binary>>;
+        {Pos, Len} ->
+            Skipped = binary:part(Rest, 0, Pos),
+            Match = binary:part(Rest, Pos, Len),
+            AbsStart = Off + Pos,
+            Before = binary:part(Full, 0, AbsStart),
+            After = binary:part(Full, AbsStart + Len, byte_size(Full) - AbsStart - Len),
+            Expanded = expand_repl(ReplBin, Match, Before, After),
+            TailStart = Pos + Len,
+            Tail = binary:part(Rest, TailStart, byte_size(Rest) - TailStart),
+            ra_expand(
+                Tail,
+                SearchBin,
+                ReplBin,
+                Full,
+                AbsStart + Len,
+                <<Acc/binary, Skipped/binary, Expanded/binary>>
+            )
     end.
 
 %% ── global functions ─────────────────────────────────────
@@ -1891,7 +1988,10 @@ digit_val(C) when C >= $a, C =< $z -> C - $a + 10;
 digit_val(C) when C >= $A, C =< $Z -> C - $A + 10;
 digit_val(_) -> -1.
 
-%% parseFloat(str) — leading decimal/float (or Infinity); else NaN.
+%% parseFloat(str) — the value of the longest leading substring that is a
+%% decimal float literal (sign, digits, optional fraction, optional exponent),
+%% or Infinity; trailing garbage is ignored; NaN if no such prefix exists.
+%% Unlike string:to_float this accepts "1e3" and ".5".
 parse_float(S) ->
     Str = string:trim(to_string(S), leading),
     case Str of
@@ -1902,16 +2002,67 @@ parse_float(S) ->
         <<"-Infinity", _/binary>> ->
             js_neg_inf;
         _ ->
-            case string:to_float(Str) of
-                {error, _} ->
-                    case string:to_integer(Str) of
-                        {error, _} -> js_nan;
-                        {I, _} -> float(I)
-                    end;
-                {F, _} ->
-                    F
+            case pf_prefix(Str) of
+                <<>> ->
+                    js_nan;
+                Tok ->
+                    try
+                        binary_to_integer(Tok)
+                    catch
+                        error:badarg ->
+                            try
+                                binary_to_float(float_fixup(Tok))
+                            catch
+                                error:badarg -> js_nan
+                            end
+                    end
             end
     end.
+
+%% Longest leading decimal-float literal of `Str` (empty ⇒ no number).
+pf_prefix(Str) ->
+    {Sign, R0} =
+        case Str of
+            <<"+", R/binary>> -> {<<>>, R};
+            <<"-", R/binary>> -> {<<"-">>, R};
+            _ -> {<<>>, Str}
+        end,
+    {IntPart, R1} = pf_digits(R0, <<>>),
+    {FracPart, R2} =
+        case R1 of
+            <<".", R1b/binary>> ->
+                {FD, R1c} = pf_digits(R1b, <<>>),
+                {<<".", FD/binary>>, R1c};
+            _ ->
+                {<<>>, R1}
+        end,
+    HasDigit = IntPart =/= <<>> orelse (FracPart =/= <<>> andalso FracPart =/= <<".">>),
+    case HasDigit of
+        false ->
+            <<>>;
+        true ->
+            {ExpPart, _} = pf_exp(R2),
+            <<Sign/binary, IntPart/binary, FracPart/binary, ExpPart/binary>>
+    end.
+
+pf_digits(<<C, R/binary>>, Acc) when C >= $0, C =< $9 -> pf_digits(R, <<Acc/binary, C>>);
+pf_digits(R, Acc) -> {Acc, R}.
+
+%% An exponent (`e`/`E`, optional sign, ≥1 digit); if no digit follows, the `e`
+%% is not part of the number, so nothing is consumed.
+pf_exp(<<E, R/binary>>) when E =:= $e; E =:= $E ->
+    {ESign, R1} =
+        case R of
+            <<"+", Rp/binary>> -> {<<"+">>, Rp};
+            <<"-", Rp/binary>> -> {<<"-">>, Rp};
+            _ -> {<<>>, R}
+        end,
+    case pf_digits(R1, <<>>) of
+        {<<>>, _} -> {<<>>, <<E, R/binary>>};
+        {Ds, R2} -> {<<E, ESign/binary, Ds/binary>>, R2}
+    end;
+pf_exp(R) ->
+    {<<>>, R}.
 
 %% isNaN(x) / isFinite(x) — coerce with ToNumber first (the global forms).
 is_nan(X) ->
@@ -2024,7 +2175,19 @@ esc_byte($\\) -> <<"\\\\">>;
 esc_byte($\n) -> <<"\\n">>;
 esc_byte($\t) -> <<"\\t">>;
 esc_byte($\r) -> <<"\\r">>;
+esc_byte($\b) -> <<"\\b">>;
+esc_byte($\f) -> <<"\\f">>;
+%% Any other control character (< U+0020) must be a \u00XX escape — a raw
+%% control byte inside a JSON string is invalid JSON. Non-ASCII UTF-8 bytes
+%% (>= 0x80) are left untouched: JSON does not require them to be escaped.
+esc_byte(B) when B < 16#20 -> unicode_escape(B);
 esc_byte(B) -> <<B>>.
+
+%% Lower-case \u00XX escape for a control byte, matching JSON.stringify output.
+unicode_escape(B) ->
+    H = string:lowercase(integer_to_binary(B, 16)),
+    Pad = binary:copy(<<"0">>, 4 - byte_size(H)),
+    <<"\\u", Pad/binary, H/binary>>.
 
 json_ref(Ref) ->
     case erlang:get(?CELL_KEY(Ref)) of
@@ -2093,22 +2256,64 @@ json_pstr(<<$\\, $/, R/binary>>, Acc) -> json_pstr(R, [$/ | Acc]);
 json_pstr(<<$\\, $n, R/binary>>, Acc) -> json_pstr(R, [$\n | Acc]);
 json_pstr(<<$\\, $t, R/binary>>, Acc) -> json_pstr(R, [$\t | Acc]);
 json_pstr(<<$\\, $r, R/binary>>, Acc) -> json_pstr(R, [$\r | Acc]);
+json_pstr(<<$\\, $b, R/binary>>, Acc) -> json_pstr(R, [$\b | Acc]);
+json_pstr(<<$\\, $f, R/binary>>, Acc) -> json_pstr(R, [$\f | Acc]);
+%% A high surrogate followed by a low surrogate is one astral code point;
+%% decoding each \u escape independently would corrupt e.g. an emoji.
+json_pstr(<<$\\, $u, H1:4/binary, $\\, $u, H2:4/binary, R/binary>>, Acc) ->
+    case {hex4(H1), hex4(H2)} of
+        {C1, C2} when
+            is_integer(C1),
+            is_integer(C2),
+            C1 >= 16#D800,
+            C1 =< 16#DBFF,
+            C2 >= 16#DC00,
+            C2 =< 16#DFFF
+        ->
+            CP = 16#10000 + (C1 - 16#D800) * 16#400 + (C2 - 16#DC00),
+            json_pstr(R, [CP | Acc]);
+        {C1, _} when is_integer(C1) ->
+            %% not a valid pair: keep the first unit, re-scan the second escape.
+            json_pstr(<<$\\, $u, H2/binary, R/binary>>, [C1 | Acc]);
+        _ ->
+            error
+    end;
 json_pstr(<<$\\, $u, H:4/binary, R/binary>>, Acc) ->
-    json_pstr(R, [binary_to_integer(H, 16) | Acc]);
+    case hex4(H) of
+        error -> error;
+        C -> json_pstr(R, [C | Acc])
+    end;
 json_pstr(<<C/utf8, R/binary>>, Acc) -> json_pstr(R, [C | Acc]);
 json_pstr(_, _) -> error.
 
+%% Parse exactly four hex digits to an integer, or `error` on a non-hex digit.
+hex4(H) ->
+    try binary_to_integer(H, 16) of
+        I -> I
+    catch
+        error:badarg -> error
+    end.
+
 json_pnum(B) ->
     {Tok, Rest} = json_num_tok(B, []),
-    case string:to_float(Tok) of
-        {error, _} ->
-            case string:to_integer(Tok) of
-                {error, _} -> error;
-                {I, <<>>} -> {ok, I, Rest};
-                _ -> error
-            end;
-        {F, <<>>} ->
-            {ok, F, Rest}
+    case json_num_val(Tok) of
+        error -> error;
+        V -> {ok, V, Rest}
+    end.
+
+%% Parse a JSON number token to an integer or float. Unlike string:to_float,
+%% this accepts exponent forms without a decimal point ("1e3") and leading-dot
+%% forms by normalising through float_fixup, so `JSON.parse("1e3")` === 1000.
+json_num_val(Tok) ->
+    try
+        binary_to_integer(Tok)
+    catch
+        error:badarg ->
+            try
+                binary_to_float(float_fixup(Tok))
+            catch
+                error:badarg -> error
+            end
     end.
 
 json_num_tok(<<C, R/binary>>, Acc) when
@@ -2123,13 +2328,19 @@ json_num_tok(<<C, R/binary>>, Acc) when
 json_num_tok(R, Acc) ->
     {list_to_binary(lists:reverse(Acc)), R}.
 
+%% `]` closes the array only at the start or after a value — never straight
+%% after a comma, so a trailing comma (`[1,]`) is a SyntaxError, per the JSON
+%% grammar. After a comma another value is required (json_parr_val).
 json_parr(<<$], R/binary>>, Acc) ->
     {ok, new_array(lists:reverse(Acc)), R};
 json_parr(B, Acc) ->
+    json_parr_val(B, Acc).
+
+json_parr_val(B, Acc) ->
     case json_val(B) of
         {ok, V, R} ->
             case json_ws(R) of
-                <<$,, R2/binary>> -> json_parr(json_ws(R2), [V | Acc]);
+                <<$,, R2/binary>> -> json_parr_val(json_ws(R2), [V | Acc]);
                 <<$], R2/binary>> -> {ok, new_array(lists:reverse([V | Acc])), R2};
                 _ -> error
             end;
@@ -2137,9 +2348,15 @@ json_parr(B, Acc) ->
             error
     end.
 
+%% `}` closes the object only at the start or after a member — never straight
+%% after a comma, so a trailing comma (`{"a":1,}`) is a SyntaxError. After a
+%% comma another `"key": value` member is required (json_pobj_member).
 json_pobj(<<$}, R/binary>>, Obj) ->
     {ok, Obj, R};
-json_pobj(<<$", R/binary>>, Obj) ->
+json_pobj(B, Obj) ->
+    json_pobj_member(B, Obj).
+
+json_pobj_member(<<$", R/binary>>, Obj) ->
     case json_pstr(R, []) of
         {ok, Key, R1} ->
             case json_ws(R1) of
@@ -2148,7 +2365,7 @@ json_pobj(<<$", R/binary>>, Obj) ->
                         {ok, V, R3} ->
                             set_prop(Obj, Key, V),
                             case json_ws(R3) of
-                                <<$,, R4/binary>> -> json_pobj(json_ws(R4), Obj);
+                                <<$,, R4/binary>> -> json_pobj_member(json_ws(R4), Obj);
                                 <<$}, R4/binary>> -> {ok, Obj, R4};
                                 _ -> error
                             end;
@@ -2161,7 +2378,7 @@ json_pobj(<<$", R/binary>>, Obj) ->
         error ->
             error
     end;
-json_pobj(_, _) ->
+json_pobj_member(_, _) ->
     error.
 
 %% ───────────────────────── lists / console / misc ─────────────────────────
