@@ -5,6 +5,7 @@
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/int
+import gleam/string
 import gleeunit/should
 import twocore/frontend/js
 
@@ -3010,6 +3011,26 @@ pub fn string_raw_missing_sub_test() {
   val("String.raw({ raw: [\"a\", \"b\"] })") |> should.equal(dyn(<<"ab">>))
   val("String.raw({ raw: [\"a\", \"b\", \"c\"] }, \"X\")")
   |> should.equal(dyn(<<"aXbc">>))
+}
+
+pub fn string_from_code_point_range_test() {
+  // §22.1.2.2 steps 2a–2c: a non-integral, negative, or > 0x10FFFF code point is
+  // a RangeError — not a TypeError. The runtime signals this as `range_error`.
+  let is_range_error = fn(src: String) -> Bool {
+    let m = compile("function f() { return " <> src <> "; }")
+    case catch_apply(m, atom.create("f"), []) {
+      Error(msg) -> string.contains(msg, "range_error")
+      Ok(_) -> False
+    }
+  }
+  is_range_error("String.fromCodePoint(1.5)") |> should.equal(True)
+  is_range_error("String.fromCodePoint(-1)") |> should.equal(True)
+  is_range_error("String.fromCodePoint(0x110000)") |> should.equal(True)
+  is_range_error("String.fromCodePoint('x')") |> should.equal(True)
+  // A valid code point still builds the string (0x41 = 'A', 0x1F600 astral).
+  val("String.fromCodePoint(65)") |> should.equal(dyn(<<"A">>))
+  val("String.fromCodePoint(0, 66)")
+  |> should.equal(dyn(<<0, "B">>))
 }
 
 // ── runtime correctness (spec regressions) ──────────────────────────────────

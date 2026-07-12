@@ -1550,16 +1550,20 @@ string_from_char_code(Codes) ->
 string_from_code_point(Codes) ->
     from_cps([code_point_of(C) || C <- Codes]).
 
+%% Coerce one argument to a code point per §22.1.2.2 (steps 2a–2c): ToNumber,
+%% then a non-integral value, a value < 0, or a value > 0x10FFFF is a RangeError
+%% — NOT a TypeError. `nan`/±Infinity from coercion are non-integral, so they
+%% are RangeErrors too.
 code_point_of(C) ->
     case coerce_num(C) of
         N when is_number(N) ->
             I = trunc(N),
             case I == N andalso I >= 0 andalso I =< 16#10FFFF of
                 true -> I;
-                false -> type_error(C)
+                false -> erlang:error({js_error, range_error, <<"Invalid code point">>})
             end;
         _ ->
-            type_error(C)
+            erlang:error({js_error, range_error, <<"Invalid code point">>})
     end.
 
 %% String.raw(template, ...substitutions) — the default tagged-template tag
