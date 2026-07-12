@@ -1370,6 +1370,24 @@ pub fn instanceof_test() {
   call(a, "f", []) |> should.equal(dyn(True))
 }
 
+// ── labeled break / continue ─────────────────────────────────────────────────
+
+pub fn labeled_break_test() {
+  let m =
+    compile(
+      "function f() { let count = 0; outer: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) { if (i * j >= 6) { break outer; } count++; } } return count; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(13.0)
+}
+
+pub fn labeled_continue_test() {
+  let m =
+    compile(
+      "function f() { let count = 0; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j === 1) { continue outer; } count++; } } return count; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

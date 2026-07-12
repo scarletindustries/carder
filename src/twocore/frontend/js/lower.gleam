@@ -20,7 +20,7 @@
 //// `- + ! ~ typeof void delete`, `in`, `instanceof`, comma `,`, `?:`, optional chaining
 //// `?.`; `let/const/var`, `= += -= *= /=
 //// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
-//// `for-in`, `break/continue`,
+//// `for-in`, `break/continue` (incl. labeled `break outer`/`continue outer`),
 //// `return`, blocks; flat array/object destructuring in `let`/`const`/`var`; objects
 //// `{}` with `.prop`/`[k]` get/set, spread `{...o}`, and method shorthand; arrays `[…]`
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
@@ -156,6 +156,10 @@ type Ctx {
     current_super: Option(String),
     loop: Option(Loop),
     brk: Option(#(String, List(String))),
+    // JS labels in scope → (break target, loop for `continue`), for labeled loops.
+    labels: Dict(String, #(#(String, List(String)), Loop)),
+    // a JS label attached to the immediately-following loop (consumed by `lower_loop`).
+    pending_label: Option(String),
     lambdas: Dict(ast.Span, Lambda),
     scope_mutated: List(String),
   )
@@ -205,6 +209,8 @@ pub fn program(
       current_super: None,
       loop: None,
       brk: None,
+      labels: dict.new(),
+      pending_label: None,
       lambdas:,
       scope_mutated: [],
     )
@@ -657,12 +663,24 @@ fn lower_stmt(
     ast.TryStatement(block:, handler:, finalizer:) ->
       lower_try(block, handler, finalizer, env, ctx, ctr, k)
 
+    // `label: <loop>` — attach the label to the following loop (via `pending_label`).
+    ast.LabeledStatement(label:, body:) ->
+      lower_stmt(body, env, Ctx(..ctx, pending_label: Some(label)), ctr, k)
+
     ast.BreakStatement(label: None) ->
       case ctx.brk {
         // break targets the innermost loop OR switch.
         Some(#(label, carried)) ->
           Ok(#(ir.Break(label, carried_vals(env, carried)), ctr))
         None -> Error(Unsupported("break outside a loop or switch"))
+      }
+    // `break outer` — target the labeled loop's exit.
+    ast.BreakStatement(label: Some(name)) ->
+      case dict.get(ctx.labels, name) {
+        Ok(#(#(label, carried), _loop)) ->
+          Ok(#(ir.Break(label, carried_vals(env, carried)), ctr))
+        Error(Nil) ->
+          Error(Unsupported("break to unknown label '" <> name <> "'"))
       }
     ast.ContinueStatement(label: None) ->
       case ctx.loop {
@@ -674,6 +692,15 @@ fn lower_stmt(
         // and the plain `while` case.
         Some(loop) -> continue_edge(loop, env, ctx, ctr)
         None -> Error(Unsupported("continue outside a loop"))
+      }
+    // `continue outer` — re-enter the labeled loop.
+    ast.ContinueStatement(label: Some(name)) ->
+      case dict.get(ctx.labels, name) {
+        Ok(#(_brk, Loop(do_while: True, ..))) ->
+          Error(Unsupported("labeled `continue` into a do/while loop"))
+        Ok(#(_brk, loop)) -> continue_edge(loop, env, ctx, ctr)
+        Error(Nil) ->
+          Error(Unsupported("continue to unknown label '" <> name <> "'"))
       }
 
     ast.FunctionDeclaration(..) -> k(env, ctr)
@@ -1381,11 +1408,20 @@ fn lower_loop(
     list.map2(carried, inits, fn(v, initv) { ir.LoopParam(v, ir.TTerm, initv) })
   let loop_env =
     list.fold(carried, env, fn(acc, v) { dict.insert(acc, v, ir.Var(v)) })
+  let this_loop = Loop(label, carried, update, do_while)
+  // If this loop was labeled (`outer: for …`), register the label → its targets and
+  // clear the pending label so a nested loop doesn't inherit it.
+  let labels = case ctx.pending_label {
+    Some(name) -> dict.insert(ctx.labels, name, #(#(label, carried), this_loop))
+    None -> ctx.labels
+  }
   let loop_ctx =
     Ctx(
       ..ctx,
-      loop: Some(Loop(label, carried, update, do_while)),
+      loop: Some(this_loop),
       brk: Some(#(label, carried)),
+      labels: labels,
+      pending_label: None,
     )
   use #(body, ctr) <- result_try(step(loop_env, loop_ctx, ctr))
   let tys = list.map(carried, fn(_) { ir.TTerm })
@@ -3140,6 +3176,7 @@ fn assigned_in_stmt(s: ast.Statement) -> List(String) {
       })
     ast.ForOfStatement(body:, ..) -> assigned_in_stmt(body)
     ast.ForInStatement(body:, ..) -> assigned_in_stmt(body)
+    ast.LabeledStatement(body:, ..) -> assigned_in_stmt(body)
     ast.SwitchStatement(cases:, ..) ->
       list.flat_map(cases, fn(c) {
         assigned_in(list.map(c.consequent, fn(w) { w.statement }))
@@ -3360,6 +3397,7 @@ fn child_stmts(s: ast.Statement) -> List(ast.Statement) {
     ast.ForStatement(body:, ..) -> [body]
     ast.ForOfStatement(body:, ..) -> [body]
     ast.ForInStatement(body:, ..) -> [body]
+    ast.LabeledStatement(body:, ..) -> [body]
     ast.SwitchStatement(cases:, ..) ->
       list.flat_map(cases, fn(c) {
         list.map(c.consequent, fn(w) { w.statement })
