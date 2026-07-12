@@ -1600,6 +1600,142 @@ pub fn date_now_test() {
   call(m, "f", []) |> should.equal(dyn(True))
 }
 
+// ── Date: constructor + getters + toISOString ────────────────────────────────
+// Spec: ECMA-262 §21.4 (a Date is a number of ms since the Unix epoch). This
+// implementation treats local time as UTC, so getX == getUTCX and the component
+// constructor / Date.UTC build a UTC instant (documented deviation).
+
+pub fn date_get_time_test() {
+  // §21.4.5.10 getTime / thisTimeValue — the stored ms round-trips exactly.
+  num("new Date(0).getTime()") |> should.equal(0.0)
+  num("new Date(-0).getTime()") |> should.equal(0.0)
+  num("new Date(-1).getTime()") |> should.equal(-1.0)
+  num("new Date(1).getTime()") |> should.equal(1.0)
+  num("new Date(8640000000000000).getTime()")
+  |> should.equal(8_640_000_000_000_000.0)
+  num("new Date(-8640000000000000).getTime()")
+  |> should.equal(-8_640_000_000_000_000.0)
+  // valueOf is the same time value (§21.4.5.11).
+  num("new Date(1483142400000).valueOf()")
+  |> should.equal(1_483_142_400_000.0)
+}
+
+pub fn date_out_of_range_is_nan_test() {
+  // A time value beyond ±8.64e15 clips to NaN (§21.4.1.31 TimeClip); NaN !== NaN, so
+  // the getTime result is the only value not strictly-equal to itself.
+  let m =
+    compile(
+      "function f() { var t = new Date(8640000000000001).getTime(); return t !== t; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn date_get_utc_full_year_test() {
+  // From test262 built-ins/Date/prototype/getUTCFullYear/this-value-valid-date.js:
+  // dec31 = 1483142400000 is 2016-12-31T00:00:00Z.
+  num("new Date(1483142400000).getUTCFullYear()") |> should.equal(2016.0)
+  num("new Date(1483142400000 - 1).getUTCFullYear()") |> should.equal(2016.0)
+  num("new Date(1483142400000 + 86400000 - 1).getUTCFullYear()")
+  |> should.equal(2016.0)
+  num("new Date(1483142400000 + 86400000).getUTCFullYear()")
+  |> should.equal(2017.0)
+  // The epoch is 1970 (and getFullYear == getUTCFullYear here).
+  num("new Date(0).getUTCFullYear()") |> should.equal(1970.0)
+  num("new Date(0).getFullYear()") |> should.equal(1970.0)
+}
+
+pub fn date_get_utc_fields_test() {
+  // 2016-12-31T00:00:00Z: month is 0-based (11 = December), date 31, Saturday (6).
+  num("new Date(1483142400000).getUTCMonth()") |> should.equal(11.0)
+  num("new Date(1483142400000).getUTCDate()") |> should.equal(31.0)
+  num("new Date(1483142400000).getUTCDay()") |> should.equal(6.0)
+  // The epoch 1970-01-01 was a Thursday (getUTCDay 4).
+  num("new Date(0).getUTCDay()") |> should.equal(4.0)
+  num("new Date(0).getUTCMonth()") |> should.equal(0.0)
+  num("new Date(0).getUTCDate()") |> should.equal(1.0)
+}
+
+pub fn date_get_utc_time_of_day_test() {
+  // 01:02:03.004 UTC on the epoch day.
+  let t = "(3600000 + 2 * 60000 + 3 * 1000 + 4)"
+  num("new Date" <> "(" <> t <> ").getUTCHours()") |> should.equal(1.0)
+  num("new Date" <> "(" <> t <> ").getUTCMinutes()") |> should.equal(2.0)
+  num("new Date" <> "(" <> t <> ").getUTCSeconds()") |> should.equal(3.0)
+  num("new Date" <> "(" <> t <> ").getUTCMilliseconds()") |> should.equal(4.0)
+  // Negative times floor into the previous day correctly: -1ms is 1969-12-31T23:59:59.999Z.
+  num("new Date(-1).getUTCFullYear()") |> should.equal(1969.0)
+  num("new Date(-1).getUTCHours()") |> should.equal(23.0)
+  num("new Date(-1).getUTCMinutes()") |> should.equal(59.0)
+  num("new Date(-1).getUTCMilliseconds()") |> should.equal(999.0)
+}
+
+pub fn date_component_constructor_test() {
+  // new Date(year, month, day, …) — treated as UTC here. 2016-12-31 == 1483142400000.
+  num("new Date(2016, 11, 31).getTime()") |> should.equal(1_483_142_400_000.0)
+  // Month overflow rolls into the year (month 12 → next January).
+  num("new Date(2016, 12, 1).getUTCFullYear()") |> should.equal(2017.0)
+  num("new Date(2016, 12, 1).getUTCMonth()") |> should.equal(0.0)
+  // The two-digit-year rule: 0..99 → 1900+year (§21.4.1.14 MakeFullYear).
+  num("new Date(99, 0, 1).getUTCFullYear()") |> should.equal(1999.0)
+  num("new Date(0, 0, 1).getUTCFullYear()") |> should.equal(1900.0)
+  // Full time components.
+  num("new Date(1970, 0, 1, 1, 2, 3, 4).getUTCHours()") |> should.equal(1.0)
+  num("new Date(1970, 0, 1, 1, 2, 3, 4).getTime()")
+  |> should.equal(3_723_004.0)
+}
+
+pub fn date_utc_static_test() {
+  // Date.UTC(2016, 11, 31) — a time value (number), not a Date (§21.4.3.4).
+  num("Date.UTC(2016, 11, 31)") |> should.equal(1_483_142_400_000.0)
+  num("Date.UTC(1970, 0, 1)") |> should.equal(0.0)
+  // Missing year → NaN (§21.4.3.4 step 1: ToNumber(undefined) is NaN); NaN !== NaN.
+  let m = compile("function f() { var t = Date.UTC(); return t !== t; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn date_to_iso_string_test() {
+  // §21.4.4.36 — the canonical ISO form.
+  let m = compile("function f() { return new Date(0).toISOString(); }")
+  call(m, "f", []) |> should.equal(dyn(<<"1970-01-01T00:00:00.000Z">>))
+  let m2 =
+    compile("function f() { return new Date(1483142400000).toISOString(); }")
+  call(m2, "f", []) |> should.equal(dyn(<<"2016-12-31T00:00:00.000Z">>))
+  // Milliseconds render with three digits.
+  let m3 = compile("function f() { return new Date(-1).toISOString(); }")
+  call(m3, "f", []) |> should.equal(dyn(<<"1969-12-31T23:59:59.999Z">>))
+}
+
+pub fn date_iso_round_trip_test() {
+  // new Date(isoString) parses back to the same instant (Date.parse ∘ toISOString).
+  num("new Date(\"1970-01-01T00:00:00.000Z\").getTime()") |> should.equal(0.0)
+  num("new Date(\"2016-12-31T00:00:00.000Z\").getTime()")
+  |> should.equal(1_483_142_400_000.0)
+  // Date-only ISO string is UTC midnight.
+  num("new Date(\"2016-12-31\").getTime()")
+  |> should.equal(1_483_142_400_000.0)
+  // Date.parse of an ISO string is the time value.
+  num("Date.parse(\"1970-01-01T00:00:00.000Z\")") |> should.equal(0.0)
+  // A timezone offset is applied: 01:00+01:00 == 00:00Z.
+  num("Date.parse(\"1970-01-01T01:00:00.000+01:00\")") |> should.equal(0.0)
+}
+
+pub fn date_timezone_offset_test() {
+  // Deviation: local == UTC, so getTimezoneOffset() is always 0.
+  num("new Date(0).getTimezoneOffset()") |> should.equal(0.0)
+}
+
+pub fn date_parse_extended_year_test() {
+  // §21.4.1.15.1 — year 0 is positive: `+000000` is valid, `-000000` (negative zero)
+  // is invalid and parses to NaN. (test262 built-ins/Date/parse/year-zero.js.)
+  num("Date.parse(\"+000000-01-01T00:00:00.000Z\")")
+  |> should.equal(-62_167_219_200_000.0)
+  let m =
+    compile(
+      "function f() { var t = Date.parse(\"-000000-03-31T00:45Z\"); return t !== t; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
 // ── array finishers + toFixed ────────────────────────────────────────────────
 
 pub fn array_finishers_test() {
