@@ -1316,6 +1316,52 @@ pub fn coercion_globals_test() {
   call(t, "f", []) |> should.equal(dyn(True))
 }
 
+pub fn primitive_wrapper_test() {
+  // `new Number/String/Boolean(x)` build a WRAPPER object boxing the coerced
+  // primitive (§21.1.1.1 / §22.1.1.1 / §20.3.1.1). It is an object: `typeof` "object".
+  val("typeof (new Number(5))") |> should.equal(dyn(<<"object">>))
+  val("typeof (new String('hi'))") |> should.equal(dyn(<<"object">>))
+  val("typeof (new Boolean(false))") |> should.equal(dyn(<<"object">>))
+
+  // valueOf unwraps to the boxed primitive (§21.1.3.7 / §22.1.3.28 / §20.3.3.3).
+  num("(new Number(5)).valueOf()") |> should.equal(5.0)
+  val("(new String('hi')).valueOf()") |> should.equal(dyn(<<"hi">>))
+  val("(new Boolean(false)).valueOf()") |> should.equal(dyn(False))
+  val("(new Boolean('x')).valueOf()") |> should.equal(dyn(True))
+
+  // toString unwraps to the primitive's string form.
+  val("(new String('hi')).toString()") |> should.equal(dyn(<<"hi">>))
+  val("(new Number(5)).toString()") |> should.equal(dyn(<<"5">>))
+
+  // The argument is coerced: ToNumber / ToString / ToBoolean.
+  num("(new Number('3.5')).valueOf()") |> should.equal(3.5)
+  val("(new String(42)).valueOf()") |> should.equal(dyn(<<"42">>))
+  val("(new Boolean(0)).valueOf()") |> should.equal(dyn(False))
+
+  // A no-argument call boxes the type's default: 0 / "" / false.
+  num("(new Number()).valueOf()") |> should.equal(0.0)
+  val("(new String()).valueOf()") |> should.equal(dyn(<<"">>))
+  val("(new Boolean()).valueOf()") |> should.equal(dyn(False))
+
+  // A String wrapper exposes `.length` and index access from the boxed string.
+  num("new String('abc').length") |> should.equal(3.0)
+  val("new String('abc')[0]") |> should.equal(dyn(<<"a">>))
+
+  // String-coercion of a wrapper unwraps to its primitive (ToPrimitive → ToString).
+  val("'v' + new Number(5)") |> should.equal(dyn(<<"v5">>))
+
+  // A wrapper is an OBJECT, so it is never strict-equal to the boxed primitive.
+  val("(new Number(5)) === 5") |> should.equal(dyn(False))
+
+  // REGRESSION GUARD: `Number/String/Boolean(x)` WITHOUT `new` still return PRIMITIVES.
+  val("typeof Number(5)") |> should.equal(dyn(<<"number">>))
+  val("typeof String(5)") |> should.equal(dyn(<<"string">>))
+  val("typeof Boolean(1)") |> should.equal(dyn(<<"boolean">>))
+  num("Number('3.5')") |> should.equal(3.5)
+  val("String(42)") |> should.equal(dyn(<<"42">>))
+  val("Boolean('')") |> should.equal(dyn(False))
+}
+
 pub fn number_string_whitespace_test() {
   // ToNumber(String) strips the full ES WhiteSpace + LineTerminator set from both
   // ends; a string of only whitespace is 0 (not NaN).

@@ -231,6 +231,14 @@ pub fn cell_set(cell: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_object")
 pub fn new_object() -> Dynamic
 
+/// `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive wrapper OBJECT.
+/// `kind` is the atom `number`/`string`/`boolean`; `x` is boxed after coercion
+/// (ToNumber/ToString/ToBoolean). Returns a cell (`typeof` "object") whose `valueOf`
+/// unwraps to the boxed primitive and whose `toString`/string-coercion unwraps to its
+/// string form; a `string` wrapper also exposes `.length` and index reads.
+@external(erlang, "twocore_rt_js_ffi", "wrapper_new")
+pub fn wrapper_new(kind: Dynamic, x: Dynamic) -> Dynamic
+
 /// `obj[key]` → the stored value, or `undefined` when absent (own properties only — no
 /// prototype chain in v1). Keys are binaries; a NUMBER key normalizes to its JS string form
 /// (`5`, `5.0` and `"5"` are the same key). A non-object receiver is a `type_error`.
