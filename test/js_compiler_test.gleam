@@ -501,6 +501,45 @@ pub fn closure_rejects_reassigned_capture_test() {
   }
 }
 
+// ── for-of ───────────────────────────────────────────────────────────────────
+
+pub fn for_of_test() {
+  let m =
+    compile(
+      "function f() { let s = 0; for (let x of [10, 20, 30]) { s += x; } return s; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(60.0)
+}
+
+pub fn for_of_break_continue_test() {
+  let b =
+    compile(
+      "function f() { let s = 0; for (let x of [1, 2, 3, 4, 5]) { if (x > 3) { break; } s += x; } return s; }",
+    )
+  to_float(call(b, "f", [])) |> should.equal(6.0)
+  let c =
+    compile(
+      "function f() { let s = 0; for (let x of [1, 2, 3, 4]) { if (x % 2 === 0) { continue; } s += x; } return s; }",
+    )
+  to_float(call(c, "f", [])) |> should.equal(4.0)
+}
+
+pub fn for_of_build_test() {
+  let m =
+    compile(
+      "function f() { let arr = [1, 2, 3]; let out = []; for (let x of arr) { out.push(x * x); } return out[2]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(9.0)
+}
+
+pub fn for_of_nested_test() {
+  let m =
+    compile(
+      "function f() { let s = 0; for (let a of [1, 2]) { for (let b of [10, 20]) { s += a * b; } } return s; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(90.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

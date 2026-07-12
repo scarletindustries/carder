@@ -290,6 +290,8 @@ fn lower_stmt(
       lower_while(condition, body, True, env, ctx, ctr, k)
     ast.ForStatement(init:, condition:, update:, body:) ->
       lower_for(init, condition, update, body, env, ctx, ctr, k)
+    ast.ForOfStatement(left:, right:, body:, ..) ->
+      lower_for_of(left, right, body, env, ctx, ctr, k)
 
     ast.BreakStatement(label: None) ->
       case ctx.loop {
@@ -530,6 +532,96 @@ fn lower_for(
     k,
   ))
   Ok(#(emit_lets(init_binds, loop_expr), ctr))
+}
+
+/// `for (let x of iterable) body` — desugar to an index loop over an array-like:
+/// `{ let $arr = iterable; for (let $i = 0; $i < $arr.length; $i = $i + 1) { let x =
+/// $arr[$i]; body } }`. `break`/`continue` then target the synthesized `for` loop. v1
+/// iterates anything with `.length` + integer indexing (arrays); other iterables fail
+/// at runtime.
+fn lower_for_of(
+  left: ast.ForInit,
+  right: ast.Expression,
+  body: ast.Statement,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+  k: Cont,
+) -> Result(#(ir.Expr, Int), Error) {
+  use x_name <- result_try(for_of_var(left))
+  let id = int.to_string(ctr)
+  let arr = "$of_arr_" <> id
+  let idx = "$of_idx_" <> id
+  let sp = ast.Span(0, 0)
+  let ident = fn(n) { ast.Identifier(span: sp, name: n) }
+  let decl = fn(n, init) {
+    ast.VariableDeclaration(kind: ast.Let, declarations: [
+      ast.VariableDeclarator(
+        id: ast.IdentifierPattern(name: n, span: sp),
+        init: Some(init),
+      ),
+    ])
+  }
+  let wrap = fn(s) { ast.StmtWithLine(line: 0, statement: s) }
+  let arr_len =
+    ast.MemberExpression(
+      span: sp,
+      object: ident(arr),
+      property: ident("length"),
+      computed: False,
+    )
+  let cond =
+    ast.BinaryExpression(
+      span: sp,
+      operator: ast.LessThan,
+      left: ident(idx),
+      right: arr_len,
+    )
+  let update =
+    ast.AssignmentExpression(
+      span: sp,
+      operator: ast.Assign,
+      left: ident(idx),
+      right: ast.BinaryExpression(
+        span: sp,
+        operator: ast.Add,
+        left: ident(idx),
+        right: ast.NumberLiteral(span: sp, value: 1.0),
+      ),
+    )
+  let elem =
+    ast.MemberExpression(
+      span: sp,
+      object: ident(arr),
+      property: ident(idx),
+      computed: True,
+    )
+  let inner_body =
+    ast.BlockStatement(body: [wrap(decl(x_name, elem)), wrap(body)])
+  let for_stmt =
+    ast.ForStatement(
+      init: Some(ast.ForInitDeclaration(decl(idx, ast.NumberLiteral(sp, 0.0)))),
+      condition: Some(cond),
+      update: Some(update),
+      body: inner_body,
+    )
+  let block = ast.BlockStatement(body: [wrap(decl(arr, right)), wrap(for_stmt)])
+  lower_stmt(block, env, ctx, ctr, k)
+}
+
+/// The bound loop variable of a `for-of`: `for (let x of …)` / `for (const x of …)` or
+/// `for (x of …)` on a pre-declared identifier. Destructuring is not yet supported.
+fn for_of_var(left: ast.ForInit) -> Result(String, Error) {
+  case left {
+    ast.ForInitDeclaration(ast.VariableDeclaration(
+      declarations: [
+        ast.VariableDeclarator(id: ast.IdentifierPattern(name:, ..), ..),
+      ],
+      ..,
+    )) -> Ok(name)
+    ast.ForInitExpression(ast.Identifier(name:, ..)) -> Ok(name)
+    _ -> Error(Unsupported("for-of binding (destructuring/other)"))
+  }
 }
 
 fn lower_for_init(
@@ -1613,6 +1705,8 @@ fn assigned_in_stmt(s: ast.Statement) -> List(String) {
         Some(u) -> assigned_of_expr(u)
         None -> []
       })
+    ast.ForOfStatement(body:, ..) -> assigned_in_stmt(body)
+    ast.ForInStatement(body:, ..) -> assigned_in_stmt(body)
     _ -> []
   }
 }
@@ -1737,6 +1831,8 @@ fn stmt_exprs(s: ast.Statement) -> List(ast.Expression) {
         option.values([condition]),
         option.values([update]),
       ])
+    ast.ForOfStatement(right:, ..) -> [right]
+    ast.ForInStatement(right:, ..) -> [right]
     _ -> []
   }
 }
@@ -1750,6 +1846,8 @@ fn child_stmts(s: ast.Statement) -> List(ast.Statement) {
     ast.WhileStatement(body:, ..) -> [body]
     ast.DoWhileStatement(body:, ..) -> [body]
     ast.ForStatement(body:, ..) -> [body]
+    ast.ForOfStatement(body:, ..) -> [body]
+    ast.ForInStatement(body:, ..) -> [body]
     _ -> []
   }
 }
@@ -1792,9 +1890,20 @@ fn declared_stmt(s: ast.Statement) -> List(String) {
     ast.FunctionDeclaration(name: Some(n), ..) -> [n]
     ast.ForStatement(init: Some(ast.ForInitDeclaration(d)), ..) ->
       declared_stmt(d)
+    ast.ForOfStatement(left:, ..) -> for_of_declared(left)
+    ast.ForInStatement(left:, ..) -> for_of_declared(left)
     _ -> []
   }
   list.append(here, list.flat_map(child_stmts(s), declared_stmt))
+}
+
+/// The variable bound by a `for-of`/`for-in` header (laxly; `[]` if not a simple
+/// identifier binding).
+fn for_of_declared(left: ast.ForInit) -> List(String) {
+  case for_of_var(left) {
+    Ok(n) -> [n]
+    Error(_) -> []
+  }
 }
 
 /// Free variables of a lambda body: identifiers read but not bound by the lambda's
