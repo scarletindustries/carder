@@ -5,6 +5,7 @@
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/int
+import gleam/string
 import gleeunit/should
 import twocore/frontend/js
 
@@ -3418,4 +3419,138 @@ pub fn number_tostring_radix_test() {
   val("(255).toString(10)") |> should.equal(dyn(<<"255">>))
   val("(0 / 0).toString(2)") |> should.equal(dyn(<<"NaN">>))
   val("(1 / 0).toString(2)") |> should.equal(dyn(<<"Infinity">>))
+}
+
+// ── URI encode / decode globals (ECMAScript §19.2.6, RFC 3629) ────────────────
+
+/// Compile+run `return <expr>;` and return the raw `catch_apply` Result: `Ok(v)`
+/// on a normal return, or `Error(msg)` when the body raises (the BEAM reason
+/// formatted to a binary — a URIError shows up as `{js_error,uri_error,…}`).
+fn run_result(expr: String) -> Result(Dynamic, String) {
+  let m = compile("function f() { return " <> expr <> "; }")
+  catch_apply(m, atom.create("f"), [])
+}
+
+/// True when running `expr` raises the JS URIError convention
+/// (`{js_error, uri_error, _}`) — the §19.2.6 "URIError" outcome.
+fn is_uri_error(expr: String) -> Bool {
+  case run_result(expr) {
+    Error(msg) -> string.contains(msg, "uri_error")
+    Ok(_) -> False
+  }
+}
+
+pub fn encode_uri_component_unreserved_test() {
+  // §19.2.6.5: the uriUnescaped set (A-Za-z0-9 and `- _ . ! ~ * ' ( )`) is left
+  // literal by encodeURIComponent.
+  val("encodeURIComponent(\"abcXYZ0189\")")
+  |> should.equal(dyn(<<"abcXYZ0189">>))
+  val("encodeURIComponent(\"-_.!~*'()\")")
+  |> should.equal(dyn(<<"-_.!~*'()">>))
+}
+
+pub fn encode_uri_component_reserved_test() {
+  // encodeURIComponent escapes the whole uriReserved set plus `#` (its
+  // unescaped set does NOT contain them). Hex digits are uppercase.
+  val("encodeURIComponent(\";/?:@&=+$,\")")
+  |> should.equal(dyn(<<"%3B%2F%3F%3A%40%26%3D%2B%24%2C">>))
+  val("encodeURIComponent(\"#\")") |> should.equal(dyn(<<"%23">>))
+  // A space is not unescaped → %20.
+  val("encodeURIComponent(\"a b\")") |> should.equal(dyn(<<"a%20b">>))
+}
+
+pub fn encode_uri_component_url_test() {
+  // A whole URL: every reserved delimiter is escaped (unlike encodeURI).
+  val("encodeURIComponent(\"http://unipro.ru/0123456789\")")
+  |> should.equal(dyn(<<"http%3A%2F%2Funipro.ru%2F0123456789">>))
+  // The empty string round-trips to the empty string.
+  val("encodeURIComponent(\"\")") |> should.equal(dyn(<<"">>))
+}
+
+pub fn encode_uri_component_utf8_test() {
+  // Non-ASCII characters are UTF-8 encoded then each octet percent-escaped
+  // (RFC 3629). `Ю` = U+042E = 0xD0 0xAE; `н` = U+043D = 0xD0 0xBD.
+  val("encodeURIComponent(\"Юн\")") |> should.equal(dyn(<<"%D0%AE%D0%BD">>))
+}
+
+pub fn encode_uri_test() {
+  // encodeURI ADDITIONALLY leaves the uriReserved set and `#` literal.
+  val("encodeURI(\";/?:@&=+$,#\")") |> should.equal(dyn(<<";/?:@&=+$,#">>))
+  // Non-reserved characters (space, `\"`) are still escaped.
+  val("encodeURI(\"a b\")") |> should.equal(dyn(<<"a%20b">>))
+  // A full URL keeps its structural delimiters.
+  val("encodeURI(\"http://unipro.ru/0123456789\")")
+  |> should.equal(dyn(<<"http://unipro.ru/0123456789">>))
+}
+
+pub fn decode_uri_component_basic_test() {
+  // decodeURIComponent has an EMPTY reserved set, so EVERY escape is decoded —
+  // including the reserved characters (§19.2.6.2).
+  val("decodeURIComponent(\"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\")")
+  |> should.equal(dyn(<<";/?:@&=+$,#">>))
+  // ASCII escapes decode to their byte; non-escaped chars pass through.
+  val("decodeURIComponent(\"%41%42%43\")") |> should.equal(dyn(<<"ABC">>))
+  val("decodeURIComponent(\"http://a/b\")")
+  |> should.equal(dyn(<<"http://a/b">>))
+}
+
+pub fn decode_uri_component_utf8_test() {
+  // A multi-octet escape run rebuilds the original UTF-8 character (RFC 3629).
+  // %D0%AE%D0%BD → `Юн`.
+  val("decodeURIComponent(\"%D0%AE%D0%BD\")")
+  |> should.equal(dyn(<<"Юн">>))
+}
+
+pub fn decode_uri_reserved_preserved_test() {
+  // decodeURI's reserved set (`; / ? : @ & = + $ , #`): an escape that decodes
+  // to one of these is LEFT as its original escape, verbatim and case-preserved
+  // (§19.2.6.1). Non-reserved escapes (e.g. %20 → space) still decode.
+  val("decodeURI(\"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23\")")
+  |> should.equal(dyn(<<"%3B%2F%3F%3A%40%26%3D%2B%24%2C%23">>))
+  val("decodeURI(\"%3b%2f\")") |> should.equal(dyn(<<"%3b%2f">>))
+  // A non-reserved escape between reserved ones: %20 decodes, %23 is preserved.
+  val("decodeURI(\"a%20b%23c\")") |> should.equal(dyn(<<"a b%23c">>))
+  // A multi-octet character is never reserved, so it always decodes.
+  val("decodeURI(\"%D0%AE\")") |> should.equal(dyn(<<"Ю">>))
+}
+
+pub fn decode_uri_malformed_escape_uri_error_test() {
+  // §19.2.6: a truncated or non-hex %-escape is a URIError.
+  is_uri_error("decodeURIComponent(\"%\")") |> should.equal(True)
+  is_uri_error("decodeURIComponent(\"%A\")") |> should.equal(True)
+  is_uri_error("decodeURIComponent(\"%1\")") |> should.equal(True)
+  is_uri_error("decodeURIComponent(\"%GG\")") |> should.equal(True)
+  is_uri_error("decodeURI(\"%\")") |> should.equal(True)
+}
+
+pub fn decode_uri_invalid_utf8_uri_error_test() {
+  // RFC 3629 rejects: continuation byte as a lead (0x80–0xBF), overlong forms,
+  // UTF-16 surrogates, and code points above U+10FFFF — each a URIError.
+  is_uri_error("decodeURIComponent(\"%80\")") |> should.equal(True)
+  // %C0%AF — overlong 2-byte encoding of `/`.
+  is_uri_error("decodeURIComponent(\"%C0%AF\")") |> should.equal(True)
+  // %ED%BF%BF — a UTF-16 low surrogate (U+DFFF).
+  is_uri_error("decodeURIComponent(\"%ED%BF%BF\")") |> should.equal(True)
+  // %ED%7F%BF — a non-continuation second octet.
+  is_uri_error("decodeURIComponent(\"%ED%7F%BF\")") |> should.equal(True)
+  // %ED%BF — a truncated 3-byte sequence.
+  is_uri_error("decodeURIComponent(\"%ED%BF\")") |> should.equal(True)
+  // %F4%90%80%80 — a code point above U+10FFFF.
+  is_uri_error("decodeURIComponent(\"%F4%90%80%80\")") |> should.equal(True)
+}
+
+pub fn decode_uri_valid_utf8_boundaries_test() {
+  // The just-valid boundaries must DECODE (not error): U+0800 (%E0%A0%80, the
+  // minimum non-overlong 3-byte) and U+10000 (%F0%90%80%80, the minimum 4-byte).
+  is_uri_error("decodeURIComponent(\"%E0%A0%80\")") |> should.equal(False)
+  is_uri_error("decodeURIComponent(\"%F0%90%80%80\")") |> should.equal(False)
+}
+
+pub fn uri_round_trip_test() {
+  // encode∘decode is the identity for a component containing reserved chars.
+  val("decodeURIComponent(encodeURIComponent(\"a b/c?d=e&f#g\"))")
+  |> should.equal(dyn(<<"a b/c?d=e&f#g">>))
+  // Non-string arguments are coerced with ToString first.
+  val("encodeURIComponent(123)") |> should.equal(dyn(<<"123">>))
+  val("encodeURI(true)") |> should.equal(dyn(<<"true">>))
 }

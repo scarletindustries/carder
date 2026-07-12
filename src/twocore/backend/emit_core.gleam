@@ -4319,6 +4319,11 @@ fn resolve_js(op: String) -> Option(String) {
     "object_from_entries" -> Some("object_from_entries")
     "json_stringify" -> Some("json_stringify")
     "json_parse" -> Some("json_parse")
+    // URI encode / decode globals
+    "encode_uri_component" -> Some("encode_uri_component")
+    "encode_uri" -> Some("encode_uri")
+    "decode_uri_component" -> Some("decode_uri_component")
+    "decode_uri" -> Some("decode_uri")
     // lists / console / misc
     "empty_list" -> Some("empty_list")
     "console_log" -> Some("console_log")

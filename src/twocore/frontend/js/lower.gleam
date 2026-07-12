@@ -4249,7 +4249,11 @@ fn is_global_fn(name: String) -> Bool {
     | "parseInt"
     | "parseFloat"
     | "isNaN"
-    | "isFinite" -> True
+    | "isFinite"
+    | "encodeURIComponent"
+    | "encodeURI"
+    | "decodeURIComponent"
+    | "decodeURI" -> True
     _ -> False
   }
 }
@@ -4293,6 +4297,16 @@ fn lower_global_call(
     "isNaN", [] -> host("is_nan", [undefined()])
     "isFinite", [x, ..] -> host("is_finite", [x])
     "isFinite", [] -> host("is_finite", [undefined()])
+    // URI encode/decode globals (§19.2.6). A no-arg call coerces the missing
+    // argument as `undefined`, so e.g. encodeURIComponent() → "undefined".
+    "encodeURIComponent", [x, ..] -> host("encode_uri_component", [x])
+    "encodeURIComponent", [] -> host("encode_uri_component", [undefined()])
+    "encodeURI", [x, ..] -> host("encode_uri", [x])
+    "encodeURI", [] -> host("encode_uri", [undefined()])
+    "decodeURIComponent", [x, ..] -> host("decode_uri_component", [x])
+    "decodeURIComponent", [] -> host("decode_uri_component", [undefined()])
+    "decodeURI", [x, ..] -> host("decode_uri", [x])
+    "decodeURI", [] -> host("decode_uri", [undefined()])
     _, _ -> Error(Unsupported(name <> "(…)"))
   }
 }

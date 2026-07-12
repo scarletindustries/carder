@@ -730,6 +730,28 @@ pub fn is_nan(x: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "is_finite")
 pub fn is_finite(x: Dynamic) -> Dynamic
 
+/// `encodeURIComponent(x)` — percent-encode ToString(x), keeping only the
+/// uriUnescaped set (`A-Za-z0-9 - _ . ! ~ * ' ( )`) literal. Malformed UTF-8 in
+/// the source string raises a URIError (`{js_error, uri_error, _}`).
+@external(erlang, "twocore_rt_js_ffi", "encode_uri_component")
+pub fn encode_uri_component(x: Dynamic) -> Dynamic
+
+/// `encodeURI(x)` — like `encode_uri_component` but ALSO keeps the uriReserved
+/// set and `#` (`; / ? : @ & = + $ , #`) literal.
+@external(erlang, "twocore_rt_js_ffi", "encode_uri")
+pub fn encode_uri(x: Dynamic) -> Dynamic
+
+/// `decodeURIComponent(x)` — decode every `%XX` escape of ToString(x) into UTF-8
+/// bytes (empty reserved set). A malformed escape or invalid UTF-8 run raises a
+/// URIError.
+@external(erlang, "twocore_rt_js_ffi", "decode_uri_component")
+pub fn decode_uri_component(x: Dynamic) -> Dynamic
+
+/// `decodeURI(x)` — decode `%XX` escapes of ToString(x), but leave a decoded
+/// reserved character (`; / ? : @ & = + $ , #`) as its original escape verbatim.
+@external(erlang, "twocore_rt_js_ffi", "decode_uri")
+pub fn decode_uri(x: Dynamic) -> Dynamic
+
 /// `x` is `null` or `undefined` → i32 `1`/`0` (behind `??` and optional chaining `?.`).
 @external(erlang, "twocore_rt_js_ffi", "is_nullish")
 pub fn is_nullish(x: Dynamic) -> Int
