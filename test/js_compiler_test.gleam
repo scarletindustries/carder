@@ -1820,6 +1820,25 @@ pub fn static_field_mutation_test() {
   to_float(call(n, "f", [])) |> should.equal(15.0)
 }
 
+pub fn static_field_inheritance_test() {
+  // A subclass reads a static field declared on a parent (via C's storage key).
+  let m =
+    compile(
+      "class A { static registry = 7; } class B extends A {} "
+      <> "function f() { return B.registry; }",
+    )
+  call(m, "main", [])
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+  // writing through the child updates the shared (parent-owned) storage.
+  let n =
+    compile(
+      "class A { static n = 1; } class B extends A {} "
+      <> "function f() { B.n = 9; return A.n; }",
+    )
+  call(n, "main", [])
+  to_float(call(n, "f", [])) |> should.equal(9.0)
+}
+
 pub fn method_overrides_accessor_test() {
   let base = "class A { get value() { return \"getter\"; } } "
   let derived =

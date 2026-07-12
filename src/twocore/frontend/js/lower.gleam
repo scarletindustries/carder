@@ -535,8 +535,10 @@ fn static_class_key(ctx: Ctx, cname: String) -> ir.Value {
   ir.ConstBinary(<<{ ctx.module_name <> "$" <> cname }:utf8>>)
 }
 
-/// If `object.property` names a static field of a known class, returns the class
-/// name and the field name (for `static_get`/`static_set` routing).
+/// If `object.property` reads/writes a static field of a known class, returns the
+/// DEFINING class name and the field name (for `static_get`/`static_set`). The
+/// defining class is resolved up the `extends` chain, so `B.x` for a static `x`
+/// declared on a parent `A` uses A's storage key — static fields are inherited.
 fn static_field_target(
   object: ast.Expression,
   property: ast.Expression,
@@ -545,15 +547,28 @@ fn static_field_target(
 ) -> Option(#(String, String)) {
   case object, property, computed {
     ast.Identifier(name: cname, ..), ast.Identifier(name: field, ..), False ->
-      case dict.get(ctx.classes, cname) {
-        Ok(info) ->
-          case list.contains(info.static_fields, field) {
-            True -> Some(#(cname, field))
-            False -> None
-          }
-        Error(Nil) -> None
+      case static_owner(cname, field, ctx) {
+        Some(owner) -> Some(#(owner, field))
+        None -> None
       }
     _, _, _ -> None
+  }
+}
+
+/// The nearest class in `cname`'s inheritance chain (self first) that declares
+/// `field` as a static field, or `None` if none does.
+fn static_owner(cname: String, field: String, ctx: Ctx) -> Option(String) {
+  case dict.get(ctx.classes, cname) {
+    Ok(info) ->
+      case list.contains(info.static_fields, field) {
+        True -> Some(cname)
+        False ->
+          case info.super_class {
+            Some(p) -> static_owner(p, field, ctx)
+            None -> None
+          }
+      }
+    Error(Nil) -> None
   }
 }
 
