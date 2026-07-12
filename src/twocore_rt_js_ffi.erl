@@ -1272,6 +1272,10 @@ array_set(Recv, Len, Map, Key, V) ->
     erlang:put(?CELL_KEY(Recv), {js_array, NewLen, maps:put(K, V, Map)}),
     V.
 
+%% Every array IS an Array instance, so `x instanceof Array` (compiled to a
+%% has_prop for the `@@is_Array` brand) is true for any array cell — arrays carry
+%% no explicit brand key, so recognise it here.
+array_has(_Map, <<"@@is_Array">>) -> 1;
 array_has(_Map, <<"length">>) -> 1;
 array_has(Map, Key) -> bool_int(maps:is_key(array_key(Key), Map)).
 
@@ -1309,26 +1313,82 @@ array_pop(Recv) when is_reference(Recv) ->
 array_pop(Recv) ->
     type_error(Recv).
 
-%% Array.from(x) — a new array from an array (copy), a string (its chars), or an
-%% array-like; a non-iterable yields an empty array.
-array_from(X) when is_reference(X) ->
-    case erlang:get(?CELL_KEY(X)) of
-        {js_array, Len, Map} -> new_array(arr_list(Len, Map));
-        _ -> new_array([])
-    end;
-array_from(X) when is_binary(X) ->
-    new_array([from_cps([C]) || C <- cps(X)]);
-array_from(_X) ->
-    new_array([]).
+%% Array.from(x) / Array.from(x, mapFn) — a NEW array built from an array (copy),
+%% a string (its code points), or an array-like object (any object carrying a
+%% `length` property plus 0-based index properties). Elements are read one at a
+%% time in index order via a fresh Get, so a `mapFn` that mutates the source array
+%% observes its own writes (the array-iterator / per-index Get of §23.1.2.1); the
+%% element count is fixed once at entry — an array's live length, a string's
+%% code-point count, or ToLength(Get(obj,"length")) for an array-like. Holes and
+%% absent indices read as `undefined`. Any other value yields an empty array.
+array_from(X) ->
+    new_array(array_from_elems(X, undefined)).
 
-%% Array.from(x, mapFn) — like array_from, then apply mapFn(element, index) to
-%% each element (§23.1.2.1 step 7).
+%% Array.from(x, mapFn) — as array_from, with mapFn(element, index) applied to each
+%% element as it is read (§23.1.2.1 step 7); a mapFn of `undefined` means no mapping.
 array_from_map(X, Fn) ->
-    {Len, Map} = arr_content(array_from(X)),
-    new_array(amap_from(Fn, arr_list(Len, Map), 0)).
+    new_array(array_from_elems(X, Fn)).
 
-amap_from(_Fn, [], _I) -> [];
-amap_from(Fn, [E | Es], I) -> [call_cb(Fn, [E, I]) | amap_from(Fn, Es, I + 1)].
+array_from_elems(X, Fn) when is_binary(X) ->
+    from_map_list([from_cps([C]) || C <- cps(X)], Fn, 0);
+array_from_elems(X, Fn) when is_reference(X) ->
+    from_map_index(X, Fn, 0, arr_from_length(X));
+array_from_elems(_X, _Fn) ->
+    [].
+
+%% The number of elements Array.from reads from a cell: an array's live length,
+%% ToLength(Get(obj,"length")) for an array-like object, or 0 for any other cell
+%% (Map/Set/RegExp/Date/generator — not iterated here, a v1 gap).
+arr_from_length(X) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_array, Len, _} -> Len;
+        M when is_map(M) -> to_length(resolve_get(maps:get(<<"length">>, M, undefined)));
+        _ -> 0
+    end.
+
+%% Build [f(x_K,K), …, f(x_{N-1},N-1)] reading each x_k FRESH from cell X (so a
+%% mapping callback sees writes it makes to later indices), f being `Fn` or the
+%% identity when Fn is `undefined`.
+from_map_index(_X, _Fn, K, N) when K >= N -> [];
+from_map_index(X, Fn, K, N) ->
+    [from_apply(Fn, arr_from_get(X, K), K) | from_map_index(X, Fn, K + 1, N)].
+
+%% As from_map_index but over an already-materialized element list (the string case).
+from_map_list([], _Fn, _I) -> [];
+from_map_list([E | Es], Fn, I) ->
+    [from_apply(Fn, E, I) | from_map_list(Es, Fn, I + 1)].
+
+from_apply(undefined, E, _I) -> E;
+from_apply(Fn, E, I) -> call_cb(Fn, [E, I]).
+
+%% Read index K (0-based) fresh from an array or array-like object cell; a hole /
+%% absent index reads as `undefined`.
+arr_from_get(X, K) ->
+    case erlang:get(?CELL_KEY(X)) of
+        {js_array, _Len, Map} -> maps:get(K, Map, undefined);
+        M when is_map(M) -> resolve_get(maps:get(to_string(K), M, undefined));
+        _ -> undefined
+    end.
+
+%% ToLength(v) (§7.1.20): ToIntegerOrInfinity clamped to the array-index range
+%% [0, 2^53-1]. NaN / -Infinity → 0; +Infinity → 2^53-1.
+to_length(V) ->
+    case coerce_num(V) of
+        nan -> 0;
+        neg_inf -> 0;
+        inf -> 16#1FFFFFFFFFFFFF;
+        N -> min(max(trunc(as_float(N)), 0), 16#1FFFFFFFFFFFFF)
+    end.
+
+%% ToIntegerOrInfinity(v) (§7.1.5): NaN → 0, ±Infinity pass through as inf/neg_inf,
+%% otherwise truncate toward zero.
+to_int_or_inf(V) ->
+    case coerce_num(V) of
+        nan -> 0;
+        inf -> inf;
+        neg_inf -> neg_inf;
+        N -> trunc(as_float(N))
+    end.
 
 %% arr.flat() — flatten one level (array elements are spread in).
 %% arr.flat(depth) — flatten nested arrays up to `depth` levels. Depth defaults to

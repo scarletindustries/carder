@@ -1374,6 +1374,58 @@ pub fn array_static_test() {
   num("Array.of(1, 2, 3).length") |> should.equal(3.0)
 }
 
+// ── Array.from edge cases (ES 23.1.2.1) ──────────────────────────────────────
+
+pub fn array_from_arraylike_test() {
+  // From an array-like object: read `length`, then indices 0..len-1 as own props.
+  let m =
+    compile(
+      "function f() { var o = { length: 4, 0: 2, 1: 4, 2: 0, 3: 16 }; return Array.from(o).join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"2,4,0,16">>))
+  // An absent index reads as undefined (rendered "" by join).
+  let hole =
+    compile(
+      "function f() { var o = { length: 3, 0: 2, 2: 16 }; return Array.from(o).join(\",\"); }",
+    )
+  call(hole, "f", []) |> should.equal(dyn(<<"2,,16">>))
+  // `{ length }` with no indices → an array of that many undefined holes.
+  num("Array.from({ length: 5 }).length") |> should.equal(5.0)
+  // A non-object, non-string source yields an empty array.
+  num("Array.from(5).length") |> should.equal(0.0)
+  // From a string: one element per code point.
+  let s = compile("function f() { return Array.from(\"abc\").join(\"-\"); }")
+  call(s, "f", []) |> should.equal(dyn(<<"a-b-c">>))
+}
+
+pub fn array_from_map_live_test() {
+  // Array.from(array, mapFn) reads each element FRESH: a mapFn that overwrites a
+  // not-yet-visited index makes the next step observe the new value
+  // (test262 Array/from/elements-updated-after).
+  let m =
+    compile(
+      "var fa = []; function famap(v, i) { if (i + 1 < fa.length) fa[i + 1] = 1; return v; } "
+      <> "function f() { fa = [1, 0, 0]; return Array.from(fa, famap).join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"1,1,1">>))
+  // The map callback receives (element, index).
+  let idx =
+    compile(
+      "function f() { return Array.from([9, 9, 9], function(v, i) { return i; }).join(\",\"); }",
+    )
+  call(idx, "f", []) |> should.equal(dyn(<<"0,1,2">>))
+}
+
+pub fn instanceof_array_test() {
+  // Every array is an Array instance; a plain object is not.
+  let a = compile("function f() { return [1, 2] instanceof Array; }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  let b = compile("function f() { return Array.from([1]) instanceof Array; }")
+  call(b, "f", []) |> should.equal(dyn(True))
+  let n = compile("function f() { var o = {}; return o instanceof Array; }")
+  call(n, "f", []) |> should.equal(dyn(False))
+}
+
 pub fn object_static_test() {
   num("Object.keys({ a: 1, b: 2 }).length") |> should.equal(2.0)
   num("Object.values({ a: 1, b: 2, c: 3 }).length") |> should.equal(3.0)
