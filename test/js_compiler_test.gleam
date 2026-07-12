@@ -2735,3 +2735,15 @@ pub fn parse_float_whitespace_test() {
   num("parseFloat('\\u1680\\u3000-2.5')") |> should.equal(-2.5)
   num("Number.isNaN(parseFloat('\\u00A0')) ? 1 : 0") |> should.equal(1.0)
 }
+
+pub fn numeric_globals_no_arg_test() {
+  // A missing argument is `undefined`: ToNumber(undefined) is NaN, so isNaN() is
+  // true and isFinite() is false; ToString(undefined) is "undefined" (no numeric
+  // prefix) so parseInt()/parseFloat() are NaN.
+  let a = compile("function f() { return isNaN(); }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  let b = compile("function f() { return isFinite(); }")
+  call(b, "f", []) |> should.equal(dyn(False))
+  num("Number.isNaN(parseInt()) ? 1 : 0") |> should.equal(1.0)
+  num("Number.isNaN(parseFloat()) ? 1 : 0") |> should.equal(1.0)
+}

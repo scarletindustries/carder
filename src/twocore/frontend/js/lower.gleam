@@ -4283,9 +4283,16 @@ fn lower_global_call(
     "Boolean", [] -> Ok(#(binds, ir.ConstAtom("false"), ctr))
     "parseInt", [s] -> host("parse_int", [s, undefined()])
     "parseInt", [s, r, ..] -> host("parse_int", [s, r])
+    // No-arg calls coerce the missing argument as `undefined`: ToString(undefined)
+    // is "undefined" (no numeric prefix) so parseInt()/parseFloat() → NaN, and
+    // ToNumber(undefined) is NaN so isNaN() → true and isFinite() → false.
+    "parseInt", [] -> host("parse_int", [undefined(), undefined()])
     "parseFloat", [s, ..] -> host("parse_float", [s])
+    "parseFloat", [] -> host("parse_float", [undefined()])
     "isNaN", [x, ..] -> host("is_nan", [x])
+    "isNaN", [] -> host("is_nan", [undefined()])
     "isFinite", [x, ..] -> host("is_finite", [x])
+    "isFinite", [] -> host("is_finite", [undefined()])
     _, _ -> Error(Unsupported(name <> "(…)"))
   }
 }
