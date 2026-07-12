@@ -1174,6 +1174,47 @@ pub fn object_method_test() {
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
 
+// ── class inheritance ────────────────────────────────────────────────────────
+
+const animal_src = "class Animal { constructor(name) { this.name = name; } speak() { return this.name + \" makes a sound\"; } } "
+
+pub fn class_inherit_override_test() {
+  let m =
+    compile(
+      animal_src
+      <> "class Dog extends Animal { constructor(name) { super(name); this.legs = 4; } speak() { return this.name + \" barks\"; } } function f() { let d = new Dog(\"Rex\"); return d.speak(); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"Rex barks">>))
+}
+
+pub fn class_inherit_fields_test() {
+  let m =
+    compile(
+      animal_src
+      <> "class Dog extends Animal { constructor(name) { super(name); this.legs = 4; } info() { return this.name + \" has \" + this.legs; } } function f() { let d = new Dog(\"Rex\"); return d.info(); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"Rex has 4">>))
+}
+
+pub fn class_inherit_method_test() {
+  // Cat inherits speak() from Animal
+  let m =
+    compile(
+      animal_src
+      <> "class Cat extends Animal { constructor(name) { super(name); } } function f() { let c = new Cat(\"Tom\"); return c.speak(); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"Tom makes a sound">>))
+}
+
+pub fn class_super_method_test() {
+  let m =
+    compile(
+      animal_src
+      <> "class Loud extends Animal { constructor(name) { super(name); } speak() { return super.speak() + \"!!!\"; } } function f() { let l = new Loud(\"X\"); return l.speak(); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"X makes a sound!!!">>))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

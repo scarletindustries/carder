@@ -25,8 +25,9 @@
 //// with indexing, `.length`, spread `[...a]`; first-class functions — function
 //// expressions, arrow functions, closures
 //// (value-capture), higher-order calls, IIFEs; classes (constructor, instance methods
-//// & fields, `new`, `this`, method calls — no inheritance); `console.log`. Control
-//// flow threads mutated variables as loop-carried params / phi-merged `If`s.
+//// & fields, `new`, `this`, method calls, `extends`/`super` inheritance);
+//// `console.log`. Control flow threads mutated variables as loop-carried params /
+//// phi-merged `If`s.
 ////
 //// Control flow also includes `for-of` (over arrays/strings), `switch` (with
 //// fall-through, default in any position, and `break` that targets the switch), and
@@ -42,12 +43,13 @@
 //// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`, and `JSON.stringify`/`JSON.parse`.
 ////
-//// Not yet (a clean `Unsupported` error / panic): class inheritance (`extends`/
-//// `super`), static/getter/setter members, nested/defaulted destructuring, call spread
-//// `f(...a)`, rest params, regex, `try`/`finally`, generators/async, and `continue`
-//// inside a `do/while`. (A regular function EXPRESSION captures `this` lexically like
-//// an arrow, rather than binding it dynamically. `JSON`/`Object.keys` key order follows
-//// the backing map, not insertion order.)
+//// Not yet (a clean `Unsupported` error / panic): static/getter/setter class members,
+//// nested/defaulted destructuring, call spread `f(...a)`, rest params, regex,
+//// `try`/`finally`, generators/async, and `continue` inside a `do/while`. (A derived
+//// class needs an explicit constructor that calls `super(…)`; field initializers run
+//// before `super()` rather than after — v1 ordering simplifications. A regular function
+//// EXPRESSION captures `this` lexically like an arrow. `JSON`/`Object.keys` key order
+//// follows the backing map, not insertion order.)
 //// (A default value on an arrow/function-EXPRESSION param only applies when it is
 //// called with the full arity or through an array method, since a closure call site
 //// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
@@ -130,10 +132,15 @@ type Lambda {
 /// source span (so an arrow/function-expression node lowers to a `MakeClosure` of its
 /// lifted function); and the set of variables reassigned in the CURRENT function scope
 /// (a closure that captures one of these by value would be unsound, so it is rejected).
-/// A class's shape for `new C(…)`: how many args its constructor takes and each
-/// instance method's name + arity (its lifted function is `C$constructor` / `C$name`).
+/// A class's shape for `new C(…)`: its superclass (for `extends`/`super` and inherited
+/// methods), how many args its constructor takes, and each instance method's name +
+/// arity (its lifted function is `C$constructor` / `C$name`).
 type ClassInfo {
-  ClassInfo(ctor_arity: Int, methods: List(#(String, Int)))
+  ClassInfo(
+    super_class: Option(String),
+    ctor_arity: Int,
+    methods: List(#(String, Int)),
+  )
 }
 
 type Ctx {
@@ -141,6 +148,8 @@ type Ctx {
     funcs: List(String),
     fn_arity: Dict(String, Int),
     classes: Dict(String, ClassInfo),
+    // the superclass name while lowering a class's constructor/methods (for `super`).
+    current_super: Option(String),
     loop: Option(Loop),
     brk: Option(#(String, List(String))),
     lambdas: Dict(ast.Span, Lambda),
@@ -165,7 +174,9 @@ pub fn program(
   let fn_names = list.map(decls, fn(d) { d.0 })
   let class_decls = list.filter_map(stmts, as_class_decl)
   let classes =
-    dict.from_list(list.map(class_decls, fn(c) { #(c.0, class_info(c.1)) }))
+    dict.from_list(
+      list.map(class_decls, fn(c) { #(c.0, class_info(c.1, c.2)) }),
+    )
   let top =
     list.filter(stmts, fn(s) {
       as_function_decl(s) == Error(Nil) && as_class_decl(s) == Error(Nil)
@@ -177,7 +188,7 @@ pub fn program(
     list.flatten([
       top,
       list.flat_map(decls, fn(d) { block_stmts(d.2) }),
-      list.flat_map(class_decls, fn(c) { class_scan_stmts(c.1) }),
+      list.flat_map(class_decls, fn(c) { class_scan_stmts(c.2) }),
     ])
   use lambdas <- result_try(collect_lambdas(scan, fn_names))
   let fn_arity =
@@ -187,6 +198,7 @@ pub fn program(
       funcs: fn_names,
       fn_arity:,
       classes:,
+      current_super: None,
       loop: None,
       brk: None,
       lambdas:,
@@ -204,9 +216,9 @@ pub fn program(
     list.try_map(dict.values(lambdas), fn(lam) { lower_lambda(lam, ctx) }),
   )
   use class_fn_lists <- result_try(
-    list.try_map(class_decls, fn(c) { lower_class(c.0, c.1, ctx) }),
+    list.try_map(class_decls, fn(c) { lower_class(c.0, c.1, c.2, ctx) }),
   )
-  let class_funcs = list.flat_map(class_fn_lists, fn(x) { x.0 })
+  let class_funcs = list.flatten(class_fn_lists)
 
   // The named JS functions (exported) plus the internal lifted lambdas + class
   // methods (not exported).
@@ -243,13 +255,25 @@ type ClassParts {
   )
 }
 
-fn as_class_decl(s: ast.Statement) -> Result(#(String, ClassParts), Nil) {
+fn as_class_decl(
+  s: ast.Statement,
+) -> Result(#(String, Option(String), ClassParts), Nil) {
   case s {
-    ast.ClassDeclaration(name: Some(name), super_class: None, body:, ..) ->
-      case class_parts(body) {
-        Ok(parts) -> Ok(#(name, parts))
-        Error(_) -> Error(Nil)
+    ast.ClassDeclaration(name: Some(name), super_class:, body:, ..) -> {
+      let parent = case super_class {
+        Some(ast.Identifier(name: p, ..)) -> Some(p)
+        _ -> None
       }
+      // A non-identifier `extends` (e.g. a mixin expression) isn't supported.
+      case super_class, parent {
+        Some(_), None -> Error(Nil)
+        _, _ ->
+          case class_parts(body) {
+            Ok(parts) -> Ok(#(name, parent, parts))
+            Error(_) -> Error(Nil)
+          }
+      }
+    }
     _ -> Error(Nil)
   }
 }
@@ -371,24 +395,28 @@ fn lower_class_method(
 
 /// A class's `ClassInfo` (constructor arity + method arities) computed from its parts,
 /// without lowering — so `new C(…)` can resolve before the methods are lowered.
-fn class_info(parts: ClassParts) -> ClassInfo {
+fn class_info(parent: Option(String), parts: ClassParts) -> ClassInfo {
   let ctor_arity = case parts.ctor {
     Some(#(p, _)) -> list.length(p)
     None -> 0
   }
   ClassInfo(
+    super_class: parent,
     ctor_arity: ctor_arity,
     methods: list.map(parts.methods, fn(m) { #(m.0, list.length(m.1)) }),
   )
 }
 
 /// Generate the IR functions for one class: `C$constructor(this, …)` plus
-/// `C$name(this, …)` per method. Returns the functions and the `ClassInfo`.
+/// `C$name(this, …)` per method. The class's constructor/methods are lowered with
+/// `current_super` set to the superclass so `super` resolves.
 fn lower_class(
   cname: String,
+  parent: Option(String),
   parts: ClassParts,
   ctx: Ctx,
-) -> Result(#(List(ir.Function), ClassInfo), Error) {
+) -> Result(List(ir.Function), Error) {
+  let cctx = Ctx(..ctx, current_super: parent)
   let ctor_params = case parts.ctor {
     Some(#(p, _)) -> p
     None -> []
@@ -397,7 +425,7 @@ fn lower_class(
     cname <> "$constructor",
     ctor_params,
     ctor_body_stmts(parts),
-    ctx,
+    cctx,
   ))
   use method_fns <- result_try(
     list.try_map(parts.methods, fn(m) {
@@ -406,16 +434,30 @@ fn lower_class(
         cname <> "$" <> mname,
         mparams,
         block_stmts(mbody),
-        ctx,
+        cctx,
       )
     }),
   )
-  let info =
-    ClassInfo(
-      ctor_arity: list.length(ctor_params),
-      methods: list.map(parts.methods, fn(m) { #(m.0, list.length(m.1)) }),
-    )
-  Ok(#([ctor_fn, ..method_fns], info))
+  Ok([ctor_fn, ..method_fns])
+}
+
+/// The instance methods to install for `new C(…)`, ancestors-first (so an overriding
+/// child method, installed later, wins): `(defining_class, method_name, arity)`.
+fn chain_methods(
+  cname: String,
+  classes: Dict(String, ClassInfo),
+) -> List(#(String, String, Int)) {
+  case dict.get(classes, cname) {
+    Error(Nil) -> []
+    Ok(info) -> {
+      let ancestors = case info.super_class {
+        Some(p) -> chain_methods(p, classes)
+        None -> []
+      }
+      let own = list.map(info.methods, fn(m) { #(cname, m.0, m.1) })
+      list.append(ancestors, own)
+    }
+  }
 }
 
 fn as_function_decl(
@@ -2002,6 +2044,13 @@ fn lower_call(
     )
       if ns == "Array" || ns == "Object" || ns == "Number" || ns == "JSON"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
+    // `super.method(args)` — call the superclass's method on the current `this`.
+    ast.MemberExpression(
+      object: ast.SuperExpression(..),
+      property: ast.Identifier(name: method, ..),
+      computed: False,
+      ..,
+    ) -> lower_super_call(Some(method), arguments, env, ctx, ctr)
     // recv.method(args) — method dispatch (array/string methods).
     ast.MemberExpression(
       object:,
@@ -2047,6 +2096,8 @@ fn lower_call(
               }
           }
       }
+    // `super(args)` — call the superclass constructor on the current `this`.
+    ast.SuperExpression(..) -> lower_super_call(None, arguments, env, ctx, ctr)
     // any other callee: evaluate it to a function value and apply it — IIFEs
     // `(x => x)(5)`, a returned/stored closure, `getFn()(…)`, etc.
     _ -> {
@@ -2054,6 +2105,38 @@ fn lower_call(
       use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
       Ok(bind_after(list.append(bc, ba), ir.CallClosure(fv, argvals), ctr))
     }
+  }
+}
+
+/// `super(args)` (member `None`) or `super.method(args)` (member `Some(name)`) — a
+/// direct call to the superclass's constructor/method, passing the current `this`.
+fn lower_super_call(
+  member: Option(String),
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case ctx.current_super, dict.get(env, "this") {
+    Some(parent), Ok(this_v) -> {
+      use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+      let fn_name = case member {
+        None -> parent <> "$constructor"
+        Some(m) -> parent <> "$" <> m
+      }
+      // fit args to the target's arity (constructor arity is known; a method's is
+      // padded generously via the closure convention, so pass args through).
+      let target_args = case member {
+        None ->
+          case dict.get(ctx.classes, parent) {
+            Ok(info) -> fit_args(argvals, info.ctor_arity)
+            Error(Nil) -> argvals
+          }
+        Some(_) -> argvals
+      }
+      Ok(bind_after(ba, ir.CallDirect(fn_name, [this_v, ..target_args]), ctr))
+    }
+    _, _ -> Error(Unsupported("`super` outside a derived class method"))
   }
 }
 
@@ -2239,29 +2322,34 @@ fn lower_new(
         Ok(info) -> {
           let #(binds, this_v, ctr) =
             bind_after([], ir.CallHost("js", "new_object", []), ctr)
-          // install each method as a closure over `this`.
+          // install every method in the class chain as a closure over `this`
+          // (ancestors first, so an overriding child method wins).
           let #(binds, ctr) =
-            list.fold(info.methods, #(binds, ctr), fn(acc, m) {
-              let #(binds, ctr) = acc
-              let #(mname, marity) = m
-              let #(bc, closure_v, ctr) =
-                bind_after(
-                  binds,
-                  ir.MakeClosure(cname <> "$" <> mname, [this_v], marity),
-                  ctr,
-                )
-              let #(bs, _r, ctr) =
-                bind_after(
-                  bc,
-                  ir.CallHost("js", "set_prop", [
-                    this_v,
-                    ir.ConstBinary(<<mname:utf8>>),
-                    closure_v,
-                  ]),
-                  ctr,
-                )
-              #(bs, ctr)
-            })
+            list.fold(
+              chain_methods(cname, ctx.classes),
+              #(binds, ctr),
+              fn(acc, m) {
+                let #(binds, ctr) = acc
+                let #(defclass, mname, marity) = m
+                let #(bc, closure_v, ctr) =
+                  bind_after(
+                    binds,
+                    ir.MakeClosure(defclass <> "$" <> mname, [this_v], marity),
+                    ctr,
+                  )
+                let #(bs, _r, ctr) =
+                  bind_after(
+                    bc,
+                    ir.CallHost("js", "set_prop", [
+                      this_v,
+                      ir.ConstBinary(<<mname:utf8>>),
+                      closure_v,
+                    ]),
+                    ctr,
+                  )
+                #(bs, ctr)
+              },
+            )
           use #(ba, argvals, ctr) <- result_try(lower_args(
             arguments,
             env,
