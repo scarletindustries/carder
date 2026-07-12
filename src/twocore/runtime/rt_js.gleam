@@ -402,6 +402,26 @@ pub fn string_raw(template: Dynamic, subs: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "date_now")
 pub fn date_now() -> Dynamic
 
+/// `new Date(...)` — construct a Date cell from the argument cons list (no args →
+/// now; one string → ISO parse; one Date → copy; one other → ToNumber; ≥2 → the
+/// component form, treated as UTC).
+@external(erlang, "twocore_rt_js_ffi", "date_new")
+pub fn date_new(args: Dynamic) -> Dynamic
+
+/// `Date.UTC(...)` — the time value (a number of ms, or NaN) for a component list.
+@external(erlang, "twocore_rt_js_ffi", "date_utc")
+pub fn date_utc(args: Dynamic) -> Dynamic
+
+/// `Date.parse(s)` — ToString then parse as ISO 8601; the time value (ms) or NaN.
+@external(erlang, "twocore_rt_js_ffi", "date_parse")
+pub fn date_parse(s: Dynamic) -> Dynamic
+
+/// A Date instance method (`getTime`/`valueOf`/`getUTCFullYear`/`toISOString`/…):
+/// `recv` the receiver, `name` the JS method name (binary), `args` the full argument
+/// cons list. Dispatches on `recv`'s tag; a non-Date receiver delegates to a user method.
+@external(erlang, "twocore_rt_js_ffi", "date_call")
+pub fn date_call(recv: Dynamic, name: Dynamic, args: Dynamic) -> Dynamic
+
 /// `arr.flatMap(fn)` — map then flatten one level.
 @external(erlang, "twocore_rt_js_ffi", "array_flat_map")
 pub fn array_flat_map(arr: Dynamic, fn_: Dynamic) -> Dynamic
