@@ -2329,6 +2329,35 @@ pub fn map_samevaluezero_keys_test() {
   call(int_float, "f", []) |> should.equal(dyn("i,true"))
 }
 
+pub fn map_iterators_test() {
+  // 24.1.3.8/.10/.4 keys()/values()/entries() return an iterator whose .next() yields
+  // {value, done} in insertion order, then {value: undefined, done: true} when spent.
+  let keys =
+    compile(
+      "function f() { let m = new Map([[\"a\", 1], [\"b\", 2]]); let it = m.keys(); let r1 = it.next(); let r2 = it.next(); let r3 = it.next(); return r1.value + r2.value + \",\" + r3.done + \",\" + r3.value; }",
+    )
+  call(keys, "f", []) |> should.equal(dyn("ab,true,undefined"))
+  let values =
+    compile(
+      "function f() { let m = new Map([[\"a\", 10], [\"b\", 20]]); let out = 0; let it = m.values(); let r = it.next(); while (!r.done) { out += r.value; r = it.next(); } return out; }",
+    )
+  to_float(call(values, "f", [])) |> should.equal(30.0)
+  let entries =
+    compile(
+      "function f() { let m = new Map([[\"a\", 1]]); let it = m.entries(); let r = it.next(); return r.value[0] + \"=\" + r.value[1]; }",
+    )
+  call(entries, "f", []) |> should.equal(dyn("a=1"))
+}
+
+pub fn set_values_iterator_test() {
+  // 24.2.3.10 Set.prototype.values iterates the set's values in insertion order.
+  let m =
+    compile(
+      "function f() { let s = new Set([3, 1, 2]); let it = s.values(); let out = \"\"; let r = it.next(); while (!r.done) { out += r.value; r = it.next(); } return out; }",
+    )
+  call(m, "f", []) |> should.equal(dyn("312"))
+}
+
 pub fn set_foreach_order_test() {
   // 24.2.3.6 Set.prototype.forEach visits values in insertion order and calls back
   // with (value, value, set) — a Set's key is its value.

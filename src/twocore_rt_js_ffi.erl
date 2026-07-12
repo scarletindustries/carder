@@ -77,6 +77,7 @@
     new_regex/2, regex_test/2, regex_source/1, regex_flags/1, str_match/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
+    js_m_keys/2, js_m_values/2, js_m_entries/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
     array_some/2, array_every/2, array_find/2, array_includes/3,
@@ -2145,6 +2146,76 @@ next_set_entry(Recv, Last) ->
         _ ->
             none
     end.
+
+%% keys/values/entries — a LIVE iterator object (a generator cell driven by `.next()`).
+%% Kind selects what each step yields: `key`, `value`, or an `[k, v]` (`[v, v]` for a
+%% Set) entry array. A private cursor cell remembers the last Seq visited; each step
+%% re-reads the live collection, so additions/deletions during iteration are honoured
+%% (CreateMapIterator / CreateSetIterator).
+js_m_keys(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, _, _} -> make_map_iter(Recv, key);
+        {js_set, _, _} -> make_set_iter(Recv, value);
+        _ -> delegate(Recv, <<"keys">>, Args)
+    end.
+
+js_m_values(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, _, _} -> make_map_iter(Recv, value);
+        {js_set, _, _} -> make_set_iter(Recv, value);
+        _ -> delegate(Recv, <<"values">>, Args)
+    end.
+
+js_m_entries(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, _, _} -> make_map_iter(Recv, entry);
+        {js_set, _, _} -> make_set_iter(Recv, entry);
+        _ -> delegate(Recv, <<"entries">>, Args)
+    end.
+
+make_map_iter(Recv, Kind) ->
+    Cursor = cell_new(-1),
+    gen_make(fun(_Arg) ->
+        Last = cell_get(Cursor),
+        case next_map_entry(Recv, Last) of
+            none ->
+                iter_result(undefined, true);
+            {Seq, K, V} ->
+                cell_set(Cursor, Seq),
+                Val =
+                    case Kind of
+                        key -> K;
+                        value -> V;
+                        entry -> new_array([K, V])
+                    end,
+                iter_result(Val, false)
+        end
+    end).
+
+make_set_iter(Recv, Kind) ->
+    Cursor = cell_new(-1),
+    gen_make(fun(_Arg) ->
+        Last = cell_get(Cursor),
+        case next_set_entry(Recv, Last) of
+            none ->
+                iter_result(undefined, true);
+            {Seq, V} ->
+                cell_set(Cursor, Seq),
+                Val =
+                    case Kind of
+                        value -> V;
+                        entry -> new_array([V, V])
+                    end,
+                iter_result(Val, false)
+        end
+    end).
+
+%% A fresh `{value: Val, done: Done}` result object for the iterator protocol.
+iter_result(Val, Done) ->
+    O = new_object(),
+    set_prop(O, <<"value">>, Val),
+    set_prop(O, <<"done">>, Done),
+    O.
 
 %% The cell's tagged content, or `undefined` for a non-reference (so the delegate path
 %% is taken for primitives / plain values).
