@@ -227,6 +227,13 @@ type Ctx {
     pending_label: Option(String),
     lambdas: Dict(ast.Span, Lambda),
     scope_mutated: List(String),
+    // TOP-LEVEL var/let/const names — a module-global store (via static_get/set with
+    // class `module_name<>"$g"`) so a callback can mutate a top-level flag that
+    // `main` then reads. A function-local of the same name shadows the global.
+    globals: List(String),
+    // True only while lowering top-level (`main`) code, so a top-level var decl
+    // initializes the global store rather than binding a local.
+    top_level: Bool,
   )
 }
 
@@ -265,6 +272,8 @@ pub fn program(
       }
     })
 
+  // Top-level var/let/const names become module-globals (a shared static store).
+  let globals = list.unique(declared_var_names(top))
   // Pre-pass: lift every function/arrow expression (in top-level code AND inside the
   // declared functions and class methods) to a named IR function, keyed by span.
   let scan =
@@ -273,7 +282,13 @@ pub fn program(
       list.flat_map(decls, fn(d) { block_stmts(d.2) }),
       list.flat_map(class_decls, fn(c) { class_scan_stmts(c.2) }),
     ])
-  use lambdas <- result_try(collect_lambdas(scan, fn_names))
+  // A closure referencing a top-level global (or a top-level function) must NOT
+  // treat it as a captured free variable — it resolves through the global store /
+  // function table at use, not by capture. So both are excluded from captures.
+  use lambdas <- result_try(collect_lambdas(
+    scan,
+    list.append(fn_names, globals),
+  ))
   let fn_arity =
     dict.from_list(list.map(decls, fn(d) { #(d.0, list.length(d.1)) }))
   let fn_rest =
@@ -299,6 +314,8 @@ pub fn program(
       pending_label: None,
       lambdas:,
       scope_mutated: [],
+      globals: globals,
+      top_level: False,
     )
 
   use funcs <- result_try(
@@ -1610,7 +1627,7 @@ fn lower_main(
   stmts: List(ast.Statement),
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
+  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts), top_level: True)
   use #(body, _ctr) <- result_try(lower_body(stmts, dict.new(), ctx2, 0))
   Ok(ir.Function(
     name: "main",
@@ -1786,14 +1803,34 @@ fn lower_var_decls(
         None -> #(ast.UndefinedExpression(span: ast.Span(0, 0)), Nil)
       }
       use #(binds, v, ctr2) <- result_try(lower_expr(e, env, ctx, ctr))
-      use #(more, ctr3) <- result_try(lower_var_decls(
-        rest,
-        dict.insert(env, x, v),
-        ctx,
-        ctr2,
-        k,
-      ))
-      Ok(#(emit_lets(binds, more), ctr3))
+      // A TOP-LEVEL declaration of a global name initializes the shared store and
+      // does NOT bind a local, so every read (here and in nested functions) routes
+      // to the store. A function-local declaration (or a non-global top-level temp
+      // like a destructuring `%d_N`) stays an ordinary SSA binding.
+      case ctx.top_level && is_global(x, ctx) {
+        True -> {
+          let #(binds2, _sv, ctr3) =
+            bind_after(binds, global_write(x, v, ctx), ctr2)
+          use #(more, ctr4) <- result_try(lower_var_decls(
+            rest,
+            env,
+            ctx,
+            ctr3,
+            k,
+          ))
+          Ok(#(emit_lets(binds2, more), ctr4))
+        }
+        False -> {
+          use #(more, ctr3) <- result_try(lower_var_decls(
+            rest,
+            dict.insert(env, x, v),
+            ctx,
+            ctr2,
+            k,
+          ))
+          Ok(#(emit_lets(binds, more), ctr3))
+        }
+      }
     }
     // `let [a, b] = e` / `let {x, y} = e` — desugar to a temp + simple declarators.
     [ast.VariableDeclarator(id: pattern, init:), ..rest] -> {
@@ -2034,6 +2071,17 @@ fn desugar_destructure(
 /// rebound. An assignment buried in a larger expression (`f(x = 1)`, `(x = 1) + 1`,
 /// `while ((line = next()) != null)`) computes the right value but its target's env
 /// rebind is not threaded here, so a later read of that target sees the old value.
+/// Rebind `x` to `v` in the SSA env ONLY if `x` is already a local binding. A
+/// module-global (never in env — its writes go to the shared store) must NOT be
+/// cached in the env, or a later read would be stale after an intervening call
+/// mutated the global.
+fn rebind(env: Env, x: String, v: ir.Value) -> Env {
+  case dict.has_key(env, x) {
+    True -> dict.insert(env, x, v)
+    False -> env
+  }
+}
+
 fn env_after_effect(e: ast.Expression, v: ir.Value, env: Env) -> Env {
   case e {
     // A plain `x = y = e` chain: `v` is the shared assigned value, so rebind `x`
@@ -2043,16 +2091,16 @@ fn env_after_effect(e: ast.Expression, v: ir.Value, env: Env) -> Env {
       left: ast.Identifier(name: x, ..),
       right: rhs,
       ..,
-    ) -> env_after_effect(rhs, v, dict.insert(env, x, v))
+    ) -> env_after_effect(rhs, v, rebind(env, x, v))
     // A compound/logical assignment (`x += e`, `x ||= e`): rebind `x`, but do NOT
     // recurse into the rhs — `v` is the whole expression's value (not the rhs's),
     // and for `||=`/`&&=`/`??=` the rhs may have been short-circuited, so an
     // assignment nested there must not rebind its target.
     ast.AssignmentExpression(left: ast.Identifier(name: x, ..), ..) ->
-      dict.insert(env, x, v)
+      rebind(env, x, v)
     // `x++` / `++x` (and `--`): `v` is the new value, so rebind `x` to it.
     ast.UpdateExpression(argument: ast.Identifier(name: x, ..), ..) ->
-      dict.insert(env, x, v)
+      rebind(env, x, v)
     _ -> env
   }
 }
@@ -3040,8 +3088,14 @@ fn lower_expr(
                 // first-class value: a zero-capture closure over it (`call_cb`
                 // fits the argument count to the function's arity at call time).
                 Ok(arity) -> Ok(bind1(ir.MakeClosure(x, [], arity), ctr))
+                // A free reference to a top-level var/let/const → the module-global
+                // store (undefined if read before its initializer runs).
                 Error(_) ->
-                  Error(Unsupported("unbound identifier '" <> x <> "'"))
+                  case is_global(x, ctx) {
+                    True -> Ok(bind1(global_read(x, ctx), ctr))
+                    False ->
+                      Error(Unsupported("unbound identifier '" <> x <> "'"))
+                  }
               }
           }
       }
@@ -3381,12 +3435,30 @@ fn lower_update(
   case argument {
     ast.Identifier(name: x, ..) ->
       case dict.get(env, x) {
-        Error(Nil) ->
-          Error(Unsupported("update of unbound identifier '" <> x <> "'"))
         Ok(cur) -> {
           let #(bone, one, ctr) = number_literal(1.0, ctr)
           Ok(guarded_arith(js_op, nop, cur, one, bone, ctr))
         }
+        // `g++`/`g--` on a module-global: read the store, ± 1, write back.
+        Error(Nil) ->
+          case is_global(x, ctx) {
+            True -> {
+              let #(bcur, cur, ctr) = bind1(global_read(x, ctx), ctr)
+              let #(bone, one, ctr) = number_literal(1.0, ctr)
+              let #(barith, newv, ctr) =
+                guarded_arith(
+                  js_op,
+                  nop,
+                  cur,
+                  one,
+                  list.append(bcur, bone),
+                  ctr,
+                )
+              Ok(bind_after(barith, global_write(x, newv, ctx), ctr))
+            }
+            False ->
+              Error(Unsupported("update of unbound identifier '" <> x <> "'"))
+          }
       }
     // `obj.p++` / `++obj.p` (and `[k]`): read obj.p once, write obj.p ± 1. As
     // with an identifier update the NEW value is yielded (the documented v1
@@ -3547,9 +3619,19 @@ fn lower_assign(
     // `x op= e` desugars to `x = x op e`; `x` is a pure identifier, so the doubled
     // read in the desugared rhs is harmless. The rhs value IS the assignment's value;
     // the env rebind of `x` is applied by the statement layer (via `env_after_effect`).
-    ast.Identifier(..) -> {
+    ast.Identifier(name: x, ..) -> {
       use rhs <- result_try(desugar_compound(op, left, right))
-      lower_expr(rhs, env, ctx, ctr)
+      // A write to a module-global (not shadowed by a local) stores through the
+      // shared static store; the desugared rhs already reads the global via the
+      // identifier fallback, so plain/compound/logical all funnel here. A local
+      // target keeps the SSA path (the env rebind is applied by env_after_effect).
+      case !dict.has_key(env, x) && is_global(x, ctx) {
+        True -> {
+          use #(binds, v, ctr) <- result_try(lower_expr(rhs, env, ctx, ctr))
+          Ok(bind_after(binds, global_write(x, v, ctx), ctr))
+        }
+        False -> lower_expr(rhs, env, ctx, ctr)
+      }
     }
     // `obj.p op= e` / `obj[k] op= e`. Evaluate the object and key EXACTLY ONCE so a
     // compound assignment (or a side-effecting/computed `getObj()[k()] += e`) doesn't
@@ -3888,7 +3970,20 @@ fn lower_spread_call(
             Ok(fv) ->
               Ok(bind_after(bl, ir.CallHost("js", "apply_fn", [fv, listv]), ctr))
             Error(Nil) ->
-              Error(Unsupported("spread call to unknown '" <> fname <> "'"))
+              case is_global(fname, ctx) {
+                // A module-global holding a function, spread-called as `g(...xs)`.
+                True -> {
+                  let #(bg, fv, ctr) =
+                    bind_after(bl, global_read(fname, ctx), ctr)
+                  Ok(bind_after(
+                    bg,
+                    ir.CallHost("js", "apply_fn", [fv, listv]),
+                    ctr,
+                  ))
+                }
+                False ->
+                  Error(Unsupported("spread call to unknown '" <> fname <> "'"))
+              }
           }
       }
     _ -> {
@@ -4016,9 +4111,28 @@ fn lower_call_fixed(
               Ok(bind_after(binds, ir.CallClosure(fv, argvals), ctr))
             }
             Error(_) ->
-              case is_global_fn(fname) {
-                True -> lower_global_call(fname, arguments, env, ctx, ctr)
-                False -> Error(Unsupported("call to unknown '" <> fname <> "'"))
+              case is_global(fname, ctx) {
+                // A module-global holding a function, called as `g(args)`.
+                True -> {
+                  let #(bg, fv, ctr) = bind1(global_read(fname, ctx), ctr)
+                  use #(binds, argvals, ctr) <- result_try(lower_args(
+                    arguments,
+                    env,
+                    ctx,
+                    ctr,
+                  ))
+                  Ok(bind_after(
+                    list.append(bg, binds),
+                    ir.CallClosure(fv, argvals),
+                    ctr,
+                  ))
+                }
+                False ->
+                  case is_global_fn(fname) {
+                    True -> lower_global_call(fname, arguments, env, ctx, ctr)
+                    False ->
+                      Error(Unsupported("call to unknown '" <> fname <> "'"))
+                  }
               }
           }
       }
@@ -5335,6 +5449,37 @@ fn global_const(name: String) -> Option(ir.Value) {
   }
 }
 
+/// Is `name` a module-global (a top-level var/let/const)? Callers check this only
+/// AFTER an env lookup, so a function-local/param/capture of the same name shadows
+/// the global.
+fn is_global(name: String, ctx: Ctx) -> Bool {
+  list.contains(ctx.globals, name)
+}
+
+/// The `#(classKey, fieldKey)` constants addressing global `name` in the shared
+/// static store — `module_name<>"$$globals"` as the class (the `$$` suffix cannot
+/// collide with a class static key `module_name<>"$"<>className`), `name` as field.
+fn global_keys(name: String, ctx: Ctx) -> #(ir.Value, ir.Value) {
+  #(
+    ir.ConstBinary(<<{ ctx.module_name <> "$$globals" }:utf8>>),
+    ir.ConstBinary(<<name:utf8>>),
+  )
+}
+
+/// Read module-global `name` from the shared static store (`undefined` if unset —
+/// so a read before its top-level initializer runs is `undefined`, as in JS).
+fn global_read(name: String, ctx: Ctx) -> ir.Expr {
+  let #(ckey, fkey) = global_keys(name, ctx)
+  ir.CallHost("js", "static_get", [ckey, fkey])
+}
+
+/// Write `v` to module-global `name` in the shared static store; the emitted
+/// `static_set` returns `v` (an assignment's value).
+fn global_write(name: String, v: ir.Value, ctx: Ctx) -> ir.Expr {
+  let #(ckey, fkey) = global_keys(name, ctx)
+  ir.CallHost("js", "static_set", [ckey, fkey, v])
+}
+
 fn bool_to_string(b: Bool) -> String {
   case b {
     True -> "true"
@@ -5716,6 +5861,22 @@ fn pattern_declared(p: ast.Pattern) -> List(String) {
 
 fn declared_stmts(stmts: List(ast.Statement)) -> List(String) {
   list.flat_map(stmts, declared_stmt)
+}
+
+/// TOP-LEVEL `var`/`let`/`const` declarator names, recursing into nested block/if/
+/// loop BODIES (via `child_stmts`) but NOT into `for`-init / for-of / for-in headers
+/// or `catch` params (those bind loop counters / loop vars that must stay locals so
+/// loop-carrying works) and NOT into nested function bodies (separate scopes). Used
+/// to seed the module-global set: a name here becomes a shared top-level global.
+fn declared_var_names(stmts: List(ast.Statement)) -> List(String) {
+  list.flat_map(stmts, fn(s) {
+    let here = case s {
+      ast.VariableDeclaration(declarations:, ..) ->
+        list.flat_map(declarations, fn(d) { pattern_declared(d.id) })
+      _ -> []
+    }
+    list.append(here, declared_var_names(child_stmts(s)))
+  })
 }
 
 fn declared_stmt(s: ast.Statement) -> List(String) {

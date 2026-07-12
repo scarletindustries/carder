@@ -429,6 +429,54 @@ pub fn first_class_top_level_fn_test() {
   to_float(call(m, "f", [])) |> should.equal(502.0)
 }
 
+pub fn global_cross_function_test() {
+  // A top-level `var` is a module-global: a setter function's write is visible to
+  // another function that reads it (functions no longer have isolated scopes for
+  // top-level names).
+  let m =
+    compile(
+      "var flag = 0; function set() { flag = 42; } "
+      <> "function f() { flag = 0; set(); return flag; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
+pub fn global_callback_flag_test() {
+  // The ubiquitous test262 pattern: a callback mutates a top-level flag that the
+  // caller then observes.
+  let m =
+    compile(
+      "var accessed = false; function cb(v) { accessed = true; return true; } "
+      <> "function f() { accessed = false; let r = [11].every(cb); return r && accessed ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+pub fn global_increment_test() {
+  // `++`/compound assignment on a global round-trips through the store.
+  let m =
+    compile(
+      "var n = 0; function bump() { n++; } function addTwo() { n += 2; } "
+      <> "function f() { n = 0; bump(); bump(); addTwo(); return n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(4.0)
+}
+
+pub fn global_shadow_test() {
+  // A function-local of the same name SHADOWS the global (env wins).
+  let m =
+    compile("var x = 100; function f() { let x = 5; x = x + 1; return x; }")
+  to_float(call(m, "f", [])) |> should.equal(6.0)
+}
+
+pub fn global_init_persists_test() {
+  // A top-level `var x = init` initializes the store when main runs; a later call
+  // to a reader function sees it (same process, so the store persists).
+  let m = compile("var g = 7; function readG() { return g; }")
+  let _ = call(m, "main", [])
+  to_float(call(m, "readG", [])) |> should.equal(7.0)
+}
+
 pub fn first_class_fn_arity_fit_test() {
   // A named callback declared with FEWER params than the caller passes is fine —
   // the extra (index, array) arguments are dropped (JS ignores extras).
