@@ -94,7 +94,7 @@
     number_is_safe_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
     object_rest/2, object_freeze/1, object_is_frozen/1,
-    object_from_entries/1,
+    object_from_entries/1, object_is/2, object_has_own/2,
     json_stringify/3, json_parse/1,
     encode_uri_component/1, encode_uri/1,
     decode_uri_component/1, decode_uri/1,
@@ -1136,6 +1136,67 @@ object_is_frozen(O) when is_reference(O) ->
     erlang:get({js_frozen, O}) =:= true;
 object_is_frozen(_) ->
     true.
+
+%% Object.is(x, y) -> JS boolean, the SameValue algorithm (§7.2.11). Like `===`
+%% except NaN is SameValue with NaN, and +0 is NOT SameValue with -0. All other
+%% values compare by strict identity (same type AND same value).
+object_is(X, Y) ->
+    same_value(X, Y).
+
+%% SameValue(x, y): true iff x and y are the same JS value under §7.2.11.
+same_value(X, Y) ->
+    T = js_type(X),
+    case T =:= js_type(Y) of
+        false -> false;
+        true ->
+            case T of
+                number -> same_value_number(X, Y);
+                _ -> X =:= Y
+            end
+    end.
+
+%% SameValue for two numbers: NaN==NaN, +0 and -0 distinguished, otherwise the
+%% same numeric value. `js_nan`/`js_inf`/`js_neg_inf` sentinels and finite
+%% ints/floats all flow through here.
+same_value_number(js_nan, js_nan) -> true;
+same_value_number(js_nan, _) -> false;
+same_value_number(_, js_nan) -> false;
+same_value_number(X, Y) ->
+    case is_neg_zero(X) =:= is_neg_zero(Y) of
+        false -> false;
+        true -> num_strict_eq(num_of(X), num_of(Y)) =:= 1
+    end.
+
+%% Is `V` the IEEE negative zero (-0.0)? Determined by the sign bit of the packed
+%% double so it is robust across OTP versions (Erlang float division cannot form
+%% -0.0's reciprocal). An integer 0 is +0 (this model has no integer -0).
+is_neg_zero(V) when is_float(V) ->
+    <<Sign:1, _:63>> = <<V:64/float>>,
+    V == 0.0 andalso Sign =:= 1;
+is_neg_zero(_) ->
+    false.
+
+%% Object.prototype.hasOwnProperty(v) -> JS boolean: does the receiver have an
+%% OWN property named ToString(v)? Per ToObject a string receiver owns its
+%% indices "0".."n-1" plus "length"; number/boolean/function wrappers own no
+%% string keys; null/undefined raise a TypeError (ToObject fails). This model has
+%% no non-enumerable data props, so an own key is exactly a stored key.
+object_has_own(Recv, Key) when is_reference(Recv) ->
+    has_prop(Recv, to_string(Key)) =:= 1;
+object_has_own(Recv, Key) when is_binary(Recv) ->
+    K = to_string(Key),
+    K =:= <<"length">> orelse
+        case str_to_index(K) of
+            {ok, I} -> I >= 0 andalso I < length(cps(Recv));
+            error -> false
+        end;
+object_has_own(Recv, _Key) ->
+    case js_type(Recv) of
+        number -> false;
+        boolean -> false;
+        function -> false;
+        _ -> type_error(Recv)
+    end.
 
 %% Define an own DATA property `Key = V` on `Obj`, storing directly and
 %% unconditionally — bypassing set_prop's accessor check so it overwrites any
@@ -3730,8 +3791,25 @@ obj_pairs(O) when is_reference(O) ->
         {js_array, Len, Map} -> [{integer_to_binary(I), maps:get(I, Map, undefined)} || I <- lists:seq(0, Len - 1)];
         _ -> type_error(O)
     end;
+obj_pairs(O) when is_binary(O) ->
+    %% ToObject(string): a String exotic object whose own enumerable properties
+    %% are the indexed characters "0".."len-1" (each a one-char string), in
+    %% ascending index order (ES2015+ Object.keys/values/entries coerce, not throw).
+    Cps = cps(O),
+    [
+        {integer_to_binary(I), from_cps([lists:nth(I + 1, Cps)])}
+     || I <- lists:seq(0, length(Cps) - 1)
+    ];
 obj_pairs(O) ->
-    type_error(O).
+    %% ToObject(v): numbers, booleans and functions wrap to objects with NO own
+    %% enumerable string keys; null/undefined (and internal reprs) are not
+    %% coercible and raise a TypeError.
+    case js_type(O) of
+        number -> [];
+        boolean -> [];
+        function -> [];
+        _ -> type_error(O)
+    end.
 
 %% is `x` null or undefined? → i32 1|0 (behind `??` and `?.`).
 is_nullish(null) -> 1;
@@ -3764,14 +3842,18 @@ object_from_entries(Entries) when is_reference(Entries) ->
 object_from_entries(_) ->
     new_object().
 
-%% Copy `source`'s own properties into `target` (in place); behind object spread
-%% `{...o}` and `Object.assign`. A null/undefined/primitive source is a no-op.
-object_assign_into(Target, Source) when is_reference(Source) ->
+%% Copy `source`'s own enumerable properties into `target` (in place); behind
+%% object spread `{...o}` and `Object.assign`. Per spec each source is ToObject-
+%% coerced: `null`/`undefined` are skipped (no-op), a string spreads its indexed
+%% characters ("0".."n-1"), and numbers/booleans/functions contribute no keys.
+object_assign_into(Target, null) ->
+    Target;
+object_assign_into(Target, undefined) ->
+    Target;
+object_assign_into(Target, Source) ->
     lists:foreach(
         fun({K, V}) -> set_prop(Target, K, resolve_get(V)) end, obj_pairs(Source)
     ),
-    Target;
-object_assign_into(Target, _Source) ->
     Target.
 
 %% Object-rest destructuring `{ a, ...rest } = obj`: a NEW object with `obj`'s own

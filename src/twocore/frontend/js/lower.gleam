@@ -4344,6 +4344,11 @@ fn lower_static_call(
     "Object", "keys", [o, ..] -> host("object_keys", [o])
     "Object", "values", [o, ..] -> host("object_values", [o])
     "Object", "entries", [o, ..] -> host("object_entries", [o])
+    // Object.is(x, y) — the SameValue predicate (NaN is same as NaN, +0 ≠ -0).
+    // Missing arguments default to `undefined` (so `Object.is()` is `true`).
+    "Object", "is", [x, y, ..] -> host("object_is", [x, y])
+    "Object", "is", [x] -> host("object_is", [x, undefined()])
+    "Object", "is", [] -> host("object_is", [undefined(), undefined()])
     "Object", "fromEntries", [e, ..] -> host("object_from_entries", [e])
     "Object", "freeze", [o, ..] -> host("object_freeze", [o])
     "Object", "isFrozen", [o, ..] -> host("object_is_frozen", [o])
@@ -4979,6 +4984,10 @@ fn lower_instance_method(
     // generator `.next(v)` — advances a generator, or delegates to a user
     // `next` method on an ordinary iterator object.
     "next", _ -> coll("gen_next")
+    // Object.prototype.hasOwnProperty(key) — own-property test (no prototype
+    // chain in this model), returning a JS boolean.
+    "hasOwnProperty", [k, ..] -> host("object_has_own", [k])
+    "hasOwnProperty", [] -> host("object_has_own", [undefined()])
     "forEach", _ -> coll("js_m_foreach")
     "get", _ -> coll("js_m_get")
     "set", _ -> coll("js_m_set")

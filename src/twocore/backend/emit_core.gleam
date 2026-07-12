@@ -4317,6 +4317,8 @@ fn resolve_js(op: String) -> Option(String) {
     "object_freeze" -> Some("object_freeze")
     "object_is_frozen" -> Some("object_is_frozen")
     "object_from_entries" -> Some("object_from_entries")
+    "object_is" -> Some("object_is")
+    "object_has_own" -> Some("object_has_own")
     "json_stringify" -> Some("json_stringify")
     "json_parse" -> Some("json_parse")
     // URI encode / decode globals
