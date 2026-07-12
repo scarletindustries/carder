@@ -760,6 +760,16 @@ pub fn object_is_frozen(obj: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_from_entries")
 pub fn object_from_entries(entries: Dynamic) -> Dynamic
 
+/// `Object.is(x, y)` → JS boolean, the SameValue algorithm: like `===` except
+/// `NaN` is same-value with `NaN` and `+0` is distinguished from `-0`.
+@external(erlang, "twocore_rt_js_ffi", "object_is")
+pub fn object_is(x: Dynamic, y: Dynamic) -> Dynamic
+
+/// `obj.hasOwnProperty(key)` → JS boolean: whether the receiver owns a property
+/// named `ToString(key)` (own properties only; null/undefined receivers throw).
+@external(erlang, "twocore_rt_js_ffi", "object_has_own")
+pub fn object_has_own(obj: Dynamic, key: Dynamic) -> Dynamic
+
 /// `JSON.stringify(v)` → a JSON string (undefined/function → `undefined`).
 @external(erlang, "twocore_rt_js_ffi", "json_stringify")
 pub fn json_stringify(v: Dynamic) -> Dynamic

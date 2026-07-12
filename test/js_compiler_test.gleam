@@ -2001,6 +2001,24 @@ pub fn to_fixed_test() {
 pub fn object_assign_test() {
   num("Object.assign({ a: 1 }, { b: 2 }, { a: 9 }).a") |> should.equal(9.0)
   num("Object.assign({ a: 1 }, { b: 2 }).b") |> should.equal(2.0)
+  // Object.assign returns the (mutated) target itself.
+  let ident =
+    compile(
+      "function f() { let t = {}; return Object.assign(t, { a: 1 }) === t; }",
+    )
+  call(ident, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn object_assign_coerces_sources_test() {
+  // Per spec each source is ToObject-coerced: a string source spreads its
+  // indexed characters into the target.
+  val("Object.assign({}, \"ab\")[0]") |> should.equal(dyn(<<"a">>))
+  val("Object.assign({}, \"ab\")[1]") |> should.equal(dyn(<<"b">>))
+  // null/undefined sources are skipped (no throw); numbers contribute no keys.
+  num("Object.keys(Object.assign({}, null, undefined, 5)).length")
+  |> should.equal(0.0)
+  // A later source overrides an earlier one; mixed primitive + object sources.
+  num("Object.assign({ a: 1 }, \"xy\", { a: 5 }).a") |> should.equal(5.0)
 }
 
 pub fn object_from_entries_test() {
@@ -2052,6 +2070,101 @@ pub fn object_is_frozen_test() {
       "function f() { let o = { a: 1 }; let before = Object.isFrozen(o) === false ? 100 : 0; Object.freeze(o); let after = Object.isFrozen(o) === true ? 10 : 0; let prim = Object.isFrozen(5) === true ? 1 : 0; return before + after + prim; }",
     )
   to_float(call(m, "f", [])) |> should.equal(111.0)
+}
+
+// ── Object.is (SameValue) ────────────────────────────────────────────────────
+
+pub fn object_is_same_value_test() {
+  // SameValue (ECMAScript §7.2.11): like === but NaN is same-value with NaN.
+  val("Object.is(NaN, NaN)") |> should.equal(dyn(True))
+  val("Object.is(1, 1)") |> should.equal(dyn(True))
+  val("Object.is(1, 1.0)") |> should.equal(dyn(True))
+  val("Object.is(1, 2)") |> should.equal(dyn(False))
+  val("Object.is(\"a\", \"a\")") |> should.equal(dyn(True))
+  val("Object.is(\"a\", \"b\")") |> should.equal(dyn(False))
+  val("Object.is(true, true)") |> should.equal(dyn(True))
+  val("Object.is(true, false)") |> should.equal(dyn(False))
+  val("Object.is(null, null)") |> should.equal(dyn(True))
+  val("Object.is(undefined, undefined)") |> should.equal(dyn(True))
+  val("Object.is(null, undefined)") |> should.equal(dyn(False))
+  // Different JS types are never same-value (no coercion).
+  val("Object.is(0, \"0\")") |> should.equal(dyn(False))
+  val("Object.is(0, false)") |> should.equal(dyn(False))
+  val("Object.is(Infinity, Infinity)") |> should.equal(dyn(True))
+  val("Object.is(Infinity, -Infinity)") |> should.equal(dyn(False))
+}
+
+pub fn object_is_arity_and_identity_test() {
+  // Missing arguments are `undefined`: Object.is() is (undefined,undefined)=true,
+  // Object.is(x) is (x,undefined) — false for any non-undefined x.
+  val("Object.is()") |> should.equal(dyn(True))
+  val("Object.is(0)") |> should.equal(dyn(False))
+  // Objects compare by reference identity, never structural equality.
+  let same = compile("function f() { let o = {}; return Object.is(o, o); }")
+  call(same, "f", []) |> should.equal(dyn(True))
+  val("Object.is({}, {})") |> should.equal(dyn(False))
+}
+
+pub fn object_is_negative_zero_test() {
+  // §7.2.11: +0 and -0 are NOT same-value, but each IS same-value with itself.
+  // The integral literal `0.0` collapses to +0 in this model, so a genuine IEEE
+  // -0.0 is derived by division (1 / -Infinity → -0, 1 / Infinity → +0).
+  let m =
+    compile(
+      "function f() {"
+      <> " let nz = 1 / -Infinity; let pz = 1 / Infinity;"
+      <> " return (Object.is(nz, pz) === false ? 1 : 0)"
+      <> " + (Object.is(nz, nz) === true ? 10 : 0)"
+      <> " + (Object.is(pz, pz) === true ? 100 : 0)"
+      <> " + (Object.is(nz, 0) === false ? 1000 : 0);"
+      <> " }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1111.0)
+}
+
+// ── Object.prototype.hasOwnProperty ──────────────────────────────────────────
+
+pub fn object_has_own_property_test() {
+  // Returns a real boolean for own vs absent data properties.
+  val("({ a: 1 }).hasOwnProperty(\"a\")") |> should.equal(dyn(True))
+  val("({ a: 1 }).hasOwnProperty(\"b\")") |> should.equal(dyn(False))
+  val("({}).hasOwnProperty(\"x\")") |> should.equal(dyn(False))
+  // An accessor (getter) property is still an OWN property.
+  val("({ get foo() { return 42; } }).hasOwnProperty(\"foo\")")
+  |> should.equal(dyn(True))
+  // The argument is ToString-coerced: a number key names the same property.
+  val("({ 5: 1 }).hasOwnProperty(5)") |> should.equal(dyn(True))
+}
+
+pub fn object_has_own_property_string_receiver_test() {
+  // ToObject(string): a String wrapper owns its character indices and "length".
+  val("\"abc\".hasOwnProperty(\"0\")") |> should.equal(dyn(True))
+  val("\"abc\".hasOwnProperty(\"2\")") |> should.equal(dyn(True))
+  val("\"abc\".hasOwnProperty(\"3\")") |> should.equal(dyn(False))
+  val("\"abc\".hasOwnProperty(\"length\")") |> should.equal(dyn(True))
+}
+
+// ── Object.keys/values/entries — ToObject primitive coercion (ES2015+) ────────
+
+pub fn object_keys_string_coercion_test() {
+  // Object.keys("abc") → the index keys "0","1","2" (String exotic object).
+  num("Object.keys(\"abc\").length") |> should.equal(3.0)
+  val("Object.keys(\"ab\")[0]") |> should.equal(dyn(<<"0">>))
+  val("Object.values(\"abc\")[0]") |> should.equal(dyn(<<"a">>))
+  val("Object.values(\"abc\")[2]") |> should.equal(dyn(<<"c">>))
+  // entries: [["0","a"], ["1","b"]] — check the second pair.
+  val("Object.entries(\"ab\")[1][0]") |> should.equal(dyn(<<"1">>))
+  val("Object.entries(\"ab\")[1][1]") |> should.equal(dyn(<<"b">>))
+  num("Object.getOwnPropertyNames(\"abc\").length") |> should.equal(3.0)
+}
+
+pub fn object_keys_number_boolean_coercion_test() {
+  // Numbers and booleans coerce to wrappers with no own enumerable keys (not a
+  // TypeError, per ES2015+): Object.keys/values return an empty array.
+  num("Object.keys(0).length") |> should.equal(0.0)
+  num("Object.keys(true).length") |> should.equal(0.0)
+  num("Object.values(42).length") |> should.equal(0.0)
+  num("Object.entries(false).length") |> should.equal(0.0)
 }
 
 // ── integration: many features combined ──────────────────────────────────────
