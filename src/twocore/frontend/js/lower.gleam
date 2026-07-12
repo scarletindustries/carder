@@ -4931,8 +4931,10 @@ fn lower_instance_method(
     "trimStart", _ -> host("str_trim_start", [])
     "trimEnd", _ -> host("str_trim_end", [])
     "repeat", [n, ..] -> host("str_repeat", [n])
-    "startsWith", [p, ..] -> host("str_starts_with", [p])
-    "endsWith", [s, ..] -> host("str_ends_with", [s])
+    "startsWith", [p, pos, ..] -> host("str_starts_with", [p, pos])
+    "startsWith", [p] -> host("str_starts_with", [p, undefined()])
+    "endsWith", [s, pos, ..] -> host("str_ends_with", [s, pos])
+    "endsWith", [s] -> host("str_ends_with", [s, undefined()])
     "replace", [a, b, ..] -> host("str_replace", [a, b])
     "replaceAll", [a, b, ..] -> host("str_replace_all", [a, b])
     // An unknown method name → look the property up and apply it. This is how a

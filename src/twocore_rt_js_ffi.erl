@@ -85,7 +85,7 @@
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
     str_upper/1, str_lower/1,
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
-    str_trim_end/1, str_repeat/2, str_starts_with/2, str_ends_with/2,
+    str_trim_end/1, str_repeat/2, str_starts_with/3, str_ends_with/3,
     str_replace/3, str_replace_all/3,
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
@@ -2571,16 +2571,40 @@ str_repeat(Str, N) ->
         false -> binary:copy(Str, Count)
     end.
 
-str_starts_with(Str, Prefix) ->
+%% str.startsWith(prefix, position) — true when `prefix` (ToString) occurs in
+%% `str` starting exactly at code-point index `position`. `position` is
+%% ToIntegerOrInfinity clamped to [0, len] (undefined/NaN → 0). Returns false
+%% when `position` + prefix length would run past the end of the string.
+str_starts_with(Str, Prefix, Pos) ->
     P = to_string(Prefix),
-    PS = byte_size(P),
-    byte_size(Str) >= PS andalso binary:part(Str, 0, PS) =:= P.
+    Cps = cps(Str),
+    Len = length(Cps),
+    Start = str_pos_clamp(Pos, Len),
+    PLen = length(cps(P)),
+    case Start + PLen > Len of
+        true -> false;
+        false -> from_cps(lists:sublist(Cps, Start + 1, PLen)) =:= P
+    end.
 
-str_ends_with(Str, Suffix) ->
+%% str.endsWith(suffix, end_position) — true when `suffix` (ToString) occurs in
+%% `str` ending exactly at code-point index `end_position`. When `end_position`
+%% is undefined it defaults to len; otherwise it is ToIntegerOrInfinity clamped
+%% to [0, len]. Returns false when the suffix would start before index 0.
+str_ends_with(Str, Suffix, EndPos) ->
     S = to_string(Suffix),
-    SS = byte_size(S),
-    SZ = byte_size(Str),
-    SZ >= SS andalso binary:part(Str, SZ - SS, SS) =:= S.
+    Cps = cps(Str),
+    Len = length(Cps),
+    End =
+        case EndPos of
+            undefined -> Len;
+            _ -> str_pos_clamp(EndPos, Len)
+        end,
+    SLen = length(cps(S)),
+    Start = End - SLen,
+    case Start < 0 of
+        true -> false;
+        false -> from_cps(lists:sublist(Cps, Start + 1, SLen)) =:= S
+    end.
 
 %% str.replace(search, repl) — the FIRST occurrence (string search; no regex in v1).
 str_replace(Str, Search, Repl) when is_reference(Search) ->

@@ -637,12 +637,25 @@ pub fn str_trim_end(str: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "str_repeat")
 pub fn str_repeat(str: Dynamic, n: Dynamic) -> Dynamic
 
-/// `str.startsWith(prefix)` / `endsWith(suffix)` → JS boolean.
+/// `str.startsWith(prefix, position)` — true when `prefix` occurs at code-point
+/// index `position` (ToIntegerOrInfinity, clamped to `[0, len]`; `undefined` →
+/// 0). Returns a JS boolean.
 @external(erlang, "twocore_rt_js_ffi", "str_starts_with")
-pub fn str_starts_with(str: Dynamic, prefix: Dynamic) -> Dynamic
+pub fn str_starts_with(
+  str: Dynamic,
+  prefix: Dynamic,
+  position: Dynamic,
+) -> Dynamic
 
+/// `str.endsWith(suffix, end_position)` — true when `suffix` ends at code-point
+/// index `end_position` (`undefined` → `len`; else ToIntegerOrInfinity clamped
+/// to `[0, len]`). Returns a JS boolean.
 @external(erlang, "twocore_rt_js_ffi", "str_ends_with")
-pub fn str_ends_with(str: Dynamic, suffix: Dynamic) -> Dynamic
+pub fn str_ends_with(
+  str: Dynamic,
+  suffix: Dynamic,
+  end_position: Dynamic,
+) -> Dynamic
 
 /// `str.replace(search, repl)` — the first occurrence (string search, no regex in v1).
 @external(erlang, "twocore_rt_js_ffi", "str_replace")
