@@ -4513,6 +4513,15 @@ fn lower_new(
     // `new Array(n)` (length) / `new Array(a, b, …)` (elements).
     ast.Identifier(name: "Array", ..) ->
       lower_array_construct(arguments, env, ctx, ctr)
+    // `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive WRAPPER object
+    // boxing the coerced primitive (unlike `Number(x)`/`String(x)`/`Boolean(x)` WITHOUT
+    // `new`, which stay primitives via `lower_global_call`).
+    ast.Identifier(name: "Number", ..) ->
+      lower_wrapper_new("number", arguments, env, ctx, ctr)
+    ast.Identifier(name: "String", ..) ->
+      lower_wrapper_new("string", arguments, env, ctx, ctr)
+    ast.Identifier(name: "Boolean", ..) ->
+      lower_wrapper_new("boolean", arguments, env, ctx, ctr)
     ast.Identifier(name: cname, ..) ->
       case dict.get(ctx.classes, cname) {
         Error(Nil) ->
@@ -4732,6 +4741,37 @@ fn lower_builtin_new(
     [] -> undefined()
   }
   Ok(bind_after(binds, ir.CallHost("js", op, [init]), ctr))
+}
+
+/// `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive wrapper OBJECT.
+/// `kind` is "number"|"string"|"boolean" and selects the runtime `wrapper_new` arm,
+/// which boxes the coerced primitive (ToNumber/ToString/ToBoolean). A no-argument call
+/// boxes the type's default per spec — `new Number()` → 0, `new String()` → "",
+/// `new Boolean()` → false — rather than coercing `undefined` (which would give
+/// NaN/"undefined"/false). The result is a cell, so `typeof` is "object" and
+/// `valueOf`/`toString` unwrap to the boxed primitive (see `twocore_rt_js_ffi`).
+fn lower_wrapper_new(
+  kind: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(binds, init, ctr) = case argvals, kind {
+    [x, ..], _ -> #(binds, x, ctr)
+    [], "number" -> {
+      let #(nb, v, ctr) = number_literal(0.0, ctr)
+      #(list.append(binds, nb), v, ctr)
+    }
+    [], "string" -> #(binds, ir.ConstBinary(<<>>), ctr)
+    [], _ -> #(binds, ir.ConstAtom("false"), ctr)
+  }
+  Ok(bind_after(
+    binds,
+    ir.CallHost("js", "wrapper_new", [ir.ConstAtom(kind), init]),
+    ctr,
+  ))
 }
 
 /// `new Date(...)` — pass ALL arguments as a cons list to the runtime `date_new`,
