@@ -3087,3 +3087,89 @@ pub fn main_test() {
   // main returns undefined; just assert it runs without error.
   call(m, "main", []) |> should.equal(dyn(atom.create("undefined")))
 }
+
+pub fn parse_int_whitespace_test() {
+  // parseInt strips the leading ES StrWhiteSpaceChar run — the full WhiteSpace +
+  // LineTerminator set, not just ASCII blanks (sec-parseint-string-radix).
+  num("parseInt('\\u00A01')") |> should.equal(1.0)
+  num("parseInt('\\u00A0\\u00A0-1')") |> should.equal(-1.0)
+  num("parseInt('\\u1680\\u2003\\u3000\\t 42')") |> should.equal(42.0)
+  // Whitespace only ⇒ no digits ⇒ NaN.
+  num("Number.isNaN(parseInt('\\u00A0')) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn parse_int_radix_toint32_test() {
+  // The radix argument is coerced with ToInt32 (mod 2^32, wrapping).
+  // 4294967298 ≡ 2, so this is base 2.
+  num("parseInt('11', 4294967298)") |> should.equal(3.0)
+  // 4294967296 ≡ 0, which means "unspecified" ⇒ base 10.
+  num("parseInt('11', 4294967296)") |> should.equal(11.0)
+  // -4294967294 ≡ 2.
+  num("parseInt('11', -4294967294)") |> should.equal(3.0)
+  // -2147483650 ≡ 2147483646, outside 2..36 ⇒ NaN.
+  num("Number.isNaN(parseInt('11', -2147483650)) ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+pub fn parse_float_whitespace_test() {
+  // parseFloat strips the same leading StrWhiteSpaceChar run.
+  num("parseFloat('\\u00A03.14')") |> should.equal(3.14)
+  num("parseFloat('\\u1680\\u3000-2.5')") |> should.equal(-2.5)
+  num("Number.isNaN(parseFloat('\\u00A0')) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn numeric_globals_no_arg_test() {
+  // A missing argument is `undefined`: ToNumber(undefined) is NaN, so isNaN() is
+  // true and isFinite() is false; ToString(undefined) is "undefined" (no numeric
+  // prefix) so parseInt()/parseFloat() are NaN.
+  let a = compile("function f() { return isNaN(); }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  let b = compile("function f() { return isFinite(); }")
+  call(b, "f", []) |> should.equal(dyn(False))
+  num("Number.isNaN(parseInt()) ? 1 : 0") |> should.equal(1.0)
+  num("Number.isNaN(parseFloat()) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn number_is_safe_integer_test() {
+  // Number.isSafeInteger(x): x is an integer-valued number with |x| ≤ 2^53 − 1
+  // (9007199254740991) — no coercion (sec-number.issafeinteger).
+  let a =
+    compile("function f() { return Number.isSafeInteger(9007199254740991); }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  // 2^53 itself is one past the safe range.
+  let b =
+    compile("function f() { return Number.isSafeInteger(9007199254740992); }")
+  call(b, "f", []) |> should.equal(dyn(False))
+  let c = compile("function f() { return Number.isSafeInteger(0); }")
+  call(c, "f", []) |> should.equal(dyn(True))
+  let n =
+    compile("function f() { return Number.isSafeInteger(-9007199254740991); }")
+  call(n, "f", []) |> should.equal(dyn(True))
+  // Non-integers are false.
+  let d = compile("function f() { return Number.isSafeInteger(1.1); }")
+  call(d, "f", []) |> should.equal(dyn(False))
+  // No coercion: numeric strings, booleans, NaN and the infinities are all false.
+  let s = compile("function f() { return Number.isSafeInteger(\"1\"); }")
+  call(s, "f", []) |> should.equal(dyn(False))
+  let i = compile("function f() { return Number.isSafeInteger(Infinity); }")
+  call(i, "f", []) |> should.equal(dyn(False))
+  let m = compile("function f() { return Number.isSafeInteger(NaN); }")
+  call(m, "f", []) |> should.equal(dyn(False))
+}
+
+pub fn number_tostring_radix_test() {
+  // Integer-valued numbers render in the requested base whether they are held as
+  // an Erlang integer (a literal) or an integral float (e.g. a division result).
+  val("(255).toString(16)") |> should.equal(dyn(<<"ff">>))
+  val("(510 / 2).toString(16)") |> should.equal(dyn(<<"ff">>))
+  val("(1024 / 64).toString(2)") |> should.equal(dyn(<<"10000">>))
+  // Dyadic fractions terminate exactly (0.5₁₀ = 0.1₂, 3.5₁₀ = 11.1₂).
+  val("(3.5).toString(2)") |> should.equal(dyn(<<"11.1">>))
+  val("(0.5).toString(2)") |> should.equal(dyn(<<"0.1">>))
+  val("(0.25).toString(2)") |> should.equal(dyn(<<"0.01">>))
+  val("(-3.5).toString(2)") |> should.equal(dyn(<<"-11.1">>))
+  // Radix 10, and NaN / ±Infinity, use the default ToString.
+  val("(255).toString(10)") |> should.equal(dyn(<<"255">>))
+  val("(0 / 0).toString(2)") |> should.equal(dyn(<<"NaN">>))
+  val("(1 / 0).toString(2)") |> should.equal(dyn(<<"Infinity">>))
+}

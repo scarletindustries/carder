@@ -90,6 +90,7 @@
     str_replace/3, str_replace_all/3,
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
+    number_is_safe_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
     object_rest/2, object_freeze/1, object_is_frozen/1,
     object_from_entries/1,
@@ -2486,7 +2487,13 @@ to_string_dispatch(Recv) when is_reference(Recv) ->
 to_string_dispatch(Recv) ->
     to_string(Recv).
 
-%% num.toString(radix) — base-`radix` (2..36) integer string; else default ToString.
+%% num.toString(radix) — base-`radix` (2..36) string; radix 10 (or an out-of-range
+%% radix, which the spec would RangeError but this v1 tolerates) falls back to the
+%% default ToString. Integer-valued numbers render as the base-R integer whether
+%% they are held as an Erlang integer or an integral float (e.g. 510/2 = 255.0 →
+%% "ff", not the base-10 "255"); genuine fractions render "<int>.<frac>" with the
+%% fraction expanded digit by digit — terminating exactly for dyadic fractions
+%% (0.5 → "0.1") and bounded otherwise. NaN / ±Infinity stringify as usual.
 num_to_string_radix(N, Radix) ->
     R =
         case coerce_num(Radix) of
@@ -2499,11 +2506,54 @@ num_to_string_radix(N, Radix) ->
         true ->
             case coerce_num(N) of
                 Num when is_integer(Num) ->
-                    list_to_binary(string:lowercase(integer_to_list(Num, R)));
+                    radix_int_str(Num, R);
+                Num when is_float(Num) ->
+                    radix_float_str(Num, R);
                 _ ->
                     to_string(N)
             end
     end.
+
+%% Signed base-R rendering of an integer, lowercased ("-ff", "10000").
+radix_int_str(Num, R) ->
+    list_to_binary(string:lowercase(integer_to_list(Num, R))).
+
+%% Signed base-R rendering of a float: integral floats reuse the integer path,
+%% otherwise "<int>.<frac>". ±0.0 → "0".
+radix_float_str(F, _R) when F == 0.0 ->
+    <<"0">>;
+radix_float_str(F, R) when F < 0 ->
+    <<"-", (radix_float_str(-F, R))/binary>>;
+radix_float_str(F, R) ->
+    IntPart = trunc(F),
+    Frac = F - IntPart,
+    case Frac == 0.0 of
+        true ->
+            radix_int_str(IntPart, R);
+        false ->
+            IntStr = radix_int_str(IntPart, R),
+            FracStr = radix_frac_digits(Frac, R, 1100, <<>>),
+            <<IntStr/binary, ".", FracStr/binary>>
+    end.
+
+%% Base-R digits of a fraction in [0,1): multiply by R, emit the integer part as
+%% the next digit, repeat until the remainder is exactly 0 (dyadic fractions
+%% terminate) or `Max` digits have been emitted (the bound for repeating ones).
+radix_frac_digits(_Frac, _R, 0, Acc) ->
+    Acc;
+radix_frac_digits(Frac, R, Max, Acc) ->
+    Scaled = Frac * R,
+    D = trunc(Scaled),
+    Rem = Scaled - D,
+    Acc2 = <<Acc/binary, (radix_digit(D))>>,
+    case Rem == 0.0 of
+        true -> Acc2;
+        false -> radix_frac_digits(Rem, R, Max - 1, Acc2)
+    end.
+
+%% A single base-36 digit value (0..35) as its lowercase character (0-9, a-z).
+radix_digit(D) when D >= 0, D =< 9 -> $0 + D;
+radix_digit(D) when D >= 10, D =< 35 -> $a + (D - 10).
 
 %% num.toExponential(d) — exponential notation with `d` fraction digits (undefined
 %% → as many digits as needed to represent the value uniquely). Erlang's scientific
@@ -3165,21 +3215,21 @@ ra_expand(Rest, SearchBin, ReplBin, Full, Off, Acc) ->
 
 %% parseInt(str, radix) — leading integer in the given radix (auto-detects 0x → 16;
 %% default 10); non-numeric prefix → NaN.
+%%
+%% Per sec-parseint-string-radix the leading run of ES `StrWhiteSpaceChar` is
+%% removed (the full `?JS_WS` set — NBSP, the Space_Separator block, the line
+%% terminators — not just the ASCII blanks Erlang's default trim knows), and the
+%% radix is coerced with ToInt32 (mod 2^32, so e.g. 4294967298 ≡ 2, and
+%% -2147483650 ≡ 2147483646 which is outside 2..36 → NaN).
 parse_int(S, RadixArg) ->
-    Str = string:trim(to_string(S), leading),
+    Str = unicode:characters_to_binary(string:trim(to_string(S), leading, ?JS_WS)),
     {Sign, Rest0} =
         case Str of
             <<"-", R/binary>> -> {-1, R};
             <<"+", R/binary>> -> {1, R};
             _ -> {1, Str}
         end,
-    Radix0 =
-        case coerce_num(RadixArg) of
-            nan -> 0;
-            inf -> 0;
-            neg_inf -> 0;
-            N -> trunc(as_float(N))
-        end,
+    Radix0 = js_to_int32(RadixArg),
     {Radix, Rest} = resolve_radix(Radix0, Rest0),
     case Radix >= 2 andalso Radix =< 36 of
         false ->
@@ -3214,9 +3264,10 @@ digit_val(_) -> -1.
 %% parseFloat(str) — the value of the longest leading substring that is a
 %% decimal float literal (sign, digits, optional fraction, optional exponent),
 %% or Infinity; trailing garbage is ignored; NaN if no such prefix exists.
-%% Unlike string:to_float this accepts "1e3" and ".5".
+%% Unlike string:to_float this accepts "1e3" and ".5". Per sec-parsefloat-string
+%% the leading run of ES `StrWhiteSpaceChar` (the full `?JS_WS` set) is removed.
 parse_float(S) ->
-    Str = string:trim(to_string(S), leading),
+    Str = unicode:characters_to_binary(string:trim(to_string(S), leading, ?JS_WS)),
     case Str of
         <<"Infinity", _/binary>> ->
             js_inf;
@@ -3312,6 +3363,16 @@ number_is_finite(_) -> false.
 number_is_integer(X) when is_integer(X) -> true;
 number_is_integer(X) when is_float(X) -> X == trunc(X);
 number_is_integer(_) -> false.
+
+%% Number.isSafeInteger — like Number.isInteger (NO coercion; only real numbers
+%% qualify) but additionally bounded to the safe-integer range |x| ≤ 2^53 − 1
+%% (9007199254740991), so 2^53 itself and the infinities/NaN are all false.
+number_is_safe_integer(X) when is_integer(X) ->
+    abs(X) =< 9007199254740991;
+number_is_safe_integer(X) when is_float(X) ->
+    X == trunc(X) andalso abs(X) =< 9007199254740991.0;
+number_is_safe_integer(_) ->
+    false.
 
 %% ── Object statics ───────────────────────────────────────
 %% NOTE: key order follows the backing map's iteration order, not JS insertion order

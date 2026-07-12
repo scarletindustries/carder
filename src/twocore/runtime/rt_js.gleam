@@ -719,6 +719,11 @@ pub fn number_is_finite(x: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "number_is_integer")
 pub fn number_is_integer(x: Dynamic) -> Dynamic
 
+/// `Number.isSafeInteger(x)` — x is an integer-valued number within the
+/// safe-integer range |x| ≤ 2^53 − 1 (no coercion).
+@external(erlang, "twocore_rt_js_ffi", "number_is_safe_integer")
+pub fn number_is_safe_integer(x: Dynamic) -> Dynamic
+
 /// `Object.keys(o)` → array of own string keys (map-iteration order; a v1 deviation).
 @external(erlang, "twocore_rt_js_ffi", "object_keys")
 pub fn object_keys(o: Dynamic) -> Dynamic

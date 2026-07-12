@@ -4303,6 +4303,7 @@ fn resolve_js(op: String) -> Option(String) {
     "number_is_nan" -> Some("number_is_nan")
     "number_is_finite" -> Some("number_is_finite")
     "number_is_integer" -> Some("number_is_integer")
+    "number_is_safe_integer" -> Some("number_is_safe_integer")
     "object_keys" -> Some("object_keys")
     "object_values" -> Some("object_values")
     "object_entries" -> Some("object_entries")
