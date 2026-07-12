@@ -2612,21 +2612,21 @@ ra_expand(Rest, SearchBin, ReplBin, Full, Off, Acc) ->
 
 %% parseInt(str, radix) — leading integer in the given radix (auto-detects 0x → 16;
 %% default 10); non-numeric prefix → NaN.
+%%
+%% Per sec-parseint-string-radix the leading run of ES `StrWhiteSpaceChar` is
+%% removed (the full `?JS_WS` set — NBSP, the Space_Separator block, the line
+%% terminators — not just the ASCII blanks Erlang's default trim knows), and the
+%% radix is coerced with ToInt32 (mod 2^32, so e.g. 4294967298 ≡ 2, and
+%% -2147483650 ≡ 2147483646 which is outside 2..36 → NaN).
 parse_int(S, RadixArg) ->
-    Str = string:trim(to_string(S), leading),
+    Str = unicode:characters_to_binary(string:trim(to_string(S), leading, ?JS_WS)),
     {Sign, Rest0} =
         case Str of
             <<"-", R/binary>> -> {-1, R};
             <<"+", R/binary>> -> {1, R};
             _ -> {1, Str}
         end,
-    Radix0 =
-        case coerce_num(RadixArg) of
-            nan -> 0;
-            inf -> 0;
-            neg_inf -> 0;
-            N -> trunc(as_float(N))
-        end,
+    Radix0 = js_to_int32(RadixArg),
     {Radix, Rest} = resolve_radix(Radix0, Rest0),
     case Radix >= 2 andalso Radix =< 36 of
         false ->
@@ -2661,9 +2661,10 @@ digit_val(_) -> -1.
 %% parseFloat(str) — the value of the longest leading substring that is a
 %% decimal float literal (sign, digits, optional fraction, optional exponent),
 %% or Infinity; trailing garbage is ignored; NaN if no such prefix exists.
-%% Unlike string:to_float this accepts "1e3" and ".5".
+%% Unlike string:to_float this accepts "1e3" and ".5". Per sec-parsefloat-string
+%% the leading run of ES `StrWhiteSpaceChar` (the full `?JS_WS` set) is removed.
 parse_float(S) ->
-    Str = string:trim(to_string(S), leading),
+    Str = unicode:characters_to_binary(string:trim(to_string(S), leading, ?JS_WS)),
     case Str of
         <<"Infinity", _/binary>> ->
             js_inf;

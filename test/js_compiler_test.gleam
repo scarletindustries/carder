@@ -2705,3 +2705,33 @@ pub fn main_test() {
   // main returns undefined; just assert it runs without error.
   call(m, "main", []) |> should.equal(dyn(atom.create("undefined")))
 }
+
+pub fn parse_int_whitespace_test() {
+  // parseInt strips the leading ES StrWhiteSpaceChar run — the full WhiteSpace +
+  // LineTerminator set, not just ASCII blanks (sec-parseint-string-radix).
+  num("parseInt('\\u00A01')") |> should.equal(1.0)
+  num("parseInt('\\u00A0\\u00A0-1')") |> should.equal(-1.0)
+  num("parseInt('\\u1680\\u2003\\u3000\\t 42')") |> should.equal(42.0)
+  // Whitespace only ⇒ no digits ⇒ NaN.
+  num("Number.isNaN(parseInt('\\u00A0')) ? 1 : 0") |> should.equal(1.0)
+}
+
+pub fn parse_int_radix_toint32_test() {
+  // The radix argument is coerced with ToInt32 (mod 2^32, wrapping).
+  // 4294967298 ≡ 2, so this is base 2.
+  num("parseInt('11', 4294967298)") |> should.equal(3.0)
+  // 4294967296 ≡ 0, which means "unspecified" ⇒ base 10.
+  num("parseInt('11', 4294967296)") |> should.equal(11.0)
+  // -4294967294 ≡ 2.
+  num("parseInt('11', -4294967294)") |> should.equal(3.0)
+  // -2147483650 ≡ 2147483646, outside 2..36 ⇒ NaN.
+  num("Number.isNaN(parseInt('11', -2147483650)) ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+pub fn parse_float_whitespace_test() {
+  // parseFloat strips the same leading StrWhiteSpaceChar run.
+  num("parseFloat('\\u00A03.14')") |> should.equal(3.14)
+  num("parseFloat('\\u1680\\u3000-2.5')") |> should.equal(-2.5)
+  num("Number.isNaN(parseFloat('\\u00A0')) ? 1 : 0") |> should.equal(1.0)
+}
