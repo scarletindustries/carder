@@ -1014,6 +1014,55 @@ pub fn under_over_application_test() {
   to_float(call(o, "run", [dyn(1)])) |> should.equal(1.0)
 }
 
+// ── destructuring ────────────────────────────────────────────────────────────
+
+pub fn array_destructure_test() {
+  let m = compile("function f() { let [a, b] = [1, 2]; return a + b; }")
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  // holes are skipped
+  let h = compile("function f() { let [, b, c] = [10, 20, 30]; return b + c; }")
+  to_float(call(h, "f", [])) |> should.equal(50.0)
+}
+
+pub fn object_destructure_test() {
+  let m =
+    compile("function f() { let { x, y } = { x: 5, y: 7 }; return x + y; }")
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+  // rename: { x: a }
+  let r = compile("function f() { let { x: a } = { x: 9 }; return a; }")
+  to_float(call(r, "f", [])) |> should.equal(9.0)
+}
+
+pub fn destructure_from_call_test() {
+  let m =
+    compile(
+      "function pair() { return [1, 2]; } function f() { let [a, b] = pair(); return a * 10 + b; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+}
+
+// ── array spread ─────────────────────────────────────────────────────────────
+
+pub fn array_spread_test() {
+  let m =
+    compile(
+      "function f() { let a = [1, 2]; let b = [...a, 3]; return b.length * 10 + b[2]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(33.0)
+  let c =
+    compile(
+      "function f() { let a = [1, 2]; let b = [3, 4]; let d = [...a, ...b]; return d[3]; }",
+    )
+  to_float(call(c, "f", [])) |> should.equal(4.0)
+  // leading element then spread
+  let lead =
+    compile("function f() { let a = [2, 3]; let b = [1, ...a]; return b[0]; }")
+  to_float(call(lead, "f", [])) |> should.equal(1.0)
+  // spread a string into chars
+  let s = compile("function f() { let c = [...\"abc\"]; return c.length; }")
+  to_float(call(s, "f", [])) |> should.equal(3.0)
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

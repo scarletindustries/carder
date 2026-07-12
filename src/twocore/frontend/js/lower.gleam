@@ -20,8 +20,9 @@
 //// `- + ! ~ typeof void`, `?:`, optional chaining `?.`; `let/const/var`, `= += -= *= /=
 //// %= &= |= ^= <<= >>= >>>=`, and `++`/`--`; `if/else`, `while`, `do/while`, `for`,
 //// `for-in`, `break/continue`,
-//// `return`, blocks; objects `{}` with `.prop`/`[k]` get/set; arrays `[…]` with
-//// indexing, `.length`, `.push`/`.pop`; first-class functions — function expressions,
+//// `return`, blocks; flat array/object destructuring in `let`/`const`/`var`; objects
+//// `{}` with `.prop`/`[k]` get/set; arrays `[…]` with indexing, `.length`, spread
+//// `[...a]`; first-class functions — function expressions,
 //// arrow functions, closures (value-capture), higher-order calls, IIFEs; `console.log`.
 //// Control flow threads mutated variables as loop-carried params / phi-merged `If`s.
 ////
@@ -39,8 +40,9 @@
 //// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
 //// `Number.isInteger`/`isNaN`/`isFinite`.
 ////
-//// Not yet (a clean `Unsupported` error / panic): classes, destructuring, spread,
-//// rest params, regex, `JSON`, `try`/`finally`, and `continue` inside a `do/while`.
+//// Not yet (a clean `Unsupported` error / panic): classes, nested/defaulted
+//// destructuring, object/call spread, rest params, regex, `JSON`, `try`/`finally`,
+//// and `continue` inside a `do/while`.
 //// (A default value on an arrow/function-EXPRESSION param only applies when it is
 //// called with the full arity or through an array method, since a closure call site
 //// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
@@ -417,7 +419,97 @@ fn lower_var_decls(
       ))
       Ok(#(emit_lets(binds, more), ctr3))
     }
-    _ -> Error(Unsupported("destructuring declaration"))
+    // `let [a, b] = e` / `let {x, y} = e` — desugar to a temp + simple declarators.
+    [ast.VariableDeclarator(id: pattern, init:), ..rest] -> {
+      let init_expr = case init {
+        Some(e) -> e
+        None -> ast.UndefinedExpression(span: ast.Span(0, 0))
+      }
+      use #(simple, ctr) <- result_try(desugar_destructure(
+        pattern,
+        init_expr,
+        ctr,
+      ))
+      lower_var_decls(list.append(simple, rest), env, ctx, ctr, k)
+    }
+  }
+}
+
+/// Desugar an array/object destructuring binding `pattern = init` into a temp holding
+/// `init` plus one simple declarator per bound name (`a = $d[0]`, `x = $d.x`, …). v1
+/// handles a flat pattern of identifiers (holes allowed); nested patterns, defaults,
+/// and rest elements are `Unsupported`.
+fn desugar_destructure(
+  pattern: ast.Pattern,
+  init: ast.Expression,
+  ctr: Int,
+) -> Result(#(List(ast.VariableDeclarator), Int), Error) {
+  let sp = ast.Span(0, 0)
+  let tmp = "$d_" <> int.to_string(ctr)
+  let ctr = ctr + 1
+  let d_id = ast.Identifier(span: sp, name: tmp)
+  let temp =
+    ast.VariableDeclarator(
+      id: ast.IdentifierPattern(name: tmp, span: sp),
+      init: Some(init),
+    )
+  let bind = fn(name, access) {
+    ast.VariableDeclarator(
+      id: ast.IdentifierPattern(name: name, span: sp),
+      init: Some(access),
+    )
+  }
+  case pattern {
+    ast.ArrayPattern(elements:) -> {
+      let indexed = list.index_map(elements, fn(el, i) { #(el, i) })
+      use decls <- result_try(
+        list.try_fold(indexed, [], fn(acc, pair) {
+          let #(el, i) = pair
+          case el {
+            None -> Ok(acc)
+            Some(ast.IdentifierPattern(name:, ..)) -> {
+              let access =
+                ast.MemberExpression(
+                  span: sp,
+                  object: d_id,
+                  property: ast.NumberLiteral(span: sp, value: int.to_float(i)),
+                  computed: True,
+                )
+              Ok(list.append(acc, [bind(name, access)]))
+            }
+            Some(_) ->
+              Error(Unsupported("nested/defaulted array destructuring"))
+          }
+        }),
+      )
+      Ok(#([temp, ..decls], ctr))
+    }
+    ast.ObjectPattern(properties:) -> {
+      use decls <- result_try(
+        list.try_map(properties, fn(p) {
+          case p {
+            ast.PatternProperty(
+              key:,
+              value: ast.IdentifierPattern(name:, ..),
+              computed:,
+              ..,
+            ) -> {
+              let access =
+                ast.MemberExpression(
+                  span: sp,
+                  object: d_id,
+                  property: key,
+                  computed: computed,
+                )
+              Ok(bind(name, access))
+            }
+            _ -> Error(Unsupported("nested/rest object destructuring"))
+          }
+        }),
+      )
+      Ok(#([temp, ..decls], ctr))
+    }
+    _ -> Error(Unsupported("destructuring pattern"))
   }
 }
 
@@ -2004,27 +2096,70 @@ fn lower_method(
 }
 
 /// `[e0, e1, …]` — evaluate each element left-to-right (a hole becomes `undefined`),
-/// then construct the array from the cons list via `new_array`.
+/// then construct the array from the cons list via `new_array`. With a spread element
+/// (`[...a, x]`) it builds incrementally: pushing single values and spreading arrays/
+/// strings into a fresh array.
 fn lower_array(
   elements: List(Option(ast.Expression)),
   env: Env,
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
-  use #(binds, vals, ctr) <- result_try(
-    list.try_fold(elements, #([], [], ctr), fn(acc, el) {
-      let #(binds, vals, ctr) = acc
+  let has_spread =
+    list.any(elements, fn(el) {
       case el {
-        Some(e) -> {
-          use #(b, v, ctr) <- result_try(lower_expr(e, env, ctx, ctr))
-          Ok(#(list.append(binds, b), list.append(vals, [v]), ctr))
-        }
-        None -> Ok(#(binds, list.append(vals, [undefined()]), ctr))
+        Some(ast.SpreadElement(..)) -> True
+        _ -> False
       }
-    }),
-  )
-  let #(binds2, listv, ctr) = build_list(vals, binds, ctr)
-  Ok(bind_after(binds2, ir.CallHost("js", "new_array", [listv]), ctr))
+    })
+  case has_spread {
+    False -> {
+      use #(binds, vals, ctr) <- result_try(
+        list.try_fold(elements, #([], [], ctr), fn(acc, el) {
+          let #(binds, vals, ctr) = acc
+          case el {
+            Some(e) -> {
+              use #(b, v, ctr) <- result_try(lower_expr(e, env, ctx, ctr))
+              Ok(#(list.append(binds, b), list.append(vals, [v]), ctr))
+            }
+            None -> Ok(#(binds, list.append(vals, [undefined()]), ctr))
+          }
+        }),
+      )
+      let #(binds2, listv, ctr) = build_list(vals, binds, ctr)
+      Ok(bind_after(binds2, ir.CallHost("js", "new_array", [listv]), ctr))
+    }
+    True -> {
+      let #(bnil, nilv, ctr) = build_list([], [], ctr)
+      let #(b0, arr, ctr) =
+        bind_after(bnil, ir.CallHost("js", "new_array", [nilv]), ctr)
+      list.try_fold(elements, #(b0, arr, ctr), fn(acc, el) {
+        let #(binds, arr, ctr) = acc
+        case el {
+          Some(ast.SpreadElement(argument:, ..)) -> {
+            use #(bs, sv, ctr) <- result_try(lower_expr(argument, env, ctx, ctr))
+            let #(binds2, _r, ctr) =
+              bind_after(
+                list.append(binds, bs),
+                ir.CallHost("js", "array_spread_into", [arr, sv]),
+                ctr,
+              )
+            Ok(#(binds2, arr, ctr))
+          }
+          other -> {
+            use #(be, v, ctr) <- result_try(case other {
+              Some(e) -> lower_expr(e, env, ctx, ctr)
+              None -> Ok(#([], undefined(), ctr))
+            })
+            let #(bl, listv, ctr) = build_list([v], list.append(binds, be), ctr)
+            let #(binds2, _r, ctr) =
+              bind_after(bl, ir.CallHost("js", "array_push", [arr, listv]), ctr)
+            Ok(#(binds2, arr, ctr))
+          }
+        }
+      })
+    }
+  }
 }
 
 /// Fit an argument list to `arity`: pad with `undefined` (so defaults apply) or drop
@@ -2517,6 +2652,7 @@ fn child_exprs(e: ast.Expression) -> List(ast.Expression) {
         False -> [object]
       }
     ast.OptionalCallExpression(callee:, arguments:, ..) -> [callee, ..arguments]
+    ast.SpreadElement(argument:, ..) -> [argument]
     ast.ObjectExpression(properties:, ..) ->
       list.flat_map(properties, fn(p) {
         case p {
@@ -2627,6 +2763,30 @@ fn reads_stmts(stmts: List(ast.Statement)) -> List(String) {
 /// Variables DECLARED in a statement list (own scope: `let/const/var`, `for`-init
 /// declarations, nested function-declaration names). Does not descend into nested
 /// function/arrow expression bodies (those are separate scopes).
+/// Every identifier BOUND by a binding pattern (handles array/object destructuring,
+/// defaults, and rest, recursively). Used to know a scope's locals.
+fn pattern_declared(p: ast.Pattern) -> List(String) {
+  case p {
+    ast.IdentifierPattern(name:, ..) -> [name]
+    ast.ArrayPattern(elements:) ->
+      list.flat_map(elements, fn(el) {
+        case el {
+          Some(pp) -> pattern_declared(pp)
+          None -> []
+        }
+      })
+    ast.ObjectPattern(properties:) ->
+      list.flat_map(properties, fn(pp) {
+        case pp {
+          ast.PatternProperty(value:, ..) -> pattern_declared(value)
+          ast.RestProperty(argument:) -> pattern_declared(argument)
+        }
+      })
+    ast.AssignmentPattern(left:, ..) -> pattern_declared(left)
+    ast.RestElement(argument:) -> pattern_declared(argument)
+  }
+}
+
 fn declared_stmts(stmts: List(ast.Statement)) -> List(String) {
   list.flat_map(stmts, declared_stmt)
 }
@@ -2634,12 +2794,7 @@ fn declared_stmts(stmts: List(ast.Statement)) -> List(String) {
 fn declared_stmt(s: ast.Statement) -> List(String) {
   let here = case s {
     ast.VariableDeclaration(declarations:, ..) ->
-      list.filter_map(declarations, fn(d) {
-        case d.id {
-          ast.IdentifierPattern(name:, ..) -> Ok(name)
-          _ -> Error(Nil)
-        }
-      })
+      list.flat_map(declarations, fn(d) { pattern_declared(d.id) })
     ast.FunctionDeclaration(name: Some(n), ..) -> [n]
     ast.ForStatement(init: Some(ast.ForInitDeclaration(d)), ..) ->
       declared_stmt(d)

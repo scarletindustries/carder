@@ -4201,6 +4201,7 @@ fn resolve_js(op: String) -> Option(String) {
     "array_push" -> Some("array_push")
     "array_pop" -> Some("array_pop")
     "is_array" -> Some("is_array")
+    "array_spread_into" -> Some("array_spread_into")
     "array_map" -> Some("array_map")
     "array_filter" -> Some("array_filter")
     "array_foreach" -> Some("array_foreach")

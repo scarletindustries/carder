@@ -64,7 +64,7 @@
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, get_prop/2, set_prop/3, has_prop/2,
-    new_array/1, array_push/2, array_pop/1, is_array/1,
+    new_array/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_some/2, array_every/2, array_find/2,
     array_find_index/2, array_index_of/2, array_includes/2, array_join/2,
@@ -930,6 +930,18 @@ array_pop(Recv) when is_reference(Recv) ->
     end;
 array_pop(Recv) ->
     type_error(Recv).
+
+%% Spread `...value` into `target` (in place): an array contributes its elements, a
+%% string its characters. Behind array-literal spread `[...a]`.
+array_spread_into(Target, Value) when is_reference(Value) ->
+    case erlang:get(?CELL_KEY(Value)) of
+        {js_array, Len, Map} -> array_push(Target, arr_list(Len, Map));
+        _ -> type_error(Value)
+    end;
+array_spread_into(Target, Value) when is_binary(Value) ->
+    array_push(Target, [from_cps([C]) || C <- cps(Value)]);
+array_spread_into(_Target, Value) ->
+    type_error(Value).
 
 %% Array.isArray(x) → 1|0.
 is_array(Recv) when is_reference(Recv) ->

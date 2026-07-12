@@ -266,6 +266,11 @@ pub fn array_pop(arr: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "is_array")
 pub fn is_array(x: Dynamic) -> Int
 
+/// Spread `value` (an array's elements or a string's chars) into `target` in place;
+/// behind array-literal spread `[...a]`.
+@external(erlang, "twocore_rt_js_ffi", "array_spread_into")
+pub fn array_spread_into(target: Dynamic, value: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 
