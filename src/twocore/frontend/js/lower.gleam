@@ -29,12 +29,14 @@
 //// shift/unshift, map/filter/forEach/reduce/some/every/find/findIndex, indexOf/
 //// includes/join/slice/concat/reverse/sort); string `.length`, indexing, and methods
 //// (charAt/charCodeAt, toUpperCase/toLowerCase, indexOf/includes/slice/substring,
-//// split/trim/repeat/startsWith/endsWith/replace/replaceAll).
+//// split/trim/repeat/startsWith/endsWith/replace/replaceAll); the global functions
+//// `parseInt`/`parseFloat`/`isNaN`/`isFinite`/`String`/`Number`/`Boolean`; and the
+//// statics `Array.isArray`/`Array.of`, `Object.keys`/`values`/`entries`,
+//// `Number.isInteger`/`isNaN`/`isFinite`.
 ////
 //// Not yet (a clean `Unsupported` error / panic): classes, `try/catch/throw`,
-//// `for-in`, regex, `JSON`/`Object`/`Number` statics, and `continue` inside a
-//// `do/while`. Scope is one flat function scope per JS function (block-scoped `let`
-//// is treated as function-scoped).
+//// `for-in`, regex, `JSON`, and `continue` inside a `do/while`. Scope is one flat
+//// function scope per JS function (block-scoped `let` is treated as function-scoped).
 ////
 //// Known v1 deviations from the spec (intentional, for speed / simplicity):
 ////   * Integers are native BEAM integers, so `+ - *` on values beyond 2^53 stay exact
@@ -55,6 +57,8 @@
 ////   * String `.length`/indexing/`charAt`/`slice`/`substring` count Unicode CODE POINTS,
 ////     not UTF-16 code units, so an astral-plane character counts as 1 (JS counts it as 2).
 ////     BMP text (the common case) is exact.
+////   * `Object.keys`/`values`/`entries` return keys in the backing map's iteration order,
+////     not JS property-insertion order.
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -1556,7 +1560,16 @@ fn lower_call(
       computed: False,
       ..,
     ) -> lower_math_call(method, arguments, env, ctx, ctr)
-    // recv.method(args) — method dispatch (array methods for now).
+    // Array.* / Object.* / Number.* statics (namespaces, not values).
+    ast.MemberExpression(
+      object: ast.Identifier(name: ns, ..),
+      property: ast.Identifier(name: method, ..),
+      computed: False,
+      ..,
+    )
+      if ns == "Array" || ns == "Object" || ns == "Number"
+    -> lower_static_call(ns, method, arguments, env, ctx, ctr)
+    // recv.method(args) — method dispatch (array/string methods).
     ast.MemberExpression(
       object:,
       property: ast.Identifier(name: method, ..),
@@ -1587,7 +1600,11 @@ fn lower_call(
               ))
               Ok(bind_after(binds, ir.CallClosure(fv, argvals), ctr))
             }
-            Error(_) -> Error(Unsupported("call to unknown '" <> fname <> "'"))
+            Error(_) ->
+              case is_global_fn(fname) {
+                True -> lower_global_call(fname, arguments, env, ctx, ctr)
+                False -> Error(Unsupported("call to unknown '" <> fname <> "'"))
+              }
           }
       }
     // any other callee: evaluate it to a function value and apply it — IIFEs
@@ -1597,6 +1614,92 @@ fn lower_call(
       use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
       Ok(bind_after(list.append(bc, ba), ir.CallClosure(fv, argvals), ctr))
     }
+  }
+}
+
+/// Whether `name` is a supported global builtin FUNCTION (called as `name(...)`).
+fn is_global_fn(name: String) -> Bool {
+  case name {
+    "String"
+    | "Number"
+    | "Boolean"
+    | "parseInt"
+    | "parseFloat"
+    | "isNaN"
+    | "isFinite" -> True
+    _ -> False
+  }
+}
+
+/// A global builtin function call: `String`/`Number`/`Boolean` coercions and
+/// `parseInt`/`parseFloat`/`isNaN`/`isFinite`.
+fn lower_global_call(
+  name: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let host = fn(op, args) {
+    Ok(bind_after(binds, ir.CallHost("js", op, args), ctr))
+  }
+  case name, argvals {
+    "String", [x, ..] -> host("to_string", [x])
+    "String", [] -> Ok(#(binds, ir.ConstBinary(<<>>), ctr))
+    "Number", [x, ..] -> host("to_number", [x])
+    "Number", [] -> {
+      let #(nb, v, ctr) = number_literal(0.0, ctr)
+      Ok(#(list.append(binds, nb), v, ctr))
+    }
+    "Boolean", [x, ..] -> {
+      let #(b2, i, ctr) =
+        bind_after(binds, ir.CallHost("js", "truthy", [x]), ctr)
+      Ok(bind_after(b2, bool_term(i), ctr))
+    }
+    "Boolean", [] -> Ok(#(binds, ir.ConstAtom("false"), ctr))
+    "parseInt", [s] -> host("parse_int", [s, undefined()])
+    "parseInt", [s, r, ..] -> host("parse_int", [s, r])
+    "parseFloat", [s, ..] -> host("parse_float", [s])
+    "isNaN", [x, ..] -> host("is_nan", [x])
+    "isFinite", [x, ..] -> host("is_finite", [x])
+    _, _ -> Error(Unsupported(name <> "(…)"))
+  }
+}
+
+/// A static-namespace call: `Array.*`, `Object.*`, `Number.*`.
+fn lower_static_call(
+  ns: String,
+  method: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let host = fn(op, args) {
+    Ok(bind_after(binds, ir.CallHost("js", op, args), ctr))
+  }
+  case ns, method, argvals {
+    "Array", "isArray", [x, ..] -> {
+      let #(b2, i, ctr) =
+        bind_after(binds, ir.CallHost("js", "is_array", [x]), ctr)
+      Ok(bind_after(b2, bool_term(i), ctr))
+    }
+    "Array", "of", _ -> {
+      let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
+      Ok(bind_after(binds2, ir.CallHost("js", "new_array", [listv]), ctr))
+    }
+    "Object", "keys", [o, ..] -> host("object_keys", [o])
+    "Object", "values", [o, ..] -> host("object_values", [o])
+    "Object", "entries", [o, ..] -> host("object_entries", [o])
+    "Number", "isInteger", [x, ..] -> host("number_is_integer", [x])
+    "Number", "isNaN", [x, ..] -> host("number_is_nan", [x])
+    "Number", "isFinite", [x, ..] -> host("number_is_finite", [x])
+    "Number", "parseInt", [s] -> host("parse_int", [s, undefined()])
+    "Number", "parseInt", [s, r, ..] -> host("parse_int", [s, r])
+    "Number", "parseFloat", [s, ..] -> host("parse_float", [s])
+    _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }
 

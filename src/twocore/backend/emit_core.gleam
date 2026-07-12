@@ -4234,6 +4234,17 @@ fn resolve_js(op: String) -> Option(String) {
     "str_ends_with" -> Some("str_ends_with")
     "str_replace" -> Some("str_replace")
     "str_replace_all" -> Some("str_replace_all")
+    // globals + statics
+    "parse_int" -> Some("parse_int")
+    "parse_float" -> Some("parse_float")
+    "is_nan" -> Some("is_nan")
+    "is_finite" -> Some("is_finite")
+    "number_is_nan" -> Some("number_is_nan")
+    "number_is_finite" -> Some("number_is_finite")
+    "number_is_integer" -> Some("number_is_integer")
+    "object_keys" -> Some("object_keys")
+    "object_values" -> Some("object_values")
+    "object_entries" -> Some("object_entries")
     // lists / console / misc
     "empty_list" -> Some("empty_list")
     "console_log" -> Some("console_log")

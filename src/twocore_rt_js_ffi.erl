@@ -74,6 +74,9 @@
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
     str_trim_end/1, str_repeat/2, str_starts_with/2, str_ends_with/2,
     str_replace/3, str_replace_all/3,
+    parse_int/2, parse_float/1, is_nan/1, is_finite/1,
+    number_is_nan/1, number_is_finite/1, number_is_integer/1,
+    object_keys/1, object_values/1, object_entries/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -1332,6 +1335,121 @@ str_replace_all(Str, Search, Repl) ->
         <<>> -> Str;
         SearchBin -> binary:replace(Str, SearchBin, ReplBin, [global])
     end.
+
+%% ── global functions ─────────────────────────────────────
+
+%% parseInt(str, radix) — leading integer in the given radix (auto-detects 0x → 16;
+%% default 10); non-numeric prefix → NaN.
+parse_int(S, RadixArg) ->
+    Str = string:trim(to_string(S), leading),
+    {Sign, Rest0} =
+        case Str of
+            <<"-", R/binary>> -> {-1, R};
+            <<"+", R/binary>> -> {1, R};
+            _ -> {1, Str}
+        end,
+    Radix0 =
+        case coerce_num(RadixArg) of
+            nan -> 0;
+            inf -> 0;
+            neg_inf -> 0;
+            N -> trunc(as_float(N))
+        end,
+    {Radix, Rest} = resolve_radix(Radix0, Rest0),
+    case Radix >= 2 andalso Radix =< 36 of
+        false ->
+            js_nan;
+        true ->
+            case take_digits(Rest, Radix, []) of
+                [] -> js_nan;
+                Digits -> Sign * list_to_integer(Digits, Radix)
+            end
+    end.
+
+resolve_radix(0, <<"0x", R/binary>>) -> {16, R};
+resolve_radix(0, <<"0X", R/binary>>) -> {16, R};
+resolve_radix(0, R) -> {10, R};
+resolve_radix(16, <<"0x", R/binary>>) -> {16, R};
+resolve_radix(16, <<"0X", R/binary>>) -> {16, R};
+resolve_radix(Radix, R) -> {Radix, R}.
+
+take_digits(<<C, Rest/binary>>, Radix, Acc) ->
+    case digit_val(C) of
+        V when V >= 0, V < Radix -> take_digits(Rest, Radix, [C | Acc]);
+        _ -> lists:reverse(Acc)
+    end;
+take_digits(<<>>, _Radix, Acc) ->
+    lists:reverse(Acc).
+
+digit_val(C) when C >= $0, C =< $9 -> C - $0;
+digit_val(C) when C >= $a, C =< $z -> C - $a + 10;
+digit_val(C) when C >= $A, C =< $Z -> C - $A + 10;
+digit_val(_) -> -1.
+
+%% parseFloat(str) — leading decimal/float (or Infinity); else NaN.
+parse_float(S) ->
+    Str = string:trim(to_string(S), leading),
+    case Str of
+        <<"Infinity", _/binary>> ->
+            js_inf;
+        <<"+Infinity", _/binary>> ->
+            js_inf;
+        <<"-Infinity", _/binary>> ->
+            js_neg_inf;
+        _ ->
+            case string:to_float(Str) of
+                {error, _} ->
+                    case string:to_integer(Str) of
+                        {error, _} -> js_nan;
+                        {I, _} -> float(I)
+                    end;
+                {F, _} ->
+                    F
+            end
+    end.
+
+%% isNaN(x) / isFinite(x) — coerce with ToNumber first (the global forms).
+is_nan(X) ->
+    case coerce_num(X) of
+        nan -> true;
+        _ -> false
+    end.
+
+is_finite(X) ->
+    case coerce_num(X) of
+        nan -> false;
+        inf -> false;
+        neg_inf -> false;
+        _ -> true
+    end.
+
+%% Number.isNaN / Number.isFinite — NO coercion (only actual numbers qualify).
+number_is_nan(js_nan) -> true;
+number_is_nan(_) -> false.
+
+number_is_finite(X) when is_integer(X); is_float(X) -> true;
+number_is_finite(_) -> false.
+
+number_is_integer(X) when is_integer(X) -> true;
+number_is_integer(X) when is_float(X) -> X == trunc(X);
+number_is_integer(_) -> false.
+
+%% ── Object statics ───────────────────────────────────────
+%% NOTE: key order follows the backing map's iteration order, not JS insertion order
+%% (a v1 deviation). Own enumerable string keys only.
+
+obj_pairs(O) when is_reference(O) ->
+    case erlang:get(?CELL_KEY(O)) of
+        M when is_map(M) -> maps:to_list(M);
+        {js_array, Len, Map} -> [{integer_to_binary(I), maps:get(I, Map, undefined)} || I <- lists:seq(0, Len - 1)];
+        _ -> type_error(O)
+    end;
+obj_pairs(O) ->
+    type_error(O).
+
+object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
+object_values(O) -> new_array([V || {_, V} <- obj_pairs(O)]).
+object_entries(O) -> new_array([new_array([K, V]) || {K, V} <- obj_pairs(O)]).
 
 %% ───────────────────────── lists / console / misc ─────────────────────────
 

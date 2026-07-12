@@ -779,6 +779,74 @@ pub fn string_for_of_test() {
   call(m, "f", []) |> should.equal(dyn(<<"a.b.c.">>))
 }
 
+// ── global functions + statics ───────────────────────────────────────────────
+
+pub fn parse_int_test() {
+  num("parseInt(\"42\")") |> should.equal(42.0)
+  num("parseInt(\"ff\", 16)") |> should.equal(255.0)
+  num("parseInt(\"0x1A\", 16)") |> should.equal(26.0)
+  num("parseInt(\"101\", 2)") |> should.equal(5.0)
+  num("parseInt(\"12px\")") |> should.equal(12.0)
+  // non-numeric → NaN
+  let m = compile("function f() { let r = parseInt(\"abc\"); return r !== r; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn parse_float_test() {
+  num("parseFloat(\"3.14\")") |> should.equal(3.14)
+  num("parseFloat(\"3.14abc\")") |> should.equal(3.14)
+  num("parseFloat(\"42\")") |> should.equal(42.0)
+}
+
+pub fn isnan_isfinite_test() {
+  let a = compile("function f() { return isNaN(0 / 0); }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  let b = compile("function f() { return isNaN(5); }")
+  call(b, "f", []) |> should.equal(dyn(False))
+  // global isNaN coerces
+  let c = compile("function f() { return isNaN(\"abc\"); }")
+  call(c, "f", []) |> should.equal(dyn(True))
+  let d = compile("function f() { return isFinite(1 / 0); }")
+  call(d, "f", []) |> should.equal(dyn(False))
+}
+
+pub fn coercion_globals_test() {
+  let s = compile("function f() { return String(42); }")
+  call(s, "f", []) |> should.equal(dyn(<<"42">>))
+  num("Number(\"3.5\")") |> should.equal(3.5)
+  num("Number(true)") |> should.equal(1.0)
+  let b = compile("function f() { return Boolean(\"\"); }")
+  call(b, "f", []) |> should.equal(dyn(False))
+  let t = compile("function f() { return Boolean(\"x\"); }")
+  call(t, "f", []) |> should.equal(dyn(True))
+}
+
+pub fn array_static_test() {
+  let a = compile("function f() { return Array.isArray([1, 2]); }")
+  call(a, "f", []) |> should.equal(dyn(True))
+  let n = compile("function f() { return Array.isArray(5); }")
+  call(n, "f", []) |> should.equal(dyn(False))
+  num("Array.of(1, 2, 3).length") |> should.equal(3.0)
+}
+
+pub fn object_static_test() {
+  num("Object.keys({ a: 1, b: 2 }).length") |> should.equal(2.0)
+  num("Object.values({ a: 1, b: 2, c: 3 }).length") |> should.equal(3.0)
+  // entries: [[key, value], ...] — check a single-key object's pair
+  let e = compile("function f() { return Object.entries({ a: 7 })[0][1]; }")
+  to_float(call(e, "f", [])) |> should.equal(7.0)
+}
+
+pub fn number_static_test() {
+  let i = compile("function f() { return Number.isInteger(5); }")
+  call(i, "f", []) |> should.equal(dyn(True))
+  let d = compile("function f() { return Number.isInteger(5.5); }")
+  call(d, "f", []) |> should.equal(dyn(False))
+  // no coercion: a numeric string is not an integer
+  let s = compile("function f() { return Number.isInteger(\"5\"); }")
+  call(s, "f", []) |> should.equal(dyn(False))
+}
+
 // ── top-level main ───────────────────────────────────────────────────────────
 
 pub fn main_test() {

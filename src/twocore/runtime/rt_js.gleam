@@ -401,6 +401,48 @@ pub fn str_replace(str: Dynamic, search: Dynamic, repl: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "str_replace_all")
 pub fn str_replace_all(str: Dynamic, search: Dynamic, repl: Dynamic) -> Dynamic
 
+// ───────────────────────── globals / statics ─────────────────────────
+
+/// `parseInt(str, radix)` — leading integer (auto-detects `0x`; default radix 10).
+@external(erlang, "twocore_rt_js_ffi", "parse_int")
+pub fn parse_int(str: Dynamic, radix: Dynamic) -> Dynamic
+
+/// `parseFloat(str)` — leading decimal/float (or Infinity), else NaN.
+@external(erlang, "twocore_rt_js_ffi", "parse_float")
+pub fn parse_float(str: Dynamic) -> Dynamic
+
+/// `isNaN(x)` — ToNumber(x) is NaN (the coercing global form).
+@external(erlang, "twocore_rt_js_ffi", "is_nan")
+pub fn is_nan(x: Dynamic) -> Dynamic
+
+/// `isFinite(x)` — ToNumber(x) is finite (the coercing global form).
+@external(erlang, "twocore_rt_js_ffi", "is_finite")
+pub fn is_finite(x: Dynamic) -> Dynamic
+
+/// `Number.isNaN(x)` — x IS the NaN number (no coercion).
+@external(erlang, "twocore_rt_js_ffi", "number_is_nan")
+pub fn number_is_nan(x: Dynamic) -> Dynamic
+
+/// `Number.isFinite(x)` — x is a finite number (no coercion).
+@external(erlang, "twocore_rt_js_ffi", "number_is_finite")
+pub fn number_is_finite(x: Dynamic) -> Dynamic
+
+/// `Number.isInteger(x)` — x is an integer-valued number (no coercion).
+@external(erlang, "twocore_rt_js_ffi", "number_is_integer")
+pub fn number_is_integer(x: Dynamic) -> Dynamic
+
+/// `Object.keys(o)` → array of own string keys (map-iteration order; a v1 deviation).
+@external(erlang, "twocore_rt_js_ffi", "object_keys")
+pub fn object_keys(o: Dynamic) -> Dynamic
+
+/// `Object.values(o)` → array of own values.
+@external(erlang, "twocore_rt_js_ffi", "object_values")
+pub fn object_values(o: Dynamic) -> Dynamic
+
+/// `Object.entries(o)` → array of `[key, value]` pairs.
+@external(erlang, "twocore_rt_js_ffi", "object_entries")
+pub fn object_entries(o: Dynamic) -> Dynamic
+
 // ───────────────────────── lists / console / misc ─────────────────────────
 
 /// The empty BEAM list `[]` (arity 0) — the nil tail an args-cons-list build starts from.
