@@ -682,10 +682,14 @@ guard_inf(F) ->
         error:badarith -> inf
     end.
 
-%% Binary Math functions: Math.pow(a,b), Math.atan2(y,x).
+%% Binary Math functions: Math.pow(a,b), Math.atan2(y,x), Math.imul(a,b).
 math_binary(pow, A, B) -> pow(A, B);
 math_binary(atan2, A, B) ->
-    out(matan2(coerce_num(A), coerce_num(B))).
+    out(matan2(coerce_num(A), coerce_num(B)));
+%% Math.imul: C-like 32-bit integer multiply — both operands ToUint32, multiply,
+%% then reinterpret the low 32 bits as a signed int32 (wrap_int32 masks).
+math_binary(imul, A, B) ->
+    wrap_int32(js_to_uint32(A) * js_to_uint32(B)).
 
 matan2(nan, _) -> nan;
 matan2(_, nan) -> nan;

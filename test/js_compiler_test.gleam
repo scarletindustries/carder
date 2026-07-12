@@ -718,6 +718,15 @@ pub fn math_fround_clz32_test() {
   num("Math.clz32(NaN)") |> should.equal(32.0)
 }
 
+pub fn math_imul_test() {
+  // C-like 32-bit integer multiply, result reinterpreted as signed int32.
+  num("Math.imul(3, 4)") |> should.equal(12.0)
+  num("Math.imul(-5, 12)") |> should.equal(-60.0)
+  // 0xffffffff is -1 as int32, so imul(0xffffffff, 5) = -5.
+  num("Math.imul(0xffffffff, 5)") |> should.equal(-5.0)
+  num("Math.imul(0xfffffffe, 5)") |> should.equal(-10.0)
+}
+
 pub fn math_expm1_log1p_test() {
   num("Math.expm1(0)") |> should.equal(0.0)
   num("Math.log1p(0)") |> should.equal(0.0)

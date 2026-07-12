@@ -4300,7 +4300,7 @@ fn math_arity(method: String) -> Option(MathArity) {
     | "log1p"
     | "fround"
     | "clz32" -> Some(MathUnary)
-    "pow" | "atan2" -> Some(MathBinary)
+    "pow" | "atan2" | "imul" -> Some(MathBinary)
     "min" | "max" | "hypot" -> Some(MathReduce)
     "random" -> Some(MathRandom)
     _ -> None
