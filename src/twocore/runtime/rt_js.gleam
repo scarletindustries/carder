@@ -559,6 +559,17 @@ pub fn new_map(init: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_set")
 pub fn new_set(init: Dynamic) -> Dynamic
 
+/// `new WeakMap(init?)` — optionally seeded from an array of `[key, value]` pairs;
+/// a non-object key in the iterable throws a TypeError (§24.3.1.1). Keys are held
+/// strongly (no real weak references are modelled).
+@external(erlang, "twocore_rt_js_ffi", "new_weakmap")
+pub fn new_weakmap(init: Dynamic) -> Dynamic
+
+/// The `WeakMap` constructor as a first-class fun value, so a bare `WeakMap`
+/// reference reports `typeof` "function".
+@external(erlang, "twocore_rt_js_ffi", "weakmap_ctor")
+pub fn weakmap_ctor() -> Dynamic
+
 // Each takes the receiver + a cons-list of ALL the call's arguments — so a delegated
 // user method (plain-object receiver) receives every argument.
 

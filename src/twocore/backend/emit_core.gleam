@@ -4290,6 +4290,9 @@ fn resolve_js(op: String) -> Option(String) {
     "set_is_disjoint_from" -> Some("set_is_disjoint_from")
     "set_is_subset_of" -> Some("set_is_subset_of")
     "set_is_superset_of" -> Some("set_is_superset_of")
+    // WeakMap
+    "new_weakmap" -> Some("new_weakmap")
+    "weakmap_ctor" -> Some("weakmap_ctor")
     "array_map" -> Some("array_map")
     "array_filter" -> Some("array_filter")
     "array_foreach" -> Some("array_foreach")
