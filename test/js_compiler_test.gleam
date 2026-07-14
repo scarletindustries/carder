@@ -5228,3 +5228,35 @@ pub fn weakmap_typeof_and_instanceof_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(2.0)
 }
+
+// `WeakMap.prototype.getOrInsert` (TC39 upsert): returns the existing value for a
+// present object key without overwriting, and inserts+returns the argument for an
+// absent key.
+pub fn weakmap_get_or_insert_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let k = {}; let a = w.getOrInsert(k, 10); let b = w.getOrInsert(k, 99); return a + b + w.get(k); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(30.0)
+}
+
+// `WeakMap.prototype.getOrInsert` throws a TypeError when the key cannot be held
+// weakly (upsert proposal step 3).
+pub fn weakmap_get_or_insert_primitive_throws_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let caught = 0; try { w.getOrInsert(1, 1); } catch (e) { if (e instanceof TypeError) { caught = 1; } } return caught; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// `WeakMap.prototype.getOrInsertComputed` invokes the callback only for an absent
+// key, storing its return value; a present key returns its value without calling the
+// callback (upsert proposal).
+pub fn weakmap_get_or_insert_computed_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let k = {}; let c = { n: 0 }; let a = w.getOrInsertComputed(k, () => { c.n++; return 7; }); let b = w.getOrInsertComputed(k, () => { c.n++; return 99; }); return a + b + c.n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(15.0)
+}

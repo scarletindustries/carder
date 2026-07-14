@@ -2774,6 +2774,24 @@ js_m_get_or_insert(Recv, Args) ->
                     erlang:put(?CELL_KEY(Recv), {js_map, Next + 1, maps:put(K, {Next, V}, D)}),
                     V
             end;
+        {js_weakmap, Next, D} ->
+            %% WeakMap.prototype.getOrInsert (upsert proposal, step 3): a key that
+            %% cannot be held weakly is a TypeError; otherwise behaves like the Map
+            %% arm (object keys compare by identity, so no SameValueZero folding).
+            K = arg(Args, 0),
+            case can_be_held_weakly(K) of
+                false ->
+                    type_error(K);
+                true ->
+                    case maps:get(K, D, undefined) of
+                        {_Seq, V} ->
+                            V;
+                        undefined ->
+                            V = arg(Args, 1),
+                            erlang:put(?CELL_KEY(Recv), {js_weakmap, Next + 1, maps:put(K, {Next, V}, D)}),
+                            V
+                    end
+            end;
         _ ->
             delegate(Recv, <<"getOrInsert">>, Args)
     end.
@@ -2805,6 +2823,33 @@ js_m_get_or_insert_computed(Recv, Args) ->
                         end,
                     erlang:put(?CELL_KEY(Recv), {js_map, Next3, maps:put(K, {Seq, Value}, D2)}),
                     Value
+            end;
+        {js_weakmap, _, D} ->
+            %% WeakMap.prototype.getOrInsertComputed (upsert proposal, step 3): a key
+            %% that cannot be held weakly is a TypeError. Otherwise, if present return
+            %% the existing value WITHOUT invoking the callback; else call
+            %% callbackfn(key), then store its return value (re-reading the live cell,
+            %% since the callback may have mutated the WeakMap).
+            K = arg(Args, 0),
+            case can_be_held_weakly(K) of
+                false ->
+                    type_error(K);
+                true ->
+                    case maps:get(K, D, undefined) of
+                        {_Seq, V} ->
+                            V;
+                        undefined ->
+                            Fn = arg(Args, 1),
+                            Value = call_cb(Fn, [K]),
+                            {js_weakmap, Next2, D2} = cell_tag(Recv),
+                            {Next3, Seq} =
+                                case maps:get(K, D2, undefined) of
+                                    {OldSeq, _} -> {Next2, OldSeq};
+                                    undefined -> {Next2 + 1, Next2}
+                                end,
+                            erlang:put(?CELL_KEY(Recv), {js_weakmap, Next3, maps:put(K, {Seq, Value}, D2)}),
+                            Value
+                    end
             end;
         _ ->
             delegate(Recv, <<"getOrInsertComputed">>, Args)
