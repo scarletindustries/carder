@@ -61,7 +61,13 @@
 //// `Number.isInteger`/`isNaN`/`isFinite` and the constants
 //// `Number.MAX_SAFE_INTEGER`/`MIN_SAFE_INTEGER`/`MAX_VALUE`/`MIN_VALUE`/`EPSILON`/
 //// `POSITIVE_INFINITY`/`NEGATIVE_INFINITY`/`NaN`, `JSON.stringify`/`parse`,
-//// `String.fromCharCode`/`fromCodePoint`/`String.raw`, and `Date.now`. Tagged templates
+//// `String.fromCharCode`/`fromCodePoint`/`String.raw`. `Date`: the constructor
+//// (`new Date(ms|iso-string|y,m,…)`), `Date.now`/`UTC`/`parse`, the `get*`/`getUTC*`
+//// field getters, `valueOf`/`getTime`/`getTimezoneOffset`, the `set*`/`setUTC*` field
+//// setters and `setTime`, and the string forms `toISOString`/`toJSON`/`toUTCString`/
+//// `toDateString`/`toTimeString` — all computed in UTC (local == UTC deviation; the
+//// local string forms therefore report a fixed `GMT+0000` zone, and `.toString()`
+//// still string-coerces to the ISO form rather than the long local form). Tagged templates
 //// `` tag`…${e}…` `` (the tag receives the cooked strings array with a `.raw`
 //// property, then the substitutions). Regex literals `/pat/flags` (backed by
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
@@ -5108,6 +5114,28 @@ fn lower_instance_method(
     "getUTCSeconds", _ -> date("getUTCSeconds")
     "getMilliseconds", _ -> date("getMilliseconds")
     "getUTCMilliseconds", _ -> date("getUTCMilliseconds")
+    // Mutating setters (§21.4.4.20-30) — dispatched in the runtime, which writes
+    // the receiver's [[DateValue]] and returns the new time value. UTC == local.
+    "setTime", _ -> date("setTime")
+    "setMilliseconds", _ -> date("setMilliseconds")
+    "setUTCMilliseconds", _ -> date("setUTCMilliseconds")
+    "setSeconds", _ -> date("setSeconds")
+    "setUTCSeconds", _ -> date("setUTCSeconds")
+    "setMinutes", _ -> date("setMinutes")
+    "setUTCMinutes", _ -> date("setUTCMinutes")
+    "setHours", _ -> date("setHours")
+    "setUTCHours", _ -> date("setUTCHours")
+    "setDate", _ -> date("setDate")
+    "setUTCDate", _ -> date("setUTCDate")
+    "setMonth", _ -> date("setMonth")
+    "setUTCMonth", _ -> date("setUTCMonth")
+    "setFullYear", _ -> date("setFullYear")
+    "setUTCFullYear", _ -> date("setUTCFullYear")
+    // Human-readable string forms (§21.4.4.35/.42/.43). `toString` is handled by
+    // the generic string-coercion dispatch above and is not re-routed here.
+    "toUTCString", _ -> date("toUTCString")
+    "toDateString", _ -> date("toDateString")
+    "toTimeString", _ -> date("toTimeString")
     // An unknown method name → look the property up and apply it. This is how a
     // method stored on an object/class instance (a function-valued property) is
     // called; `recv.m` that isn't a function is `undefined` → a runtime bad-call.

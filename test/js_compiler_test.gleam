@@ -2188,6 +2188,100 @@ pub fn date_parse_extended_year_test() {
   call(m, "f", []) |> should.equal(dyn(True))
 }
 
+// ── Date: setters (§21.4.4.20-30) ────────────────────────────────────────────
+
+pub fn date_set_time_test() {
+  // §21.4.4.27 — setTime replaces the time value and returns TimeClip(ToNumber).
+  num("new Date(123).setTime(1000)") |> should.equal(1000.0)
+  // The mutation is observable through getTime on the same object.
+  let m =
+    compile(
+      "function f() { var d = new Date(123); d.setTime(1000); return d.getTime(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1000.0)
+  // A non-finite argument clips to NaN.
+  num(
+    "(new Date(0).setTime(Infinity)) !== (new Date(0).setTime(Infinity)) ? 1 : 0",
+  )
+  |> should.equal(1.0)
+}
+
+pub fn date_set_utc_hours_test() {
+  // §21.4.4.34 — setUTCHours(1) on the epoch → 01:00:00.000Z == 3_600_000 ms.
+  num("new Date(0).setUTCHours(1)") |> should.equal(3_600_000.0)
+  // Optional min/sec/ms are applied when supplied (1h 2m 3s 4ms).
+  num("new Date(0).setUTCHours(1, 2, 3, 4)") |> should.equal(3_723_004.0)
+  // setHours mirrors setUTCHours (local == UTC deviation).
+  num("new Date(0).setHours(1)") |> should.equal(3_600_000.0)
+}
+
+pub fn date_set_full_year_test() {
+  // §21.4.4.21 — setFullYear sets the year, keeping month/date/time-of-day.
+  // new Date(0) is 1970-01-01T00:00:00Z, so setFullYear(2015) → 2015-01-01Z.
+  num("new Date(0).setFullYear(2015) === Date.UTC(2015, 0, 1) ? 1 : 0")
+  |> should.equal(1.0)
+  // Optional month/date arguments are honoured.
+  num("new Date(0).setFullYear(2015, 5, 10) === Date.UTC(2015, 5, 10) ? 1 : 0")
+  |> should.equal(1.0)
+  // On an Invalid Date the base time is treated as +0 (so the year still sets).
+  num("new Date(NaN).setFullYear(1970) === Date.UTC(1970, 0, 1) ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+pub fn date_setters_invalid_stay_nan_test() {
+  // §21.4.4 — every setter EXCEPT setFullYear leaves an Invalid Date as NaN.
+  num("(new Date(NaN).setHours(0)) !== (new Date(NaN).setHours(0)) ? 1 : 0")
+  |> should.equal(1.0)
+  num("(new Date(NaN).setMonth(0)) !== (new Date(NaN).setMonth(0)) ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+pub fn date_set_month_overflow_test() {
+  // §21.4.4.25 — MakeDay normalizes month overflow into the year: month 13 of
+  // 2016 is February 2017, keeping the day-of-month.
+  num(
+    "new Date(Date.UTC(2016, 0, 15)).setUTCMonth(13) === Date.UTC(2017, 1, 15) ? 1 : 0",
+  )
+  |> should.equal(1.0)
+}
+
+pub fn date_set_date_test() {
+  // §21.4.4.20 — setDate replaces the day-of-month; overflow rolls into the month.
+  num(
+    "new Date(Date.UTC(2016, 0, 1)).setUTCDate(32) === Date.UTC(2016, 1, 1) ? 1 : 0",
+  )
+  |> should.equal(1.0)
+}
+
+// ── Date: human-readable string forms (§21.4.4.35/.42/.43) ────────────────────
+
+pub fn date_to_utc_string_test() {
+  // §21.4.4.43 — "Www, DD Mon YYYY HH:mm:ss GMT" (timezone-independent).
+  val("new Date(0).toUTCString()")
+  |> should.equal(dyn(<<"Thu, 01 Jan 1970 00:00:00 GMT">>))
+  // Weekday tracks the actual day (2014-03-23 was a Sunday).
+  val("new Date(\"2014-03-23T00:00:00Z\").toUTCString()")
+  |> should.equal(dyn(<<"Sun, 23 Mar 2014 00:00:00 GMT">>))
+  // A negative (expanded) year is zero-padded to four digits with a leading '-'.
+  val("new Date(\"-000001-07-01T00:00Z\").toUTCString()")
+  |> should.equal(dyn(<<"Thu, 01 Jul -0001 00:00:00 GMT">>))
+  // An Invalid Date renders as "Invalid Date".
+  val("new Date(NaN).toUTCString()") |> should.equal(dyn(<<"Invalid Date">>))
+}
+
+pub fn date_to_date_and_time_string_test() {
+  // §21.4.4.35 — toDateString is "Www Mon DD YYYY".
+  val("new Date(0).toDateString()")
+  |> should.equal(dyn(<<"Thu Jan 01 1970">>))
+  // §21.4.4.42 — toTimeString is "HH:mm:ss GMT+0000" (local == UTC deviation).
+  val("new Date(0).toTimeString()")
+  |> should.equal(dyn(<<"00:00:00 GMT+0000">>))
+  val("new Date(NaN).toDateString()")
+  |> should.equal(dyn(<<"Invalid Date">>))
+  val("new Date(NaN).toTimeString()")
+  |> should.equal(dyn(<<"Invalid Date">>))
+}
+
 // ── array finishers + toFixed ────────────────────────────────────────────────
 
 pub fn array_finishers_test() {
