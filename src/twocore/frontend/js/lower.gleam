@@ -5038,6 +5038,10 @@ fn lower_instance_method(
     "has", _ -> coll("js_m_has")
     "delete", _ -> coll("js_m_delete")
     "clear", _ -> coll("js_m_clear")
+    // Map.prototype.getOrInsert / getOrInsertComputed (TC39 upsert proposal);
+    // dispatch on the receiver type in the runtime and delegate on a plain object.
+    "getOrInsert", _ -> coll("js_m_get_or_insert")
+    "getOrInsertComputed", _ -> coll("js_m_get_or_insert_computed")
     // Map/Set iterators — a live `{value, done}` cursor driven by `.next()`. On a
     // plain object these delegate to a same-named user method.
     "keys", _ -> coll("js_m_keys")

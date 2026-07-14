@@ -79,6 +79,7 @@
     str_match/2, str_search/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
+    js_m_get_or_insert/2, js_m_get_or_insert_computed/2,
     js_m_keys/2, js_m_values/2, js_m_entries/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
@@ -2494,6 +2495,59 @@ js_m_clear(Recv, Args) ->
             undefined;
         _ ->
             delegate(Recv, <<"clear">>, Args)
+    end.
+
+%% Map.prototype.getOrInsert(key, value) — the TC39 `upsert` proposal
+%% (sec-map.prototype.getorinsert). Canonicalizes `key` with SameValueZero
+%% (`mapkey_norm`), then: if an entry for `key` already exists, returns its EXISTING
+%% value and does NOT overwrite it; otherwise appends `{key, value}` as the last entry
+%% and returns `value`. On a non-Map receiver, delegates to a same-named user method.
+js_m_get_or_insert(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, Next, D} ->
+            K = mapkey_norm(arg(Args, 0)),
+            case maps:get(K, D, undefined) of
+                {_Seq, V} ->
+                    V;
+                undefined ->
+                    V = arg(Args, 1),
+                    erlang:put(?CELL_KEY(Recv), {js_map, Next + 1, maps:put(K, {Next, V}, D)}),
+                    V
+            end;
+        _ ->
+            delegate(Recv, <<"getOrInsert">>, Args)
+    end.
+
+%% Map.prototype.getOrInsertComputed(key, callbackfn) — the TC39 `upsert` proposal
+%% (sec-map.prototype.getorinsertcomputed). Canonicalizes `key`; if an entry already
+%% exists, returns its value WITHOUT invoking `callbackfn`. Otherwise calls
+%% `callbackfn(canonicalKey)` (the canonical key is passed as the single argument),
+%% then — re-reading the live map, since the callback may have mutated it — sets the
+%% entry for `key` to the callback's RETURN value and returns it. The return value
+%% wins over any mutation the callback made to the same key (step 6 re-scan). A
+%% re-inserted key keeps its position if the callback already created it, else appends.
+%% On a non-Map receiver, delegates to a same-named user method.
+js_m_get_or_insert_computed(Recv, Args) ->
+    case cell_tag(Recv) of
+        {js_map, _, D} ->
+            K = mapkey_norm(arg(Args, 0)),
+            case maps:get(K, D, undefined) of
+                {_Seq, V} ->
+                    V;
+                undefined ->
+                    Fn = arg(Args, 1),
+                    Value = call_cb(Fn, [K]),
+                    {js_map, Next2, D2} = cell_tag(Recv),
+                    {Next3, Seq} =
+                        case maps:get(K, D2, undefined) of
+                            {OldSeq, _} -> {Next2, OldSeq};
+                            undefined -> {Next2 + 1, Next2}
+                        end,
+                    erlang:put(?CELL_KEY(Recv), {js_map, Next3, maps:put(K, {Seq, Value}, D2)}),
+                    Value
+            end;
+        _ ->
+            delegate(Recv, <<"getOrInsertComputed">>, Args)
     end.
 
 %% forEach across arrays, Maps (fn(v, k, m)), Sets (fn(v, v, s)), or a user method.
