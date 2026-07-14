@@ -4252,6 +4252,7 @@ fn is_global_fn(name: String) -> Bool {
     "String"
     | "Number"
     | "Boolean"
+    | "RegExp"
     | "parseInt"
     | "parseFloat"
     | "isNaN"
@@ -4291,6 +4292,12 @@ fn lower_global_call(
       Ok(bind_after(b2, bool_term(i), ctr))
     }
     "Boolean", [] -> Ok(#(binds, ir.ConstAtom("false"), ctr))
+    // `RegExp(pattern, flags)` called WITHOUT `new` — same construction as
+    // `new RegExp(...)` per §22.2.3.1 (a v1 simplification always builds a fresh
+    // RegExp rather than returning an existing regex argument unchanged).
+    "RegExp", [p, f, ..] -> host("regex_construct", [p, f])
+    "RegExp", [p] -> host("regex_construct", [p, undefined()])
+    "RegExp", [] -> host("regex_construct", [undefined(), undefined()])
     "parseInt", [s] -> host("parse_int", [s, undefined()])
     "parseInt", [s, r, ..] -> host("parse_int", [s, r])
     // No-arg calls coerce the missing argument as `undefined`: ToString(undefined)
@@ -4543,6 +4550,9 @@ fn lower_new(
     // `new Array(n)` (length) / `new Array(a, b, …)` (elements).
     ast.Identifier(name: "Array", ..) ->
       lower_array_construct(arguments, env, ctx, ctr)
+    // `new RegExp(pattern, flags)` — a built-in RegExp (see `lower_regex_new`).
+    ast.Identifier(name: "RegExp", ..) ->
+      lower_regex_new(arguments, env, ctx, ctr)
     // `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive WRAPPER object
     // boxing the coerced primitive (unlike `Number(x)`/`String(x)`/`Boolean(x)` WITHOUT
     // `new`, which stay primitives via `lower_global_call`).
@@ -4817,6 +4827,29 @@ fn lower_date_new(
   use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
   let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
   Ok(bind_after(binds2, ir.CallHost("js", "date_new", [listv]), ctr))
+}
+
+/// `new RegExp(pattern, flags)` / `RegExp(pattern, flags)` — build a RegExp from a
+/// pattern and optional flags per §22.2.3.1. The pattern may be a string or an
+/// existing RegExp (whose source, and — when `flags` is omitted — flags are reused);
+/// a missing pattern/flags argument arrives as `undefined`, which the runtime
+/// `regex_construct` coerces to the empty pattern / empty flags. Extra arguments are
+/// ignored (RegExp takes at most two). Both the `new` and plain-call forms lower here
+/// (a v1 simplification: the plain call always constructs a fresh RegExp rather than
+/// returning an existing regex argument unchanged).
+fn lower_regex_new(
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(pat, flags) = case argvals {
+    [p, f, ..] -> #(p, f)
+    [p] -> #(p, undefined())
+    [] -> #(undefined(), undefined())
+  }
+  Ok(bind_after(binds, ir.CallHost("js", "regex_construct", [pat, flags]), ctr))
 }
 
 /// `recv.method(args)` — a method call. Dispatches the built-in array/string/Map/Set

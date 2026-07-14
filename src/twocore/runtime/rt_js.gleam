@@ -475,6 +475,12 @@ pub fn num_to_string_radix(n: Dynamic, radix: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_regex")
 pub fn new_regex(pattern: Dynamic, flags: Dynamic) -> Dynamic
 
+/// `new RegExp(pattern, flags)` / `RegExp(pattern, flags)` — resolve the pattern
+/// (string or an existing RegExp whose source/flags are reused) and optional flags
+/// per §22.2.3.1, then compile. `undefined` arguments become the empty pattern/flags.
+@external(erlang, "twocore_rt_js_ffi", "regex_construct")
+pub fn regex_construct(pattern: Dynamic, flags: Dynamic) -> Dynamic
+
 /// `re.test(str)` → JS boolean (advances `lastIndex` for a global/sticky regex).
 @external(erlang, "twocore_rt_js_ffi", "regex_test")
 pub fn regex_test(re: Dynamic, str: Dynamic) -> Dynamic
