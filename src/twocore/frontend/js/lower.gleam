@@ -81,9 +81,13 @@
 //// spec `toString` (`"name: message"`, or just `name` when the message is empty),
 //// and usable on the right of `instanceof` (`e instanceof TypeError`, `e instanceof
 //// Error`). NO real Error prototype chain, `.stack`, `cause`, or `class X extends
-//// Error` (a deliberate v1 boundary — the runtime error VALUE is a distinct tag from
-//// the runtime's INTERNAL error-signalling, which a JS `try`/`catch` still does not
-//// intercept).
+//// Error` (a deliberate v1 boundary). The runtime error VALUE is a distinct tag
+//// (`{js_err, …}`) from the runtime's INTERNAL error-signalling
+//// (`{js_error, Kind, Detail}`), but a JS `try`/`catch` now catches BOTH: an internal
+//// engine error (a `type_error`/`range_error` from a bad primitive op, or a native
+//// `{badfun,_}` from calling a non-callable) is CONVERTED at the catch to a `{js_err, …}`
+//// value with the matching `name` (usually "TypeError"), so `assert.throws(TypeError, …)`
+//// over an engine op passes (the broadening lives in `emit_core.emit_js_catch_clause`).
 ////
 //// DELIBERATE BOUNDARY — `eval` and the `Function` constructor are permanently
 //// unsupported (a clear `Unsupported` error): this is an AHEAD-OF-TIME compiler with
@@ -104,8 +108,10 @@
 //// follows the backing map, not insertion order.)
 //// (A default value on an arrow/function-EXPRESSION param only applies when it is
 //// called with the full arity or through an array method, since a closure call site
-//// can't pad; top-level function defaults always apply.) Only an explicit `throw` is
-//// caught (a runtime type error propagates), and a variable mutated in a try body
+//// can't pad; top-level function defaults always apply.) A `try`/`catch` catches an
+//// explicit `throw` AND the engine's internal runtime errors (§14.15) — the latter bound
+//// as a converted TypeError value; a `{wasm_trap,_}` trap / fuel raise still propagates.
+//// A variable mutated in a try body
 //// before a throw keeps its pre-try value in the handler — this applies equally to a
 //// `finally`'s EXCEPTIONAL (re-raise) path, which acts as a handler and so sees the
 //// pre-try value of a scalar the body mutated before throwing; the finally's
@@ -2661,7 +2667,11 @@ fn lower_switch(
 /// `try { B } catch (e) { H }` — lower to the IR `Try`: the body and handler each
 /// yield the block's mutated (carried) variables on normal completion, and a `throw`
 /// inside `B` (via the `js_exn` tag) transfers to `H` with the thrown value bound to
-/// `e`. `return`/`break`/`continue` inside `B`/`H` transfer out of the try as usual.
+/// `e`. The engine's own runtime errors (a TypeError etc.) also transfer to `H` — the
+/// `js_exn` catch is broadened at emit time (`emit_core.emit_js_catch_clause`) to convert
+/// an internal `{js_error,…}` (or a native `{badfun,_}`) into a caught TypeError value —
+/// so `H` runs for BOTH channels. `return`/`break`/`continue` inside `B`/`H` transfer out
+/// of the try as usual.
 ///
 /// v1 limits: `finally` and a non-identifier catch binding are `Unsupported`, and — as
 /// with all our SSA-style mutation — variables mutated in `B` before a throw are NOT
@@ -2751,9 +2761,13 @@ fn lower_try_catch(
 /// handler that captures the exception, runs `F`, and `throw_ref`s it). A
 /// `return`/`break`/`continue` that would exit the try (bypassing `F`) is a clean
 /// `Unsupported` — as is control flow inside `F` itself. `F` is lowered twice
-/// (the normal path and the re-raise path). Like all our try handling, only an
-/// explicit `throw` is intercepted; a variable mutated in `B` before a throw
-/// keeps its pre-try value in `F`'s re-raise path.
+/// (the normal path and the re-raise path). When a `catch (e) { C }` is present, its
+/// broadened `js_exn` handler catches the engine's own runtime errors too (like any
+/// `try`/`catch`), so `C` runs and `F` then runs on the NORMAL path. The bare
+/// `try B finally F` re-raise path is an `OnAll` gated on `is_wasm_exn`, so it currently
+/// runs `F` for an explicit `throw` (a wasm exn) but NOT for an un-caught internal engine
+/// error — that residual escapes without running `F` (a v1 limitation, unchanged here).
+/// A variable mutated in `B` before a throw keeps its pre-try value in `F`'s re-raise path.
 fn lower_try_finally(
   block: ast.Statement,
   handler: Option(ast.CatchClause),

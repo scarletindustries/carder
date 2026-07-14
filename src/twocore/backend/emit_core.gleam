@@ -154,6 +154,18 @@ const gc_module = "twocore@runtime@rt_gc"
 /// allow-set (S5, no `erlang` entry).
 const exn_module = "twocore@runtime@rt_exn"
 
+/// The JS frontend's single exception-tag NAME (PINNED to `frontend/js/lower.gleam`'s
+/// `js_exn_tag` constant). A `Try` handler whose `OnTag` names this tag is a JavaScript
+/// `try`/`catch`, and its catch is BROADENED (see `emit_catch_clause`) to also intercept the
+/// runtime's internal engine errors (`{js_error, Kind, Detail}`) — per ECMAScript a
+/// `try`/`catch` catches TypeErrors etc., not just an explicit `throw`. Keying on this name
+/// scopes the broadening to JS: the WASM/Porffor frontend names its tags `tag<idx>`
+/// (`frontend/wasm/lower.tagname`), never "js_exn", so a WASM `catch $t` is emitted UNCHANGED.
+/// (Even were a hand-written IR module to declare a tag literally named "js_exn", the extra
+/// `rt_js:js_error_to_value` probe is inert: it only matches `{js_error,_,_}`, which no WASM
+/// path ever raises, and returns `Error(Nil)` — a re-raise — for anything else.)
+const js_exn_tag_name = "js_exn"
+
 // ─────────────────────────────── error type (D4) ───────────────────────────────
 
 /// This stage's own error type (D4 — there is no shared `StageError`). `emit_module`
@@ -5956,6 +5968,10 @@ fn emit_catch_clause(
   case on {
     // `catch $t` — match the SAME module-local tag identity throw used (T4); the matched clause
     // binds the payload operands directly (`{ok, [P0,P1,…]}`), so throw/catch arities agree.
+    // The JS frontend's `js_exn` tag is BROADENED to also catch the runtime's internal engine
+    // errors (see `emit_js_catch_clause`); every other tag is the plain WASM `catch $t` below.
+    ir.OnTag(tag) if tag == js_exn_tag_name ->
+      emit_js_catch_clause(payload, rvar, hbody, next, state1, ctx)
     ir.OnTag(tag) -> {
       use tag_id <- result.try(resolve_tag(ctx, tag))
       let match = seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
@@ -5986,6 +6002,60 @@ fn emit_catch_clause(
       ))
     }
   }
+}
+
+/// Emit the BROADENED catch clause for the JS frontend's `js_exn` tag (a JavaScript
+/// `try`/`catch`). Per ECMAScript §14.15, a `catch` intercepts BOTH an explicit `throw`
+/// AND the engine's own runtime errors (a TypeError from calling a non-callable value,
+/// reading a property of `null`/`undefined`, …). Two channels feed one `catch` binding:
+///
+/// - an explicit `throw x` is a `{wasm_exn, TagId, [x]}` — matched by `rt_exn:match_tag`,
+///   which yields `{ok, [x]}` and binds the thrown value AS-IS (unwrapped, unchanged);
+/// - the runtime's internal `{js_error, Kind, Detail}` is CONVERTED by
+///   `rt_js:js_error_to_value` to `{ok, [ErrCell]}` — a `{js_err, Name, Msg}` cell, so the
+///   caught `e` is a proper TypeError/RangeError/… (`.name` / `.message` / `instanceof`).
+///
+/// The convert probe runs ONLY when `match_tag` failed (`{error, _}`), so it never re-wraps
+/// an explicit throw. `js_error_to_value` returns `{error, nil}` for a `{wasm_trap, _}` trap,
+/// an `exit`, or any other BEAM term, so the final `case` falls to `next` (the re-raise) —
+/// traps and host aborts propagate out of the `try` untouched (T7). Both channels expose the
+/// SAME `{ok, [E]}` shape, so ONE payload pattern binds the single catch parameter (a JS
+/// `catch` always binds one — or zero — names; `payload` is `[e]` or `[]`).
+fn emit_js_catch_clause(
+  payload: List(String),
+  rvar: String,
+  hbody: CExpr,
+  next: CExpr,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use tag_id <- result.try(resolve_tag(ctx, js_exn_tag_name))
+  let match = seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
+  let convert =
+    CCall(CAtom(ctx.binding.js_runtime_module), CAtom("js_error_to_value"), [
+      CVar(rvar),
+    ])
+  let #(caught, state1) = fresh_var(state)
+  let #(okv, state2) = fresh_var(state1)
+  let #(w_err, state3) = fresh_var(state2)
+  let #(w_final, state4) = fresh_var(state3)
+  // Caught = case match_tag(R, Tag) of {error, _} -> js_error_to_value(R); Ok -> Ok end
+  let caught_expr =
+    CCase(match, [
+      CClause([PTuple([PAtom("error"), PVar(w_err)])], CAtom("true"), convert),
+      CClause([PVar(okv)], CAtom("true"), CVar(okv)),
+    ])
+  // case Caught of {ok, [E]} -> handler ; _ -> next end
+  let dispatch =
+    CCase(CVar(caught), [
+      CClause(
+        [PTuple([PAtom("ok"), list_pattern(payload)])],
+        CAtom("true"),
+        hbody,
+      ),
+      CClause([PVar(w_final)], CAtom("true"), next),
+    ])
+  Ok(#(CLet([caught], caught_expr, dispatch), state4))
 }
 
 // ─────────────────────────────── values ───────────────────────────────

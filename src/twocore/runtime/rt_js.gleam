@@ -253,6 +253,20 @@ pub fn error_make(name: Dynamic, msg_arg: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "error_ctor")
 pub fn error_ctor(name: Dynamic) -> Dynamic
 
+/// Classify a caught BEAM `reason` for a JS `try`/`catch`: when it is the runtime's
+/// INTERNAL engine-error convention `{js_error, Kind, Detail}` (a `type_error` /
+/// `range_error` / … raised by a bad primitive op), CONVERT it to a JS-level error VALUE
+/// and return `Ok([err])` — `err` a fresh `{js_err, Name, Message}` cell whose `Name` is
+/// the matching ECMAScript constructor ("TypeError", …), so the caught `e` answers
+/// `.name` / `.message` / `instanceof` correctly. Returns `Error(Nil)` for ANY other
+/// reason (an explicit-`throw` `{wasm_exn,_,_}` handled by `rt_exn.match_tag` upstream, a
+/// `{wasm_trap,_}` trap, an exit, an arbitrary BEAM error) — the emitted catch then
+/// RE-RAISES it, so traps / host aborts propagate out of the `try` untouched (T7). The
+/// one-element list mirrors `rt_exn.match_tag`'s `Ok(Payload)` shape so ONE catch-binding
+/// pattern serves both the explicit-throw and engine-error channels.
+@external(erlang, "twocore_rt_js_ffi", "js_error_to_value")
+pub fn js_error_to_value(reason: Dynamic) -> Result(List(Dynamic), Nil)
+
 /// `obj[key]` → the stored value, or `undefined` when absent (own properties only — no
 /// prototype chain in v1). Keys are binaries; a NUMBER key normalizes to its JS string form
 /// (`5`, `5.0` and `"5"` are the same key). A non-object receiver is a `type_error`.

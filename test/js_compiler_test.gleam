@@ -5058,3 +5058,81 @@ pub fn error_instanceof_test() {
     )
   call(m, "f", []) |> should.equal(dyn(True))
 }
+
+// ==== catch engine errors (wave 5) ====
+//
+// Per ECMAScript §14.15 (TryStatement) a `catch` intercepts the ENGINE's own runtime
+// errors — a TypeError from calling a non-callable value (§13.3.6.1) or from reading a
+// property of `null`/`undefined` (§7.3.2 GetV → ToObject) — not only an explicit
+// `throw`. The caught binding is a real TypeError (`.name` / `.message` / `instanceof`),
+// an explicit `throw` is still caught AS-IS, and `finally` still runs on both paths.
+
+// Calling a non-callable value (`x()` where `x` is a number) throws a TypeError that the
+// surrounding `try`/`catch` catches (rather than aborting the function).
+pub fn catch_not_callable_test() {
+  let m =
+    compile(
+      "function f(){ let caught = 0; let g = 5; try { g(); } catch (e) { caught = 1; } return caught; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// A method call on `undefined` (`u.f()`) throws while resolving the property and is caught.
+pub fn catch_undefined_member_call_test() {
+  let m =
+    compile(
+      "function f(){ let caught = 0; let u = undefined; try { u.f(); } catch (e) { caught = 1; } return caught; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// Reading a property of `null` (`n.x`) throws a TypeError that is caught.
+pub fn catch_null_property_test() {
+  let m =
+    compile(
+      "function f(){ let caught = 0; let n = null; try { n.x; } catch (e) { caught = 1; } return caught; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// The caught engine error is a genuine TypeError: `.name` is "TypeError", it is
+// `instanceof TypeError` and `instanceof Error` but not a sibling NativeError, and its
+// `.message` is a string.
+pub fn catch_engine_error_is_typeerror_test() {
+  let m =
+    compile(
+      "function f(){ let n = null; try { n.x; } catch (e) { return e.name; } }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"TypeError">>))
+
+  let g =
+    compile(
+      "function f(){ let n = null; try { n.x; } catch (e) { return (e instanceof TypeError) && (e instanceof Error) && !(e instanceof RangeError) && (typeof e.message === \"string\"); } }",
+    )
+  call(g, "f", []) |> should.equal(dyn(True))
+}
+
+// An explicit `throw` of a primitive is still caught UNCHANGED — the caught value is the
+// thrown string itself, bound as-is (NOT rewrapped into an error object).
+pub fn catch_explicit_throw_unchanged_test() {
+  let m =
+    compile(
+      "function f(){ try { throw \"x\"; } catch (e) { return (e === \"x\") && (typeof e === \"string\"); } }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// `finally` runs on the caught-engine-error path (the inner engine error is caught, then
+// finally runs) AND on the normal-completion path.
+pub fn catch_engine_error_finally_test() {
+  // engine error caught (caught=1), then finally runs (ran=1) → 1*10 + 1 = 11.
+  num(
+    "(function(){ let o = { ran: 0, caught: 0 }; let g = 5; try { g(); } catch (e) { o.caught = 1; } finally { o.ran = 1; } return o.ran * 10 + o.caught; })()",
+  )
+  |> should.equal(11.0)
+  // normal completion still runs finally: 1 + 4 = 5.
+  num(
+    "(function(){ let o = { ran: 0 }; try { o.ran = 1; } finally { o.ran = o.ran + 4; } return o.ran; })()",
+  )
+  |> should.equal(5.0)
+}
