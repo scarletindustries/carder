@@ -1831,7 +1831,12 @@ date_parse(V) ->
 %% own method). `Name` is the JS method name (a binary); `Args` the full argument list.
 date_call(Recv, Name, Args) ->
     case cell_tag(Recv) of
-        {js_date, Ms} -> date_field(Name, Ms, Args);
+        {js_date, Ms} ->
+            case is_date_setter(Name) of
+                %% Setters mutate the receiver cell, so they need `Recv`.
+                true -> date_set(Recv, Name, Ms, Args);
+                false -> date_field(Name, Ms, Args)
+            end;
         %% a primitive wrapper: `valueOf` unwraps to the boxed primitive, `toString`
         %% to its string form; no other method exists on a wrapper in this v1 model.
         {js_wrapper, _Kind, Prim} ->
@@ -1855,6 +1860,18 @@ date_field(<<"toISOString">>, nan, _) -> range_error(<<"Invalid time value">>);
 date_field(<<"toISOString">>, Ms, _) -> to_iso_string(Ms);
 date_field(<<"toJSON">>, nan, _) -> null;
 date_field(<<"toJSON">>, Ms, _) -> to_iso_string(Ms);
+%% Human-readable string forms. An Invalid Date renders as "Invalid Date" for each
+%% (§21.4.4.41/.35/.42/.43). Local and UTC coincide (deviation), so the local
+%% `toString`/`toTimeString` render a fixed `GMT+0000` zone.
+date_field(<<"toUTCString">>, nan, _) -> <<"Invalid Date">>;
+date_field(<<"toUTCString">>, Ms, _) -> to_utc_string(Ms);
+date_field(<<"toDateString">>, nan, _) -> <<"Invalid Date">>;
+date_field(<<"toDateString">>, Ms, _) -> to_date_string(Ms);
+date_field(<<"toTimeString">>, nan, _) -> <<"Invalid Date">>;
+date_field(<<"toTimeString">>, Ms, _) -> to_time_string(Ms);
+date_field(<<"toString">>, nan, _) -> <<"Invalid Date">>;
+date_field(<<"toString">>, Ms, _) ->
+    <<(to_date_string(Ms))/binary, " ", (to_time_string(Ms))/binary>>;
 date_field(_Name, nan, _) -> js_nan;
 date_field(Name, Ms, _) -> date_component(Name, Ms).
 
@@ -1883,6 +1900,195 @@ date_component(Name, Ms) ->
         <<"getUTCMilliseconds">> -> MsOfDay rem 1000;
         _ -> type_error(Name)
     end.
+
+%% True for the mutating Date setter method names (§21.4.4.20-30). Setters need the
+%% receiver cell (to write the new [[DateValue]]), so they are dispatched from
+%% `date_call` rather than `date_field`. The UTC variants coincide with the local
+%% ones (module deviation).
+is_date_setter(N) ->
+    lists:member(N, [
+        <<"setTime">>,
+        <<"setMilliseconds">>,
+        <<"setUTCMilliseconds">>,
+        <<"setSeconds">>,
+        <<"setUTCSeconds">>,
+        <<"setMinutes">>,
+        <<"setUTCMinutes">>,
+        <<"setHours">>,
+        <<"setUTCHours">>,
+        <<"setDate">>,
+        <<"setUTCDate">>,
+        <<"setMonth">>,
+        <<"setUTCMonth">>,
+        <<"setFullYear">>,
+        <<"setUTCFullYear">>
+    ]).
+
+%% Execute a Date setter: compute the new time value from the current time `Ms` and
+%% the argument list, write it back into the receiver cell `Recv`, and RETURN it (a
+%% JS number, or NaN). Per §21.4.4:
+%%   - `setTime(time)` replaces the whole value with `TimeClip(ToNumber(time))`.
+%%   - the field setters recompute one or more components; absent trailing arguments
+%%     are taken from the current value, and any non-finite argument yields NaN.
+%%   - an Invalid Date (`nan`) stays NaN for every setter EXCEPT `setFullYear`, which
+%%     treats a NaN base time as +0 so the year can still be established.
+date_set(Recv, <<"setTime">>, _Ms, Args) ->
+    date_store(Recv, time_clip(coerce_num(arg(Args, 0))));
+date_set(Recv, Name, Ms, Args) ->
+    date_store(Recv, date_set_value(Name, Ms, Args)).
+
+%% Write `{js_date, New}` into the cell and return the external time value.
+date_store(Recv, New) ->
+    cell_set(Recv, {js_date, New}),
+    out_ms(New).
+
+%% New time value for a field setter, or `nan`. Decomposes the current time into UTC
+%% components, overlays the ones the setter provides, then re-composes via MakeDay/
+%% MakeTime + TimeClip.
+date_set_value(Name, Ms, Args) ->
+    IsFullYear =
+        Name =:= <<"setFullYear">> orelse Name =:= <<"setUTCFullYear">>,
+    case Ms =:= nan andalso not IsFullYear of
+        true ->
+            nan;
+        false ->
+            %% setFullYear uses +0 as its base when the date is invalid.
+            T =
+                case Ms of
+                    nan -> 0;
+                    _ -> Ms
+                end,
+            MsOfDay = floor_mod(T, ?MS_PER_DAY),
+            Days = (T - MsOfDay) div ?MS_PER_DAY,
+            {Y, Mo1, D} = civil_from_days(Days),
+            H = MsOfDay div 3600000,
+            Mi = (MsOfDay div 60000) rem 60,
+            S = (MsOfDay div 1000) rem 60,
+            MilS = MsOfDay rem 1000,
+            date_recompose(Name, {Y, Mo1 - 1, D, H, Mi, S, MilS}, Args)
+    end.
+
+%% Overlay the setter's arguments onto the current 0-based (year, month, date,
+%% hours, minutes, seconds, ms) tuple, then build the time value. `component/3`
+%% yields the current field when the argument is absent and `nan` for a non-finite
+%% argument; any `nan` component makes the whole result NaN (MakeDay/MakeTime).
+date_recompose(Name, {Y, Mo, D, H, Mi, S, MilS}, A) ->
+    {NY, NMo, ND, NH, NMi, NS, NMilS} =
+        case Name of
+            <<"setMilliseconds">> -> {Y, Mo, D, H, Mi, S, component(A, 0, MilS)};
+            <<"setUTCMilliseconds">> ->
+                {Y, Mo, D, H, Mi, S, component(A, 0, MilS)};
+            <<"setSeconds">> ->
+                {Y, Mo, D, H, Mi, component(A, 0, S), component(A, 1, MilS)};
+            <<"setUTCSeconds">> ->
+                {Y, Mo, D, H, Mi, component(A, 0, S), component(A, 1, MilS)};
+            <<"setMinutes">> ->
+                {Y, Mo, D, H, component(A, 0, Mi), component(A, 1, S),
+                    component(A, 2, MilS)};
+            <<"setUTCMinutes">> ->
+                {Y, Mo, D, H, component(A, 0, Mi), component(A, 1, S),
+                    component(A, 2, MilS)};
+            <<"setHours">> ->
+                {Y, Mo, D, component(A, 0, H), component(A, 1, Mi),
+                    component(A, 2, S), component(A, 3, MilS)};
+            <<"setUTCHours">> ->
+                {Y, Mo, D, component(A, 0, H), component(A, 1, Mi),
+                    component(A, 2, S), component(A, 3, MilS)};
+            <<"setDate">> -> {Y, Mo, component(A, 0, D), H, Mi, S, MilS};
+            <<"setUTCDate">> -> {Y, Mo, component(A, 0, D), H, Mi, S, MilS};
+            <<"setMonth">> ->
+                {Y, component(A, 0, Mo), component(A, 1, D), H, Mi, S, MilS};
+            <<"setUTCMonth">> ->
+                {Y, component(A, 0, Mo), component(A, 1, D), H, Mi, S, MilS};
+            <<"setFullYear">> ->
+                {component(A, 0, Y), component(A, 1, Mo), component(A, 2, D), H,
+                    Mi, S, MilS};
+            <<"setUTCFullYear">> ->
+                {component(A, 0, Y), component(A, 1, Mo), component(A, 2, D), H,
+                    Mi, S, MilS}
+        end,
+    case lists:member(nan, [NY, NMo, ND, NH, NMi, NS, NMilS]) of
+        true ->
+            nan;
+        false ->
+            Day = make_day(NY, NMo, ND),
+            Time = NH * 3600000 + NMi * 60000 + NS * 1000 + NMilS,
+            time_clip(Day * ?MS_PER_DAY + Time)
+    end.
+
+%% `Date.prototype.toUTCString` (§21.4.4.43) for a valid time value: the
+%% timezone-independent form `Www, DD Mon YYYY HH:mm:ss GMT`, e.g.
+%% "Wed, 01 Jan 1970 00:00:00 GMT". The year is at least four digits, zero-padded,
+%% with a leading `-` for negative (expanded) years.
+to_utc_string(Ms) ->
+    {Y, Mo, D, Wd, H, Mi, S} = date_parts(Ms),
+    iolist_to_binary(
+        io_lib:format(
+            "~s, ~2..0B ~s ~s ~2..0B:~2..0B:~2..0B GMT",
+            [weekday_abbr(Wd), D, month_abbr(Mo), date_year_str(Y), H, Mi, S]
+        )
+    ).
+
+%% The date portion shared by `toString`/`toDateString` (§21.4.4.41/.35):
+%% `Www Mon DD YYYY`, e.g. "Thu Jan 01 1970". Local == UTC (deviation).
+to_date_string(Ms) ->
+    {Y, Mo, D, Wd, _H, _Mi, _S} = date_parts(Ms),
+    iolist_to_binary(
+        io_lib:format(
+            "~s ~s ~2..0B ~s",
+            [weekday_abbr(Wd), month_abbr(Mo), D, date_year_str(Y)]
+        )
+    ).
+
+%% The time portion shared by `toString`/`toTimeString` (§21.4.4.41/.42):
+%% `HH:mm:ss GMT+0000`. The zone is fixed at +0000 because local == UTC (deviation).
+to_time_string(Ms) ->
+    {_Y, _Mo, _D, _Wd, H, Mi, S} = date_parts(Ms),
+    iolist_to_binary(
+        io_lib:format("~2..0B:~2..0B:~2..0B GMT+0000", [H, Mi, S])
+    ).
+
+%% Decompose a valid integer time value into its UTC calendar fields:
+%% `{Year, Month1, Date, Weekday, Hours, Minutes, Seconds}` where `Month1` is
+%% 1-based and `Weekday` is 0=Sunday.
+date_parts(Ms) ->
+    MsOfDay = floor_mod(Ms, ?MS_PER_DAY),
+    Days = (Ms - MsOfDay) div ?MS_PER_DAY,
+    {Y, Mo, D} = civil_from_days(Days),
+    Wd = floor_mod(Days + 4, 7),
+    H = MsOfDay div 3600000,
+    Mi = (MsOfDay div 60000) rem 60,
+    S = (MsOfDay div 1000) rem 60,
+    {Y, Mo, D, Wd, H, Mi, S}.
+
+%% Three-letter English weekday abbreviation for a day index (0=Sunday).
+weekday_abbr(0) -> "Sun";
+weekday_abbr(1) -> "Mon";
+weekday_abbr(2) -> "Tue";
+weekday_abbr(3) -> "Wed";
+weekday_abbr(4) -> "Thu";
+weekday_abbr(5) -> "Fri";
+weekday_abbr(6) -> "Sat".
+
+%% Three-letter English month abbreviation for a 1-based month number.
+month_abbr(1) -> "Jan";
+month_abbr(2) -> "Feb";
+month_abbr(3) -> "Mar";
+month_abbr(4) -> "Apr";
+month_abbr(5) -> "May";
+month_abbr(6) -> "Jun";
+month_abbr(7) -> "Jul";
+month_abbr(8) -> "Aug";
+month_abbr(9) -> "Sep";
+month_abbr(10) -> "Oct";
+month_abbr(11) -> "Nov";
+month_abbr(12) -> "Dec".
+
+%% The year field used by the human-readable string forms: at least four digits,
+%% zero-padded, with a leading `-` for negative years (e.g. -1 -> "-0001",
+%% 20 -> "0020", -123456 -> "-123456").
+date_year_str(Y) when Y < 0 -> io_lib:format("-~4..0B", [-Y]);
+date_year_str(Y) -> io_lib:format("~4..0B", [Y]).
 
 %% Build a time value (ms integer or `nan`) from a component argument list, shared by
 %% the component-form `new Date(y, m, …)` and `Date.UTC(…)`. Defaults per spec: month
