@@ -3997,3 +3997,34 @@ pub fn negative_zero_division_sign_test() {
   num("1 / -0 === -Infinity ? 1 : 0") |> should.equal(1.0)
   num("1 / 0 === Infinity ? 1 : 0") |> should.equal(1.0)
 }
+
+pub fn number_string_negative_zero_test() {
+  // ToNumber(String) of a signed zero: §9.3.1 makes the MV of
+  // "- StrUnsignedDecimalLiteral" the negation of the unsigned MV, and the
+  // negation of 0 is -0. So "-0"/"-0.0"/"-0e5" coerce to negative zero, which is
+  // === 0 but has sign bit set (1 / -0 is -Infinity).
+  num("Number('-0') === 0 ? 1 : 0") |> should.equal(1.0)
+  num("1 / Number('-0') === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Number('-0.0') === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Number('-0e5') === -Infinity ? 1 : 0") |> should.equal(1.0)
+  // A leading "+" or no sign gives positive zero (1 / 0 is +Infinity).
+  num("1 / Number('0') === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Number('+0') === Infinity ? 1 : 0") |> should.equal(1.0)
+  // A non-zero magnitude keeps its value/sign.
+  num("Number('-5')") |> should.equal(-5.0)
+  num("Number('-0.5')") |> should.equal(-0.5)
+}
+
+pub fn number_format_negative_zero_test() {
+  // toExponential/toFixed add a "-" only when x < 0 (§21.1.3.2 / §21.1.3.3).
+  // Negative zero is not < 0, so it formats without a sign.
+  val("(-0).toExponential(4)") |> should.equal(dyn(<<"0.0000e+0">>))
+  val("(-0).toExponential(1)") |> should.equal(dyn(<<"0.0e+0">>))
+  val("(-0).toFixed(2)") |> should.equal(dyn(<<"0.00">>))
+  // A genuinely-negative value that merely ROUNDS to zero keeps its sign: x < 0
+  // makes s = "-" before rounding, so (-0.0001).toFixed(2) is "-0.00".
+  val("(-0.0001).toFixed(2)") |> should.equal(dyn(<<"-0.00">>))
+  // Ordinary negatives are unaffected.
+  val("(-123.456).toExponential(2)") |> should.equal(dyn(<<"-1.23e+2">>))
+  val("(-1.5).toFixed(0)") |> should.equal(dyn(<<"-2">>))
+}
