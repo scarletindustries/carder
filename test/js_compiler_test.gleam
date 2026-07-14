@@ -4244,3 +4244,25 @@ pub fn regexp_call_without_new_test() {
   val("RegExp(\"abc\", \"m\").multiline") |> should.equal(dyn(True))
   val("RegExp(\"a.c\").test(\"axc\")") |> should.equal(dyn(True))
 }
+
+// ==== String (wave 1) ====
+
+// §22.1.3.22 String.prototype.toLocaleLowerCase / §22.1.3.24
+// toLocaleUpperCase: with no locale-sensitive data available they must behave
+// exactly like toLowerCase / toUpperCase. (test262
+// String/prototype/toLocaleLowerCase/S15.5.4.17_A1_T1 &
+// toLocaleUpperCase/S15.5.4.19_A1_T1.)
+pub fn string_to_locale_lower_upper_test() {
+  val("\"Hello World\".toLocaleLowerCase()")
+  |> should.equal(dyn(<<"hello world">>))
+  val("\"Hello World\".toLocaleUpperCase()")
+  |> should.equal(dyn(<<"HELLO WORLD">>))
+  // Locale-insensitive SpecialCasing: sharp S upper-cases to "SS", the FF
+  // ligature upper-cases to "FF" (String/prototype/toLocaleUpperCase/special_casing).
+  val("\"\\u00DF\".toLocaleUpperCase()") |> should.equal(dyn(<<"SS">>))
+  // Supplementary-plane code points are case-mapped like toLowerCase
+  // (String/prototype/toLocaleLowerCase/supplementary_plane: DESERET CAPITAL
+  // LETTER LONG I U+10400 -> small U+10428).
+  val("\"\\u{10400}\".toLocaleLowerCase()")
+  |> should.equal(dyn(<<"\u{10428}">>))
+}

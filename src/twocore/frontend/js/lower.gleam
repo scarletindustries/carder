@@ -5110,6 +5110,10 @@ fn lower_instance_method(
     "normalize", [] -> host("str_normalize", [undefined()])
     "toUpperCase", _ -> host("str_upper", [])
     "toLowerCase", _ -> host("str_lower", [])
+    // §22.1.3.22/24: without locale-sensitive data, toLocaleUpperCase /
+    // toLocaleLowerCase behave exactly like toUpperCase / toLowerCase.
+    "toLocaleUpperCase", _ -> host("str_upper", [])
+    "toLocaleLowerCase", _ -> host("str_lower", [])
     "substring", [] -> host("str_substring", [undefined(), undefined()])
     "substring", [s] -> host("str_substring", [s, undefined()])
     "substring", [s, e, ..] -> host("str_substring", [s, e])
