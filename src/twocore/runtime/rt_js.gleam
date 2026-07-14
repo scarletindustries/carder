@@ -570,6 +570,20 @@ pub fn new_weakmap(init: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "weakmap_ctor")
 pub fn weakmap_ctor() -> Dynamic
 
+/// `new WeakSet([iterable])` — a `{js_weakset, …}` cell (§24.4); `add`/`has`/`delete`
+/// dispatch through `js_m_add`/`js_m_has`/`js_m_delete` on the WeakSet tag.
+@external(erlang, "twocore_rt_js_ffi", "new_weakset")
+pub fn new_weakset(init: Dynamic) -> Dynamic
+
+/// The bare `WeakSet` identifier as a function value (so `typeof WeakSet` is
+/// "function"); calling it without `new` throws a TypeError.
+@external(erlang, "twocore_rt_js_ffi", "weakset_ctor")
+pub fn weakset_ctor() -> Dynamic
+
+/// `WeakSet(...)` called without `new` — always throws a TypeError (§24.4.1.1).
+@external(erlang, "twocore_rt_js_ffi", "weakset_no_new")
+pub fn weakset_no_new() -> Dynamic
+
 // Each takes the receiver + a cons-list of ALL the call's arguments — so a delegated
 // user method (plain-object receiver) receives every argument.
 

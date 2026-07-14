@@ -47,3 +47,6 @@ erl_crash.dump
 /c_src/*.so
 /c_src/*.dylib
 /c_src/*.o
+
+# Claude Code agent worktrees (local isolation artifacts — never commit)
+.claude/worktrees/
