@@ -4095,7 +4095,7 @@ radix_digit(D) when D >= 10, D =< 35 -> $a + (D - 10).
 %% prefix is added only when `x < 0`; negative zero is not `< 0`, so it renders
 %% without a leading "-" — Erlang would otherwise emit "-0…", so ±0 is normalised.
 num_to_exponential(N, D) ->
-    case coerce_num(N) of
+    case coerce_num(this_number_value(N)) of
         nan ->
             <<"NaN">>;
         inf ->
@@ -4195,7 +4195,7 @@ num_to_precision(N, P) ->
         nan ->
             to_string(N);
         Pn ->
-            case coerce_num(N) of
+            case coerce_num(this_number_value(N)) of
                 nan -> <<"NaN">>;
                 inf -> <<"Infinity">>;
                 neg_inf -> <<"-Infinity">>;
@@ -4306,11 +4306,23 @@ num_to_fixed(N, D) ->
             nan -> 0;
             _ -> max(0, trunc(as_float(coerce_num(D))))
         end,
-    case coerce_num(N) of
+    case coerce_num(this_number_value(N)) of
         nan -> <<"NaN">>;
         inf -> <<"Infinity">>;
         neg_inf -> <<"-Infinity">>;
         Num -> float_to_binary(strip_neg_zero(as_float(Num)), [{decimals, Digits}])
+    end.
+
+%% thisNumberValue(this value) for the Number.prototype formatting methods
+%% (§21.1.3): a `new Number(x)` wrapper object unwraps to its boxed primitive
+%% number; every other value (a primitive number, or anything else) passes through
+%% unchanged so the caller's `coerce_num` handles it. Per spec a non-Number
+%% receiver is a TypeError, but exceptions on the receiver are not modelled here —
+%% a non-wrapper simply falls through to the ordinary numeric coercion.
+this_number_value(N) ->
+    case cell_tag(N) of
+        {js_wrapper, number, Prim} -> Prim;
+        _ -> N
     end.
 
 %% Normalise negative zero to positive zero (any non-zero float is returned
