@@ -239,6 +239,20 @@ pub fn new_object() -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "wrapper_new")
 pub fn wrapper_new(kind: Dynamic, x: Dynamic) -> Dynamic
 
+/// `new Name(msg)` / `Name(msg)` — construct a JS error VALUE `{js_err, Name, Msg}`.
+/// `name` is the binary constructor name ("TypeError", "Error", …); `msg_arg` is
+/// the raw first constructor argument, or the `undefined` atom when none was given
+/// (an `undefined` message becomes "" per §20.5.1.1). The result is a throwable
+/// cell carrying readable `.name`/`.message` and a spec `toString`.
+@external(erlang, "twocore_rt_js_ffi", "error_make")
+pub fn error_make(name: Dynamic, msg_arg: Dynamic) -> Dynamic
+
+/// An error constructor as a first-class fun VALUE — so a BARE `TypeError`
+/// reference has `typeof` "function" and, if applied, constructs an error. `name`
+/// is the binary constructor name.
+@external(erlang, "twocore_rt_js_ffi", "error_ctor")
+pub fn error_ctor(name: Dynamic) -> Dynamic
+
 /// `obj[key]` → the stored value, or `undefined` when absent (own properties only — no
 /// prototype chain in v1). Keys are binaries; a NUMBER key normalizes to its JS string form
 /// (`5`, `5.0` and `"5"` are the same key). A non-object receiver is a `type_error`.
