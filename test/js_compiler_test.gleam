@@ -5136,3 +5136,61 @@ pub fn catch_engine_error_finally_test() {
   )
   |> should.equal(5.0)
 }
+
+// ==== Number (wave 6) ====
+
+// thisNumberValue: the Number.prototype formatting methods operate on the boxed
+// primitive of a `new Number(x)` wrapper object, not on the object itself. Per
+// sec-number.prototype.toexponential step 1 (thisNumberValue) followed by step 7
+// (x = +Infinity returns "Infinity" BEFORE the fractionDigits range check), so an
+// out-of-range fractionDigits like 1000 still returns the signed "Infinity".
+pub fn number_wrapper_toexponential_infinity_test() {
+  let m =
+    compile(
+      "function f(){ var n = new Number(Infinity); return n.toExponential(1000); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("Infinity"))
+
+  let g =
+    compile(
+      "function g(){ var n = new Number(-Infinity); return n.toExponential(1000); }",
+    )
+  call(g, "g", []) |> should.equal(dyn("-Infinity"))
+}
+
+// sec-number.prototype.toprecision: thisNumberValue unwraps the wrapper, then step
+// 7 returns "Infinity"/"-Infinity" for a non-finite value before the precision
+// range check, so `new Number(Infinity).toPrecision(1000)` is "Infinity".
+pub fn number_wrapper_toprecision_infinity_test() {
+  let m =
+    compile(
+      "function f(){ var n = new Number(Infinity); return n.toPrecision(1000); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("Infinity"))
+}
+
+// A finite `new Number(x)` wrapper formats as its boxed primitive: 1e21 to three
+// significant digits uses exponential form (e >= p), giving "1.00e+21".
+pub fn number_wrapper_toprecision_finite_test() {
+  let m =
+    compile(
+      "function f(){ var n = new Number(\"1000000000000000000000\"); return n.toPrecision(3); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("1.00e+21"))
+}
+
+// toFixed on a Number wrapper uses the boxed primitive and rounds half-away-from-
+// zero: `new Number(2.5).toFixed(0)` is "3".
+pub fn number_wrapper_tofixed_test() {
+  let m =
+    compile("function f(){ var n = new Number(2.5); return n.toFixed(0); }")
+  call(m, "f", []) |> should.equal(dyn("3"))
+}
+
+// toPrecision renders from the EXACT decimal expansion of the double, so high
+// precision reveals the true stored value: 1.2345e27 to 21 significant digits is
+// "1.23449999999999996184e+27" (sec-number.prototype.toprecision, exponential form).
+pub fn number_toprecision_high_precision_exact_test() {
+  val("(1.2345e+27).toPrecision(21)")
+  |> should.equal(dyn("1.23449999999999996184e+27"))
+}
