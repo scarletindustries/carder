@@ -60,3 +60,7 @@ the main thing right now is getting good WASM conformance, then focus on finding
 
 building this burns a lot of tokens. i'd love help if you have some spare claude tokens and want to contribute! claude works out of the specs/ folder, and maintains a ledger of state and a standard workflow
 for planning new phases. that's worked pretty well so far to get to where the project is now. that being said, I leave claude working on it 24/7, so rather than double-work, hit me up on Discord (@hiett) and we can allocate the workload so there's no overlap.
+
+## license
+
+2core is licensed under the [Apache License 2.0](LICENSE). you're free to use, modify, and distribute it — including in commercial and closed-source products — provided you keep the license and attribution notices intact. the Apache license also carries an explicit patent grant. see [LICENSE](LICENSE) and [NOTICE](NOTICE) for the full terms.
