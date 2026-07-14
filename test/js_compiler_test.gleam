@@ -3997,3 +3997,13 @@ pub fn negative_zero_division_sign_test() {
   num("1 / -0 === -Infinity ? 1 : 0") |> should.equal(1.0)
   num("1 / 0 === Infinity ? 1 : 0") |> should.equal(1.0)
 }
+
+pub fn replace_all_empty_search_test() {
+  // §22.1.3.20: an empty search string is found at every position 0..len, so
+  // the replacement is inserted before each code point AND once at the end.
+  val("'a'.replaceAll('', '_')") |> should.equal(dyn(<<"_a_">>))
+  val("'aab c  \\nx'.replaceAll('', '_')")
+  |> should.equal(dyn(<<"_a_a_b_ _c_ _ _\n_x_">>))
+  // Both the receiver and the search being empty inserts the replacement once.
+  val("''.replaceAll('', 'abc')") |> should.equal(dyn(<<"abc">>))
+}
