@@ -1545,11 +1545,17 @@ has_prop(Recv, _Key) ->
 %% `typeof` is still "object" (a cell is a reference); `Array.isArray` and the
 %% array-aware `to_string`/property ops distinguish it by the tagged content.
 
-%% [e0, e1, …] — build the array from the emitter's cons list of elements.
+%% [e0, e1, …] — build the array from the emitter's cons list of elements. The
+%% `js_hole` sentinel (emitted for an array-literal elision, `[0, , 2]`) advances the
+%% length but is NOT stored, leaving that index a genuine hole (absent key) — a hole is
+%% distinct from the value `undefined` per ES §13.2.4.
 new_array(List) when is_list(List) ->
     {Len, Map} =
         lists:foldl(
-            fun(E, {I, M}) -> {I + 1, maps:put(I, E, M)} end,
+            fun
+                (js_hole, {I, M}) -> {I + 1, M};
+                (E, {I, M}) -> {I + 1, maps:put(I, E, M)}
+            end,
             {0, #{}},
             List
         ),
@@ -1598,6 +1604,14 @@ array_key(K) when is_binary(K) ->
         {ok, I} -> I;
         error -> K
     end;
+%% A boolean / null / undefined index is a PRIMITIVE key: ToPropertyKey coerces it
+%% via ToString, so `arr[true]`/`arr[null]`/`arr[undefined]` address the ordinary
+%% string properties "true"/"false"/"null"/"undefined" (never an array index, so
+%% `length` is untouched) — ES §10.4.2.1 / §7.1.19.
+array_key(true) -> <<"true">>;
+array_key(false) -> <<"false">>;
+array_key(null) -> <<"null">>;
+array_key(undefined) -> <<"undefined">>;
 array_key(K) -> prop_key(K).
 
 %% A binary key is an array index only if it is the canonical decimal form of an
@@ -1650,7 +1664,10 @@ array_push(Recv, Vals) when is_reference(Recv), is_list(Vals) ->
         {js_array, Len, Map} ->
             {NewLen, NewMap} =
                 lists:foldl(
-                    fun(V, {I, M}) -> {I + 1, maps:put(I, V, M)} end,
+                    fun
+                        (js_hole, {I, M}) -> {I + 1, M};
+                        (V, {I, M}) -> {I + 1, maps:put(I, V, M)}
+                    end,
                     {Len, Map},
                     Vals
                 ),

@@ -5338,8 +5338,11 @@ fn lower_instance_method(
   }
 }
 
-/// `[e0, e1, …]` — evaluate each element left-to-right (a hole becomes `undefined`),
-/// then construct the array from the cons list via `new_array`. With a spread element
+/// `[e0, e1, …]` — evaluate each element left-to-right, then construct the array
+/// from the cons list via `new_array`. An ELISION (`[0, , 2]`) lowers to the private
+/// `js_hole` sentinel so the index is genuinely absent from the array (per the spec a
+/// hole is NOT the value `undefined`: `[0, , 2].indexOf(undefined)` is -1 because
+/// indexOf skips indices the array does not HAVE). With a spread element
 /// (`[...a, x]`) it builds incrementally: pushing single values and spreading arrays/
 /// strings into a fresh array.
 fn lower_array(
@@ -5365,7 +5368,7 @@ fn lower_array(
               use #(b, v, ctr) <- result_try(lower_expr(e, env, ctx, ctr))
               Ok(#(list.append(binds, b), list.append(vals, [v]), ctr))
             }
-            None -> Ok(#(binds, list.append(vals, [undefined()]), ctr))
+            None -> Ok(#(binds, list.append(vals, [hole()]), ctr))
           }
         }),
       )
@@ -5392,7 +5395,7 @@ fn lower_array(
           other -> {
             use #(be, v, ctr) <- result_try(case other {
               Some(e) -> lower_expr(e, env, ctx, ctr)
-              None -> Ok(#([], undefined(), ctr))
+              None -> Ok(#([], hole(), ctr))
             })
             let #(bl, listv, ctr) = build_list([v], list.append(binds, be), ctr)
             let #(binds2, _r, ctr) =
@@ -5884,6 +5887,16 @@ fn is_integral(v: Float) -> Bool {
 /// The JS `undefined` value — the `rt_js` sentinel atom.
 fn undefined() -> ir.Value {
   ir.ConstAtom("undefined")
+}
+
+/// The private ARRAY-HOLE sentinel emitted for an array-literal elision (`[0, , 2]`).
+/// `new_array` / `array_push` recognise `js_hole` and leave that index absent from the
+/// backing map (so the array HAS a length but not the key), which the spec requires:
+/// a hole is distinct from the value `undefined` (`[0, , 2].indexOf(undefined) === -1`,
+/// hole indices are skipped by indexOf/lastIndexOf's HasProperty check). `js_hole` is
+/// never a reachable JS value, so it can only appear in this position.
+fn hole() -> ir.Value {
+  ir.ConstAtom("js_hole")
 }
 
 /// The value of a free identifier that names a global constant of the JS runtime

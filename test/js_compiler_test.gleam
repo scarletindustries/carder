@@ -5205,3 +5205,67 @@ pub fn object_freeze_implies_sealed_and_nonextensible_test() {
     )
   call(g, "f", []) |> should.equal(dyn(True))
 }
+
+// ==== Array (wave 6) ====
+
+// ES §13.2.4 / §22.1.3.14: an array-literal ELISION creates a HOLE, which is
+// distinct from the value `undefined`. indexOf/lastIndexOf visit only indices the
+// array HAS (HasProperty), so a hole is skipped: `[0, , 2].indexOf(undefined)` is -1.
+pub fn array_elision_hole_indexof_skipped_test() {
+  num("[0, , 2].indexOf(undefined) === -1 ? 1 : 0")
+  |> should.equal(1.0)
+  num("[0, , 2].lastIndexOf(undefined) === -1 ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+// Contrast: an EXPLICIT `undefined` element is a real value the array HAS, so
+// indexOf finds it at its index (proving the hole/undefined distinction).
+pub fn array_explicit_undefined_indexof_found_test() {
+  num("[0, undefined, 2].indexOf(undefined)")
+  |> should.equal(1.0)
+}
+
+// A hole still occupies a length slot (`[0, , 2].length` is 3) and reading it
+// yields `undefined` (§13.2.4 ArrayAccumulation increments the length past an
+// elision; Get of an absent index is undefined).
+pub fn array_elision_hole_length_and_read_test() {
+  num("[0, , 2].length")
+  |> should.equal(3.0)
+  num("[0, , 2][1] === undefined ? 1 : 0")
+  |> should.equal(1.0)
+  num("[,].length")
+  |> should.equal(1.0)
+}
+
+// §22.1.3.13 includes reads Get(O, k) WITHOUT a HasProperty check, so a hole reads
+// as `undefined` and is found by SameValueZero: `[0, , 2].includes(undefined)` is true.
+pub fn array_elision_hole_includes_found_test() {
+  num("[0, , 2].includes(undefined) ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+// ES §10.4.2.1 / §7.1.19: a boolean / null / undefined array index is coerced by
+// ToPropertyKey (ToString) to the ordinary string property "true"/"false"/"null"/
+// "undefined" — never an integer index, so `length` stays 0 and `arr[1]` is a hole.
+pub fn array_boolean_key_is_string_property_test() {
+  num(
+    "(function(){ var x = []; x[true] = 1; return (x.length === 0 && x[1] === undefined && x[\"true\"] === 1) ? 1 : 0; })()",
+  )
+  |> should.equal(1.0)
+}
+
+pub fn array_null_undefined_key_is_string_property_test() {
+  num(
+    "(function(){ var x = []; x[null] = 7; x[undefined] = 8; return (x.length === 0 && x[\"null\"] === 7 && x[\"undefined\"] === 8) ? 1 : 0; })()",
+  )
+  |> should.equal(1.0)
+}
+
+// §22.1.3.6 (every) et al. iterate only the integer indices [0,length): an expando
+// added under a non-index (boolean) key is NOT visited by the callback.
+pub fn array_every_skips_boolean_expando_test() {
+  num(
+    "(function(){ var out = []; var a = [0,1,2,3,4]; a[true] = 9; a.every(function(v){ out.push(v); return true; }); return out.length; })()",
+  )
+  |> should.equal(5.0)
+}
