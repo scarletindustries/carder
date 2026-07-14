@@ -84,6 +84,7 @@
     set_union/2, set_intersection/2, set_difference/2,
     set_symmetric_difference/2, set_is_disjoint_from/2,
     set_is_subset_of/2, set_is_superset_of/2,
+    new_weakmap/1, weakmap_ctor/0,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
     array_some/2, array_every/2, array_find/2, array_includes/3,
@@ -1524,6 +1525,14 @@ has_prop(Recv, Key) when is_reference(Recv) ->
                 <<"@@is_Set">> -> 1;
                 _ -> 0
             end;
+        %% Every WeakMap cell IS a WeakMap instance, so `x instanceof WeakMap`
+        %% (compiled to a has_prop for the `@@is_WeakMap` brand) is true for any
+        %% WeakMap cell.
+        {js_weakmap, _, _} ->
+            case Key of
+                <<"@@is_WeakMap">> -> 1;
+                _ -> 0
+            end;
         %% `err instanceof Error` is true for every error value; `err instanceof T`
         %% is true only when T names this error's own constructor. `lower_instanceof`
         %% compiles `x instanceof T` to has_prop(x, "@@is_T"), so match the brand.
@@ -2653,6 +2662,50 @@ new_set(Init) ->
     end,
     S.
 
+%% A WeakMap is a cell `{js_weakmap, Next, Data}`, mirroring the ordinary Map cell so
+%% the shared collection-method dispatch (`js_m_set`/`get`/`has`/`delete`) can reuse
+%% `mapkey_norm` and the same `Key => {Seq, Value}` storage. No real weak references
+%% are modelled — entries are held strongly (test262 exercises the API surface, not
+%% garbage collection). The spec (§24.3) requires every key to be an object; a
+%% primitive key is rejected on `set` (TypeError) and treated as absent by
+%% `get`/`has`/`delete`, enforced in those method arms via `can_be_held_weakly/1`.
+%%
+%% `new WeakMap(iterable?)` seeds each `[key, value]` pair through `js_m_set`, so a
+%% non-object key in the initial iterable throws a TypeError just as an explicit
+%% `.set(prim, v)` would (§24.3.1.1 → WeakMap.prototype.set step 4).
+new_weakmap(Init) ->
+    M = cell_new({js_weakmap, 0, #{}}),
+    case is_array(Init) of
+        1 ->
+            {Len, Map} = arr_content(Init),
+            lists:foreach(
+                fun(Pair) ->
+                    case is_array(Pair) of
+                        1 ->
+                            {_, PM} = arr_content(Pair),
+                            js_m_set(M, [maps:get(0, PM, undefined), maps:get(1, PM, undefined)]);
+                        0 ->
+                            ok
+                    end
+                end,
+                arr_list(Len, Map)
+            );
+        0 ->
+            ok
+    end,
+    M.
+
+%% The WeakMap constructor as a first-class fun VALUE, so a BARE `WeakMap` reference
+%% has `typeof` "function" (sec-weakmap-constructor). Applied through a closure call
+%% site it constructs a WeakMap from the optional iterable, mirroring `error_ctor/1`.
+weakmap_ctor() ->
+    fun(Init) -> new_weakmap(Init) end.
+
+%% CanBeHeldWeakly (sec-canbeheldweakly): only objects may be WeakMap keys in this
+%% model. Objects are BEAM references (cells); every primitive (number/string/boolean/
+%% null/undefined/the numeric sentinels) is rejected. Returns `true`/`false`.
+can_be_held_weakly(K) -> is_reference(K).
+
 %% SameValueZero key canonicalization. An integral float becomes the equal integer
 %% (unifying `1`/`1.0` and collapsing `-0.0` to `0`); every other term (non-integral
 %% float, string, boolean, ref, the `js_nan`/`js_inf`/`js_neg_inf` sentinels) is left as
@@ -2680,6 +2733,23 @@ js_m_set(Recv, Args) ->
                 end,
             erlang:put(?CELL_KEY(Recv), {js_map, Next2, maps:put(K, {Seq, V}, D)}),
             Recv;
+        {js_weakmap, Next, D} ->
+            %% WeakMap.prototype.set (§24.3.3.3): a key that cannot be held weakly
+            %% (any primitive) is a TypeError; otherwise store as an ordinary Map.
+            K = arg(Args, 0),
+            case can_be_held_weakly(K) of
+                false ->
+                    type_error(K);
+                true ->
+                    V = arg(Args, 1),
+                    {Next2, Seq} =
+                        case maps:get(K, D, undefined) of
+                            {OldSeq, _} -> {Next, OldSeq};
+                            undefined -> {Next + 1, Next}
+                        end,
+                    erlang:put(?CELL_KEY(Recv), {js_weakmap, Next2, maps:put(K, {Seq, V}, D)}),
+                    Recv
+            end;
         _ ->
             delegate(Recv, <<"set">>, Args)
     end.
@@ -2688,6 +2758,13 @@ js_m_get(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, D} ->
             case maps:get(mapkey_norm(arg(Args, 0)), D, undefined) of
+                {_Seq, V} -> V;
+                undefined -> undefined
+            end;
+        {js_weakmap, _, D} ->
+            %% WeakMap.prototype.get (§24.3.3.1): a key that cannot be held weakly is
+            %% never present, so return undefined WITHOUT throwing.
+            case maps:get(arg(Args, 0), D, undefined) of
                 {_Seq, V} -> V;
                 undefined -> undefined
             end;
@@ -2714,6 +2791,10 @@ js_m_has(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, D} -> maps:is_key(mapkey_norm(arg(Args, 0)), D);
         {js_set, _, D} -> maps:is_key(mapkey_norm(arg(Args, 0)), D);
+        %% WeakMap.prototype.has (§24.3.3.2): a key that cannot be held weakly is
+        %% never present (returns false without throwing); an object key is a plain
+        %% membership test.
+        {js_weakmap, _, D} -> maps:is_key(arg(Args, 0), D);
         _ -> delegate(Recv, <<"has">>, Args)
     end.
 
@@ -2735,6 +2816,18 @@ js_m_delete(Recv, Args) ->
             case maps:is_key(V, D) of
                 true ->
                     erlang:put(?CELL_KEY(Recv), {js_set, Next, maps:remove(V, D)}),
+                    true;
+                false ->
+                    false
+            end;
+        {js_weakmap, Next, D} ->
+            %% WeakMap.prototype.delete (§24.3.3.4): removes and returns true only
+            %% when an entry existed; a key that cannot be held weakly is never
+            %% present, so this returns false without throwing.
+            K = arg(Args, 0),
+            case maps:is_key(K, D) of
+                true ->
+                    erlang:put(?CELL_KEY(Recv), {js_weakmap, Next, maps:remove(K, D)}),
                     true;
                 false ->
                     false
@@ -2772,6 +2865,24 @@ js_m_get_or_insert(Recv, Args) ->
                     erlang:put(?CELL_KEY(Recv), {js_map, Next + 1, maps:put(K, {Next, V}, D)}),
                     V
             end;
+        {js_weakmap, Next, D} ->
+            %% WeakMap.prototype.getOrInsert (upsert proposal, step 3): a key that
+            %% cannot be held weakly is a TypeError; otherwise behaves like the Map
+            %% arm (object keys compare by identity, so no SameValueZero folding).
+            K = arg(Args, 0),
+            case can_be_held_weakly(K) of
+                false ->
+                    type_error(K);
+                true ->
+                    case maps:get(K, D, undefined) of
+                        {_Seq, V} ->
+                            V;
+                        undefined ->
+                            V = arg(Args, 1),
+                            erlang:put(?CELL_KEY(Recv), {js_weakmap, Next + 1, maps:put(K, {Next, V}, D)}),
+                            V
+                    end
+            end;
         _ ->
             delegate(Recv, <<"getOrInsert">>, Args)
     end.
@@ -2803,6 +2914,33 @@ js_m_get_or_insert_computed(Recv, Args) ->
                         end,
                     erlang:put(?CELL_KEY(Recv), {js_map, Next3, maps:put(K, {Seq, Value}, D2)}),
                     Value
+            end;
+        {js_weakmap, _, D} ->
+            %% WeakMap.prototype.getOrInsertComputed (upsert proposal, step 3): a key
+            %% that cannot be held weakly is a TypeError. Otherwise, if present return
+            %% the existing value WITHOUT invoking the callback; else call
+            %% callbackfn(key), then store its return value (re-reading the live cell,
+            %% since the callback may have mutated the WeakMap).
+            K = arg(Args, 0),
+            case can_be_held_weakly(K) of
+                false ->
+                    type_error(K);
+                true ->
+                    case maps:get(K, D, undefined) of
+                        {_Seq, V} ->
+                            V;
+                        undefined ->
+                            Fn = arg(Args, 1),
+                            Value = call_cb(Fn, [K]),
+                            {js_weakmap, Next2, D2} = cell_tag(Recv),
+                            {Next3, Seq} =
+                                case maps:get(K, D2, undefined) of
+                                    {OldSeq, _} -> {Next2, OldSeq};
+                                    undefined -> {Next2 + 1, Next2}
+                                end,
+                            erlang:put(?CELL_KEY(Recv), {js_weakmap, Next3, maps:put(K, {Seq, Value}, D2)}),
+                            Value
+                    end
             end;
         _ ->
             delegate(Recv, <<"getOrInsertComputed">>, Args)

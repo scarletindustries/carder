@@ -3135,15 +3135,20 @@ fn lower_expr(
                       // shadows it): resolve to the constructor as a fun VALUE, so
                       // `typeof TypeError` is "function" and it can be passed as an
                       // (ignored) argument to `assert.throws`.
-                      case is_error_ctor(x) {
-                        True ->
+                      case is_error_ctor(x), x {
+                        True, _ ->
                           Ok(bind1(
                             ir.CallHost("js", "error_ctor", [
                               ir.ConstBinary(<<x:utf8>>),
                             ]),
                             ctr,
                           ))
-                        False ->
+                        // A bare `WeakMap` reference resolves to the constructor as a
+                        // fun VALUE, so `typeof WeakMap` is "function" per
+                        // sec-weakmap-constructor.
+                        False, "WeakMap" ->
+                          Ok(bind1(ir.CallHost("js", "weakmap_ctor", []), ctr))
+                        False, _ ->
                           Error(Unsupported("unbound identifier '" <> x <> "'"))
                       }
                   }
@@ -4638,6 +4643,10 @@ fn lower_new(
       lower_builtin_new("new_map", arguments, env, ctx, ctr)
     ast.Identifier(name: "Set", ..) ->
       lower_builtin_new("new_set", arguments, env, ctx, ctr)
+    // `new WeakMap(iterable?)` — a built-in collection backed by the Map machinery
+    // (§24.3). Object-only keys are enforced in the runtime `js_m_*` arms.
+    ast.Identifier(name: "WeakMap", ..) ->
+      lower_builtin_new("new_weakmap", arguments, env, ctx, ctr)
     // `new Date(...)` — a built-in Date (all argument forms; see `date_new`). Not a
     // class: no prototype machinery, just a `{js_date, Ms}` cell from the runtime.
     ast.Identifier(name: "Date", ..) -> lower_date_new(arguments, env, ctx, ctr)

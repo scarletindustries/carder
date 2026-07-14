@@ -5373,3 +5373,127 @@ pub fn set_iterator_sticky_done_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(1.0)
 }
+
+// ==== WeakMap (wave 6) ====
+
+// `new WeakMap()` with an object key round-trips a value through set/get, and `has`
+// reports membership (§24.3.3.1 / §24.3.3.3).
+pub fn weakmap_set_get_has_test() {
+  let m =
+    compile(
+      "function f(){ let k = {}; let w = new WeakMap(); w.set(k, 42); return w.get(k) + (w.has(k) ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(43.0)
+}
+
+// `WeakMap.prototype.get` returns undefined for an object key that was never set
+// (§24.3.3.1 step 5), and `has` returns false for it.
+pub fn weakmap_absent_object_key_test() {
+  let m =
+    compile(
+      "function f(){ let k = {}; let w = new WeakMap(); return (w.get(k) === undefined ? 1 : 0) + (w.has(k) ? 0 : 1); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(2.0)
+}
+
+// `WeakMap.prototype.set` returns the WeakMap itself (§24.3.3.3 step 9).
+pub fn weakmap_set_returns_this_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let k = {}; return (w.set(k, 1) === w) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// `WeakMap.prototype.delete` returns true when an entry is removed and false otherwise
+// (§24.3.3.4 step 6); after deletion `has` is false.
+pub fn weakmap_delete_returns_boolean_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let k = {}; w.set(k, 1); let d1 = w.delete(k); let d2 = w.delete(k); return (d1 === true && d2 === false && !w.has(k)) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// `WeakMap.prototype.set` throws a TypeError when the key cannot be held weakly, i.e.
+// is a primitive (§24.3.3.3 step 4). The thrown value is a real TypeError.
+pub fn weakmap_set_primitive_key_throws_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let caught = 0; try { w.set(1, 1); } catch (e) { if (e instanceof TypeError) { caught = 1; } } return caught; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// Distinct primitive key types all throw on `set` (§24.3.3.3 step 4): string, null,
+// undefined, boolean.
+pub fn weakmap_set_various_primitives_throw_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let n = 0; let ks = [\"s\", null, undefined, true]; for (let i = 0; i < ks.length; i++) { try { w.set(ks[i], 1); } catch (e) { n++; } } return n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(4.0)
+}
+
+// `get`/`has`/`delete` with a key that cannot be held weakly do NOT throw: `get`
+// returns undefined (§24.3.3.1 step 4), `has` returns false (§24.3.3.2 step 4), and
+// `delete` returns false (§24.3.3.4 step 4).
+pub fn weakmap_primitive_key_no_throw_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); return (w.get(1) === undefined ? 1 : 0) + (w.has(\"x\") ? 0 : 1) + (w.delete(null) === false ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
+// `new WeakMap(iterable)` seeds each `[key, value]` pair (§24.3.1.1), preserving the
+// association for object keys.
+pub fn weakmap_iterable_seed_test() {
+  let m =
+    compile(
+      "function f(){ let a = {}; let b = {}; let w = new WeakMap([[a, 10], [b, 20]]); return w.get(a) + w.get(b); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(30.0)
+}
+
+// A WeakMap value is an object whose bare constructor reference has typeof "function"
+// (sec-weakmap-constructor), and instances answer `instanceof WeakMap`.
+pub fn weakmap_typeof_and_instanceof_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); return ((typeof WeakMap === \"function\") ? 1 : 0) + ((w instanceof WeakMap) ? 1 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(2.0)
+}
+
+// `WeakMap.prototype.getOrInsert` (TC39 upsert): returns the existing value for a
+// present object key without overwriting, and inserts+returns the argument for an
+// absent key.
+pub fn weakmap_get_or_insert_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let k = {}; let a = w.getOrInsert(k, 10); let b = w.getOrInsert(k, 99); return a + b + w.get(k); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(30.0)
+}
+
+// `WeakMap.prototype.getOrInsert` throws a TypeError when the key cannot be held
+// weakly (upsert proposal step 3).
+pub fn weakmap_get_or_insert_primitive_throws_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let caught = 0; try { w.getOrInsert(1, 1); } catch (e) { if (e instanceof TypeError) { caught = 1; } } return caught; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// `WeakMap.prototype.getOrInsertComputed` invokes the callback only for an absent
+// key, storing its return value; a present key returns its value without calling the
+// callback (upsert proposal).
+pub fn weakmap_get_or_insert_computed_test() {
+  let m =
+    compile(
+      "function f(){ let w = new WeakMap(); let k = {}; let c = { n: 0 }; let a = w.getOrInsertComputed(k, () => { c.n++; return 7; }); let b = w.getOrInsertComputed(k, () => { c.n++; return 99; }); return a + b + c.n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(15.0)
+}
