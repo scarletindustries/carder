@@ -5174,3 +5174,29 @@ pub fn array_elision_hole_includes_found_test() {
   num("[0, , 2].includes(undefined) ? 1 : 0")
   |> should.equal(1.0)
 }
+
+// ES §10.4.2.1 / §7.1.19: a boolean / null / undefined array index is coerced by
+// ToPropertyKey (ToString) to the ordinary string property "true"/"false"/"null"/
+// "undefined" — never an integer index, so `length` stays 0 and `arr[1]` is a hole.
+pub fn array_boolean_key_is_string_property_test() {
+  num(
+    "(function(){ var x = []; x[true] = 1; return (x.length === 0 && x[1] === undefined && x[\"true\"] === 1) ? 1 : 0; })()",
+  )
+  |> should.equal(1.0)
+}
+
+pub fn array_null_undefined_key_is_string_property_test() {
+  num(
+    "(function(){ var x = []; x[null] = 7; x[undefined] = 8; return (x.length === 0 && x[\"null\"] === 7 && x[\"undefined\"] === 8) ? 1 : 0; })()",
+  )
+  |> should.equal(1.0)
+}
+
+// §22.1.3.6 (every) et al. iterate only the integer indices [0,length): an expando
+// added under a non-index (boolean) key is NOT visited by the callback.
+pub fn array_every_skips_boolean_expando_test() {
+  num(
+    "(function(){ var out = []; var a = [0,1,2,3,4]; a[true] = 9; a.every(function(v){ out.push(v); return true; }); return out.length; })()",
+  )
+  |> should.equal(5.0)
+}

@@ -1530,6 +1530,14 @@ array_key(K) when is_binary(K) ->
         {ok, I} -> I;
         error -> K
     end;
+%% A boolean / null / undefined index is a PRIMITIVE key: ToPropertyKey coerces it
+%% via ToString, so `arr[true]`/`arr[null]`/`arr[undefined]` address the ordinary
+%% string properties "true"/"false"/"null"/"undefined" (never an array index, so
+%% `length` is untouched) — ES §10.4.2.1 / §7.1.19.
+array_key(true) -> <<"true">>;
+array_key(false) -> <<"false">>;
+array_key(null) -> <<"null">>;
+array_key(undefined) -> <<"undefined">>;
 array_key(K) -> prop_key(K).
 
 %% A binary key is an array index only if it is the canonical decimal form of an
