@@ -4802,12 +4802,21 @@ json_prop_item(_) -> undefined.
 
 %% The indentation gap for `space`. Numbers clamp to [0,10] spaces (floor toward
 %% zero); Strings contribute their first 10 code units; other types → no gap.
+%% Per sec-json.stringify step 5, a `space` that is a Number wrapper object
+%% (`new Number(n)`) is first coerced to its boxed number, and a String wrapper
+%% (`new String(s)`) to its boxed string, before the Number/String cases apply.
 json_gap(N) when is_integer(N) -> json_gap_spaces(N);
 json_gap(N) when is_float(N) -> json_gap_spaces(trunc(N));
 json_gap(js_inf) -> binary:copy(<<" ">>, 10);
 json_gap(js_neg_inf) -> <<>>;
 json_gap(js_nan) -> <<>>;
 json_gap(S) when is_binary(S) -> from_cps(lists:sublist(cps(S), 10));
+json_gap(Ref) when is_reference(Ref) ->
+    case erlang:get(?CELL_KEY(Ref)) of
+        {js_wrapper, number, Prim} -> json_gap(Prim);
+        {js_wrapper, string, Prim} -> json_gap(Prim);
+        _ -> <<>>
+    end;
 json_gap(_) -> <<>>.
 
 json_gap_spaces(N) when N >= 1 -> binary:copy(<<" ">>, min(10, N));
@@ -4834,18 +4843,29 @@ json_get(Holder, Key) -> get_prop(Holder, Key).
 
 %% If `value` is an object exposing a callable own `toJSON`, replace it with
 %% `toJSON(key)`; otherwise leave it unchanged (sec-serializejsonproperty step 2).
+%% This applies to plain objects AND to arrays: an array is an object, so a
+%% `toJSON` method assigned to it (`arr.toJSON = ...`) must be honoured — e.g. a
+%% `toJSON` returning `undefined` makes `JSON.stringify(arr)` yield `undefined`
+%% rather than serializing the array's elements.
 json_apply_tojson(Key, V) when is_reference(V) ->
     case erlang:get(?CELL_KEY(V)) of
         M when is_map(M) ->
-            case resolve_get(maps:get(<<"toJSON">>, M, undefined)) of
-                Fn when is_function(Fn) -> call_cb(Fn, [Key]);
-                _ -> V
-            end;
+            json_call_tojson(Key, V, maps:get(<<"toJSON">>, M, undefined));
+        {js_array, _Len, Map} ->
+            json_call_tojson(Key, V, maps:get(<<"toJSON">>, Map, undefined));
         _ ->
             V
     end;
 json_apply_tojson(_Key, V) ->
     V.
+
+%% If `Stored` (the raw `toJSON` slot, possibly an accessor) resolves to a
+%% callable, return `toJSON(key)`; otherwise return the untouched value `V`.
+json_call_tojson(Key, V, Stored) ->
+    case resolve_get(Stored) of
+        Fn when is_function(Fn) -> call_cb(Fn, [Key]);
+        _ -> V
+    end.
 
 json_serialize_value(V, St, Indent) ->
     case js_type(V) of

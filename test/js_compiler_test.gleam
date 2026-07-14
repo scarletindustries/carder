@@ -4244,3 +4244,36 @@ pub fn regexp_call_without_new_test() {
   val("RegExp(\"abc\", \"m\").multiline") |> should.equal(dyn(True))
   val("RegExp(\"a.c\").test(\"axc\")") |> should.equal(dyn(True))
 }
+
+// ==== JSON (wave 1) ====
+
+// sec-json.stringify step 5/6: a `space` that is a Number wrapper object
+// (`new Number(n)`) is coerced to its boxed number, then truncated toward zero
+// (ToInteger) and clamped to [0,10] before it becomes the indentation gap.
+pub fn json_stringify_space_number_wrapper_test() {
+  // new Number(2.9) → 2 → a two-space gap (matches JSON.stringify(x, null, 2)).
+  val("JSON.stringify({a:1}, null, new Number(2.9))")
+  |> should.equal(dyn(<<"{\n  \"a\": 1\n}">>))
+  // Parity: the wrapper and the equivalent primitive produce identical output.
+  val("JSON.stringify({a:1}, null, new Number(6.99999))")
+  |> should.equal(val("JSON.stringify({a:1}, null, 6)"))
+}
+
+// sec-serializejsonproperty step 2: an array is an object, so a `toJSON` method
+// assigned to it must run. A `toJSON` returning `undefined` makes the property
+// produce no JSON text — at the top level JSON.stringify then returns undefined,
+// not the serialized elements.
+pub fn json_stringify_array_tojson_test() {
+  let m =
+    compile(
+      "function f(){ var a=[1,2]; a.toJSON=function(){}; return JSON.stringify(a); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(atom.create("undefined")))
+
+  // A toJSON returning a value is serialized in place of the array itself.
+  let n =
+    compile(
+      "function f(){ var a=[1,2]; a.toJSON=function(){ return \"x\"; }; return JSON.stringify(a); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(<<"\"x\"">>))
+}
