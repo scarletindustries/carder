@@ -3997,3 +3997,46 @@ pub fn negative_zero_division_sign_test() {
   num("1 / -0 === -Infinity ? 1 : 0") |> should.equal(1.0)
   num("1 / 0 === Infinity ? 1 : 0") |> should.equal(1.0)
 }
+
+// ── RegExp constructor (test262 built-ins/RegExp) ─────────────────────────────
+// §22.2.3.1 RegExp(pattern, flags): a string pattern with an optional flags
+// string builds a RegExp whose source/flags getters reflect the arguments.
+pub fn regexp_ctor_string_test() {
+  val("new RegExp(\"abc\").source") |> should.equal(dyn(<<"abc">>))
+  val("new RegExp(\"abc\", \"g\").flags") |> should.equal(dyn(<<"g">>))
+  val("new RegExp(\"a\", \"gi\").global") |> should.equal(dyn(True))
+  val("new RegExp(\"a\", \"gi\").ignoreCase") |> should.equal(dyn(True))
+  val("new RegExp(\"a\").global") |> should.equal(dyn(False))
+  // The pattern actually compiles and matches.
+  val("new RegExp(\"b.d\").test(\"abcd\")") |> should.equal(dyn(True))
+  val("new RegExp(\"x\").test(\"abcd\")") |> should.equal(dyn(False))
+}
+
+// §22.2.3.1 step 1: when the pattern is an existing RegExp and flags is
+// undefined, its source AND flags are reused (15.10.4.1_A1_T1).
+pub fn regexp_ctor_from_regex_test() {
+  val("new RegExp(/./i).source") |> should.equal(dyn(<<".">>))
+  val("new RegExp(/./i).ignoreCase") |> should.equal(dyn(True))
+  val("new RegExp(/a/g).global") |> should.equal(dyn(True))
+  // A supplied flags string overrides the source regex's own flags.
+  val("new RegExp(/a/g, \"i\").global") |> should.equal(dyn(False))
+  val("new RegExp(/a/g, \"i\").ignoreCase") |> should.equal(dyn(True))
+}
+
+// §22.2.3.1 step "If pattern is undefined, let P be the empty String": a
+// no-argument RegExp has empty flags and a source of "(?:)" per
+// EscapeRegExpPattern (§22.2.6.13.1) (15.10.4.1_A3_T1).
+pub fn regexp_ctor_empty_test() {
+  val("new RegExp().global") |> should.equal(dyn(False))
+  val("new RegExp().multiline") |> should.equal(dyn(False))
+  val("new RegExp().ignoreCase") |> should.equal(dyn(False))
+  val("new RegExp().source") |> should.equal(dyn(<<"(?:)">>))
+}
+
+// §22.2.3.1: RegExp called WITHOUT `new` performs the same construction as with
+// `new` for a string pattern (15.10.3.1).
+pub fn regexp_call_without_new_test() {
+  val("RegExp(\"abc\", \"m\").source") |> should.equal(dyn(<<"abc">>))
+  val("RegExp(\"abc\", \"m\").multiline") |> should.equal(dyn(True))
+  val("RegExp(\"a.c\").test(\"axc\")") |> should.equal(dyn(True))
+}

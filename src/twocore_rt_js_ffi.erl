@@ -74,7 +74,8 @@
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
     array_last_index_of/3, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
     to_string_dispatch/1, num_to_string_radix/2,
-    new_regex/2, regex_test/2, regex_exec/2, regex_source/1, regex_flags/1,
+    new_regex/2, regex_construct/2, regex_test/2, regex_exec/2, regex_source/1,
+    regex_flags/1,
     str_match/2, str_search/2,
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
@@ -2430,6 +2431,49 @@ new_regex(Pattern, Flags) ->
         {ok, MP} -> cell_new({js_regex, MP, F, P});
         {error, _} -> type_error(Pattern)
     end.
+
+%% RegExp(pattern, flags) constructor semantics — RegExpInitialize (§22.2.3.1 /
+%% §22.2.1.1). Resolves the effective pattern P and flags F, then compiles them
+%% like a `/P/F` literal:
+%%   * If `Pattern` is already a RegExp, reuse its original source; the flags are
+%%     `Pattern`'s own when `Flags` is `undefined`, otherwise the supplied `Flags`.
+%%   * Otherwise an `undefined` pattern or `undefined` flags becomes the empty
+%%     string (per steps "If pattern is undefined, let P be the empty String")
+%%     and any other value is ToString'd.
+%% An empty resolved pattern is stored as the escaped source `"(?:)"` so that
+%% `re.source` reports `"(?:)"` (EscapeRegExpPattern, §22.2.6.13.1) rather than
+%% the empty string, while still compiling to a pattern that matches the empty
+%% string. `Pattern`/`Flags` arrive as raw JS values from the constructor call.
+regex_construct(Pattern, Flags) ->
+    {P, F} =
+        case is_regex(Pattern) of
+            true ->
+                {_MP, PF, PS} = regex_content(Pattern),
+                F1 =
+                    case Flags of
+                        undefined -> PF;
+                        _ -> to_string(Flags)
+                    end,
+                {PS, F1};
+            false ->
+                P1 =
+                    case Pattern of
+                        undefined -> <<>>;
+                        _ -> to_string(Pattern)
+                    end,
+                F1 =
+                    case Flags of
+                        undefined -> <<>>;
+                        _ -> to_string(Flags)
+                    end,
+                {P1, F1}
+        end,
+    Source =
+        case P of
+            <<>> -> <<"(?:)">>;
+            _ -> P
+        end,
+    new_regex(Source, F).
 
 re_opts(Flags) ->
     Base = [unicode],

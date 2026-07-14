@@ -4244,6 +4244,7 @@ fn resolve_js(op: String) -> Option(String) {
     "num_to_string_radix" -> Some("num_to_string_radix")
     // regex
     "new_regex" -> Some("new_regex")
+    "regex_construct" -> Some("regex_construct")
     "regex_test" -> Some("regex_test")
     "regex_exec" -> Some("regex_exec")
     "regex_source" -> Some("regex_source")
