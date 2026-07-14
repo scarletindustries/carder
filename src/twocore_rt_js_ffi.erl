@@ -2710,7 +2710,12 @@ regex_construct(Pattern, Flags) ->
     new_regex(Source, F).
 
 re_opts(Flags) ->
-    Base = [unicode],
+    %% `dupnames` permits duplicate named capture groups, which ES2025 allows
+    %% when the groups sit in mutually exclusive alternatives — e.g.
+    %% `(?<x>a)|(?<x>b)` (§22.2.1.1, GroupSpecifiersThatMatch). PCRE rejects them
+    %% without this option; `re:inspect/namelist` and `all_names` capture still
+    %% report a single name bound to whichever alternative participated.
+    Base = [unicode, dupnames],
     lists:foldl(
         fun({Ch, Opt}, Acc) ->
             case has_flag(Flags, Ch) of
