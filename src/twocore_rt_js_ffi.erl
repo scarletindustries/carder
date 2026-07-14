@@ -4785,6 +4785,12 @@ json_pnum(B) ->
 %% this accepts exponent forms without a decimal point ("1e3") and leading-dot
 %% forms by normalising through float_fixup, so `JSON.parse("1e3")` === 1000.
 json_num_val(Tok) ->
+    case json_num_raw(Tok) of
+        error -> error;
+        V -> json_neg_zero_fixup(Tok, V)
+    end.
+
+json_num_raw(Tok) ->
     try
         binary_to_integer(Tok)
     catch
@@ -4795,6 +4801,15 @@ json_num_val(Tok) ->
                 error:badarg -> error
             end
     end.
+
+%% A JSON number whose mathematical value is zero but which carries a leading
+%% minus sign (e.g. "-0", "-0.0", "-0e10") has the math value negative zero, and
+%% ECMAScript's JSON.parse preserves it as the IEEE-754 value -0 (sec-json.parse
+%% parses per ECMA-404, then the MV feeds ToNumber which distinguishes ±0).
+%% binary_to_integer("-0") returns positive integer 0, so re-tag any zero-valued
+%% leading-minus token as the float -0.0.
+json_neg_zero_fixup(<<$-, _/binary>>, V) when V == 0 -> -0.0;
+json_neg_zero_fixup(_, V) -> V.
 
 json_num_tok(<<C, R/binary>>, Acc) when
     C >= $0, C =< $9;
