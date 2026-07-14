@@ -5031,6 +5031,13 @@ fn lower_instance_method(
     // chain in this model), returning a JS boolean.
     "hasOwnProperty", [k, ..] -> host("object_has_own", [k])
     "hasOwnProperty", [] -> host("object_has_own", [undefined()])
+    // Function.prototype.call / .apply — dispatch in the runtime on the receiver.
+    // On a function value the target is applied to the forwarded arguments (the
+    // `thisArg` head is ignored — plain functions carry no receiver in this model);
+    // on a plain object these delegate to a same-named user method. `.call` forwards
+    // every argument after `thisArg`; `.apply` spreads the array in its second arg.
+    "call", _ -> coll("func_call")
+    "apply", _ -> coll("func_apply")
     "forEach", _ -> coll("js_m_foreach")
     "get", _ -> coll("js_m_get")
     "set", _ -> coll("js_m_set")

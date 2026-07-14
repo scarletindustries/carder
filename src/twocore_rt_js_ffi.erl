@@ -67,7 +67,7 @@
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2,
-    apply_fn/2, fit_list/2, array_to_list/1,
+    apply_fn/2, func_call/2, func_apply/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     date_new/1, date_utc/1, date_parse/1, date_call/3,
@@ -3157,6 +3157,43 @@ cp_sub(Cps, From, To) -> from_cps(lists:sublist(Cps, From + 1, max(0, To - From)
 %% `f(...args)`); arity-adaptive like a callback.
 apply_fn(F, Args) when is_function(F) -> call_cb(F, Args);
 apply_fn(F, _Args) -> not_callable(F).
+
+%% Function.prototype.call(thisArg, ...args) — §20.2.3.3. This compiler models a
+%% plain function as a bare BEAM closure with no bound receiver, so `thisArg` (the
+%% head of `AllArgs`) is ignored and the target is applied to the remaining
+%% arguments (arity-adaptive via call_cb: missing params default to `undefined`,
+%% extras are dropped). A non-function receiver delegates to a same-named user
+%% `call` method on the object (so `obj.call(...)` still reaches a user method).
+func_call(F, AllArgs) when is_function(F) ->
+    Rest =
+        case AllArgs of
+            [] -> [];
+            [_This | R] -> R
+        end,
+    call_cb(F, Rest);
+func_call(Recv, AllArgs) ->
+    delegate(Recv, <<"call">>, AllArgs).
+
+%% Function.prototype.apply(thisArg, argArray) — §20.2.3.1. Ignores `thisArg` (see
+%% func_call) and applies the target to the elements of `argArray`. Per step 3, a
+%% null/undefined `argArray` means the empty argument list. A non-function receiver
+%% delegates to a same-named user `apply` method. `AllArgs` is the raw call argument
+%% list `[thisArg, argArray | _]`.
+func_apply(F, AllArgs) when is_function(F) ->
+    ArgArray =
+        case AllArgs of
+            [_This, AA | _] -> AA;
+            _ -> undefined
+        end,
+    call_cb(F, apply_arg_list(ArgArray));
+func_apply(Recv, AllArgs) ->
+    delegate(Recv, <<"apply">>, AllArgs).
+
+%% CreateListFromArrayLike for Function.prototype.apply: null/undefined → no args;
+%% otherwise the array's elements in order.
+apply_arg_list(undefined) -> [];
+apply_arg_list(null) -> [];
+apply_arg_list(Arr) -> array_to_list(Arr).
 
 %% Pad (with `undefined`) or truncate an argument list to exactly N elements —
 %% so a runtime `new C(...args)` can call the fixed-arity `C$constructor`.
