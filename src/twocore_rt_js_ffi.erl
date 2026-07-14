@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, wrapper_new/2, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, wrapper_new/2, error_make/2, error_ctor/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2,
@@ -867,6 +867,8 @@ to_string(V) when is_reference(V) ->
         {js_date, Ms} -> date_to_string(Ms);
         %% a primitive wrapper stringifies as its boxed primitive (ToPrimitive → ToString).
         {js_wrapper, _Kind, Prim} -> to_string(Prim);
+        %% an error stringifies per Error.prototype.toString (§20.5.3.4).
+        {js_err, Name, Msg} -> error_to_string(Name, Msg);
         _ -> <<"[object Object]">>
     end;
 %% any internal repr (tuple/map/list/…).
@@ -1014,6 +1016,48 @@ wrapper_new(number, X) -> cell_new({js_wrapper, number, to_number(X)});
 wrapper_new(string, X) -> cell_new({js_wrapper, string, to_string(X)});
 wrapper_new(boolean, X) -> cell_new({js_wrapper, boolean, truthy(X) =:= 1}).
 
+%% ───────────────────────── error objects ─────────────────────────
+%% A JS error VALUE (from `new TypeError(m)` / `TypeError(m)`) is a cell holding
+%% `{js_err, Name, Message}` — both binaries. It is a JS-level value that flows
+%% through variables, `throw`, and try/catch like any object. This is DELIBERATELY
+%% a different tag from the runtime's INTERNAL `erlang:error({js_error, Kind, Detail})`
+%% convention (that one is a raised Erlang exception used to signal bad primitive
+%% ops — never a JS value), so the two mechanisms never collide.
+%%
+%% v1 scope: readable `.name` / `.message`, a spec `toString`, `instanceof` against
+%% the seven bound constructor globals, and throwability. NO real prototype chain,
+%% `.stack`, `cause`, or Error subclassing.
+
+%% `new Name(msg)` / `Name(msg)` — construct the error value. `Name` is the binary
+%% constructor name ("TypeError", "Error", …); `MsgArg` is the raw first argument
+%% (or the atom `undefined` when the constructor was called with no argument). Per
+%% §20.5.1.1 / §19.5.1.1 an `undefined` message is NOT installed, so `.message`
+%% reads the prototype's "" default; any other argument is ToString'd.
+error_make(Name, MsgArg) ->
+    cell_new({js_err, to_string(Name), error_message([MsgArg])}).
+
+%% An error constructor as a first-class fun VALUE, so a BARE `TypeError` reference
+%% has `typeof` "function" and, if applied through a closure call site, constructs
+%% an error. Fixed arity 1 (the NativeError `length` is 1); the common uses — the
+%% dedicated call/`new` lowering and being passed as an (ignored) argument to the
+%% test harness's `assertThrows` — do not depend on this fun's arity.
+error_ctor(Name) ->
+    N = to_string(Name),
+    fun(Msg) -> cell_new({js_err, N, error_message([Msg])}) end.
+
+%% The `message` string for an error: an absent or `undefined` argument yields ""
+%% (the prototype default), otherwise ToString of the argument.
+error_message([]) -> <<>>;
+error_message([undefined | _]) -> <<>>;
+error_message([Arg | _]) -> to_string(Arg).
+
+%% Error.prototype.toString (§20.5.3.4 / §19.5.3.4): the name alone when the message
+%% is empty, the message alone when the name is empty, else "name: message". Both
+%% arguments are already-ToString'd binaries.
+error_to_string(Name, <<>>) -> Name;
+error_to_string(<<>>, Msg) -> Msg;
+error_to_string(Name, Msg) -> <<Name/binary, ": ", Msg/binary>>.
+
 %% A generator object — a cell holding the compiled step closure. The frontend
 %% transforms `function* g(){…}` into a state machine (a closure over a persistent
 %% context) and hands the step function here. `.next(v)` drives one step. Once the
@@ -1138,6 +1182,15 @@ get_prop(Recv, Key) when is_reference(Recv) ->
             string_prop(Str, Key);
         {js_wrapper, _Kind, _Prim} ->
             undefined;
+        %% an error exposes its own `name`/`message` data properties (§20.5.3);
+        %% every other read (`stack`, `cause`, `constructor`, …) is `undefined`
+        %% in this v1 model, which has no error prototype chain.
+        {js_err, Name, Msg} ->
+            case Key of
+                <<"name">> -> Name;
+                <<"message">> -> Msg;
+                _ -> undefined
+            end;
         M when is_map(M) ->
             resolve_get(maps:get(prop_key(Key), M, undefined));
         _ ->
@@ -1343,6 +1396,15 @@ has_prop(Recv, Key) when is_reference(Recv) ->
         {js_set, _, _} ->
             case Key of
                 <<"@@is_Set">> -> 1;
+                _ -> 0
+            end;
+        %% `err instanceof Error` is true for every error value; `err instanceof T`
+        %% is true only when T names this error's own constructor. `lower_instanceof`
+        %% compiles `x instanceof T` to has_prop(x, "@@is_T"), so match the brand.
+        {js_err, Name, _} ->
+            case Key of
+                <<"@@is_Error">> -> 1;
+                <<"@@is_", N/binary>> when N =:= Name -> 1;
                 _ -> 0
             end;
         M when is_map(M) -> bool_int(maps:is_key(prop_key(Key), M));

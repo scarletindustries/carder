@@ -74,7 +74,16 @@
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
 //// `Map`/`Set` (`new Map()`/`new Set()`, `.set`/`.get`/`.add`/`.has`/`.delete`/`.clear`/
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
-//// plain object).
+//// plain object). The error-constructor globals `Error`, `TypeError`, `RangeError`,
+//// `SyntaxError`, `ReferenceError`, `EvalError`, `URIError`: referenceable as a fun
+//// value (`typeof` "function"), callable (`TypeError(m)`) and newable
+//// (`new TypeError(m)`) to a throwable error value carrying `.name`/`.message` and a
+//// spec `toString` (`"name: message"`, or just `name` when the message is empty),
+//// and usable on the right of `instanceof` (`e instanceof TypeError`, `e instanceof
+//// Error`). NO real Error prototype chain, `.stack`, `cause`, or `class X extends
+//// Error` (a deliberate v1 boundary — the runtime error VALUE is a distinct tag from
+//// the runtime's INTERNAL error-signalling, which a JS `try`/`catch` still does not
+//// intercept).
 ////
 //// DELIBERATE BOUNDARY — `eval` and the `Function` constructor are permanently
 //// unsupported (a clear `Unsupported` error): this is an AHEAD-OF-TIME compiler with
@@ -3107,7 +3116,22 @@ fn lower_expr(
                   case is_global(x, ctx) {
                     True -> Ok(bind1(global_read(x, ctx), ctr))
                     False ->
-                      Error(Unsupported("unbound identifier '" <> x <> "'"))
+                      // A bare reference to an error-constructor global (checked
+                      // LAST so a user-declared function/var/class of the same name
+                      // shadows it): resolve to the constructor as a fun VALUE, so
+                      // `typeof TypeError` is "function" and it can be passed as an
+                      // (ignored) argument to `assert.throws`.
+                      case is_error_ctor(x) {
+                        True ->
+                          Ok(bind1(
+                            ir.CallHost("js", "error_ctor", [
+                              ir.ConstBinary(<<x:utf8>>),
+                            ]),
+                            ctr,
+                          ))
+                        False ->
+                          Error(Unsupported("unbound identifier '" <> x <> "'"))
+                      }
                   }
               }
           }
@@ -4264,6 +4288,26 @@ fn is_global_fn(name: String) -> Bool {
     | "decodeURI"
     | "escape"
     | "unescape" -> True
+    _ -> is_error_ctor(name)
+  }
+}
+
+/// The seven ECMAScript error-constructor globals this compiler binds: the base
+/// `Error` (§20.5) and the six NativeErrors (§20.5.5) `TypeError`, `RangeError`,
+/// `SyntaxError`, `ReferenceError`, `EvalError`, `URIError`. As a bare identifier
+/// each resolves to a fun value; called (`TypeError(m)`) or `new`ed
+/// (`new TypeError(m)`) each constructs a throwable error value carrying `.name`
+/// and `.message`. `AggregateError` is intentionally excluded (it needs
+/// `errors`/`cause`, out of scope).
+fn is_error_ctor(name: String) -> Bool {
+  case name {
+    "Error"
+    | "TypeError"
+    | "RangeError"
+    | "SyntaxError"
+    | "ReferenceError"
+    | "EvalError"
+    | "URIError" -> True
     _ -> False
   }
 }
@@ -4329,7 +4373,21 @@ fn lower_global_call(
     "escape", [] -> host("global_escape", [undefined()])
     "unescape", [x, ..] -> host("global_unescape", [x])
     "unescape", [] -> host("global_unescape", [undefined()])
-    _, _ -> Error(Unsupported(name <> "(…)"))
+    // `TypeError(msg)` / `Error(msg)` / … WITHOUT `new` — per §20.5.1.1 /
+    // §19.5.1.1 a NativeError called as a function still constructs an error, so
+    // this behaves exactly like `new Name(msg)`. The message is ToString of the
+    // first argument (or "" when none / undefined).
+    _, _ ->
+      case is_error_ctor(name) {
+        True -> {
+          let msg = case argvals {
+            [x, ..] -> x
+            [] -> undefined()
+          }
+          host("error_make", [ir.ConstBinary(<<name:utf8>>), msg])
+        }
+        False -> Error(Unsupported(name <> "(…)"))
+      }
   }
 }
 
@@ -4574,10 +4632,18 @@ fn lower_new(
     ast.Identifier(name: cname, ..) ->
       case dict.get(ctx.classes, cname) {
         Error(Nil) ->
-          case dynamic_code(cname) {
-            True -> Error(dynamic_code_unsupported(cname))
+          // Not a user class: `new TypeError(msg)` / `new Error(msg)` / … build a
+          // built-in error value (like `Number`/`Date`/`RegExp` above, these known
+          // constructors are special-cased since `new` otherwise only supports
+          // declared classes). Everything else is a genuine unknown / eval.
+          case is_error_ctor(cname) {
+            True -> lower_error_new(cname, arguments, env, ctx, ctr)
             False ->
-              Error(Unsupported("new " <> cname <> "(…) (unknown class)"))
+              case dynamic_code(cname) {
+                True -> Error(dynamic_code_unsupported(cname))
+                False ->
+                  Error(Unsupported("new " <> cname <> "(…) (unknown class)"))
+              }
           }
         Ok(info) -> {
           let #(binds, this_v, ctr) =
@@ -4819,6 +4885,31 @@ fn lower_wrapper_new(
   Ok(bind_after(
     binds,
     ir.CallHost("js", "wrapper_new", [ir.ConstAtom(kind), init]),
+    ctr,
+  ))
+}
+
+/// `new TypeError(msg)` / `new Error(msg)` / … — construct a built-in error value
+/// via the runtime `error_make(Name, MsgArg)`. `name` is the constructor name (one
+/// of the seven in `is_error_ctor`). Only the first argument is used as the message
+/// (ToString of it, or "" when absent), per §20.5.1.1 / §19.5.1.1; extra arguments
+/// are evaluated (for side effects) but otherwise ignored (no `options`/`cause`).
+/// The result is a throwable cell exposing `.name`/`.message` and a spec `toString`.
+fn lower_error_new(
+  name: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(binds, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let msg = case argvals {
+    [x, ..] -> x
+    [] -> undefined()
+  }
+  Ok(bind_after(
+    binds,
+    ir.CallHost("js", "error_make", [ir.ConstBinary(<<name:utf8>>), msg]),
     ctr,
   ))
 }

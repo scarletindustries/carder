@@ -4194,6 +4194,9 @@ fn resolve_js(op: String) -> Option(String) {
     // objects
     "new_object" -> Some("new_object")
     "wrapper_new" -> Some("wrapper_new")
+    // error constructors (§20.5 Error + the six NativeErrors)
+    "error_make" -> Some("error_make")
+    "error_ctor" -> Some("error_ctor")
     "get_prop" -> Some("get_prop")
     "set_prop" -> Some("set_prop")
     "gen_make" -> Some("gen_make")

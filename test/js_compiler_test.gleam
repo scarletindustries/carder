@@ -4990,3 +4990,71 @@ pub fn set_spread_test() {
   let m = compile("function f(){ return [...new Set([3,1,2,1])].join(\",\"); }")
   call(m, "f", []) |> should.equal(dyn(<<"3,1,2">>))
 }
+
+// ==== Error constructors (wave 4) ====
+
+// `new TypeError(msg).message` is ToString(msg) and `.name` is the constructor name
+// (§20.5.5 NativeError, §20.5.8.1 message). A no-argument or `undefined` message is
+// NOT installed, so `.message` reads the prototype default "" (§20.5.1.1). The base
+// Error's name is "Error"; a non-string message is ToString'd.
+pub fn error_message_and_name_test() {
+  val("new TypeError(\"boom\").message") |> should.equal(dyn(<<"boom">>))
+  val("new TypeError(\"boom\").name") |> should.equal(dyn(<<"TypeError">>))
+  val("new RangeError().name") |> should.equal(dyn(<<"RangeError">>))
+  val("new RangeError().message") |> should.equal(dyn(<<"">>))
+  val("new TypeError(undefined).message") |> should.equal(dyn(<<"">>))
+  val("new Error(\"x\").name") |> should.equal(dyn(<<"Error">>))
+  val("new EvalError(42).message") |> should.equal(dyn(<<"42">>))
+  val("new URIError(\"bad\").name") |> should.equal(dyn(<<"URIError">>))
+}
+
+// Error.prototype.toString (§20.5.3.4 / §19.5.3.4): "name: message", or just the
+// name when the message is empty — via both `String(e)` and `e.toString()`.
+pub fn error_to_string_test() {
+  val("String(new TypeError(\"m\"))") |> should.equal(dyn(<<"TypeError: m">>))
+  val("String(new Error())") |> should.equal(dyn(<<"Error">>))
+  val("String(new RangeError(\"bad\"))")
+  |> should.equal(dyn(<<"RangeError: bad">>))
+  val("(new SyntaxError(\"oops\")).toString()")
+  |> should.equal(dyn(<<"SyntaxError: oops">>))
+  val("(new Error(\"\")).toString()") |> should.equal(dyn(<<"Error">>))
+}
+
+// A NativeError called WITHOUT `new` still constructs an error (§20.5.5.2 /
+// §19.5.1.1): `TypeError(m)` behaves exactly like `new TypeError(m)`.
+pub fn error_call_form_test() {
+  val("TypeError(\"m\").message") |> should.equal(dyn(<<"m">>))
+  val("String(ReferenceError(\"nope\"))")
+  |> should.equal(dyn(<<"ReferenceError: nope">>))
+}
+
+// A bare error-constructor reference is a fun VALUE, so `typeof TypeError` is
+// "function" (§20.5.6.2 — NativeError constructors are functions) and it can be
+// passed around as an (ignored) argument, as the test262 shim's assertThrows does.
+pub fn error_ctor_is_function_test() {
+  val("typeof TypeError") |> should.equal(dyn(<<"function">>))
+  val("typeof Error") |> should.equal(dyn(<<"function">>))
+  let m =
+    compile("function id(x){ return 1; } function f(){ return id(TypeError); }")
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// `throw new TypeError(x)` propagates a real error value that `try`/`catch` binds,
+// and the caught value exposes `.name` and `.message`.
+pub fn error_throw_catch_test() {
+  let m =
+    compile(
+      "function f(){ try { throw new TypeError(\"x\"); } catch (e) { return e.name + \"|\" + e.message; } }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"TypeError|x">>))
+}
+
+// instanceof (bonus, resolved against the compile-time RHS name): an error is
+// instanceof its own constructor AND the base Error, but not a sibling NativeError.
+pub fn error_instanceof_test() {
+  let m =
+    compile(
+      "function f(){ var e = new TypeError(\"x\"); return (e instanceof TypeError) && (e instanceof Error) && !(e instanceof RangeError); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
