@@ -3599,14 +3599,51 @@ num_to_exponential(N, D) ->
         neg_inf ->
             <<"-Infinity">>;
         Num ->
-            F = strip_neg_zero(as_float(Num)),
-            Raw =
-                case coerce_num(D) of
-                    nan -> exp_shortest(F, 0);
-                    Dn -> float_to_binary(F, [{scientific, max(0, trunc(as_float(Dn)))}])
-                end,
-            fix_exp(Raw)
+            F = as_float(Num),
+            case D of
+                %% fractionDigits undefined ONLY → shortest round-tripping form. The
+                %% spec's undefined branch breaks ties toward the even digit, which
+                %% matches Erlang's {scientific,_} rounding, so this path is unchanged.
+                %% Note: a specified argument that coerces to NaN (e.g. NaN itself, or a
+                %% non-numeric string) is NOT undefined — it takes the specified path
+                %% below, where ToIntegerOrInfinity(NaN) = 0 (see `to_frac_digits`).
+                undefined ->
+                    fix_exp(exp_shortest(strip_neg_zero(F), 0));
+                %% fractionDigits specified → exactly `Fd` fraction digits with
+                %% round-half-away-from-zero (ES2023 21.1.3.2: on an exact tie choose
+                %% the larger mantissa). Erlang's {scientific,_} would round half-even,
+                %% so this is rendered from the exact decimal expansion instead.
+                _ ->
+                    exp_specified(F, to_frac_digits(D))
+            end
     end.
+
+%% ToIntegerOrInfinity of a specified fractionDigits argument, clamped to a
+%% non-negative digit count. Per ES ToIntegerOrInfinity, NaN (and any value that
+%% coerces to NaN) maps to 0. The ±Infinity case (spec: RangeError) is not modelled
+%% — exceptions are not yet supported — and is treated as 0 rather than crashing.
+to_frac_digits(D) ->
+    case coerce_num(D) of
+        nan -> 0;
+        inf -> 0;
+        neg_inf -> 0;
+        Dn -> max(0, trunc(as_float(Dn)))
+    end.
+
+%% Render `F` in exponential notation with exactly `Fd` fraction digits
+%% (i.e. `Fd + 1` significant digits), rounding half-away-from-zero. Zero (and
+%% negative zero, which the spec treats as non-negative) renders as "0[.0…]e+0".
+exp_specified(F, Fd) when F == 0 ->
+    Frac =
+        case Fd of
+            0 -> "";
+            _ -> [$. | lists:duplicate(Fd, $0)]
+        end,
+    iolist_to_binary(["0", Frac, "e+0"]);
+exp_specified(F, Fd) ->
+    {Ds, E0} = float_sig_digits(abs(F)),
+    {RD, Einc} = round_half_up_digits(Ds, Fd + 1),
+    sci_from_digits(F < 0, RD, E0 + Einc, Fd + 1).
 
 %% The fewest fraction digits whose scientific rendering of `F` round-trips to `F`.
 exp_shortest(F, D) when D >= 17 ->
@@ -3665,21 +3702,95 @@ num_to_precision(N, P) ->
 precision_go(F, P) when F == 0 ->
     num_to_fixed(0.0, P - 1);
 precision_go(F, P) ->
-    Sci = float_to_binary(F, [{scientific, P - 1}]),
-    E = sci_exponent(Sci),
+    %% Round to `P` significant digits from the exact decimal expansion, using
+    %% round-half-away-from-zero (ES2023 21.1.3.5). `E` is the decimal exponent of
+    %% the leading digit AFTER rounding (a 9…9 → 10…0 carry bumps it). Per the spec
+    %% the exponential form is used when E < -6 or E >= P, otherwise fixed.
+    {Ds, E0} = float_sig_digits(abs(F)),
+    {RD, Einc} = round_half_up_digits(Ds, P),
+    E = E0 + Einc,
     case E < -6 orelse E >= P of
-        true -> fix_exp(Sci);
+        true -> sci_from_digits(F < 0, RD, E, P);
         false -> num_to_fixed(F, P - 1 - E)
     end.
 
-%% The decimal exponent encoded in an Erlang scientific literal ("1.2e+05" → 5).
-sci_exponent(Sci) ->
-    [_, <<Sign, Digits/binary>>] = binary:split(Sci, <<"e">>),
-    N = binary_to_integer(Digits),
-    case Sign of
-        $- -> -N;
-        _ -> N
+%% Exact significant decimal digits of a positive finite float `X`.
+%%
+%% Returns `{Ds, E}` where `Ds` is the non-empty digit string of the exact value
+%% of `X` (an IEEE-754 double is a dyadic rational, so its decimal expansion is
+%% finite and exact — no rounding here), with no leading zeros, and `E` is the
+%% base-10 exponent of the leading digit, i.e. `X = Ds[0].Ds[1..] × 10^E`. Callers
+%% round `Ds` to the desired number of significant digits themselves.
+float_sig_digits(X) ->
+    <<_S:1, Eb:11, M:52>> = <<X/float>>,
+    {Mant, Exp} =
+        case Eb of
+            0 -> {M, -1074};
+            _ -> {M + (1 bsl 52), Eb - 1075}
+        end,
+    case Exp >= 0 of
+        true ->
+            Ds = integer_to_list(Mant bsl Exp),
+            {Ds, length(Ds) - 1};
+        false ->
+            %% X = Mant × 2^Exp = (Mant × 5^-Exp) × 10^Exp, and Mant × 5^-Exp is an
+            %% integer whose digits are exactly the significant digits of X.
+            Ds = integer_to_list(Mant * ipow5(-Exp)),
+            {Ds, length(Ds) - 1 + Exp}
     end.
+
+%% Exact 5^N for N >= 0 (bignum; used to convert a double's binary mantissa to its
+%% exact decimal digits).
+ipow5(N) -> ipow5(N, 1).
+ipow5(0, Acc) -> Acc;
+ipow5(N, Acc) -> ipow5(N - 1, Acc * 5).
+
+%% Round the digit string `Ds` to `K` significant digits, half-away-from-zero.
+%%
+%% Returns `{RD, Einc}` where `RD` is exactly `K` digits and `Einc` is 1 when a
+%% 9…9 → 10…0 carry increased the leading digit's power of ten (else 0). For a
+%% positive digit string, rounding half-up means rounding up iff the first
+%% discarded digit is >= 5 (an exact tie, discarded == 5000…, also rounds up).
+round_half_up_digits(Ds, K) ->
+    L = length(Ds),
+    case L =< K of
+        true ->
+            {Ds ++ lists:duplicate(K - L, $0), 0};
+        false ->
+            {Head, [D | _]} = lists:split(K, Ds),
+            case D >= $5 of
+                false ->
+                    {Head, 0};
+                true ->
+                    S = integer_to_list(list_to_integer(Head) + 1),
+                    case length(S) > K of
+                        true -> {lists:sublist(S, K), 1};
+                        false -> {S, 0}
+                    end
+            end
+    end.
+
+%% Assemble an exponential-notation string from `K` rounded significant digits
+%% `RD`, the leading digit's decimal exponent `E`, and a negative-sign flag.
+%% Format matches JS: one integer digit, an optional fraction, then "e", a
+%% mandatory sign, and the minimal-width exponent (e.g. "1.235e+4", "9e-1").
+sci_from_digits(Neg, RD, E, K) ->
+    Mant =
+        case K of
+            1 -> RD;
+            _ -> [hd(RD), $. | tl(RD)]
+        end,
+    ESign =
+        case E < 0 of
+            true -> $-;
+            false -> $+
+        end,
+    Sign =
+        case Neg of
+            true -> "-";
+            false -> ""
+        end,
+    iolist_to_binary([Sign, Mant, $e, ESign, integer_to_list(abs(E))]).
 
 %% num.toFixed(d) — fixed-point string with `d` decimals. Per the spec the sign is
 %% "-" only when `x < 0`; negative zero is not `< 0` and renders as "0…", so ±0 is

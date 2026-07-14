@@ -4403,3 +4403,48 @@ pub fn string_to_locale_lower_upper_test() {
   val("\"\\u{10400}\".toLocaleLowerCase()")
   |> should.equal(dyn(<<"\u{10428}">>))
 }
+
+// ==== Number (wave 1) ====
+
+// Number.prototype.toExponential / toPrecision round HALF-AWAY-FROM-ZERO when a
+// digit count is specified: ES2023 21.1.3.2/21.1.3.5 pick, on an exact tie, the
+// mantissa n for which n × 10^(e-f) is LARGER. Erlang's native scientific
+// formatting rounds half-to-even, so these exact-tie cases exercise the fix.
+// e.g. 25 = 2.5e1 → toExponential(0): 2.5 ties between 2 and 3 → 3 ("3e+1");
+// 12345 = 1.2345e4 → toExponential(3): 1.2345 ties → 1.235 ("1.235e+4").
+pub fn number_exponential_half_up_test() {
+  val("(25).toExponential(0)") |> should.equal(dyn(<<"3e+1">>))
+  val("(12345).toExponential(3)") |> should.equal(dyn(<<"1.235e+4">>))
+  val("(2.5).toExponential(0)") |> should.equal(dyn(<<"3e+0">>))
+  // Non-tie cases still round to nearest and pad to the requested width.
+  val("(123.456).toExponential(6)") |> should.equal(dyn(<<"1.234560e+2">>))
+  val("(0.9999).toExponential(3)") |> should.equal(dyn(<<"9.999e-1">>))
+  // A 9…9 → 10…0 carry bumps the exponent.
+  val("(0.9999).toExponential(2)") |> should.equal(dyn(<<"1.00e+0">>))
+}
+
+// toPrecision applies the same half-away-from-zero tie-break in its exponential
+// branch (exponent < -6 or >= p). 25 to 1 significant digit → "3e+1"; 12345 to
+// 4 significant digits → "1.235e+4".
+pub fn number_precision_half_up_test() {
+  val("(25).toPrecision(1)") |> should.equal(dyn(<<"3e+1">>))
+  val("(12345).toPrecision(4)") |> should.equal(dyn(<<"1.235e+4">>))
+  // Fixed branch is unaffected and still correct.
+  val("(123.456).toPrecision(5)") |> should.equal(dyn(<<"123.46">>))
+}
+
+// toExponential distinguishes `undefined` (→ shortest round-tripping form) from
+// an argument that COERCES to NaN. Per ES ToIntegerOrInfinity, NaN → 0, so
+// (123.456).toExponential(NaN) is 0 fraction digits ("1e+2"), NOT the shortest
+// form. null → 0, false → 0, true → 1, "2" → 2, "" → 0 (21.1.3.2 step 3).
+pub fn number_exponential_fractiondigits_coercion_test() {
+  val("(123.456).toExponential()") |> should.equal(dyn(<<"1.23456e+2">>))
+  val("(123.456).toExponential(undefined)")
+  |> should.equal(dyn(<<"1.23456e+2">>))
+  val("(123.456).toExponential(NaN)") |> should.equal(dyn(<<"1e+2">>))
+  val("(123.456).toExponential(null)") |> should.equal(dyn(<<"1e+2">>))
+  val("(123.456).toExponential(false)") |> should.equal(dyn(<<"1e+2">>))
+  val("(123.456).toExponential(true)") |> should.equal(dyn(<<"1.2e+2">>))
+  val("(123.456).toExponential('2')") |> should.equal(dyn(<<"1.23e+2">>))
+  val("(123.456).toExponential('')") |> should.equal(dyn(<<"1e+2">>))
+}
