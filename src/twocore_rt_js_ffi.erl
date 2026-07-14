@@ -101,6 +101,8 @@
     number_is_safe_integer/1,
     object_keys/1, object_values/1, object_entries/1, object_assign_into/2,
     object_rest/2, object_freeze/1, object_is_frozen/1,
+    object_prevent_extensions/1, object_is_extensible/1,
+    object_seal/1, object_is_sealed/1,
     object_from_entries/1, object_is/2, object_has_own/2,
     json_stringify/3, json_parse/1,
     encode_uri_component/1, encode_uri/1,
@@ -1297,8 +1299,21 @@ set_prop_live(Recv, Key, V) ->
                 {js_accessor, _, _} ->
                     V;
                 _ ->
-                    erlang:put(?CELL_KEY(Recv), maps:put(K, V, M)),
-                    V
+                    %% Adding a brand-new own property to a NON-EXTENSIBLE object
+                    %% (Object.preventExtensions/seal/freeze) is refused; in
+                    %% non-strict mode this is a silent no-op. Writes to an
+                    %% EXISTING key are unaffected (extensibility only bars new
+                    %% keys — configurability/writability is a separate flag).
+                    case
+                        (not maps:is_key(K, M)) andalso
+                            erlang:get({js_nonextensible, Recv}) =:= true
+                    of
+                        true ->
+                            V;
+                        false ->
+                            erlang:put(?CELL_KEY(Recv), maps:put(K, V, M)),
+                            V
+                    end
             end;
         _ ->
             type_error(Recv)
@@ -1310,6 +1325,11 @@ set_prop_live(Recv, Key, V) ->
 %% object's keys. A non-object primitive is returned unchanged (already immutable).
 object_freeze(O) when is_reference(O) ->
     erlang:put({js_frozen, O}, true),
+    %% Freezing implies the object is also non-extensible and sealed
+    %% (SetIntegrityLevel(frozen) first performs [[PreventExtensions]]), so
+    %% Object.isExtensible/isSealed report the derived state correctly.
+    erlang:put({js_nonextensible, O}, true),
+    erlang:put({js_sealed, O}, true),
     O;
 object_freeze(O) ->
     O.
@@ -1319,6 +1339,56 @@ object_freeze(O) ->
 object_is_frozen(O) when is_reference(O) ->
     erlang:get({js_frozen, O}) =:= true;
 object_is_frozen(_) ->
+    true.
+
+%% Object.preventExtensions(o): mark o non-extensible — no NEW own property can be
+%% added afterwards (existing properties stay writable/configurable) — and return
+%% o. Non-extensibility is tracked in a SEPARATE process-dictionary entry keyed by
+%% the cell ref, so it never appears among the object's keys. A non-object
+%% primitive is returned unchanged (it can never gain properties anyway).
+object_prevent_extensions(O) when is_reference(O) ->
+    erlang:put({js_nonextensible, O}, true),
+    O;
+object_prevent_extensions(O) ->
+    O.
+
+%% Object.isExtensible(o) -> Erlang boolean atom. True iff o is an object that has
+%% not been made non-extensible (via preventExtensions/seal/freeze). Per ES2015
+%% (§19.1.2.13) a non-object primitive is NOT extensible, so this returns `false`
+%% for it rather than throwing.
+object_is_extensible(O) when is_reference(O) ->
+    erlang:get({js_nonextensible, O}) =/= true;
+object_is_extensible(_) ->
+    false.
+
+%% Object.seal(o): make o non-extensible AND mark every existing own property
+%% non-configurable (they can no longer be deleted or reconfigured, but remain
+%% writable), then return o. In this descriptor-free model configurability is
+%% tracked with a single per-object `js_sealed` flag. A non-object primitive is
+%% returned unchanged.
+object_seal(O) when is_reference(O) ->
+    erlang:put({js_nonextensible, O}, true),
+    erlang:put({js_sealed, O}, true),
+    O;
+object_seal(O) ->
+    O.
+
+%% Object.isSealed(o) -> Erlang boolean atom, the TestIntegrityLevel(o, sealed)
+%% predicate (§7.3.15): o is sealed iff it is non-extensible AND every own
+%% property is non-configurable. In this model that holds when the object was
+%% sealed or frozen, OR when it is non-extensible and has no own properties (the
+%% integrity check is then vacuously satisfied). A non-object primitive is sealed
+%% (true) per spec.
+object_is_sealed(O) when is_reference(O) ->
+    case erlang:get({js_nonextensible, O}) =:= true of
+        false ->
+            false;
+        true ->
+            erlang:get({js_sealed, O}) =:= true orelse
+                erlang:get({js_frozen, O}) =:= true orelse
+                obj_pairs(O) =:= []
+    end;
+object_is_sealed(_) ->
     true.
 
 %% Object.is(x, y) -> JS boolean, the SameValue algorithm (§7.2.11). Like `===`
@@ -1415,11 +1485,15 @@ define_accessor(Obj, Key, Getter, Setter) when is_reference(Obj) ->
 define_accessor(Obj, _, _, _) ->
     type_error(Obj).
 
-%% delete recv[key] — remove the property; always returns `true` (non-strict).
+%% delete recv[key] — remove the property; returns `true` on success (non-strict).
+%% A FROZEN or SEALED object has non-configurable own properties, so `delete` is a
+%% no-op and reports `false` (§13.5.1.2 with a non-configurable target).
 delete_prop(Recv, Key) when is_reference(Recv) ->
-    case erlang:get({js_frozen, Recv}) of
+    case
+        erlang:get({js_frozen, Recv}) =:= true orelse
+            erlang:get({js_sealed, Recv}) =:= true
+    of
         true ->
-            %% frozen: delete is a no-op in non-strict mode, and reports false.
             false;
         _ ->
             delete_prop_live(Recv, Key)

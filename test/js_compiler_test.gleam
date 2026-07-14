@@ -5136,3 +5136,72 @@ pub fn catch_engine_error_finally_test() {
   )
   |> should.equal(5.0)
 }
+
+// ==== Object (wave 6) ====
+
+// Object.isExtensible on a freshly-created object is `true` (§19.1.2.13); after
+// Object.preventExtensions it is `false`, and preventExtensions returns the object.
+pub fn object_prevent_extensions_flips_extensible_test() {
+  let g =
+    compile(
+      "function f(){ var o = {}; var before = Object.isExtensible(o); var ret = Object.preventExtensions(o); return before === true && (ret === o) && Object.isExtensible(o) === false; }",
+    )
+  call(g, "f", []) |> should.equal(dyn(True))
+}
+
+// Object.isExtensible on a non-object primitive returns `false` WITHOUT throwing
+// (ES2015 §19.1.2.13 step 1 short-circuits to false).
+pub fn object_is_extensible_primitive_false_test() {
+  val("Object.isExtensible(0)") |> should.equal(dyn(False))
+  val("Object.isExtensible(undefined)") |> should.equal(dyn(False))
+  val("Object.isExtensible(\"s\")") |> should.equal(dyn(False))
+}
+
+// A non-extensible object silently refuses NEW own properties (non-strict mode),
+// but writes to EXISTING properties and deletes still succeed (preventExtensions
+// bars additions only — it does not affect writability or configurability).
+pub fn object_prevent_extensions_blocks_new_props_test() {
+  let g =
+    compile(
+      "function f(){ var o = { a: 1 }; Object.preventExtensions(o); o.b = 2; o.a = 5; var d = delete o.a; return (o.b === undefined) && (o.a === undefined) && (d === true); }",
+    )
+  call(g, "f", []) |> should.equal(dyn(True))
+}
+
+// Object.seal makes the object non-extensible AND non-configurable: isExtensible
+// becomes false, isSealed becomes true, and `delete` of an own property fails
+// (returns false, property survives). seal returns the same object.
+pub fn object_seal_test() {
+  let g =
+    compile(
+      "function f(){ var o = { a: 1 }; var ret = Object.seal(o); var d = delete o.a; return (ret === o) && (Object.isExtensible(o) === false) && (Object.isSealed(o) === true) && (d === false) && (o.a === 1); }",
+    )
+  call(g, "f", []) |> should.equal(dyn(True))
+}
+
+// A fresh, still-extensible object is NOT sealed (§7.3.15 requires
+// non-extensibility). A non-object primitive IS sealed per spec.
+pub fn object_is_sealed_defaults_test() {
+  val("Object.isSealed({})") |> should.equal(dyn(False))
+  val("Object.isSealed(1)") |> should.equal(dyn(True))
+}
+
+// A non-extensible object with no own properties is vacuously sealed
+// (TestIntegrityLevel over an empty key set succeeds).
+pub fn object_prevent_extensions_empty_is_sealed_test() {
+  let g =
+    compile(
+      "function f(){ var o = {}; Object.preventExtensions(o); return Object.isSealed(o); }",
+    )
+  call(g, "f", []) |> should.equal(dyn(True))
+}
+
+// SetIntegrityLevel(frozen) also prevents extensions and seals: a frozen object
+// reports isExtensible false and isSealed true (freeze is stronger than seal).
+pub fn object_freeze_implies_sealed_and_nonextensible_test() {
+  let g =
+    compile(
+      "function f(){ var o = { a: 1 }; Object.freeze(o); return (Object.isExtensible(o) === false) && (Object.isSealed(o) === true) && (Object.isFrozen(o) === true); }",
+    )
+  call(g, "f", []) |> should.equal(dyn(True))
+}
