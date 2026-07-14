@@ -1,2 +1,5 @@
 # The test262 checkout is large (~54k files) — fetch it locally, never commit it.
+# Match both a real directory and an accidental symlink named `suite` (a trailing
+# slash would only match a directory, letting a symlink slip through `git add -A`).
+suite
 suite/
