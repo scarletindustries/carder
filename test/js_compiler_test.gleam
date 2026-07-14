@@ -4505,3 +4505,84 @@ pub fn json_stringify_array_tojson_test() {
     )
   call(n, "f", []) |> should.equal(dyn(<<"\"x\"">>))
 }
+
+// ==== GlobalFns (wave 3) ====
+
+// escape (Annex B B.2.1.1): the unescaped set — uriAlpha, DecimalDigit, and
+// `@*_+-./` — is left literal.
+pub fn escape_unmodified_set_test() {
+  let s =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./"
+  val("escape(\"" <> s <> "\")")
+  |> should.equal(
+    dyn(<<
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./",
+    >>),
+  )
+}
+
+// B.2.1.1 step 5d: a code unit < 256 outside the unescaped set becomes `%XY`
+// with two UPPERCASE hex digits.
+pub fn escape_below_256_test() {
+  val("escape(\"!\\\"#$%&'()\")")
+  |> should.equal(dyn(<<"%21%22%23%24%25%26%27%28%29">>))
+  val("escape(\",\")") |> should.equal(dyn(<<"%2C">>))
+  val("escape(\":;<=>?\")") |> should.equal(dyn(<<"%3A%3B%3C%3D%3E%3F">>))
+  // Latin-1 high bytes 0xFD..0xFF.
+  val("escape(\"\\u00fd\\u00fe\\u00ff\")")
+  |> should.equal(dyn(<<"%FD%FE%FF">>))
+}
+
+// B.2.1.1 step 5c: a code unit >= 256 becomes `%uWXYZ` (four uppercase hex).
+pub fn escape_above_256_test() {
+  val("escape(\"\\u0100\\u0101\\u0102\")")
+  |> should.equal(dyn(<<"%u0100%u0101%u0102">>))
+  val("escape(\"\\ufffd\\ufffe\\uffff\")")
+  |> should.equal(dyn(<<"%uFFFD%uFFFE%uFFFF">>))
+}
+
+// B.2.1.1: an astral code point is escaped as its UTF-16 surrogate pair, each a
+// `%uXXXX` unit — escape('\u{10401}') === '%uD801%uDC01'.
+pub fn escape_astral_surrogate_pair_test() {
+  val("escape(\"\\u{10401}\")") |> should.equal(dyn(<<"%uD801%uDC01">>))
+}
+
+// B.2.1.1 step 1: the argument is ToString-coerced first.
+pub fn escape_argument_coercion_test() {
+  val("escape(undefined)") |> should.equal(dyn(<<"undefined">>))
+  val("escape(null)") |> should.equal(dyn(<<"null">>))
+  val("escape(true)") |> should.equal(dyn(<<"true">>))
+  val("escape()") |> should.equal(dyn(<<"undefined">>))
+  val("escape(\"\")") |> should.equal(dyn(<<"">>))
+}
+
+// unescape (Annex B B.2.1.2): `%uXXXX` decodes to that code unit, `%XX` to that
+// code unit; both round-trip escape.
+pub fn unescape_decodes_escapes_test() {
+  val("unescape(\"%3A%3B%3C%3D%3E%3F\")") |> should.equal(dyn(<<":;<=>?">>))
+  val("unescape(\"%u0041%u0042\")") |> should.equal(dyn(<<"AB">>))
+  // U+00FD is UTF-8 bytes 0xC3 0xBD; U+FFFF is 0xEF 0xBF 0xBF (spelled as bytes
+  // here because U+FFFF is a Unicode noncharacter and cannot be a source char).
+  val("unescape(\"%FD\")") |> should.equal(dyn(<<0xC3, 0xBD>>))
+  val("unescape(\"%uffff\")") |> should.equal(dyn(<<0xEF, 0xBF, 0xBF>>))
+}
+
+// B.2.1.2 step 5b: a `%` NOT followed by a well-formed escape passes through
+// verbatim (case preserved), and only the matching form is consumed.
+pub fn unescape_ignores_malformed_test() {
+  // `%U` (capital U) is not the `%u` form.
+  val("unescape(\"%U0000\")") |> should.equal(dyn(<<"%U0000">>))
+  // A four-hex escape interrupted by end-of-string is left alone.
+  val("unescape(\"%u\")") |> should.equal(dyn(<<"%u">>))
+  val("unescape(\"%u001\")") |> should.equal(dyn(<<"%u001">>))
+  // A non-hex digit in the two-digit form leaves the `%` verbatim.
+  val("unescape(\"%g00\")") |> should.equal(dyn(<<"%g00">>))
+  val("unescape(\"%\")") |> should.equal(dyn(<<"%">>))
+}
+
+// unescape is the inverse of escape on the round-trippable set.
+pub fn unescape_roundtrips_escape_test() {
+  // U+0100 is UTF-8 0xC4 0x80; U+00FF is 0xC3 0xBF.
+  val("unescape(escape(\"Hello, World! \\u0100\\u00ff\"))")
+  |> should.equal(dyn(<<"Hello, World! ", 0xC4, 0x80, 0xC3, 0xBF>>))
+}

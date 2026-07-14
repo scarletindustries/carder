@@ -4332,6 +4332,8 @@ fn resolve_js(op: String) -> Option(String) {
     "encode_uri" -> Some("encode_uri")
     "decode_uri_component" -> Some("decode_uri_component")
     "decode_uri" -> Some("decode_uri")
+    "global_escape" -> Some("global_escape")
+    "global_unescape" -> Some("global_unescape")
     // lists / console / misc
     "empty_list" -> Some("empty_list")
     "console_log" -> Some("console_log")

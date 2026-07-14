@@ -779,6 +779,18 @@ pub fn decode_uri_component(x: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "decode_uri")
 pub fn decode_uri(x: Dynamic) -> Dynamic
 
+/// `escape(x)` — the legacy Annex B (B.2.1.1) escaper. Percent-escapes ToString(x)
+/// code-unit by code-unit: a code unit ≥ 256 → `%uWXYZ`, a code unit < 256 not in
+/// the unescaped set (`A-Za-z0-9@*_+-./`) → `%XY`, all uppercase hex. Never raises.
+@external(erlang, "twocore_rt_js_ffi", "global_escape")
+pub fn global_escape(x: Dynamic) -> Dynamic
+
+/// `unescape(x)` — the legacy Annex B (B.2.1.2) inverse of `escape`. Replaces each
+/// `%uXXXX` and `%XX` escape in ToString(x) with the corresponding code unit; a `%`
+/// not followed by a well-formed escape is left verbatim. Never raises.
+@external(erlang, "twocore_rt_js_ffi", "global_unescape")
+pub fn global_unescape(x: Dynamic) -> Dynamic
+
 /// `x` is `null` or `undefined` → i32 `1`/`0` (behind `??` and optional chaining `?.`).
 @external(erlang, "twocore_rt_js_ffi", "is_nullish")
 pub fn is_nullish(x: Dynamic) -> Int
