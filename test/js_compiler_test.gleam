@@ -3699,7 +3699,9 @@ pub fn math_round_half_test() {
   // ties round toward +Infinity, not toward zero.
   num("Math.round(2.5)") |> should.equal(3.0)
   num("Math.round(-2.5)") |> should.equal(-2.0)
-  num("Math.round(-0.5)") |> should.equal(0.0)
+  // Per sec-math.round: for -0.5 <= x < 0 the result is -0, not +0 (the tie
+  // -0.5 rounds up to zero but keeps the negative sign). 1 / -0 is -Infinity.
+  num("1 / Math.round(-0.5) === -Infinity ? 1 : 0") |> should.equal(1.0)
   num("Math.round(2.4)") |> should.equal(2.0)
 }
 
@@ -4504,4 +4506,77 @@ pub fn json_stringify_array_tojson_test() {
       "function f(){ var a=[1,2]; a.toJSON=function(){ return \"x\"; }; return JSON.stringify(a); }",
     )
   call(n, "f", []) |> should.equal(dyn(<<"\"x\"">>))
+}
+
+// ==== Math (wave 3) ====
+
+// Math.ceil / floor / round / trunc must preserve the IEEE sign of a zero
+// result per each function's spec table. A negative argument that rounds to
+// zero yields -0 (detected via 1 / result === -Infinity), a positive one +0.
+pub fn math_round_family_negative_zero_test() {
+  // Math.ceil(x) is -0 for -0 and for -1 < x < 0 (S15.8.2.6_A3 / _A6).
+  num("1 / Math.ceil(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.ceil(-0.5) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.ceil(-0.999999999999999) === -Infinity ? 1 : 0")
+  |> should.equal(1.0)
+
+  // Math.floor(-0) is -0 (S15.8.2.9_A3); floor of a negative fraction is not
+  // zero and keeps its magnitude (floor(-0.5) === -1).
+  num("1 / Math.floor(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("Math.floor(-0.5)") |> should.equal(-1.0)
+
+  // Math.round(-0) is -0, and round(x) is -0 for -0.5 <= x < 0 (S15.8.2.15_A3).
+  num("1 / Math.round(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.round(-0.3) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.round(-0.5) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  // round(-0.6) rounds away from zero (ties go toward +Infinity): -1.
+  num("Math.round(-0.6)") |> should.equal(-1.0)
+
+  // Math.trunc(-0) is -0 and trunc(x) is -0 for -1 < x < 0 (trunc-specialVals).
+  num("1 / Math.trunc(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.trunc(-0.9) === -Infinity ? 1 : 0") |> should.equal(1.0)
+
+  // Positive zeros stay +0 (1 / +0 === +Infinity).
+  num("1 / Math.floor(0.5) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.trunc(0.02) === Infinity ? 1 : 0") |> should.equal(1.0)
+}
+
+// Sign-of-zero-preserving unary Math functions: sign, cbrt, expm1, log1p all
+// map -0 to -0 and +0 to +0 per their spec tables.
+pub fn math_unary_negative_zero_test() {
+  num("1 / Math.sign(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.sign(0) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.cbrt(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.cbrt(0) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.expm1(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.log1p(-0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  // Math.abs is the exception: abs(-0) is +0, not -0.
+  num("1 / Math.abs(-0) === Infinity ? 1 : 0") |> should.equal(1.0)
+}
+
+// Math.min / Math.max treat +0 as strictly larger than -0 (V8 zeros tests):
+// max(-0, 0) is +0 and min(0, -0) is -0.
+pub fn math_minmax_signed_zero_test() {
+  num("1 / Math.max(-0, -0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.max(0, -0) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.max(-0, 0) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.max(0, 0, -0) === Infinity ? 1 : 0") |> should.equal(1.0)
+
+  num("1 / Math.min(0, 0) === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.min(-0, -0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.min(0, -0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.min(-0, 0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.min(0, 0, -0) === -Infinity ? 1 : 0") |> should.equal(1.0)
+}
+
+// Math.pow(-Infinity, x) for x < 0: an odd-integer exponent yields -0, an even
+// one yields +0 (sec-numeric-types-number-exponentiate / exp-operator_A15).
+pub fn math_pow_neg_infinity_test() {
+  num("1 / Math.pow(-Infinity, -111) === -Infinity ? 1 : 0")
+  |> should.equal(1.0)
+  num("1 / Math.pow(-Infinity, -1) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / Math.pow(-Infinity, -2) === Infinity ? 1 : 0") |> should.equal(1.0)
+  // positive exponents keep the earlier behaviour: odd -> -Infinity, even -> +Infinity.
+  num("Math.pow(-Infinity, 3) === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("Math.pow(-Infinity, 2) === Infinity ? 1 : 0") |> should.equal(1.0)
 }
