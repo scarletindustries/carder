@@ -4214,6 +4214,8 @@ fn resolve_js(op: String) -> Option(String) {
     "is_array" -> Some("is_array")
     "array_spread_into" -> Some("array_spread_into")
     "apply_fn" -> Some("apply_fn")
+    "func_call" -> Some("func_call")
+    "func_apply" -> Some("func_apply")
     "fit_list" -> Some("fit_list")
     "array_to_list" -> Some("array_to_list")
     "array_from" -> Some("array_from")

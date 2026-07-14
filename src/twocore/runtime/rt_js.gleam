@@ -335,6 +335,20 @@ pub fn array_spread_into(target: Dynamic, value: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "apply_fn")
 pub fn apply_fn(f: Dynamic, args: Dynamic) -> Dynamic
 
+/// `f.call(thisArg, ...args)` — apply function value `f` to the arguments after
+/// `thisArg` (which is ignored: plain functions carry no receiver here). `args` is
+/// the full call argument list `[thisArg, ...rest]`; a non-function receiver
+/// delegates to a same-named user `call` method.
+@external(erlang, "twocore_rt_js_ffi", "func_call")
+pub fn func_call(f: Dynamic, args: Dynamic) -> Dynamic
+
+/// `f.apply(thisArg, argArray)` — apply function value `f` to the elements of
+/// `argArray` (a null/undefined `argArray` means no arguments; `thisArg` is
+/// ignored). `args` is the full call argument list `[thisArg, argArray]`; a
+/// non-function receiver delegates to a same-named user `apply` method.
+@external(erlang, "twocore_rt_js_ffi", "func_apply")
+pub fn func_apply(f: Dynamic, args: Dynamic) -> Dynamic
+
 /// Pad (with undefined) or truncate an argument list to exactly `n` elements, so a
 /// spread `new C(...args)` can call the fixed-arity constructor.
 @external(erlang, "twocore_rt_js_ffi", "fit_list")

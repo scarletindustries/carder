@@ -4702,3 +4702,73 @@ pub fn unescape_roundtrips_escape_test() {
   val("unescape(escape(\"Hello, World! \\u0100\\u00ff\"))")
   |> should.equal(dyn(<<"Hello, World! ", 0xC4, 0x80, 0xC3, 0xBF>>))
 }
+
+// ==== Function (wave 3) ====
+
+// Function.prototype.call (sec-function.prototype.call): apply the target to the
+// arguments after `thisArg`. `thisArg` is ignored in this compiler (a plain
+// function carries no bound receiver), so the observable effect is forwarding the
+// remaining arguments to the target.
+pub fn function_call_forwards_args_test() {
+  let m =
+    compile(
+      "function add(a, b) { return a + b; } function run() { return add.call(null, 2, 3); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(5.0)
+}
+
+// A zero-argument target invoked via `.call` with only a `thisArg` runs with no
+// arguments and returns its value.
+pub fn function_call_no_args_test() {
+  let m =
+    compile(
+      "function g() { return 42; } function run() { return g.call(null); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(42.0)
+}
+
+// `.call` is arity-adaptive like any JS call: a parameter with no corresponding
+// argument is `undefined`, not an error.
+pub fn function_call_missing_arg_is_undefined_test() {
+  let m =
+    compile(
+      "function f(a, b) { return b === undefined ? 1 : 0; } function run() { return f.call(null, 7); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(1.0)
+}
+
+// Function.prototype.apply (sec-function.prototype.apply): apply the target to the
+// ELEMENTS of the array-like passed as the second argument.
+pub fn function_apply_spreads_array_test() {
+  let m =
+    compile(
+      "function add(a, b) { return a + b; } function run() { return add.apply(null, [4, 5]); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(9.0)
+}
+
+// apply step 3: a null or undefined argArray means the empty argument list (not a
+// TypeError), so a zero-argument target still runs.
+pub fn function_apply_null_argarray_test() {
+  let m =
+    compile(
+      "function g() { return 7; } function run() { return g.apply(null, null); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(7.0)
+
+  let n =
+    compile(
+      "function g() { return 7; } function run() { return g.apply(null); }",
+    )
+  to_float(call(n, "run", [])) |> should.equal(7.0)
+}
+
+// call/apply on a plain (non-function) object still reach a same-named user method,
+// so an object property literally named `call` keeps working.
+pub fn object_call_method_delegation_test() {
+  let m =
+    compile(
+      "function run() { var o = { call: function(x) { return x + 1; } }; return o.call(9); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(10.0)
+}
