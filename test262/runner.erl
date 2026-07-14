@@ -62,8 +62,8 @@ bump(K, M) -> maps:update_with(K, fun(X) -> X + 1 end, 1, M).
 is_skip(O) -> lists:member(O, [skip_flag, skip_include, skip_negative, skip_eval]).
 
 print_summary(Tally) ->
-    Order = [pass, fail_assert, runtime_error, compile_unsupported, compile_parse,
-             compile_backend, compile_lower_other, compile_other,
+    Order = [pass, fail_assert, runtime_error, timeout, compile_unsupported,
+             compile_parse, compile_backend, compile_lower_other, compile_other,
              skip_flag, skip_include, skip_negative, skip_eval],
     io:format("~n==== RESULTS ====~n"),
     [io:format("  ~-20s ~p~n", [K, maps:get(K, Tally, 0)]) || K <- Order],
@@ -94,6 +94,7 @@ tally_area(Area, Outcome, Acc) ->
         pass -> inc(inc(M0, pass), ran);
         fail_assert -> inc(inc(M0, fixable), ran);
         runtime_error -> inc(inc(M0, fixable), ran);
+        timeout -> M0;  %% a hang: globally visible, but kept out of the fixable ranking
         _ ->
             case is_skip(Outcome) of
                 true -> M0;
@@ -137,11 +138,36 @@ run_one(File, N) ->
 run_body(Body, N) ->
     Full = <<(shim())/binary, "\n", (rewrite(Body))/binary>>,
     ModName = list_to_binary("twocore@t262@m" ++ integer_to_list(N)),
-    try twocore@frontend@js:compile_and_load(Full, ModName) of
-        {ok, Mod} -> execute(Mod);
-        {error, Err} -> classify_compile_error(Err)
-    catch
-        Ce:Re -> {compile_other, io_lib:format("~p:~p", [Ce, Re])}
+    %% Compile AND execute inside a monitored worker with a wall-clock timeout, so a
+    %% test that makes the compiler or the generated code loop forever (test262 has
+    %% many, and this compiler has known non-termination hazards) can never hang the
+    %% whole runner. `exit(Pid, kill)` is untrappable and the BEAM scheduler is
+    %% preemptive, so even a tight busy-loop is reliably reaped. Override the 5s cap
+    %% with T262_TIMEOUT_MS.
+    TimeoutMs = list_to_integer(os:getenv("T262_TIMEOUT_MS", "5000")),
+    Parent = self(),
+    Ref = make_ref(),
+    {Pid, MRef} = spawn_monitor(fun() ->
+        Outcome =
+            try twocore@frontend@js:compile_and_load(Full, ModName) of
+                {ok, Mod} -> execute(Mod);
+                {error, Err} -> classify_compile_error(Err)
+            catch
+                Ce:Re -> {compile_other, io_lib:format("~p:~p", [Ce, Re])}
+            end,
+        Parent ! {Ref, Outcome}
+    end),
+    receive
+        {Ref, Outcome} ->
+            erlang:demonitor(MRef, [flush]),
+            Outcome;
+        {'DOWN', MRef, process, Pid, Reason} ->
+            {compile_other, io_lib:format("worker_crash:~p", [Reason])}
+    after TimeoutMs ->
+        erlang:exit(Pid, kill),
+        erlang:demonitor(MRef, [flush]),
+        receive {Ref, _} -> ok after 0 -> ok end,
+        {timeout, ""}
     end.
 
 %% True if the test body uses eval or the Function constructor (dynamic code).
