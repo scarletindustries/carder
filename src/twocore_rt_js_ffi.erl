@@ -3218,30 +3218,55 @@ call_cb(Fn, Args) ->
     Padded = Args ++ lists:duplicate(max(0, A - length(Args)), undefined),
     erlang:apply(Fn, lists:sublist(Padded, A)).
 
+%% map(fn) — per ES §22.1.3.19: visit every index k in [0, len) where the array
+%% currently HAS an own element (holes are NOT visited and are PRESERVED as holes
+%% in the result), re-reading the live array each step so a callback that mutates
+%% or deletes later indices is observed. `len` is captured at entry, so elements
+%% the callback adds beyond the original length are never visited. The result has
+%% the same length as the source. Callback: (element, index, array).
 array_map(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    new_array(amap(Fn, Recv, arr_list(Len, Map), 0)).
-amap(_, _, [], _) -> [];
-amap(Fn, Arr, [X | Xs], I) -> [call_cb(Fn, [X, I, Arr]) | amap(Fn, Arr, Xs, I + 1)].
-
-array_filter(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    new_array(afilter(Fn, Recv, arr_list(Len, Map), 0)).
-afilter(_, _, [], _) -> [];
-afilter(Fn, Arr, [X | Xs], I) ->
-    case truthy(call_cb(Fn, [X, I, Arr])) of
-        1 -> [X | afilter(Fn, Arr, Xs, I + 1)];
-        0 -> afilter(Fn, Arr, Xs, I + 1)
+    {Len, _Map} = arr_content(Recv),
+    cell_new({js_array, Len, amap(Fn, Recv, 0, Len, #{})}).
+amap(_, _, K, Len, Acc) when K >= Len -> Acc;
+amap(Fn, Arr, K, Len, Acc) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> amap(Fn, Arr, K + 1, Len, maps:put(K, call_cb(Fn, [X, K, Arr]), Acc));
+        error -> amap(Fn, Arr, K + 1, Len, Acc)
     end.
 
+%% filter(fn) — per ES §22.1.3.7: visit only present elements (holes skipped, not
+%% visited), live re-read each step, iteration bounded by the entry length. The
+%% result is a DENSE array of the kept elements. Callback: (element, index, array).
+array_filter(Recv, Fn) ->
+    {Len, _Map} = arr_content(Recv),
+    new_array(afilter(Fn, Recv, 0, Len)).
+afilter(_, _, K, Len) when K >= Len -> [];
+afilter(Fn, Arr, K, Len) ->
+    case arr_index(Arr, K) of
+        {ok, X} ->
+            case truthy(call_cb(Fn, [X, K, Arr])) of
+                1 -> [X | afilter(Fn, Arr, K + 1, Len)];
+                0 -> afilter(Fn, Arr, K + 1, Len)
+            end;
+        error ->
+            afilter(Fn, Arr, K + 1, Len)
+    end.
+
+%% forEach(fn) — per ES §22.1.3.12: call the callback once for each present element
+%% (holes are skipped via a per-step HasProperty check), re-reading the live array
+%% each step and bounding iteration by the length captured at entry. Returns
+%% undefined. Callback: (element, index, array).
 array_foreach(Recv, Fn) ->
-    {Len, Map} = arr_content(Recv),
-    aforeach(Fn, Recv, arr_list(Len, Map), 0),
+    {Len, _Map} = arr_content(Recv),
+    aforeach(Fn, Recv, 0, Len),
     undefined.
-aforeach(_, _, [], _) -> ok;
-aforeach(Fn, Arr, [X | Xs], I) ->
-    call_cb(Fn, [X, I, Arr]),
-    aforeach(Fn, Arr, Xs, I + 1).
+aforeach(_, _, K, Len) when K >= Len -> ok;
+aforeach(Fn, Arr, K, Len) ->
+    case arr_index(Arr, K) of
+        {ok, X} -> call_cb(Fn, [X, K, Arr]);
+        error -> ok
+    end,
+    aforeach(Fn, Arr, K + 1, Len).
 
 %% Live own-element read at integer index `I` of the array cell `Recv`.
 %% Returns `{ok, Value}` when index `I` currently holds an own element, or
@@ -3397,10 +3422,6 @@ aflatmap(Fn, Arr, K, Len) ->
         error -> aflatmap(Fn, Arr, K + 1, Len)
     end.
 
-index_pairs(L) -> index_pairs(L, 0).
-index_pairs([], _) -> [];
-index_pairs([X | Xs], I) -> [{X, I} | index_pairs(Xs, I + 1)].
-
 %% arr.findLast(fn) / findLastIndex(fn) — like find/findIndex from the end:
 %% visit every index from Len-1 down to 0 (a hole reads as undefined), live re-read.
 array_find_last(Recv, Fn) ->
@@ -3431,10 +3452,9 @@ afind_last_i(Fn, Arr, K) ->
 array_last_index_of(Recv, X, From) when is_binary(Recv) ->
     str_last_index_of(Recv, X, From);
 array_last_index_of(Recv, X, From) ->
-    {Len, Map} = arr_content(Recv),
+    {Len, _Map} = arr_content(Recv),
     Cap = last_idx_from(From, Len),
-    Pairs = [P || {_E, I} = P <- index_pairs(arr_list(Len, Map)), I =< Cap],
-    alast_idx(Pairs, X, -1).
+    alast_idx(Recv, min(Cap, Len - 1), X).
 
 last_idx_from(undefined, Len) ->
     Len - 1;
@@ -3451,11 +3471,19 @@ last_idx_from(From, Len) ->
             end
     end.
 
-alast_idx([], _, Acc) -> Acc;
-alast_idx([{E, I} | Rest], X, Acc) ->
-    case strict_eq(E, X) of
-        1 -> alast_idx(Rest, X, I);
-        0 -> alast_idx(Rest, X, Acc)
+%% Per ES §22.1.3.17, lastIndexOf scans from `K` downward and visits only
+%% indices the array HAS (holes skipped via HasProperty, so
+%% `[0, , 2].lastIndexOf(undefined)` is -1), re-reading the live array each step.
+alast_idx(_Arr, K, _X) when K < 0 -> -1;
+alast_idx(Arr, K, X) ->
+    case arr_index(Arr, K) of
+        {ok, E} ->
+            case strict_eq(E, X) of
+                1 -> K;
+                0 -> alast_idx(Arr, K - 1, X)
+            end;
+        error ->
+            alast_idx(Arr, K - 1, X)
     end.
 
 %% recv.toString() — a user-defined `toString` method (a function property) wins;
@@ -3663,9 +3691,9 @@ strip_neg_zero(F) -> F.
 %% receiver does a substring search honouring the `position` argument.
 array_index_of(Recv, X, From) when is_binary(Recv) -> str_index_of(Recv, X, From);
 array_index_of(Recv, X, From) ->
-    {Len, Map} = arr_content(Recv),
+    {Len, _Map} = arr_content(Recv),
     Start = idx_from(From, Len),
-    aidx(lists:nthtail(min(Start, Len), arr_list(Len, Map)), Start, X).
+    aidx(Recv, Start, Len, X).
 
 idx_from(From, Len) ->
     case coerce_num(From) of
@@ -3680,11 +3708,19 @@ idx_from(From, Len) ->
             end
     end.
 
-aidx([], _, _) -> -1;
-aidx([E | Es], I, X) ->
-    case strict_eq(E, X) of
-        1 -> I;
-        0 -> aidx(Es, I + 1, X)
+%% Per ES §22.1.3.14, indexOf visits only indices the array HAS (holes are
+%% skipped via HasProperty, so `[0, , 2].indexOf(undefined)` is -1) and re-reads
+%% the live array each step. `Len` bounds iteration from `K` upward.
+aidx(_Arr, K, Len, _X) when K >= Len -> -1;
+aidx(Arr, K, Len, X) ->
+    case arr_index(Arr, K) of
+        {ok, E} ->
+            case strict_eq(E, X) of
+                1 -> K;
+                0 -> aidx(Arr, K + 1, Len, X)
+            end;
+        error ->
+            aidx(Arr, K + 1, Len, X)
     end.
 
 %% includes → a JS boolean atom. Unlike indexOf (which uses ===), Array.includes
