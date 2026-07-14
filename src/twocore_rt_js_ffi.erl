@@ -81,6 +81,7 @@
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
     js_m_get_or_insert/2, js_m_get_or_insert_computed/2,
     js_m_keys/2, js_m_values/2, js_m_entries/2,
+    new_weakset/1, weakset_ctor/0, weakset_no_new/0,
     set_union/2, set_intersection/2, set_difference/2,
     set_symmetric_difference/2, set_is_disjoint_from/2,
     set_is_subset_of/2, set_is_superset_of/2,
@@ -1450,6 +1451,13 @@ has_prop(Recv, Key) when is_reference(Recv) ->
                 <<"@@is_Set">> -> 1;
                 _ -> 0
             end;
+        %% Every WeakSet cell IS a WeakSet instance, so `x instanceof WeakSet`
+        %% (compiled to a has_prop for the `@@is_WeakSet` brand) is true for it.
+        {js_weakset, _} ->
+            case Key of
+                <<"@@is_WeakSet">> -> 1;
+                _ -> 0
+            end;
         %% `err instanceof Error` is true for every error value; `err instanceof T`
         %% is true only when T names this error's own constructor. `lower_instanceof`
         %% compiles `x instanceof T` to has_prop(x, "@@is_T"), so match the brand.
@@ -2562,6 +2570,58 @@ new_set(Init) ->
     end,
     S.
 
+%% ── WeakSet (§24.4) ──────────────────────────────────────
+%% A WeakSet is a cell `{js_weakset, Data}` where `Data` is an Erlang map
+%% `Element => true`. Only values that CanBeHeldWeakly (§7.3.35 — Objects and,
+%% in this model, functions; Symbols are unsupported) may be stored, so keys are
+%% always references/funs and no SameValueZero float folding is needed (each
+%% object is identity-distinct). We do NOT model real weak references — an added
+%% element is retained for the collection's lifetime; that is unobservable to
+%% conformant code, which cannot enumerate a WeakSet. There is no iteration,
+%% ordering, size, or clear on a WeakSet, so no insertion sequence is tracked.
+%%
+%% The `add`/`has`/`delete` method names are shared with Map/Set and dispatch on
+%% the cell tag in `js_m_add`/`js_m_has`/`js_m_delete`.
+
+%% CanBeHeldWeakly(v) (§7.3.35): true for an Object (a cell reference) or a
+%% function value. Everything else — numbers, strings, booleans, null, undefined,
+%% the number sentinels — is a primitive that cannot be a WeakSet element.
+can_be_held_weakly(V) -> is_reference(V) orelse is_function(V).
+
+%% `new WeakSet([iterable])` (§24.4.1.1). With no argument (or `undefined`/`null`)
+%% builds an empty WeakSet. With an array, adds each element via `js_m_add`, which
+%% throws a TypeError for any element that cannot be held weakly (step 8's adder).
+%% A non-array, non-null/undefined argument is not iterable in this model, so
+%% GetIterator throws a TypeError (matching `new WeakSet({})`).
+new_weakset(Init) ->
+    S = cell_new({js_weakset, #{}}),
+    case Init of
+        undefined ->
+            ok;
+        null ->
+            ok;
+        _ ->
+            case is_array(Init) of
+                1 ->
+                    {Len, Map} = arr_content(Init),
+                    lists:foreach(fun(V) -> js_m_add(S, [V]) end, arr_list(Len, Map));
+                0 ->
+                    type_error(Init)
+            end
+    end,
+    S.
+
+%% The bare `WeakSet` identifier as a first-class value: a function object, so
+%% `typeof WeakSet` is "function". Calling it as a plain function (without `new`)
+%% throws a TypeError (§24.4.1.1 step 1 — NewTarget must be defined).
+weakset_ctor() ->
+    fun(_) -> weakset_no_new() end.
+
+%% `WeakSet(...)` invoked WITHOUT `new` — §24.4.1.1 step 1 requires NewTarget to
+%% be defined, so a plain call always throws a TypeError.
+weakset_no_new() ->
+    type_error(<<"Constructor WeakSet requires 'new'">>).
+
 %% SameValueZero key canonicalization. An integral float becomes the equal integer
 %% (unifying `1`/`1.0` and collapsing `-0.0` to `0`); every other term (non-integral
 %% float, string, boolean, ref, the `js_nan`/`js_inf`/`js_neg_inf` sentinels) is left as
@@ -2615,6 +2675,18 @@ js_m_add(Recv, Args) ->
                 end,
             erlang:put(?CELL_KEY(Recv), {js_set, Next2, D2}),
             Recv;
+        %% WeakSet.prototype.add (§24.4.3.1): the value MUST be able to be held
+        %% weakly, else a TypeError is thrown; a duplicate is a no-op. Returns the
+        %% WeakSet.
+        {js_weakset, D} ->
+            V = arg(Args, 0),
+            case can_be_held_weakly(V) of
+                true ->
+                    erlang:put(?CELL_KEY(Recv), {js_weakset, maps:put(V, true, D)}),
+                    Recv;
+                false ->
+                    type_error(V)
+            end;
         _ ->
             delegate(Recv, <<"add">>, Args)
     end.
@@ -2623,6 +2695,11 @@ js_m_has(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, D} -> maps:is_key(mapkey_norm(arg(Args, 0)), D);
         {js_set, _, D} -> maps:is_key(mapkey_norm(arg(Args, 0)), D);
+        %% WeakSet.prototype.has (§24.4.3.4): a value that cannot be held weakly is
+        %% never a member, so return false without throwing.
+        {js_weakset, D} ->
+            V = arg(Args, 0),
+            can_be_held_weakly(V) andalso maps:is_key(V, D);
         _ -> delegate(Recv, <<"has">>, Args)
     end.
 
@@ -2644,6 +2721,18 @@ js_m_delete(Recv, Args) ->
             case maps:is_key(V, D) of
                 true ->
                     erlang:put(?CELL_KEY(Recv), {js_set, Next, maps:remove(V, D)}),
+                    true;
+                false ->
+                    false
+            end;
+        %% WeakSet.prototype.delete (§24.4.3.3): removes an element and returns true
+        %% only when it was present; a value that cannot be held weakly (so was never
+        %% a member) returns false without throwing.
+        {js_weakset, D} ->
+            V = arg(Args, 0),
+            case can_be_held_weakly(V) andalso maps:is_key(V, D) of
+                true ->
+                    erlang:put(?CELL_KEY(Recv), {js_weakset, maps:remove(V, D)}),
                     true;
                 false ->
                     false

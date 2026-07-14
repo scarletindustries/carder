@@ -5136,3 +5136,102 @@ pub fn catch_engine_error_finally_test() {
   )
   |> should.equal(5.0)
 }
+
+// ==== WeakSet (wave 6) ====
+
+// §24.4: `typeof WeakSet` is "function" and the constructor builds a WeakSet whose
+// `add` returns the WeakSet itself (§24.4.3.1 step 8) and stores an Object member
+// that `has` then reports present (§24.4.3.4).
+pub fn weakset_add_has_test() {
+  val("typeof WeakSet") |> should.equal(dyn("function"))
+  // add returns `this` (the WeakSet).
+  let m =
+    compile(
+      "function f(){ let s = new WeakSet(); let o = {}; return s.add(o) === s; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+  // an added object is present; a different object is not.
+  let n =
+    compile(
+      "function f(){ let s = new WeakSet(); let a = {}; let b = {}; s.add(a); return (s.has(a) === true) && (s.has(b) === false); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
+// §24.4.3.1 step 3: `add` of a value that cannot be held weakly (a primitive)
+// throws a TypeError.
+pub fn weakset_add_primitive_throws_test() {
+  let m = compile("function f(){ let s = new WeakSet(); return s.add(1); }")
+  let threw = case catch_apply(m, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw |> should.equal(True)
+  // a string primitive is likewise rejected.
+  let n = compile("function f(){ let s = new WeakSet(); return s.add(\"x\"); }")
+  let threw2 = case catch_apply(n, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw2 |> should.equal(True)
+}
+
+// §24.4.3.3 `delete` removes a present Object member and returns true; a member not
+// present (including a primitive that could never be held weakly) returns false and
+// does not throw.
+pub fn weakset_delete_test() {
+  let m =
+    compile(
+      "function f(){ let s = new WeakSet(); let o = {}; s.add(o); let r = s.delete(o); return (r === true) && (s.has(o) === false); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+  // delete of an absent object → false (no-op).
+  let n = compile("function f(){ let s = new WeakSet(); return s.delete({}); }")
+  call(n, "f", []) |> should.equal(dyn(False))
+  // delete of a primitive → false, no throw (§24.4.3.3 step 3).
+  let p = compile("function f(){ let s = new WeakSet(); return s.delete(1); }")
+  call(p, "f", []) |> should.equal(dyn(False))
+}
+
+// §24.4.3.1 step 5: adding a value already present is a no-op that still returns the
+// WeakSet (deduplication by SameValue on object identity).
+pub fn weakset_duplicate_add_test() {
+  let m =
+    compile(
+      "function f(){ let o = {}; let s = new WeakSet([o]); return s.add(o) === s; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §24.4: a WeakSet is an instance of WeakSet (`x instanceof WeakSet`).
+pub fn weakset_instanceof_test() {
+  let m = compile("function f(){ return (new WeakSet()) instanceof WeakSet; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §24.4.1.1: seeding from an array adds each Object element; a non-iterable argument
+// (a plain object) makes GetIterator throw a TypeError.
+pub fn weakset_constructor_iterable_test() {
+  let m =
+    compile(
+      "function f(){ let a = {}; let b = {}; let s = new WeakSet([a, b]); return s.has(a) && s.has(b); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+  // new WeakSet({}) — a non-iterable object → TypeError.
+  let n = compile("function f(){ return new WeakSet({}); }")
+  let threw = case catch_apply(n, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw |> should.equal(True)
+}
+
+// §24.4.1.1 step 1: `WeakSet(...)` called WITHOUT `new` throws a TypeError.
+pub fn weakset_requires_new_test() {
+  let m = compile("function f(){ return WeakSet(); }")
+  let threw = case catch_apply(m, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw |> should.equal(True)
+}

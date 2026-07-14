@@ -74,7 +74,11 @@
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.
 //// `Map`/`Set` (`new Map()`/`new Set()`, `.set`/`.get`/`.add`/`.has`/`.delete`/`.clear`/
 //// `.forEach`/`.size`; these method names delegate to a same-named user method on a
-//// plain object). The error-constructor globals `Error`, `TypeError`, `RangeError`,
+//// plain object). `WeakSet` (`new WeakSet(iterable?)`, `.add`/`.has`/`.delete`) per
+//// §24.4 — values MUST be objects (a primitive throws TypeError on `add`; `has`/
+//// `delete` of a primitive return false), `x instanceof WeakSet` works, and `typeof
+//// WeakSet` is "function". Not weak in fact — elements are retained (unobservable, as
+//// a WeakSet is non-enumerable); no `.clear`/iteration (the spec has none). The error-constructor globals `Error`, `TypeError`, `RangeError`,
 //// `SyntaxError`, `ReferenceError`, `EvalError`, `URIError`: referenceable as a fun
 //// value (`typeof` "function"), callable (`TypeError(m)`) and newable
 //// (`new TypeError(m)`) to a throwable error value carrying `.name`/`.message` and a
@@ -3135,15 +3139,20 @@ fn lower_expr(
                       // shadows it): resolve to the constructor as a fun VALUE, so
                       // `typeof TypeError` is "function" and it can be passed as an
                       // (ignored) argument to `assert.throws`.
-                      case is_error_ctor(x) {
-                        True ->
+                      case is_error_ctor(x), x {
+                        True, _ ->
                           Ok(bind1(
                             ir.CallHost("js", "error_ctor", [
                               ir.ConstBinary(<<x:utf8>>),
                             ]),
                             ctr,
                           ))
-                        False ->
+                        // A bare `WeakSet` reference resolves to the constructor as a
+                        // function VALUE, so `typeof WeakSet` is "function" (calling it
+                        // without `new` throws a TypeError, per §24.4.1.1).
+                        False, "WeakSet" ->
+                          Ok(bind1(ir.CallHost("js", "weakset_ctor", []), ctr))
+                        False, _ ->
                           Error(Unsupported("unbound identifier '" <> x <> "'"))
                       }
                   }
@@ -4301,7 +4310,9 @@ fn is_global_fn(name: String) -> Bool {
     | "decodeURIComponent"
     | "decodeURI"
     | "escape"
-    | "unescape" -> True
+    | "unescape"
+    | // `WeakSet` — routed so a call WITHOUT `new` throws a TypeError (§24.4.1.1).
+      "WeakSet" -> True
     _ -> is_error_ctor(name)
   }
 }
@@ -4367,6 +4378,10 @@ fn lower_global_call(
     "parseInt", [] -> host("parse_int", [undefined(), undefined()])
     "parseFloat", [s, ..] -> host("parse_float", [s])
     "parseFloat", [] -> host("parse_float", [undefined()])
+    // `WeakSet(...)` WITHOUT `new` — §24.4.1.1 step 1 requires a defined
+    // NewTarget, so a plain call always throws a TypeError (the arguments are
+    // still evaluated for side effects via `binds`).
+    "WeakSet", _ -> host("weakset_no_new", [])
     "isNaN", [x, ..] -> host("is_nan", [x])
     "isNaN", [] -> host("is_nan", [undefined()])
     "isFinite", [x, ..] -> host("is_finite", [x])
@@ -4625,6 +4640,9 @@ fn lower_new(
       lower_builtin_new("new_map", arguments, env, ctx, ctr)
     ast.Identifier(name: "Set", ..) ->
       lower_builtin_new("new_set", arguments, env, ctx, ctr)
+    // `new WeakSet()` / `new WeakSet(iterable)` — a built-in WeakSet (§24.4).
+    ast.Identifier(name: "WeakSet", ..) ->
+      lower_builtin_new("new_weakset", arguments, env, ctx, ctr)
     // `new Date(...)` — a built-in Date (all argument forms; see `date_new`). Not a
     // class: no prototype machinery, just a `{js_date, Ms}` cell from the runtime.
     ast.Identifier(name: "Date", ..) -> lower_date_new(arguments, env, ctx, ctr)

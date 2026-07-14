@@ -4283,6 +4283,10 @@ fn resolve_js(op: String) -> Option(String) {
     "js_m_keys" -> Some("js_m_keys")
     "js_m_values" -> Some("js_m_values")
     "js_m_entries" -> Some("js_m_entries")
+    // WeakSet
+    "new_weakset" -> Some("new_weakset")
+    "weakset_ctor" -> Some("weakset_ctor")
+    "weakset_no_new" -> Some("weakset_no_new")
     "set_union" -> Some("set_union")
     "set_intersection" -> Some("set_intersection")
     "set_difference" -> Some("set_difference")
