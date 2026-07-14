@@ -4244,3 +4244,51 @@ pub fn regexp_call_without_new_test() {
   val("RegExp(\"abc\", \"m\").multiline") |> should.equal(dyn(True))
   val("RegExp(\"a.c\").test(\"axc\")") |> should.equal(dyn(True))
 }
+
+// ==== Date (wave 1) ====
+
+// §21.4.4.41 Date.prototype.toString → ToDateString: the long form
+// `Www Mon DD YYYY HH:mm:ss GMT+0000`, NOT the ISO string. The epoch is a Thursday
+// at 00:00:00 (built-ins/Date/prototype/toString/format.js).
+pub fn date_to_string_long_form_test() {
+  val("new Date(0).toString()")
+  |> should.equal(dyn(<<"Thu Jan 01 1970 00:00:00 GMT+0000">>))
+}
+
+// §21.4.4.41: an Invalid Date's toString is exactly "Invalid Date"
+// (built-ins/Date/prototype/toString/invalid-date.js).
+pub fn date_to_string_invalid_test() {
+  val("new Date(NaN).toString()") |> should.equal(dyn(<<"Invalid Date">>))
+}
+
+// §21.4.4.41 note 2 / ToDateString: string coercion of a Date uses the same long
+// form as `.toString()` (default @@toPrimitive with hint "default" → toString).
+pub fn date_string_coercion_long_form_test() {
+  val("\"\" + new Date(0)")
+  |> should.equal(dyn(<<"Thu Jan 01 1970 00:00:00 GMT+0000">>))
+}
+
+// §21.4.4.35 DateString: years must be serialized with AT LEAST four digits, and a
+// negative (expanded) year keeps every digit with a leading `-` — so year -1 is
+// "-0001" and year -123456 is "-123456" (built-ins/Date/prototype/toDateString/
+// negative-year.js). Extract the year with split(' ')[3].
+pub fn date_to_date_string_negative_year_test() {
+  let yr = fn(iso: String) {
+    val("new Date(\"" <> iso <> "\").toDateString().split(\" \")[3]")
+  }
+  yr("-000001-07-01T00:00Z") |> should.equal(dyn(<<"-0001">>))
+  yr("-000123-07-01T00:00Z") |> should.equal(dyn(<<"-0123">>))
+  yr("-012345-07-01T00:00Z") |> should.equal(dyn(<<"-12345">>))
+  yr("-123456-07-01T00:00Z") |> should.equal(dyn(<<"-123456">>))
+}
+
+// §21.4.4.43 Date.prototype.toUTCString: the year field has the same minimum-four-
+// digit, sign-prefixed padding (built-ins/Date/prototype/toUTCString/negative-year.js).
+// The UTC form is "Www, DD Mon YYYY HH:mm:ss GMT", so the year is split(' ')[3].
+pub fn date_to_utc_string_negative_year_test() {
+  let yr = fn(iso: String) {
+    val("new Date(\"" <> iso <> "\").toUTCString().split(\" \")[3]")
+  }
+  yr("-000012-07-01T00:00Z") |> should.equal(dyn(<<"-0012">>))
+  yr("-123456-07-01T00:00Z") |> should.equal(dyn(<<"-123456">>))
+}

@@ -66,8 +66,9 @@
 //// field getters, `valueOf`/`getTime`/`getTimezoneOffset`, the `set*`/`setUTC*` field
 //// setters and `setTime`, and the string forms `toISOString`/`toJSON`/`toUTCString`/
 //// `toDateString`/`toTimeString` — all computed in UTC (local == UTC deviation; the
-//// local string forms therefore report a fixed `GMT+0000` zone, and `.toString()`
-//// still string-coerces to the ISO form rather than the long local form). Tagged templates
+//// local string forms therefore report a fixed `GMT+0000` zone). `.toString()` and
+//// string coercion render the long form `Www Mon DD YYYY HH:mm:ss GMT+0000` (the
+//// spec's ToDateString), and an Invalid Date renders as "Invalid Date". Tagged templates
 //// `` tag`…${e}…` `` (the tag receives the cooked strings array with a `.raw`
 //// property, then the substitutions). Regex literals `/pat/flags` (backed by
 //// Erlang's PCRE) with `re.test`, `str.match`/`replace`/`split`, and `re.source`/`flags`.

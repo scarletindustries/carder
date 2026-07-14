@@ -1885,9 +1885,7 @@ date_field(<<"toDateString">>, nan, _) -> <<"Invalid Date">>;
 date_field(<<"toDateString">>, Ms, _) -> to_date_string(Ms);
 date_field(<<"toTimeString">>, nan, _) -> <<"Invalid Date">>;
 date_field(<<"toTimeString">>, Ms, _) -> to_time_string(Ms);
-date_field(<<"toString">>, nan, _) -> <<"Invalid Date">>;
-date_field(<<"toString">>, Ms, _) ->
-    <<(to_date_string(Ms))/binary, " ", (to_time_string(Ms))/binary>>;
+date_field(<<"toString">>, Ms, _) -> date_to_string(Ms);
 date_field(_Name, nan, _) -> js_nan;
 date_field(Name, Ms, _) -> date_component(Name, Ms).
 
@@ -2102,9 +2100,21 @@ month_abbr(12) -> "Dec".
 
 %% The year field used by the human-readable string forms: at least four digits,
 %% zero-padded, with a leading `-` for negative years (e.g. -1 -> "-0001",
-%% 20 -> "0020", -123456 -> "-123456").
-date_year_str(Y) when Y < 0 -> io_lib:format("-~4..0B", [-Y]);
-date_year_str(Y) -> io_lib:format("~4..0B", [Y]).
+%% 20 -> "0020", -123456 -> "-123456"). Per §21.4.4 DateString/ToUTCString the
+%% width is a MINIMUM — expanded years (5+ digits) keep every digit. `io_lib`'s
+%% fixed-width `~4..0B` cannot express this: it overflows to `*` characters when the
+%% value needs more than four digits, so the padding is done by hand.
+date_year_str(Y) ->
+    Digits = pad_year_digits(integer_to_binary(abs(Y))),
+    case Y < 0 of
+        true -> <<"-", Digits/binary>>;
+        false -> Digits
+    end.
+
+%% Left-zero-pad a decimal year to a MINIMUM of four digits; a wider year is returned
+%% unchanged (so year -123456 keeps all six digits).
+pad_year_digits(Bin) when byte_size(Bin) >= 4 -> Bin;
+pad_year_digits(Bin) -> pad_year_digits(<<"0", Bin/binary>>).
 
 %% Build a time value (ms integer or `nan`) from a component argument list, shared by
 %% the component-form `new Date(y, m, …)` and `Date.UTC(…)`. Defaults per spec: month
@@ -2200,11 +2210,14 @@ iso_year(Y) when Y >= 0, Y =< 9999 -> io_lib:format("~4..0B", [Y]);
 iso_year(Y) when Y < 0 -> io_lib:format("-~6..0B", [-Y]);
 iso_year(Y) -> io_lib:format("+~6..0B", [Y]).
 
-%% A Date's string form (used by `to_string`): ISO for a valid date, "Invalid Date"
-%% for NaN. DEVIATION: real `Date.prototype.toString` renders the long LOCAL form; we
-%% emit the ISO (UTC) string so the result is deterministic and timezone-free.
+%% A Date's string form, used by both `Date.prototype.toString` (§21.4.4.41 →
+%% ToDateString) and string coercion (`String(date)` / `"" + date`): the long form
+%% `Www Mon DD YYYY HH:mm:ss GMT+0000`, or "Invalid Date" for NaN. The zone is fixed
+%% at +0000 because local == UTC (module deviation), but the layout now matches the
+%% spec's ToDateString rather than the ISO form.
 date_to_string(nan) -> <<"Invalid Date">>;
-date_to_string(Ms) -> to_iso_string(Ms).
+date_to_string(Ms) ->
+    <<(to_date_string(Ms))/binary, " ", (to_time_string(Ms))/binary>>.
 
 %% Parse an ISO 8601 Date Time String (§21.4.1.15) into an integer time value or `nan`.
 %% Supported: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, and any of those followed by
@@ -3459,11 +3472,18 @@ alast_idx([{E, I} | Rest], X, Acc) ->
     end.
 
 %% recv.toString() — a user-defined `toString` method (a function property) wins;
-%% otherwise the default ToString.
+%% otherwise the default ToString. A Date cell has no property map, so it is resolved
+%% directly to its string form (§21.4.4.41): reading a property off it via `get_prop`
+%% would raise a TypeError rather than fall through to the default ToString.
 to_string_dispatch(Recv) when is_reference(Recv) ->
-    case get_prop(Recv, <<"toString">>) of
-        F when is_function(F) -> F();
-        _ -> to_string(Recv)
+    case cell_tag(Recv) of
+        {js_date, Ms} ->
+            date_to_string(Ms);
+        _ ->
+            case get_prop(Recv, <<"toString">>) of
+                F when is_function(F) -> F();
+                _ -> to_string(Recv)
+            end
     end;
 to_string_dispatch(Recv) ->
     to_string(Recv).
