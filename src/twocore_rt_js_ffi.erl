@@ -4195,10 +4195,26 @@ str_replace_all(Str, Search, Repl) ->
         false ->
             ReplBin = to_string(Repl),
             case to_string(Search) of
-                <<>> -> Str;
+                <<>> -> ra_empty(cps(Str), ReplBin, <<>>);
                 SearchBin -> ra_expand(Str, SearchBin, ReplBin, Str, 0, <<>>)
             end
     end.
+
+%% replaceAll with an EMPTY search string. Per §22.1.3.20 the empty string is
+%% found (via StringIndexOf) at every position 0..len, so the replacement is
+%% inserted before each code point AND once at the very end — e.g.
+%% `'a'.replaceAll('', '_')` → `'_a_'` and `''.replaceAll('', 'abc')` → `'abc'`.
+%% At each empty match the matched text is empty, with `Before` = the code
+%% points already consumed and `After` = the remaining code points, so the
+%% `` $` `` / `$'` substitutions expand against the correct sides of the split.
+ra_empty([], Repl, Before) ->
+    expand_repl(Repl, <<>>, Before, <<>>);
+ra_empty([C | Rest], Repl, Before) ->
+    After = from_cps([C | Rest]),
+    Expanded = expand_repl(Repl, <<>>, Before, After),
+    Ch = from_cps([C]),
+    Tail = ra_empty(Rest, Repl, <<Before/binary, Ch/binary>>),
+    <<Expanded/binary, Ch/binary, Tail/binary>>.
 
 ra_expand(Rest, SearchBin, ReplBin, Full, Off, Acc) ->
     case binary:match(Rest, SearchBin) of
