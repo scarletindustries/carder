@@ -846,29 +846,37 @@ type_of(V) ->
 %% divergence note).
 str_to_num(Bin) ->
     T = unicode:characters_to_binary(string:trim(Bin, both, ?JS_WS)),
+    V =
+        case T of
+            <<>> -> 0;
+            <<"Infinity">> -> inf;
+            <<"+Infinity">> -> inf;
+            <<"-Infinity">> -> neg_inf;
+            %% Non-decimal integer literals (NO sign is permitted after the prefix).
+            <<"0x", H/binary>> -> radix_int(H, 16);
+            <<"0X", H/binary>> -> radix_int(H, 16);
+            <<"0o", O/binary>> -> radix_int(O, 8);
+            <<"0O", O/binary>> -> radix_int(O, 8);
+            <<"0b", B/binary>> -> radix_int(B, 2);
+            <<"0B", B/binary>> -> radix_int(B, 2);
+            _ ->
+                try
+                    binary_to_integer(T)
+                catch
+                    error:badarg ->
+                        try
+                            binary_to_float(float_fixup(T))
+                        catch
+                            error:badarg -> nan
+                        end
+                end
+        end,
+    %% Per §9.3.1: the MV of `StrDecimalLiteral ::: - StrUnsignedDecimalLiteral` is
+    %% the negation of the unsigned MV, and the negation of 0 is -0. So a leading
+    %% "-" on a zero magnitude (e.g. "-0", "-0.0", "-0e5") yields negative zero.
     case T of
-        <<>> -> 0;
-        <<"Infinity">> -> inf;
-        <<"+Infinity">> -> inf;
-        <<"-Infinity">> -> neg_inf;
-        %% Non-decimal integer literals (NO sign is permitted after the prefix).
-        <<"0x", H/binary>> -> radix_int(H, 16);
-        <<"0X", H/binary>> -> radix_int(H, 16);
-        <<"0o", O/binary>> -> radix_int(O, 8);
-        <<"0O", O/binary>> -> radix_int(O, 8);
-        <<"0b", B/binary>> -> radix_int(B, 2);
-        <<"0B", B/binary>> -> radix_int(B, 2);
-        _ ->
-            try
-                binary_to_integer(T)
-            catch
-                error:badarg ->
-                    try
-                        binary_to_float(float_fixup(T))
-                    catch
-                        error:badarg -> nan
-                    end
-            end
+        <<"-", _/binary>> when V == 0 -> -0.0;
+        _ -> V
     end.
 
 %% Parse the digits after a 0x/0o/0b prefix in the given base; empty digits or a
@@ -3480,7 +3488,9 @@ radix_digit(D) when D >= 10, D =< 35 -> $a + (D - 10).
 %% num.toExponential(d) — exponential notation with `d` fraction digits (undefined
 %% → as many digits as needed to represent the value uniquely). Erlang's scientific
 %% format zero-pads the exponent to two digits (`e+02`); JS uses the minimal
-%% exponent (`e+2`), so the exponent is de-padded afterwards.
+%% exponent (`e+2`), so the exponent is de-padded afterwards. Per the spec the sign
+%% prefix is added only when `x < 0`; negative zero is not `< 0`, so it renders
+%% without a leading "-" — Erlang would otherwise emit "-0…", so ±0 is normalised.
 num_to_exponential(N, D) ->
     case coerce_num(N) of
         nan ->
@@ -3490,7 +3500,7 @@ num_to_exponential(N, D) ->
         neg_inf ->
             <<"-Infinity">>;
         Num ->
-            F = as_float(Num),
+            F = strip_neg_zero(as_float(Num)),
             Raw =
                 case coerce_num(D) of
                     nan -> exp_shortest(F, 0);
@@ -3572,7 +3582,10 @@ sci_exponent(Sci) ->
         _ -> N
     end.
 
-%% num.toFixed(d) — fixed-point string with `d` decimals.
+%% num.toFixed(d) — fixed-point string with `d` decimals. Per the spec the sign is
+%% "-" only when `x < 0`; negative zero is not `< 0` and renders as "0…", so ±0 is
+%% normalised before formatting. A genuinely-negative value that merely ROUNDS to
+%% zero (e.g. `(-0.0001).toFixed(2)` → "-0.00") is untouched — only exact ±0 changes.
 num_to_fixed(N, D) ->
     Digits =
         case coerce_num(D) of
@@ -3583,8 +3596,14 @@ num_to_fixed(N, D) ->
         nan -> <<"NaN">>;
         inf -> <<"Infinity">>;
         neg_inf -> <<"-Infinity">>;
-        Num -> float_to_binary(as_float(Num), [{decimals, Digits}])
+        Num -> float_to_binary(strip_neg_zero(as_float(Num)), [{decimals, Digits}])
     end.
+
+%% Normalise negative zero to positive zero (any non-zero float is returned
+%% unchanged). Used by the Number formatting methods, whose spec algorithms treat
+%% `x = -0` as non-negative and therefore emit no leading "-".
+strip_neg_zero(F) when F == 0 -> 0.0;
+strip_neg_zero(F) -> F.
 
 %% ── array value methods ──────────────────────────────────
 
