@@ -5136,3 +5136,49 @@ pub fn catch_engine_error_finally_test() {
   )
   |> should.equal(5.0)
 }
+
+// ==== Set (wave 6) ====
+
+// Set.prototype.forEach must reject a non-callable callbackfn with a TypeError
+// BEFORE visiting any entry (ES §23.2.3.6 step 3: "If IsCallable(callbackfn) is
+// false, throw a TypeError exception."). A non-empty set with a number callback
+// still throws rather than silently iterating.
+pub fn set_foreach_non_callable_throws_test() {
+  let m =
+    compile(
+      "function f(){ try { new Set([1]).forEach(0); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+  // null callbacks are likewise non-callable → TypeError, not a silent no-op.
+  let n =
+    compile(
+      "function f(){ try { new Set([1]).forEach(null); return 0; } catch (e) { return (e instanceof TypeError) ? 1 : 2; } }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(1.0)
+}
+
+// A Set iterator reflects entries added AFTER it is created but BEFORE it is
+// done, yet once it has reported done it detaches from the set (ES §23.2.5.2.1
+// step 8 sets [[IteratedSet]] to undefined) so a later addition is never
+// surfaced by a repeated next() call.
+pub fn set_iterator_sticky_done_test() {
+  let m =
+    compile(
+      "function f(){"
+      <> " var s = new Set(); s.add(1); s.add(2);"
+      <> " var it = s.values();"
+      <> " var r1 = it.next();"
+      <> " s.add(3);"
+      <> " var r2 = it.next();"
+      <> " var r3 = it.next();"
+      <> " var r4 = it.next();"
+      <> " s.add(4);"
+      <> " var r5 = it.next();"
+      <> " return (r1.value === 1 && r1.done === false"
+      <> "   && r2.value === 2 && r3.value === 3"
+      <> "   && r4.value === undefined && r4.done === true"
+      <> "   && r5.value === undefined && r5.done === true) ? 1 : 0;"
+      <> "}",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}

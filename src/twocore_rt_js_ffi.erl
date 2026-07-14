@@ -2732,6 +2732,12 @@ js_m_foreach(Recv, Args) ->
                     map_foreach(Recv, Fn, -1),
                     undefined;
                 {js_set, _, _} ->
+                    %% §23.2.3.6 step 3: reject a non-callable callbackfn with a
+                    %% TypeError BEFORE visiting any entry.
+                    case is_function(Fn) of
+                        true -> ok;
+                        false -> not_callable(Fn)
+                    end,
                     set_foreach(Recv, Fn, -1),
                     undefined;
                 _ ->
@@ -2985,18 +2991,26 @@ make_map_iter(Recv, Kind) ->
 make_set_iter(Recv, Kind) ->
     Cursor = cell_new(-1),
     gen_make(fun(_Arg) ->
-        Last = cell_get(Cursor),
-        case next_set_entry(Recv, Last) of
-            none ->
+        case cell_get(Cursor) of
+            %% §23.2.5.2.1 step 8: once the iterator is exhausted it detaches
+            %% from the set (its [[IteratedSet]] becomes undefined), so entries
+            %% added AFTER the iterator is done are never visited.
+            done ->
                 iter_result(undefined, true);
-            {Seq, V} ->
-                cell_set(Cursor, Seq),
-                Val =
-                    case Kind of
-                        value -> V;
-                        entry -> new_array([V, V])
-                    end,
-                iter_result(Val, false)
+            Last ->
+                case next_set_entry(Recv, Last) of
+                    none ->
+                        cell_set(Cursor, done),
+                        iter_result(undefined, true);
+                    {Seq, V} ->
+                        cell_set(Cursor, Seq),
+                        Val =
+                            case Kind of
+                                value -> V;
+                                entry -> new_array([V, V])
+                            end,
+                        iter_result(Val, false)
+                end
         end
     end).
 
