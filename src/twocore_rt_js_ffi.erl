@@ -1328,10 +1328,17 @@ is_array_length(_) -> false.
 %% Normalize an array property key: an integer index stays an integer, a
 %% canonical numeric string becomes that index, `length` is left as-is, and
 %% every other key is an ordinary (string) property.
-array_key(K) when is_integer(K) -> K;
+array_key(K) when is_integer(K) ->
+    %% An integer is an array index only in [0, 2^32 - 1); every other integer
+    %% (negatives, and values >= 2^32-1 such as 2^32-1 itself) is an ordinary
+    %% string property that must NOT bump `length`.
+    case K >= 0 andalso K < 4294967295 of
+        true -> K;
+        false -> integer_to_binary(K)
+    end;
 array_key(K) when is_float(K) ->
     case K == trunc(K) of
-        true -> trunc(K);
+        true -> array_key(trunc(K));
         false -> to_string(K)
     end;
 array_key(<<"length">>) -> <<"length">>;

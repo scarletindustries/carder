@@ -4953,6 +4953,9 @@ fn lower_instance_method(
     "fill", [v, s, e, ..] -> host("array_fill", [v, s, e])
     "fill", [v, s] -> host("array_fill", [v, s, undefined()])
     "fill", [v] -> host("array_fill", [v, undefined(), undefined()])
+    // `.fill()` with no arguments fills the whole array with `undefined`
+    // (ToObject then a Set of `value`, which defaults to `undefined`).
+    "fill", [] -> host("array_fill", [undefined(), undefined(), undefined()])
     "copyWithin", [t, s, e, ..] -> host("array_copy_within", [t, s, e])
     "copyWithin", [t, s] -> host("array_copy_within", [t, s, undefined()])
     "copyWithin", [t] ->
