@@ -4244,3 +4244,27 @@ pub fn regexp_call_without_new_test() {
   val("RegExp(\"abc\", \"m\").multiline") |> should.equal(dyn(True))
   val("RegExp(\"a.c\").test(\"axc\")") |> should.equal(dyn(True))
 }
+
+// ==== RegExp (wave 1) ====
+// §22.2.1.1 GroupSpecifiersThatMatch — ES2025 permits duplicate named capture
+// groups when they occupy mutually exclusive alternatives, e.g.
+// `(?<x>a)|(?<x>b)`. Both groups still occupy distinct numbered slots; only the
+// participating one contributes to `.groups`. Mirrors test262
+// built-ins/RegExp/named-groups/duplicate-names-{match,exec,test}.
+pub fn regex_duplicate_named_groups_test() {
+  // Compiles at all (previously a TypeError from the underlying engine).
+  val("/(?<x>a)|(?<x>b)/.test(\"b\")") |> should.equal(dyn(True))
+  // "bab".match(/(?<x>a)|(?<x>b)/) === ["b", undefined, "b"].
+  num("/(?<x>a)|(?<x>b)/.exec(\"bab\").length") |> should.equal(3.0)
+  val("/(?<x>a)|(?<x>b)/.exec(\"bab\")[0]") |> should.equal(dyn(<<"b">>))
+  val("/(?<x>a)|(?<x>b)/.exec(\"bab\")[1] === undefined")
+  |> should.equal(dyn(True))
+  val("/(?<x>a)|(?<x>b)/.exec(\"bab\")[2]") |> should.equal(dyn(<<"b">>))
+  // `.groups.x` resolves to whichever alternative matched.
+  val("/(?<x>a)|(?<x>b)/.exec(\"b\").groups.x") |> should.equal(dyn(<<"b">>))
+  val("/(?<x>a)|(?<x>b)/.exec(\"a\").groups.x") |> should.equal(dyn(<<"a">>))
+  // A named backreference `\k<x>` across the alternatives still resolves.
+  val("/(?:(?<x>a)|(?<x>b))\\k<x>/.test(\"aa\")") |> should.equal(dyn(True))
+  val("/(?:(?<x>a)|(?<x>b))\\k<x>/.test(\"bb\")") |> should.equal(dyn(True))
+  val("/(?:(?<x>a)|(?<x>b))\\k<x>/.test(\"ab\")") |> should.equal(dyn(False))
+}
