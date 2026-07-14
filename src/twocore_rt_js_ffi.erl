@@ -101,6 +101,7 @@
     json_stringify/3, json_parse/1,
     encode_uri_component/1, encode_uri/1,
     decode_uri_component/1, decode_uri/1,
+    global_escape/1, global_unescape/1,
     empty_list/0, console_log/1, not_callable/1
 ]).
 
@@ -4827,6 +4828,85 @@ uri_codepoint([B1, B2, B3, B4]) ->
 
 %% A JS URIError (§19.2.6.5): a malformed %-escape or invalid UTF-8 octet run.
 uri_error() -> erlang:error({js_error, uri_error, <<"URI malformed">>}).
+
+%% ───────────────────────── escape / unescape (Annex B) ─────────────────────
+%%
+%% The legacy Annex B string escapers (B.2.1). Unlike the URI functions these
+%% operate on UTF-16 CODE UNITS, not bytes: a code unit ≥ 256 becomes `%uWXYZ`
+%% (four uppercase hex), a code unit < 256 that is not in the unescaped set
+%% becomes `%XY` (two uppercase hex), and the unescaped set stays literal. JS
+%% strings are UTF-8 binaries here, so escape first decodes to code points and
+%% re-expands any astral code point (> U+FFFF) into its UTF-16 surrogate pair,
+%% matching e.g. escape('\u{10401}') === '%uD801%uDC01'.
+
+%% escape(string) — B.2.1.1. Percent-escapes ToString(string) code-unit by
+%% code-unit, leaving only the unescaped set literal. Never raises.
+global_escape(V) ->
+    CUs = string_to_code_units(to_string(V)),
+    list_to_binary(lists:map(fun esc_unit/1, CUs)).
+
+%% One escaped code unit (0..16#FFFF) as an iolist fragment.
+esc_unit(U) when U < 256 ->
+    case esc_unescaped(U) of
+        true -> <<U>>;
+        false -> <<$%, (uri_hex2(U))/binary>>
+    end;
+esc_unit(U) ->
+    <<$%, $u, (esc_hex4(U))/binary>>.
+
+%% escape's unescaped set: uriAlpha | DecimalDigit | "@*_+-./".
+esc_unescaped(B) ->
+    (B >= $A andalso B =< $Z) orelse
+        (B >= $a andalso B =< $z) orelse
+        (B >= $0 andalso B =< $9) orelse
+        lists:member(B, [$@, $*, $_, $+, $-, $., $/]).
+
+%% The four UPPERCASE hex digits of a code unit (0..16#FFFF), as a 4-byte binary.
+esc_hex4(U) ->
+    <<(uri_hexdig((U bsr 12) band 16#F)), (uri_hexdig((U bsr 8) band 16#F)),
+        (uri_hexdig((U bsr 4) band 16#F)), (uri_hexdig(U band 16#F))>>.
+
+%% Decode a UTF-8 string binary into the list of its UTF-16 code units: each
+%% code point ≤ U+FFFF is one unit; an astral code point becomes a high/low
+%% surrogate pair.
+string_to_code_units(Bin) ->
+    lists:flatmap(fun code_point_to_units/1, unicode:characters_to_list(Bin, utf8)).
+
+code_point_to_units(CP) when CP > 16#FFFF ->
+    C = CP - 16#10000,
+    [16#D800 bor (C bsr 10), 16#DC00 bor (C band 16#3FF)];
+code_point_to_units(CP) ->
+    [CP].
+
+%% unescape(string) — B.2.1.2. Reverses escape: `%uXXXX` → that code unit,
+%% `%XX` → that code unit, everything else passes through. A `%` not followed by
+%% a well-formed escape is left verbatim (case preserved). Never raises.
+global_unescape(V) -> unesc(to_string(V), <<>>).
+
+unesc(<<$%, $u, A, B, C, D, Rest/binary>>, Acc) ->
+    case
+        {uri_hexval(A), uri_hexval(B), uri_hexval(C), uri_hexval(D)}
+    of
+        {D1, D2, D3, D4} when
+            is_integer(D1), is_integer(D2), is_integer(D3), is_integer(D4)
+        ->
+            CU = ((D1 * 16 + D2) * 16 + D3) * 16 + D4,
+            unesc(Rest, <<Acc/binary, CU/utf8>>);
+        _ ->
+            unesc(<<$u, A, B, C, D, Rest/binary>>, <<Acc/binary, $%>>)
+    end;
+unesc(<<$%, A, B, Rest/binary>>, Acc) ->
+    case {uri_hexval(A), uri_hexval(B)} of
+        {D1, D2} when is_integer(D1), is_integer(D2) ->
+            CU = D1 * 16 + D2,
+            unesc(Rest, <<Acc/binary, CU/utf8>>);
+        _ ->
+            unesc(<<A, B, Rest/binary>>, <<Acc/binary, $%>>)
+    end;
+unesc(<<C, Rest/binary>>, Acc) ->
+    unesc(Rest, <<Acc/binary, C>>);
+unesc(<<>>, Acc) ->
+    Acc.
 
 %% Number.isNaN / Number.isFinite — NO coercion (only actual numbers qualify).
 number_is_nan(js_nan) -> true;

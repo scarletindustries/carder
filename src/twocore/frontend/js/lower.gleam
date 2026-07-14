@@ -4261,7 +4261,9 @@ fn is_global_fn(name: String) -> Bool {
     | "encodeURIComponent"
     | "encodeURI"
     | "decodeURIComponent"
-    | "decodeURI" -> True
+    | "decodeURI"
+    | "escape"
+    | "unescape" -> True
     _ -> False
   }
 }
@@ -4321,6 +4323,12 @@ fn lower_global_call(
     "decodeURIComponent", [] -> host("decode_uri_component", [undefined()])
     "decodeURI", [x, ..] -> host("decode_uri", [x])
     "decodeURI", [] -> host("decode_uri", [undefined()])
+    // Legacy Annex B escapers (B.2.1). A no-arg call coerces the missing
+    // argument as `undefined`, so e.g. escape() → "undefined".
+    "escape", [x, ..] -> host("global_escape", [x])
+    "escape", [] -> host("global_escape", [undefined()])
+    "unescape", [x, ..] -> host("global_unescape", [x])
+    "unescape", [] -> host("global_unescape", [undefined()])
     _, _ -> Error(Unsupported(name <> "(…)"))
   }
 }
