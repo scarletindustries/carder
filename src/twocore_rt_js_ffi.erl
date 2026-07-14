@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, wrapper_new/2, error_make/2, error_ctor/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2,
@@ -1044,6 +1044,58 @@ error_make(Name, MsgArg) ->
 error_ctor(Name) ->
     N = to_string(Name),
     fun(Msg) -> cell_new({js_err, N, error_message([Msg])}) end.
+
+%% js_error_to_value(Reason) -> {ok, [ErrCell]} | {error, nil}
+%% Classify a caught BEAM error `Reason` for a JS `try`/`catch` and, when it is the
+%% runtime's INTERNAL engine-error convention `{js_error, Kind, Detail}` (raised by
+%% `type_error/1`, `range_error/1`, `not_callable/1`, `uri_error/0`, …), CONVERT it to
+%% a JS-level error VALUE so the `catch` binding behaves per ECMAScript. The value is a
+%% fresh `{js_err, Name, Message}` cell (the same shape `new TypeError(m)` produces), so
+%% the bound `e` answers `.name` / `.message` and `e instanceof TypeError` correctly.
+%%
+%% The 1-element list return mirrors `twocore_rt_exn_ffi:match_tag/2`'s `{ok, Payload}`
+%% wire shape (Payload a list), so the emitter binds the single catch parameter with the
+%% SAME `[E]` list pattern it uses for an explicit `throw`.
+%%
+%% Any OTHER `Reason` — a `{wasm_exn, _, _}` (an explicit JS `throw`, already handled by
+%% `match_tag` upstream), a `{wasm_trap, _}` trap / fuel raise, an `exit`, or an arbitrary
+%% BEAM error — yields `{error, nil}` so the caller RE-RAISES it. That is what keeps traps
+%% and must-propagate signals escaping the `try` (ECMAScript catches Errors, not host
+%% aborts) and keeps an explicit throw bound AS-IS rather than rewrapped.
+js_error_to_value({js_error, Kind, Detail}) ->
+    Name = js_error_kind_name(Kind),
+    Msg = js_error_kind_message(Kind, Detail),
+    {ok, [cell_new({js_err, Name, Msg})]};
+js_error_to_value({badfun, _Target}) ->
+    %% A native `apply` of a non-function VALUE — the direct-call lowering of `x()` when
+    %% `x` is not callable (a number, object, undefined, …). ECMAScript §13.3.6.1 makes
+    %% this a TypeError ("x is not a function"). `{badfun, _}` is the EXACT BEAM reason
+    %% `erlang:apply` raises for a non-fun; it is a JS-operation consequence, not a host
+    %% abort, so a JS `try`/`catch` must catch it. (Matched by shape, narrowly — a
+    %% `{badarity, _}` wrong-arity apply is deliberately NOT matched.)
+    {ok, [cell_new({js_err, <<"TypeError">>, <<"is not a function">>})]};
+js_error_to_value(_) ->
+    {error, nil}.
+
+%% Map an internal engine-error Kind atom to its ECMAScript constructor name (the binary
+%% stored as `.name`, and matched by `instanceof`). Every Kind the runtime raises today
+%% (`type_error` / `range_error` / `uri_error`) has a dedicated NativeError; any future or
+%% unknown Kind degrades to the base `Error`.
+js_error_kind_name(type_error) -> <<"TypeError">>;
+js_error_kind_name(range_error) -> <<"RangeError">>;
+js_error_kind_name(uri_error) -> <<"URIError">>;
+js_error_kind_name(_) -> <<"Error">>.
+
+%% The `.message` for a converted engine error. `range_error`/`uri_error` already carry a
+%% descriptive binary `Detail` (e.g. "Invalid array length"), so it is used verbatim. A
+%% `type_error`'s `Detail` is the offending VALUE (a `not_callable` target, a bad receiver),
+%% which has no faithful short rendering, so a fixed spec-flavoured message is used; a binary
+%% `Detail` (should one arise) passes through.
+js_error_kind_message(_Kind, Detail) when is_binary(Detail) -> Detail;
+js_error_kind_message(type_error, _Detail) -> <<"not an object or not callable">>;
+js_error_kind_message(range_error, _Detail) -> <<"value out of range">>;
+js_error_kind_message(uri_error, _Detail) -> <<"URI malformed">>;
+js_error_kind_message(_Kind, _Detail) -> <<>>.
 
 %% The `message` string for an error: an absent or `undefined` argument yields ""
 %% (the prototype default), otherwise ToString of the argument.
