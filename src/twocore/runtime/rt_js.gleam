@@ -555,6 +555,18 @@ pub fn js_m_delete(recv: Dynamic, args: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "js_m_clear")
 pub fn js_m_clear(recv: Dynamic, args: Dynamic) -> Dynamic
 
+/// `map.getOrInsert(key, value)` (TC39 upsert proposal). Returns the existing value
+/// for `key` (SameValueZero) if present without overwriting, else inserts and returns
+/// `value`.
+@external(erlang, "twocore_rt_js_ffi", "js_m_get_or_insert")
+pub fn js_m_get_or_insert(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `map.getOrInsertComputed(key, callbackfn)` (TC39 upsert proposal). Returns the
+/// existing value if `key` is present (callback not called); else calls
+/// `callbackfn(canonicalKey)`, stores its return value under `key`, and returns it.
+@external(erlang, "twocore_rt_js_ffi", "js_m_get_or_insert_computed")
+pub fn js_m_get_or_insert_computed(recv: Dynamic, args: Dynamic) -> Dynamic
+
 /// `forEach(fn)` across arrays, Maps `fn(v, k, m)`, and Sets `fn(v, v, s)`.
 @external(erlang, "twocore_rt_js_ffi", "js_m_foreach")
 pub fn js_m_foreach(recv: Dynamic, args: Dynamic) -> Dynamic

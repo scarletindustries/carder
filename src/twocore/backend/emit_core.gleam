@@ -4262,6 +4262,8 @@ fn resolve_js(op: String) -> Option(String) {
     "js_m_has" -> Some("js_m_has")
     "js_m_delete" -> Some("js_m_delete")
     "js_m_clear" -> Some("js_m_clear")
+    "js_m_get_or_insert" -> Some("js_m_get_or_insert")
+    "js_m_get_or_insert_computed" -> Some("js_m_get_or_insert_computed")
     "js_m_foreach" -> Some("js_m_foreach")
     "js_m_keys" -> Some("js_m_keys")
     "js_m_values" -> Some("js_m_values")

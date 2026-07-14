@@ -4772,3 +4772,100 @@ pub fn object_call_method_delegation_test() {
     )
   to_float(call(m, "run", [])) |> should.equal(10.0)
 }
+
+// ==== Map (wave 3) ====
+
+// Map.prototype.getOrInsert(key, value) — TC39 `upsert` proposal
+// (sec-map.prototype.getorinsert). When `key` is absent, appends `{key, value}` and
+// returns the inserted `value`.
+pub fn map_get_or_insert_absent_test() {
+  let m =
+    compile("function f() { let m = new Map(); return m.getOrInsert(1, 42); }")
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+  let n =
+    compile(
+      "function f() { let m = new Map(); m.getOrInsert(7, 8); return m.get(7); }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(8.0)
+}
+
+// getOrInsert must NOT overwrite an existing entry: with `key` present it returns the
+// EXISTING value and leaves the stored value untouched (steps 4/5 return before insert).
+pub fn map_get_or_insert_present_no_overwrite_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.set(1, 10); return m.getOrInsert(1, 42); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+  let n =
+    compile(
+      "function f() { let m = new Map(); m.set(1, 10); m.getOrInsert(1, 42); return m.get(1); }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(10.0)
+}
+
+// CanonicalizeKeyedCollectionKey folds -0 to +0, so getOrInsert(-0, …) inserts under
+// the +0 key and getOrInsert on -0 finds an entry stored under +0 (SameValueZero).
+pub fn map_get_or_insert_normalizes_zero_key_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.getOrInsert(-0, 42); return m.get(0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+  let n =
+    compile(
+      "function f() { let m = new Map(); m.set(+0, 42); return m.getOrInsert(-0, 1); }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(42.0)
+}
+
+// Map.prototype.getOrInsertComputed(key, callbackfn) — when `key` is absent it calls
+// the callback, stores the returned value, and returns it.
+pub fn map_get_or_insert_computed_absent_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); return m.getOrInsertComputed(5, function() { return 99; }); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(99.0)
+  let n =
+    compile(
+      "function f() { let m = new Map(); m.getOrInsertComputed(5, function() { return 99; }); return m.get(5); }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(99.0)
+}
+
+// getOrInsertComputed must NOT evaluate the callback when `key` is already present;
+// it returns the existing value (so a callback that would return 99 is never reached).
+pub fn map_get_or_insert_computed_present_skips_callback_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.set(5, 7); return m.getOrInsertComputed(5, function() { return 99; }); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+}
+
+// The CANONICAL key (+0 for a -0 argument) is passed to the callback (step 6:
+// Call(callbackfn, key)). Here the callback returns 1 iff it received +0.
+pub fn map_get_or_insert_computed_canonical_key_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); return m.getOrInsertComputed(-0, function(key) { return 1 / key > 0 ? 1 : 0; }); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// The callback's return value wins over any mutation the callback made to the same
+// key: after the callback runs, the entry for `key` is (re-scanning the live map) set
+// to the returned value. A callback that returns nothing stores `undefined`.
+pub fn map_get_or_insert_computed_overwrites_mutation_test() {
+  let m =
+    compile(
+      "function f() { let m = new Map(); m.getOrInsertComputed(1, function() { m.set(1, 0); return 3; }); return m.get(1); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  let n =
+    compile(
+      "function f() { let m = new Map(); m.getOrInsertComputed(2, function() { m.set(2, 1); }); return m.get(2) === undefined ? 1 : 0; }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(1.0)
+}
