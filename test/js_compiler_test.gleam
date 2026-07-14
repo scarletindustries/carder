@@ -4580,3 +4580,44 @@ pub fn math_pow_neg_infinity_test() {
   num("Math.pow(-Infinity, 3) === -Infinity ? 1 : 0") |> should.equal(1.0)
   num("Math.pow(-Infinity, 2) === Infinity ? 1 : 0") |> should.equal(1.0)
 }
+
+// ==== Object (wave 3) ====
+
+// sec-object.values / EnumerableOwnPropertyNames (ES2020 7.3.23): the own
+// enumerable key names are snapshotted first, but each key's presence and value
+// are re-checked at visit time. A getter that deletes a *later* key while an
+// earlier key is being read means that later key is skipped — it must NOT appear
+// with its stale snapshot value. Mirrors test262
+// built-ins/Object/values/getter-removing-future-key.js.
+pub fn object_values_getter_removes_future_key_test() {
+  let m =
+    compile(
+      "function f(){ var o = { a: 'A', get b(){ delete this.c; return 'B'; }, c: 'C' };"
+      <> " var v = Object.values(o); return v.length + '|' + v.join(','); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"2|A,B">>))
+}
+
+// sec-object.entries: same re-checking rule as Object.values — the entry for a
+// key deleted by an earlier getter is omitted, so the result has 2 entries, not
+// 3. Mirrors test262 built-ins/Object/entries/getter-removing-future-key.js.
+pub fn object_entries_getter_removes_future_key_test() {
+  let m =
+    compile(
+      "function f(){ var o = { a: 'A', get b(){ delete this.c; return 'B'; }, c: 'C' };"
+      <> " var e = Object.entries(o);"
+      <> " return e.length + '|' + e[0][0] + e[0][1] + '|' + e[1][0] + e[1][1]; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"2|aA|bB">>))
+}
+
+// Regression guard: with no getter side effects, Object.values still reports every
+// own enumerable value (the re-checking pass must not drop live keys).
+pub fn object_values_plain_object_test() {
+  let m =
+    compile(
+      "function f(){ var o = { a: 1, b: 2, c: 3 };"
+      <> " var v = Object.values(o); return v.length + '|' + v.join(','); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"3|1,2,3">>))
+}

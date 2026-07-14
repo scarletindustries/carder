@@ -4886,9 +4886,34 @@ is_nullish(_) -> 0.
 
 %% keys are listed WITHOUT invoking getters; values/entries resolve accessors.
 object_keys(O) -> new_array([K || {K, _} <- obj_pairs(O)]).
-object_values(O) -> new_array([resolve_get(V) || {_, V} <- obj_pairs(O)]).
+
+%% Object.values / Object.entries follow EnumerableOwnPropertyNames (ES2020 7.3.23):
+%% the own enumerable key *names* are snapshotted up front, then each key is
+%% visited in order and, for every key, its presence is re-checked and its value
+%% re-read via [[Get]] AT VISIT TIME. A getter that runs while an earlier key is
+%% being read can delete a later key; that later key must then be skipped rather
+%% than reported with a stale snapshot value. `object_visit_own_keys/1` performs
+%% that re-checking pass and returns `[{Key, Value}]` for the keys still present.
+object_values(O) ->
+    new_array([V || {_, V} <- object_visit_own_keys(O)]).
 object_entries(O) ->
-    new_array([new_array([K, resolve_get(V)]) || {K, V} <- obj_pairs(O)]).
+    new_array([new_array([K, V]) || {K, V} <- object_visit_own_keys(O)]).
+
+%% Snapshot the own enumerable key names of `O`, then re-visit them in order,
+%% dropping any key no longer present (deleted by an earlier key's getter) and
+%% reading the surviving keys' current values with [[Get]] (invoking accessors,
+%% `this`-bound to `O`). Returns `[{Key, Value}]` in the original key order.
+object_visit_own_keys(O) ->
+    Keys = [K || {K, _} <- obj_pairs(O)],
+    lists:filtermap(
+        fun(K) ->
+            case object_has_own(O, K) of
+                true -> {true, {K, get_prop(O, K)}};
+                false -> false
+            end
+        end,
+        Keys
+    ).
 
 %% Object.fromEntries(pairs) — build an object from an array of [key, value] arrays.
 object_from_entries(Entries) when is_reference(Entries) ->
