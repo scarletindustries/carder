@@ -177,6 +177,15 @@ zero_aware_sign(_) -> 1.
 signed_zero(S) when S < 0 -> -0.0;
 signed_zero(_) -> 0.0.
 
+%% Sign-preserving zero for the rounding functions (floor/ceil/round/trunc).
+%% Per each Math.* spec table, a zero result inherits the IEEE sign of the
+%% ORIGINAL argument: Math.ceil(-0.5), Math.trunc(-0.9) and Math.round(-0.3)
+%% all yield -0, as do the operations applied to -0 itself. A non-zero result
+%% (an Erlang integer) passes straight through; only the exact-zero case is
+%% rewritten to +0.0 / -0.0 by the argument's sign bit.
+signed_int_result(0, Orig) -> signed_zero(zero_aware_sign(as_float(Orig)));
+signed_int_result(R, _Orig) -> R.
+
 bool_int(true) -> 1;
 bool_int(false) -> 0.
 
@@ -491,7 +500,14 @@ npow(neg_inf, Exp) when Exp > 0 ->
         true -> neg_inf;
         false -> inf
     end;
-npow(neg_inf, _) -> 0;
+%% base −∞ with a negative exponent: an odd-integer exponent yields −0, every
+%% other (even or fractional) negative exponent yields +0
+%% (sec-numeric-types-number-exponentiate).
+npow(neg_inf, Exp) ->
+    case is_odd_int(Exp) of
+        true -> -0.0;
+        false -> 0
+    end;
 npow(Base, Exp) when is_integer(Base), is_integer(Exp), Exp >= 0 ->
     int_pow(Base, Exp);
 npow(Base, Exp) ->
@@ -584,6 +600,18 @@ munary(Method, nan) ->
     end;
 munary(Method, inf) -> munary_inf(Method, 1);
 munary(Method, neg_inf) -> munary_inf(Method, -1);
+%% Sign-of-zero preservation. Every unary Math function whose spec table maps a
+%% zero argument to a zero result preserves the IEEE sign of that zero — e.g.
+%% Math.sign(-0), Math.cbrt(-0), Math.expm1(-0), Math.log1p(-0), Math.sin(-0)
+%% all return -0. Math.abs is the sole exception (abs(-0) = +0), so it is
+%% excluded here and handled by its own finite clause. Only a float ±0.0
+%% argument needs this rewrite; integer 0 is already +0.
+munary(abs, N) -> munary_finite(abs, N);
+munary(Method, N) when is_float(N), N == 0.0 ->
+    case munary_finite(Method, N) of
+        R when R == 0 -> signed_zero(zero_aware_sign(N));
+        R -> R
+    end;
 munary(Method, N) -> munary_finite(Method, N).
 
 munary_inf(abs, _) -> inf;
@@ -618,8 +646,8 @@ munary_inf(_, _) -> nan.
 inf_of(1) -> inf;
 inf_of(-1) -> neg_inf.
 
-munary_finite(floor, N) -> floor(as_float(N));
-munary_finite(ceil, N) -> ceil(as_float(N));
+munary_finite(floor, N) -> signed_int_result(floor(as_float(N)), N);
+munary_finite(ceil, N) -> signed_int_result(ceil(as_float(N)), N);
 %% JS Math.round is round-half-toward-+Infinity. The naive floor(x + 0.5) is
 %% NOT equivalent: for the largest double below 0.5 (0.49999999999999994) the
 %% sum rounds up to 1.0, giving 1 instead of 0. Compare the fraction directly:
@@ -627,11 +655,13 @@ munary_finite(ceil, N) -> ceil(as_float(N));
 munary_finite(round, N) ->
     F = as_float(N),
     Fl = floor(F),
-    case F - Fl >= 0.5 of
-        true -> Fl + 1;
-        false -> Fl
-    end;
-munary_finite(trunc, N) -> trunc(as_float(N));
+    R =
+        case F - Fl >= 0.5 of
+            true -> Fl + 1;
+            false -> Fl
+        end,
+    signed_int_result(R, N);
+munary_finite(trunc, N) -> signed_int_result(trunc(as_float(N)), N);
 munary_finite(abs, N) -> abs(N);
 munary_finite(sign, N) ->
     if
@@ -782,6 +812,10 @@ mmin(inf, B) -> B;
 mmin(A, inf) -> A;
 mmin(neg_inf, _) -> neg_inf;
 mmin(_, neg_inf) -> neg_inf;
+%% Per sec-math.min, the comparison treats +0 as larger than -0, so a tie
+%% between zeros resolves to -0 whenever either operand is -0 (Erlang `=<`
+%% considers -0.0 and 0.0 equal and would otherwise leak the wrong sign).
+mmin(A, B) when A == 0, B == 0 -> signed_zero(minus_zero_sign(is_neg_zero(A) orelse is_neg_zero(B)));
 mmin(A, B) when A =< B -> A;
 mmin(_, B) -> B.
 
@@ -789,8 +823,16 @@ mmax(neg_inf, B) -> B;
 mmax(A, neg_inf) -> A;
 mmax(inf, _) -> inf;
 mmax(_, inf) -> inf;
+%% Per sec-math.max, +0 is larger than -0: a tie between zeros resolves to +0
+%% unless BOTH operands are -0.
+mmax(A, B) when A == 0, B == 0 -> signed_zero(minus_zero_sign(is_neg_zero(A) andalso is_neg_zero(B)));
 mmax(A, B) when A >= B -> A;
 mmax(_, B) -> B.
+
+%% Map a "this zero is negative" boolean to a sign argument for signed_zero/1
+%% (true → -1 → -0.0, false → +1 → +0.0).
+minus_zero_sign(true) -> -1;
+minus_zero_sign(false) -> 1.
 
 %% JS ToString → a binary. Strings pass through; integral floats < 1e21 print
 %% integer-style (String(5.0) = "5"); other floats use [short] (shortest
