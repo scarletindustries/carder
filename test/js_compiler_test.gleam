@@ -1886,6 +1886,21 @@ pub fn json_parse_test() {
   call(s, "f", []) |> should.equal(dyn(<<"hello">>))
 }
 
+pub fn json_parse_negative_zero_test() {
+  // sec-json.parse: a JSON number token that is negative zero ("-0", "-0.0",
+  // "-0e5") parses to IEEE-754 negative zero, not positive zero. 1/-0 is
+  // -Infinity, so this distinguishes it from +0 (whose reciprocal is +Infinity).
+  num("1 / JSON.parse(\"-0\") === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / JSON.parse(\"-0.0\") === -Infinity ? 1 : 0") |> should.equal(1.0)
+  num("1 / JSON.parse(\"-0e5\") === -Infinity ? 1 : 0") |> should.equal(1.0)
+  // Surrounding whitespace does not change the sign.
+  num("1 / JSON.parse(\" \\n-0 \") === -Infinity ? 1 : 0") |> should.equal(1.0)
+  // A plain "0" stays positive zero (1/+0 is +Infinity).
+  num("1 / JSON.parse(\"0\") === Infinity ? 1 : 0") |> should.equal(1.0)
+  // A non-zero negative number is unaffected.
+  num("JSON.parse(\"-5\")") |> should.equal(-5.0)
+}
+
 pub fn json_roundtrip_test() {
   num("JSON.parse(JSON.stringify([10, 20, 30]))[1]") |> should.equal(20.0)
   let m =
