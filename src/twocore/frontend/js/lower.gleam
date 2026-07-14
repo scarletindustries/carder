@@ -5038,6 +5038,15 @@ fn lower_instance_method(
     "has", _ -> coll("js_m_has")
     "delete", _ -> coll("js_m_delete")
     "clear", _ -> coll("js_m_clear")
+    // ES2024 Set composition methods (23.2.3.x). Each takes one set-like `other`
+    // and dispatches in the runtime on the receiver's Set tag.
+    "union", _ -> coll("set_union")
+    "intersection", _ -> coll("set_intersection")
+    "difference", _ -> coll("set_difference")
+    "symmetricDifference", _ -> coll("set_symmetric_difference")
+    "isDisjointFrom", _ -> coll("set_is_disjoint_from")
+    "isSubsetOf", _ -> coll("set_is_subset_of")
+    "isSupersetOf", _ -> coll("set_is_superset_of")
     // Map/Set iterators — a live `{value, done}` cursor driven by `.next()`. On a
     // plain object these delegate to a same-named user method.
     "keys", _ -> coll("js_m_keys")

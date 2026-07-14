@@ -80,6 +80,9 @@
     new_map/1, new_set/1, js_m_set/2, js_m_get/2, js_m_add/2, js_m_has/2,
     js_m_delete/2, js_m_clear/2, js_m_foreach/2,
     js_m_keys/2, js_m_values/2, js_m_entries/2,
+    set_union/2, set_intersection/2, set_difference/2,
+    set_symmetric_difference/2, set_is_disjoint_from/2,
+    set_is_subset_of/2, set_is_superset_of/2,
     array_map/2, array_filter/2, array_foreach/2, array_reduce/3,
     array_reduce1/2, array_reduce_right/3, array_reduce_right1/2,
     array_some/2, array_every/2, array_find/2, array_includes/3,
@@ -1291,6 +1294,13 @@ delete_prop_live(Recv, Key) ->
 has_prop(Recv, Key) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, _Len, Map} -> array_has(Map, Key);
+        %% Every Set cell IS a Set instance, so `x instanceof Set` (compiled to a
+        %% has_prop for the `@@is_Set` brand) is true for any Set cell.
+        {js_set, _, _} ->
+            case Key of
+                <<"@@is_Set">> -> 1;
+                _ -> 0
+            end;
         M when is_map(M) -> bool_int(maps:is_key(prop_key(Key), M));
         _ -> type_error(Recv)
     end;
@@ -2595,6 +2605,153 @@ js_m_entries(Recv, Args) ->
         _ -> delegate(Recv, <<"entries">>, Args)
     end.
 
+%% ─────────────────── ES2024 Set composition methods ───────────────────
+%% union / intersection / difference / symmetricDifference / isDisjointFrom /
+%% isSubsetOf / isSupersetOf (23.2.3.x). Each takes the receiver Set and one
+%% "other" argument. Per the spec the argument is coerced via GetSetRecord, which
+%% treats any object exposing numeric `size` + callable `has`/`keys` as set-like;
+%% here we implement the common cases where `other` is a Set (or, used set-like, a
+%% Map — its keys are the elements). SameValueZero membership is inherited from the
+%% Set cell's mapkey_norm'd keys, so 1/1.0 and -0/+0 coincide and NaN is a single
+%% element. The receiver must be a Set cell, else a TypeError is raised
+%% (RequireInternalSlot). Composition methods return a fresh Set; predicates return
+%% a JS boolean (`true`/`false`).
+
+%% Elements of a Set cell in insertion order (ascending Seq).
+set_elems(Recv) ->
+    case cell_tag(Recv) of
+        {js_set, _, D} ->
+            Sorted = lists:sort(fun({_, A}, {_, B}) -> A =< B end, maps:to_list(D)),
+            [V || {V, _} <- Sorted];
+        _ ->
+            []
+    end.
+
+%% Number of elements in a Set cell.
+set_size(Recv) ->
+    case cell_tag(Recv) of
+        {js_set, _, D} -> maps:size(D);
+        _ -> 0
+    end.
+
+%% SameValueZero membership test against a Set cell.
+set_has_elem(Recv, V0) ->
+    V = mapkey_norm(V0),
+    case cell_tag(Recv) of
+        {js_set, _, D} -> maps:is_key(V, D);
+        _ -> false
+    end.
+
+%% GetSetRecord-style view of the `other` argument: its element count.
+setlike_size(Other) ->
+    case cell_tag(Other) of
+        {js_set, _, D} -> maps:size(D);
+        {js_map, _, D} -> maps:size(D);
+        _ -> 0
+    end.
+
+%% GetSetRecord-style membership on the `other` argument (Set values / Map keys).
+setlike_has(Other, V0) ->
+    V = mapkey_norm(V0),
+    case cell_tag(Other) of
+        {js_set, _, D} -> maps:is_key(V, D);
+        {js_map, _, D} -> maps:is_key(V, D);
+        _ -> false
+    end.
+
+%% GetSetRecord-style key iteration of the `other` argument, in insertion order.
+setlike_elems(Other) ->
+    case cell_tag(Other) of
+        {js_set, _, _} ->
+            set_elems(Other);
+        {js_map, _, D} ->
+            Sorted = lists:sort(
+                fun({_, {A, _}}, {_, {B, _}}) -> A =< B end, maps:to_list(D)
+            ),
+            [K || {K, _} <- Sorted];
+        _ ->
+            []
+    end.
+
+%% Build a fresh Set cell from a list of elements (later duplicates ignored, first
+%% occurrence fixes the position — matching insertion order).
+set_from_elems(Elems) ->
+    S = cell_new({js_set, 0, #{}}),
+    lists:foreach(fun(V) -> js_m_add(S, [V]) end, Elems),
+    S.
+
+%% RequireInternalSlot(O, [[SetData]]) — the receiver of a Set method must be a Set.
+require_set(Recv) ->
+    case cell_tag(Recv) of
+        {js_set, _, _} -> ok;
+        _ -> type_error(Recv)
+    end.
+
+%% 23.2.3.17 Set.prototype.union — every element of this or other, this's elements
+%% first (in this's order), then other's remaining elements (in other's order).
+set_union(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    set_from_elems(set_elems(Recv) ++ setlike_elems(Other)).
+
+%% 23.2.3.9 Set.prototype.intersection — elements in both. Ordered as in the smaller
+%% side: when |this| <= |other| iterate this, else iterate other.
+set_intersection(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    ThisElems = set_elems(Recv),
+    case length(ThisElems) =< setlike_size(Other) of
+        true ->
+            set_from_elems([V || V <- ThisElems, setlike_has(Other, V)]);
+        false ->
+            set_from_elems([V || V <- setlike_elems(Other), set_has_elem(Recv, V)])
+    end.
+
+%% 23.2.3.5 Set.prototype.difference — elements of this not in other, in this's order.
+set_difference(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    set_from_elems([V || V <- set_elems(Recv), not setlike_has(Other, V)]).
+
+%% 23.2.3.14 Set.prototype.symmetricDifference — elements in exactly one set: this's
+%% elements not in other (this's order) followed by other's elements not in this
+%% (other's order).
+set_symmetric_difference(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    InThisOnly = [V || V <- set_elems(Recv), not setlike_has(Other, V)],
+    InOtherOnly = [V || V <- setlike_elems(Other), not set_has_elem(Recv, V)],
+    set_from_elems(InThisOnly ++ InOtherOnly).
+
+%% 23.2.3.7 Set.prototype.isDisjointFrom — true when this and other share no element.
+set_is_disjoint_from(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    ThisElems = set_elems(Recv),
+    case length(ThisElems) =< setlike_size(Other) of
+        true -> not lists:any(fun(V) -> setlike_has(Other, V) end, ThisElems);
+        false -> not lists:any(fun(V) -> set_has_elem(Recv, V) end, setlike_elems(Other))
+    end.
+
+%% 23.2.3.11 Set.prototype.isSubsetOf — true when every element of this is in other.
+set_is_subset_of(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    ThisElems = set_elems(Recv),
+    case length(ThisElems) > setlike_size(Other) of
+        true -> false;
+        false -> lists:all(fun(V) -> setlike_has(Other, V) end, ThisElems)
+    end.
+
+%% 23.2.3.12 Set.prototype.isSupersetOf — true when every element of other is in this.
+set_is_superset_of(Recv, Args) ->
+    require_set(Recv),
+    Other = arg(Args, 0),
+    case setlike_size(Other) > set_size(Recv) of
+        true -> false;
+        false -> lists:all(fun(V) -> set_has_elem(Recv, V) end, setlike_elems(Other))
+    end.
+
 make_map_iter(Recv, Kind) ->
     Cursor = cell_new(-1),
     gen_make(fun(_Arg) ->
@@ -3176,6 +3333,9 @@ array_spread_into(Target, Value) when is_reference(Value) ->
     case erlang:get(?CELL_KEY(Value)) of
         {js_array, Len, Map} -> array_push(Target, arr_list(Len, Map));
         {js_gen, _} -> array_push(Target, drain_gen(Value, []));
+        %% Spreading a Set yields its elements in insertion order (the Set is an
+        %% iterable whose iterator is Set.prototype.values).
+        {js_set, _, _} -> array_push(Target, set_elems(Value));
         _ -> type_error(Value)
     end;
 array_spread_into(Target, Value) when is_binary(Value) ->
