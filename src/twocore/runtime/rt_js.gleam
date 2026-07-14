@@ -582,6 +582,38 @@ pub fn js_m_values(recv: Dynamic, args: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "js_m_entries")
 pub fn js_m_entries(recv: Dynamic, args: Dynamic) -> Dynamic
 
+// ES2024 Set composition methods. Each takes the receiver Set + a cons-list of the
+// call's arguments (the single `other` set-like). union/intersection/difference/
+// symmetricDifference return a fresh Set; the is* predicates return a JS boolean.
+
+/// `set.union(other)` — a new Set of every element in either.
+@external(erlang, "twocore_rt_js_ffi", "set_union")
+pub fn set_union(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `set.intersection(other)` — a new Set of the elements in both.
+@external(erlang, "twocore_rt_js_ffi", "set_intersection")
+pub fn set_intersection(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `set.difference(other)` — a new Set of this's elements not in other.
+@external(erlang, "twocore_rt_js_ffi", "set_difference")
+pub fn set_difference(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `set.symmetricDifference(other)` — a new Set of the elements in exactly one.
+@external(erlang, "twocore_rt_js_ffi", "set_symmetric_difference")
+pub fn set_symmetric_difference(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `set.isDisjointFrom(other)` → boolean: no element in common.
+@external(erlang, "twocore_rt_js_ffi", "set_is_disjoint_from")
+pub fn set_is_disjoint_from(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `set.isSubsetOf(other)` → boolean: every element of this is in other.
+@external(erlang, "twocore_rt_js_ffi", "set_is_subset_of")
+pub fn set_is_subset_of(recv: Dynamic, args: Dynamic) -> Dynamic
+
+/// `set.isSupersetOf(other)` → boolean: every element of other is in this.
+@external(erlang, "twocore_rt_js_ffi", "set_is_superset_of")
+pub fn set_is_superset_of(recv: Dynamic, args: Dynamic) -> Dynamic
+
 // Array iteration/query methods. Callback-taking ones (`map`/`filter`/`reduce`/…) apply
 // the JS callback with its own arity (extra/missing args tolerated).
 

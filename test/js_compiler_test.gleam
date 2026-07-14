@@ -4869,3 +4869,124 @@ pub fn map_get_or_insert_computed_overwrites_mutation_test() {
     )
   to_float(call(n, "f", [])) |> should.equal(1.0)
 }
+
+// ==== Set (wave 3) ====
+
+// 23.2.3.17 Set.prototype.union — every element in either set. Result order is
+// this's elements (in insertion order) then other's remaining elements.
+pub fn set_union_test() {
+  // combined values, deduped, in the right order
+  let m =
+    compile(
+      "function f(){ let a=new Set([1,2]); let b=new Set([2,3]); return [...a.union(b)].join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"1,2,3">>))
+  // ordering follows the receiver first, then the argument
+  let n =
+    compile(
+      "function f(){ let a=new Set([3]); let b=new Set([1,2]); return [...a.union(b)].join(\",\"); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(<<"3,1,2">>))
+  // the result is a fresh Set instance
+  let s =
+    compile(
+      "function f(){ return (new Set([1]).union(new Set([2]))) instanceof Set; }",
+    )
+  call(s, "f", []) |> should.equal(dyn(True))
+}
+
+// 23.2.3.9 Set.prototype.intersection — elements present in both. Result order is
+// taken from the smaller side: this when |this| <= |other|, else other.
+pub fn set_intersection_test() {
+  let m =
+    compile(
+      "function f(){ let a=new Set([1,3,5]); let b=new Set([3,2,1]); return [...a.intersection(b)].join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"1,3">>))
+  // |this| > |other|: order comes from other
+  let n =
+    compile(
+      "function f(){ let a=new Set([1,3,5,7]); let b=new Set([3,2,1]); return [...a.intersection(b)].join(\",\"); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(<<"3,1">>))
+  // disjoint sets intersect to the empty set
+  let e =
+    compile(
+      "function f(){ return new Set([1,2]).intersection(new Set([3,4])).size; }",
+    )
+  to_float(call(e, "f", [])) |> should.equal(0.0)
+}
+
+// 23.2.3.5 Set.prototype.difference — this's elements not in other, in this's order.
+pub fn set_difference_test() {
+  let m =
+    compile(
+      "function f(){ let a=new Set([1,2,3]); let b=new Set([2]); return [...a.difference(b)].join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"1,3">>))
+  // subtracting a superset leaves nothing
+  let e =
+    compile(
+      "function f(){ return new Set([1,2]).difference(new Set([1,2,3])).size; }",
+    )
+  to_float(call(e, "f", [])) |> should.equal(0.0)
+}
+
+// 23.2.3.14 Set.prototype.symmetricDifference — elements in exactly one set: this's
+// unique elements (this order) then other's unique elements (other order).
+pub fn set_symmetric_difference_test() {
+  let m =
+    compile(
+      "function f(){ let a=new Set([1,2,3]); let b=new Set([3,4]); return [...a.symmetricDifference(b)].join(\",\"); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(<<"1,2,4">>))
+  // symmetric difference with itself is empty
+  let e =
+    compile(
+      "function f(){ let a=new Set([1,2]); return a.symmetricDifference(a).size; }",
+    )
+  to_float(call(e, "f", [])) |> should.equal(0.0)
+}
+
+// 23.2.3.7 / .11 / .12 — the Set relation predicates return JS booleans.
+pub fn set_predicates_test() {
+  // isDisjointFrom
+  let d =
+    compile(
+      "function f(){ return new Set([1,2]).isDisjointFrom(new Set([3,4])) === true && new Set([1,2]).isDisjointFrom(new Set([2,3])) === false; }",
+    )
+  call(d, "f", []) |> should.equal(dyn(True))
+  // isSubsetOf
+  let sub =
+    compile(
+      "function f(){ return new Set([1,2]).isSubsetOf(new Set([1,2,3])) === true && new Set([1,4]).isSubsetOf(new Set([1,2,3])) === false; }",
+    )
+  call(sub, "f", []) |> should.equal(dyn(True))
+  // isSupersetOf
+  let sup =
+    compile(
+      "function f(){ return new Set([1,2,3]).isSupersetOf(new Set([1,2])) === true && new Set([1,2]).isSupersetOf(new Set([1,2,3])) === false; }",
+    )
+  call(sup, "f", []) |> should.equal(dyn(True))
+}
+
+// SameValueZero membership across the composition methods: NaN is a single element
+// and -0/+0 are the same key (23.2.3.x inherit Set's SameValueZero equality).
+pub fn set_samevaluezero_methods_test() {
+  // NaN is deduped across union
+  let nan =
+    compile("function f(){ return new Set([NaN]).union(new Set([NaN])).size; }")
+  to_float(call(nan, "f", [])) |> should.equal(1.0)
+  // -0 and +0 intersect as one element
+  let z =
+    compile(
+      "function f(){ return new Set([-0]).intersection(new Set([0])).size; }",
+    )
+  to_float(call(z, "f", [])) |> should.equal(1.0)
+}
+
+// Spreading a Set iterates its values in insertion order (Set.prototype.values).
+pub fn set_spread_test() {
+  let m = compile("function f(){ return [...new Set([3,1,2,1])].join(\",\"); }")
+  call(m, "f", []) |> should.equal(dyn(<<"3,1,2">>))
+}
