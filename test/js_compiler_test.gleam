@@ -4147,3 +4147,57 @@ pub fn number_format_negative_zero_test() {
   val("(-123.456).toExponential(2)") |> should.equal(dyn(<<"-1.23e+2">>))
   val("(-1.5).toFixed(0)") |> should.equal(dyn(<<"-2">>))
 }
+
+pub fn array_fill_no_arguments_test() {
+  // Array.prototype.fill (§23.1.3.7): with no `value` argument, `value` is
+  // `undefined`, so every element in [k, final) is set to `undefined`. A fill
+  // with no arguments over the whole array therefore yields all-undefined.
+  let m =
+    compile(
+      "function f() {"
+      <> " var a = [0, 0, 0]; a.fill();"
+      <> " return (a[0] === undefined && a[1] === undefined"
+      <> "         && a[2] === undefined && a.length === 3) ? 1 : 0;"
+      <> "}",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+
+  // `[].fill()` returns the same (empty) array — length stays 0.
+  num("[].fill().length") |> should.equal(0.0)
+}
+
+pub fn array_index_out_of_range_is_ordinary_property_test() {
+  // Array exotic [[DefineOwnProperty]] (§10.4.2.1): an integer property key is
+  // an *array index* only when it is a canonical number in [0, 2^32 - 1). The
+  // value 2^32 - 1 (4294967295) is NOT an array index, so assigning it must
+  // create an ordinary property and leave `length` unchanged.
+  let m =
+    compile(
+      "function f() {"
+      <> " var a = [0, 1, 2]; a[4294967295] = 9;"
+      <> " return (a.length === 3 && a[4294967295] === 9) ? 1 : 0;"
+      <> "}",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+
+  // A negative integer index is likewise an ordinary property: length stays 0
+  // and the value round-trips.
+  let m2 =
+    compile(
+      "function f() {"
+      <> " var a = []; a[-1] = 7;"
+      <> " return (a.length === 0 && a[-1] === 7) ? 1 : 0;"
+      <> "}",
+    )
+  to_float(call(m2, "f", [])) |> should.equal(1.0)
+
+  // A genuine array index still bumps length to index + 1 (§10.4.2.1 step 3.h).
+  let m3 =
+    compile(
+      "function f() {"
+      <> " var a = []; a[1] = 1; a[4294967295] = 1;"
+      <> " return a.length;"
+      <> "}",
+    )
+  to_float(call(m3, "f", [])) |> should.equal(2.0)
+}
