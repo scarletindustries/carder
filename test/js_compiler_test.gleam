@@ -4292,3 +4292,92 @@ pub fn date_to_utc_string_negative_year_test() {
   yr("-000012-07-01T00:00Z") |> should.equal(dyn(<<"-0012">>))
   yr("-123456-07-01T00:00Z") |> should.equal(dyn(<<"-123456">>))
 }
+
+// ==== Array (wave 1) ====
+
+// Compile `function f(){ <body> }`, run it, and return the result as a Float.
+// Used for multi-statement Array tests whose bodies pass function-expression
+// callbacks to array methods.
+fn body_num(body: String) -> Float {
+  let m = compile("function f() { " <> body <> " }")
+  to_float(call(m, "f", []))
+}
+
+// Array.prototype.forEach — per ES2015 §22.1.3.10 the callback is invoked only
+// for indices the array HAS (holes are skipped via a per-step HasProperty check).
+// `new Array(10)` is ten holes; assigning a[1] makes exactly one present element.
+// (The visited indices are recorded by pushing onto a shared array — a reference,
+// so the mutation is observed even though scalar captures are by value.)
+pub fn array_foreach_skips_holes_test() {
+  body_num(
+    "var a = new Array(10); a[1] = 5; var log = [];"
+    <> " a.forEach(function(v,i){ log.push(i); }); return log.length;",
+  )
+  |> should.equal(1.0)
+}
+
+// forEach re-reads the live array each step, so an element DELETED by an earlier
+// callback is not visited when iteration reaches it (§22.1.3.10, HasProperty):
+// deleting index 3 from the first callback drops it to 4 visited elements.
+pub fn array_foreach_visits_deleted_as_hole_test() {
+  body_num(
+    "var a = [1,2,3,4,5]; var log = [];"
+    <> " a.forEach(function(v,i){ if (i === 0) { delete a[3]; } log.push(v); });"
+    <> " return log.length;",
+  )
+  |> should.equal(4.0)
+}
+
+// forEach observes a value WRITTEN by an earlier callback (live re-read): once the
+// callback sets a[4] = 6, the value passed when iteration reaches index 4 is 6.
+pub fn array_foreach_sees_new_value_test() {
+  body_num(
+    "var a = [1,2,3,4,5]; var log = [];"
+    <> " a.forEach(function(v,i){ a[4] = 6; log.push(v); }); return log[4];",
+  )
+  |> should.equal(6.0)
+}
+
+// Array.prototype.map — per §22.1.3.15 the result has the SAME length as the
+// source, holes are NOT visited (and stay holes), so the callback runs once for
+// the single present element of a ten-hole array. `log` records the visits.
+pub fn array_map_preserves_length_skips_holes_test() {
+  // r.length * 100 + visitCount  ==>  10 length, 1 visit.
+  body_num(
+    "var a = new Array(10); a[1] = 5; var log = [];"
+    <> " var r = a.map(function(v){ log.push(v); return v; });"
+    <> " return r.length * 100 + log.length;",
+  )
+  |> should.equal(1001.0)
+}
+
+// Array.prototype.filter — per §22.1.3.7 only present elements are visited (holes
+// skipped) and the result is a DENSE array of the kept elements.
+pub fn array_filter_skips_holes_dense_result_test() {
+  body_num(
+    "var a = new Array(5); a[1] = 1; a[3] = 1;"
+    <> " var r = a.filter(function(v){ return true; }); return r.length;",
+  )
+  |> should.equal(2.0)
+}
+
+// Array.prototype.indexOf — per §22.1.3.12 a hole is NOT a present element, so a
+// deleted slot is skipped and `indexOf(undefined)` over an array whose only match
+// would be that hole returns -1.
+pub fn array_index_of_skips_holes_test() {
+  body_num("var a = [10,20,30]; delete a[1]; return a.indexOf(undefined);")
+  |> should.equal(-1.0)
+}
+
+// A genuine `undefined` element (present, not a hole) IS found by indexOf.
+pub fn array_index_of_finds_present_undefined_test() {
+  body_num("var a = [10, undefined, 30]; return a.indexOf(undefined);")
+  |> should.equal(1.0)
+}
+
+// Array.prototype.lastIndexOf — per §22.1.3.15 holes are skipped, so a deleted
+// slot never matches and the search returns -1.
+pub fn array_last_index_of_skips_holes_test() {
+  body_num("var a = [10,20,30]; delete a[1]; return a.lastIndexOf(undefined);")
+  |> should.equal(-1.0)
+}
