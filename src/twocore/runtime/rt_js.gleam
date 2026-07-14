@@ -930,6 +930,27 @@ pub fn object_freeze(obj: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_is_frozen")
 pub fn object_is_frozen(obj: Dynamic) -> Dynamic
 
+/// `Object.preventExtensions(o)` — mark `o` non-extensible (no new own property
+/// may be added; existing ones stay writable/deletable) and return it; a
+/// non-object primitive is returned unchanged.
+@external(erlang, "twocore_rt_js_ffi", "object_prevent_extensions")
+pub fn object_prevent_extensions(obj: Dynamic) -> Dynamic
+
+/// `Object.isExtensible(o)` → JS boolean; `false` for any non-object primitive
+/// (per ES2015 it does not throw).
+@external(erlang, "twocore_rt_js_ffi", "object_is_extensible")
+pub fn object_is_extensible(obj: Dynamic) -> Dynamic
+
+/// `Object.seal(o)` — make `o` non-extensible and its existing own properties
+/// non-configurable (they can no longer be deleted), then return it; a non-object
+/// primitive is returned unchanged.
+@external(erlang, "twocore_rt_js_ffi", "object_seal")
+pub fn object_seal(obj: Dynamic) -> Dynamic
+
+/// `Object.isSealed(o)` → JS boolean; `true` for any non-object primitive.
+@external(erlang, "twocore_rt_js_ffi", "object_is_sealed")
+pub fn object_is_sealed(obj: Dynamic) -> Dynamic
+
 /// `Object.fromEntries(pairs)` — build an object from an array of `[key, value]` arrays.
 @external(erlang, "twocore_rt_js_ffi", "object_from_entries")
 pub fn object_from_entries(entries: Dynamic) -> Dynamic

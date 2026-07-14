@@ -4446,6 +4446,19 @@ fn lower_static_call(
     "Object", "fromEntries", [e, ..] -> host("object_from_entries", [e])
     "Object", "freeze", [o, ..] -> host("object_freeze", [o])
     "Object", "isFrozen", [o, ..] -> host("object_is_frozen", [o])
+    // Object.preventExtensions / isExtensible / seal / isSealed — the
+    // extensibility & integrity-level operations (§19.1.2). With no argument the
+    // receiver is `undefined` (a primitive), which each op accepts per ES2015.
+    "Object", "preventExtensions", [o, ..] ->
+      host("object_prevent_extensions", [o])
+    "Object", "preventExtensions", [] ->
+      host("object_prevent_extensions", [undefined()])
+    "Object", "isExtensible", [o, ..] -> host("object_is_extensible", [o])
+    "Object", "isExtensible", [] -> host("object_is_extensible", [undefined()])
+    "Object", "seal", [o, ..] -> host("object_seal", [o])
+    "Object", "seal", [] -> host("object_seal", [undefined()])
+    "Object", "isSealed", [o, ..] -> host("object_is_sealed", [o])
+    "Object", "isSealed", [] -> host("object_is_sealed", [undefined()])
     // No non-enumerable own properties exist in this model, so getOwnPropertyNames
     // is Object.keys (an array's "length" pseudo-property is omitted — a v1 gap).
     "Object", "getOwnPropertyNames", [o, ..] -> host("object_keys", [o])
