@@ -6028,11 +6028,26 @@ sub_index(V, Len, _Default) ->
 %% lim = 0, return A"). An `undefined` limit means 2^32-1 (effectively
 %% unbounded). A larger limit truncates the raw split to that many leading
 %% substrings.
-str_split(Str, Sep, Limit) ->
+str_split(Str0, Sep, Limit) ->
+    Str = str_this(Str0),
     case split_limit(Limit) of
         0 -> new_array([]);
         Lim -> new_array(split_take(str_split_all(Str, Sep), Lim))
     end.
+
+%% Coerce a String-method `this` receiver to its primitive string binary. Per
+%% the String.prototype algorithms (`S = ToString(RequireObjectCoercible(this))`,
+%% e.g. §22.1.3.21 split step 2), a `new String(x)` WRAPPER object must be treated
+%% as its boxed string primitive. This unwraps a `{js_wrapper, string, Prim}` cell
+%% to `Prim` (already a binary) and returns any plain string unchanged, so
+%% `new String("a-b").split("-")` behaves identically to `"a-b".split("-")`.
+str_this(V) when is_reference(V) ->
+    case erlang:get(?CELL_KEY(V)) of
+        {js_wrapper, string, Prim} -> Prim;
+        _ -> V
+    end;
+str_this(V) ->
+    V.
 
 %% ToUint32(limit) with `undefined` mapped to the spec's 2^32-1 default. NaN and
 %% ±Infinity coerce to 0; any other number is truncated toward zero and reduced

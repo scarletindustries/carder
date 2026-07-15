@@ -6579,3 +6579,39 @@ pub fn ctor_in_closure_throws_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(1.0)
 }
+
+// ==== String (wave 11) ====
+
+/// String.prototype.split unwraps a `new String(...)` wrapper receiver to its
+/// boxed primitive before splitting (spec §22.1.3.21 step 2: `S = ToString(O)`),
+/// so a wrapper behaves identically to the string primitive.
+pub fn string_split_wrapper_receiver_test() {
+  // new String("hello").split("hello") -> ["", ""]  (separator spans the whole string)
+  num("(function(){ return (new String('hello')).split('hello').length; })()")
+  |> should.equal(2.0)
+  val("(function(){ return (new String('hello')).split('hello')[0]; })()")
+  |> should.equal(dyn(""))
+  val("(function(){ return (new String('hello')).split('hello')[1]; })()")
+  |> should.equal(dyn(""))
+  // new String("one-1 two-2 four-4").split("-4") -> ["one-1 two-2 four", ""]
+  num(
+    "(function(){ return (new String('one-1 two-2 four-4')).split('-4').length; })()",
+  )
+  |> should.equal(2.0)
+  // A wrapper split on a substring yields the same array as the primitive.
+  num("(function(){ return (new String('a,b,c')).split(',').length; })()")
+  |> should.equal(3.0)
+  val("(function(){ return (new String('a,b,c')).split(',')[1]; })()")
+  |> should.equal(dyn("b"))
+  // split() with no separator on a wrapper returns a one-element array holding
+  // the whole (coerced) string (spec step 11: separator undefined).
+  num("(function(){ return (new String(' ')).split().length; })()")
+  |> should.equal(1.0)
+  val("(function(){ return (new String(' ')).split()[0]; })()")
+  |> should.equal(dyn(" "))
+  // The result is a genuine Array (its constructor is Array).
+  num(
+    "(function(){ return (new String('hello')).split('h').constructor === Array ? 1 : 0; })()",
+  )
+  |> should.equal(1.0)
+}
