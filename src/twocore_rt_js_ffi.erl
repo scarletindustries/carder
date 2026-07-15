@@ -1264,7 +1264,7 @@ get_prop(Recv, Key) when is_reference(Recv) ->
         {js_regex, _, Flags, Src} ->
             case Key of
                 <<"source">> -> Src;
-                <<"flags">> -> Flags;
+                <<"flags">> -> canonical_flags(Flags);
                 <<"global">> -> has_flag(Flags, $g);
                 <<"ignoreCase">> -> has_flag(Flags, $i);
                 <<"multiline">> -> has_flag(Flags, $m);
@@ -3955,7 +3955,17 @@ regex_source(Re) ->
     S.
 regex_flags(Re) ->
     {_MP, F, _S} = regex_content(Re),
-    F.
+    canonical_flags(F).
+
+%% Serialise a regex's flag set in the canonical order mandated by the
+%% `RegExp.prototype.flags` getter (§22.2.6.4): d, g, i, m, s, u, v, y — one
+%% code unit per flag actually present, independent of the order the flags were
+%% supplied at construction. `Flags` is the regex's OriginalFlags binary; the
+%% result is a binary containing only the recognised flag characters that are
+%% set, always in the fixed order above.
+canonical_flags(Flags) ->
+    Order = [$d, $g, $i, $m, $s, $u, $v, $y],
+    list_to_binary([C || C <- Order, has_flag(Flags, C)]).
 
 %% String.prototype.match(re) (§22.2.6.8 via RegExp.prototype[@@match]). A
 %% non-regex `Re` is coerced to `new RegExp(Re)`. For a global regex: reset
