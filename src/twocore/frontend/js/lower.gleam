@@ -4876,6 +4876,22 @@ fn lower_static_call(
     "Object", "is", [x, y, ..] -> host("object_is", [x, y])
     "Object", "is", [x] -> host("object_is", [x, undefined()])
     "Object", "is", [] -> host("object_is", [undefined(), undefined()])
+    // Object.hasOwn(obj, key) (sec-object.hasown) — own-property test that, unlike
+    // `obj.hasOwnProperty(key)`, works with a null-prototype receiver. Reuses the
+    // same runtime op as `hasOwnProperty`.
+    "Object", "hasOwn", [o, k, ..] -> host("object_has_own", [o, k])
+    "Object", "hasOwn", [o] -> host("object_has_own", [o, undefined()])
+    // Object.getPrototypeOf(obj) (sec-object.getprototypeof) — this v1 model tracks
+    // no prototype chain, so an ordinary object reports `null` (shared with
+    // Reflect.getPrototypeOf); a primitive receiver throws a TypeError.
+    "Object", "getPrototypeOf", [o, ..] -> host("reflect_get_prototype_of", [o])
+    // Object.groupBy(items, callbackfn) (sec-object.groupby) — group the iterable's
+    // elements into a new null-prototype object keyed by ToPropertyKey(callback
+    // result). A missing callback lowers to `undefined` so the runtime's
+    // IsCallable check throws a TypeError (GroupBy step 2).
+    "Object", "groupBy", [items, cb, ..] -> host("object_group_by", [items, cb])
+    "Object", "groupBy", [items] ->
+      host("object_group_by", [items, undefined()])
     "Object", "fromEntries", [e, ..] -> host("object_from_entries", [e])
     "Object", "freeze", [o, ..] -> host("object_freeze", [o])
     "Object", "isFrozen", [o, ..] -> host("object_is_frozen", [o])

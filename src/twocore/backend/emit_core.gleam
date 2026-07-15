@@ -4382,6 +4382,7 @@ fn resolve_js(op: String) -> Option(String) {
     "object_from_entries" -> Some("object_from_entries")
     "object_is" -> Some("object_is")
     "object_has_own" -> Some("object_has_own")
+    "object_group_by" -> Some("object_group_by")
     // Reflect namespace
     "reflect_has" -> Some("reflect_has")
     "reflect_get" -> Some("reflect_get")
