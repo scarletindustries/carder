@@ -7328,3 +7328,76 @@ pub fn wave14_arrow_callback_ignores_thisarg_test() {
   val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
   |> should.equal(dyn("2,4,6"))
 }
+
+// ==== JSON (wave 15) ====
+
+// SerializeJSONProperty step 4.c (sec-serializejsonproperty): a Boolean wrapper
+// object is serialized as its primitive [[BooleanData]], so `new Boolean(true)`
+// stringifies to "true", not "{}". Mirrors JSON/stringify/value-boolean-object.js.
+pub fn json_wrapper_boolean_test() {
+  val("JSON.stringify(new Boolean(true))") |> should.equal(dyn("true"))
+  val("JSON.stringify(new Boolean(false))") |> should.equal(dyn("false"))
+}
+
+// A Boolean wrapper nested inside an object (returned via toJSON) is unwrapped to
+// its primitive per step 4.c — `{"key":false}`, not `{"key":{}}`.
+pub fn json_wrapper_boolean_nested_test() {
+  val(
+    "JSON.stringify({toJSON: function() { return {key: new Boolean(false)}; }})",
+  )
+  |> should.equal(dyn("{\"key\":false}"))
+}
+
+// A Boolean wrapper produced by a replacer function is unwrapped (step 4 runs
+// after the replacer) — `[true]`. Mirrors the third value-boolean-object case.
+pub fn json_wrapper_boolean_from_replacer_test() {
+  val(
+    "JSON.stringify([1], function(_k, v) { return v === 1 ? new Boolean(true) : v; })",
+  )
+  |> should.equal(dyn("[true]"))
+}
+
+// SerializeJSONProperty step 4.a/4.b: Number and String wrapper objects serialize
+// as their primitive [[NumberData]]/[[StringData]].
+pub fn json_wrapper_number_string_test() {
+  val("JSON.stringify(new Number(14))") |> should.equal(dyn("14"))
+  val("JSON.stringify(new String('hi'))") |> should.equal(dyn("\"hi\""))
+}
+
+// SerializeJSONObject step 1: a directly self-referential object is cyclical and
+// MUST throw a TypeError (not loop forever). Mirrors value-object-circular.js.
+pub fn json_circular_object_throws_test() {
+  let m =
+    compile(
+      "function f() { var d = {}; d.prop = d; try { JSON.stringify(d); return 0; } catch (e) { return e instanceof TypeError ? 1 : 0; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// SerializeJSONArray step 1: a self-referential array is cyclical and MUST throw a
+// TypeError. Mirrors value-array-circular.js.
+pub fn json_circular_array_throws_test() {
+  let m =
+    compile(
+      "function f() { var a = []; a.push(a); try { JSON.stringify(a); return 0; } catch (e) { return e instanceof TypeError ? 1 : 0; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// An indirectly cyclical structure (a getter/reference chain back to an ancestor)
+// also throws. Mirrors the `indirect` case of value-object-circular.js.
+pub fn json_circular_indirect_throws_test() {
+  let m =
+    compile(
+      "function f() { var root = {}; root.a = { b: root }; try { JSON.stringify(root); return 0; } catch (e) { return e instanceof TypeError ? 1 : 0; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// The cycle check is a STACK of ancestors, not a global seen-set: the SAME object
+// referenced twice in sibling positions (a diamond, not a cycle) serializes fine.
+pub fn json_shared_ref_no_false_cycle_test() {
+  let m =
+    compile("function f() { var x = { a: 1 }; return JSON.stringify([x, x]); }")
+  call(m, "f", []) |> should.equal(dyn("[{\"a\":1},{\"a\":1}]"))
+}
