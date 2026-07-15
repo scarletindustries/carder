@@ -278,6 +278,14 @@ type Ctx {
     // top-level functions with a rest param → their FIXED param count (a call bundles
     // the trailing args into the rest array passed as the last parameter).
     fn_rest: Dict(String, Int),
+    // top-level function names whose body reads `this` and which therefore have a
+    // `<name>%this` implementation taking `this` as an explicit LEADING parameter
+    // (with `<name>/n` a thin wrapper forwarding the sloppy-mode default `this` =
+    // globalThis). A call/callback site that supplies a dynamic `this` — an Array
+    // iteration method's `thisArg`, or `.call`/`.apply`/`.bind` — targets the
+    // `%this` impl so the receiver reaches the function's `this` (wave 14). A name
+    // NOT in this set carries no `this` parameter, so a `thisArg` for it is dropped.
+    this_fns: List(String),
     classes: Dict(String, ClassInfo),
     // the superclass name while lowering a class's constructor/methods (for `super`).
     current_super: Option(String),
@@ -370,12 +378,24 @@ pub fn program(
         }
       }),
     )
+  // Top-level functions whose body reads `this`: `lower_function` splits each into a
+  // `<name>%this` impl (taking `this`) plus a wrapper, and a `thisArg` call site can
+  // target the impl to make the receiver reach the callback's `this` (wave 14).
+  let this_fns =
+    list.filter_map(decls, fn(d) {
+      let #(name, params, body) = d
+      case function_reads_this(pattern_names_lax(params), block_stmts(body)) {
+        True -> Ok(name)
+        False -> Error(Nil)
+      }
+    })
   let ctx =
     Ctx(
       module_name: module_name,
       funcs: fn_names,
       fn_arity:,
       fn_rest:,
+      this_fns:,
       classes:,
       current_super: None,
       loop: None,
@@ -389,12 +409,16 @@ pub fn program(
       top_level: False,
     )
 
-  use funcs <- result_try(
+  use func_pairs <- result_try(
     list.try_map(decls, fn(d) {
       let #(name, params, body) = d
       lower_function(name, params, body, ctx)
     }),
   )
+  // The exported wrapper (or plain function) of each declaration, plus the internal
+  // `%this` impls those with a `this` body produced.
+  let funcs = list.map(func_pairs, fn(p) { p.0 })
+  let func_extras = list.flat_map(func_pairs, fn(p) { p.1 })
   use main <- result_try(lower_main(top, ctx))
   use lambda_funcs <- result_try(
     list.try_map(dict.values(lambdas), fn(lam) { lower_lambda(lam, ctx) }),
@@ -404,10 +428,10 @@ pub fn program(
   )
   let class_funcs = list.flatten(class_fn_lists)
 
-  // The named JS functions (exported) plus the internal lifted lambdas + class
-  // methods (not exported).
+  // The named JS functions (exported) plus the internal `%this` impls, lifted
+  // lambdas, and class methods (not exported).
   let named = [main, ..funcs]
-  let functions = list.flatten([named, lambda_funcs, class_funcs])
+  let functions = list.flatten([named, func_extras, lambda_funcs, class_funcs])
   Ok(ir.Module(
     name: module_name,
     uses_numerics: True,
@@ -826,13 +850,17 @@ fn lower_class(
       )
     }),
   )
-  // static methods are plain functions (no `this`): reuse the top-level function path.
-  use static_fns <- result_try(
+  // static methods reuse the top-level function path (`this` inside a static method
+  // is not modelled beyond the sloppy default, so a `this`-reading static gets the
+  // wrapper + `%this` impl split like any plain function; its extras are collected).
+  use static_pairs <- result_try(
     list.try_map(parts.statics, fn(m) {
       let #(mname, mparams, mbody) = m
       lower_function(cname <> "$static$" <> mname, mparams, mbody, cctx)
     }),
   )
+  let static_fns = list.map(static_pairs, fn(p) { p.0 })
+  let static_extras = list.flat_map(static_pairs, fn(p) { p.1 })
   // accessors: each getter is `C$get$name(this)`, each setter `C$set$name(this, v)`,
   // lowered like a method (this-first). A property may have either or both.
   use accessor_fns <- result_try(
@@ -865,7 +893,13 @@ fn lower_class(
     }),
   )
   Ok(
-    list.flatten([[ctor_fn], method_fns, static_fns, list.flatten(accessor_fns)]),
+    list.flatten([
+      [ctor_fn],
+      method_fns,
+      static_fns,
+      static_extras,
+      list.flatten(accessor_fns),
+    ]),
   )
 }
 
@@ -1670,12 +1704,29 @@ fn transform_generator(
   Ok(gen_wrap(param_names, locals, st))
 }
 
+/// Lower a top-level `function` declaration (also reused for a class's STATIC
+/// methods) to its IR function(s).
+///
+/// Returns `#(exported, extras)`: `exported` is the `<name>/n` function the module
+/// exports and every ordinary call site targets; `extras` is the additional internal
+/// functions to add to the module (NOT exported).
+///
+/// If the body references `this` (directly, or through a nested arrow/function
+/// expression that captures it in this model), the function is split so `this` can be
+/// a real call-time value (wave 14): an implementation `<name>%this/(n+1)` takes
+/// `this` as an explicit LEADING parameter, and the exported `<name>/n` becomes a thin
+/// wrapper that forwards the sloppy-mode default `this` (the `globalThis` singleton,
+/// §10.2.1.2) — so a plain `f(…)` call is behaviour-identical to before (its `this`
+/// was already `globalThis`). A call site that has a dynamic receiver (an iteration
+/// method's `thisArg`, or `.call`/`.apply`/`.bind`) instead targets the `%this` impl,
+/// making the receiver reach the function's `this`. If the body never reads `this`,
+/// a single unchanged `<name>/n` function is produced (`extras` empty).
 fn lower_function(
   name: String,
   params: List(ast.Pattern),
   body: ast.Statement,
   ctx: Ctx,
-) -> Result(ir.Function, Error) {
+) -> Result(#(ir.Function, List(ir.Function)), Error) {
   use #(pnames, defaults, rest) <- result_try(param_info(params))
   // A rest param is an ordinary trailing parameter bound to an array (the caller
   // bundles the extra args); no default prologue applies to it.
@@ -1683,10 +1734,6 @@ fn lower_function(
     Some(r) -> list.append(pnames, [r])
     None -> pnames
   }
-  let env =
-    list.fold(all_params, dict.new(), fn(acc, n) {
-      dict.insert(acc, n, ir.Var(n))
-    })
   let stmts = list.append(default_prologue(defaults), block_stmts(body))
   let ctx2 =
     Ctx(
@@ -1694,14 +1741,83 @@ fn lower_function(
       scope_mutated: assigned_in(stmts),
       ctor_aliases: ctor_aliases_of(stmts),
     )
-  use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
-  Ok(ir.Function(
-    name: name,
-    params: list.map(all_params, fn(n) { ir.Local(n, ir.TTerm) }),
-    result: [ir.TTerm],
-    locals: [],
-    body: body_expr,
-  ))
+  case function_reads_this(all_params, block_stmts(body)) {
+    // No `this` in the body — the ordinary single-function lowering (unchanged).
+    False -> {
+      let env =
+        list.fold(all_params, dict.new(), fn(acc, n) {
+          dict.insert(acc, n, ir.Var(n))
+        })
+      use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
+      Ok(
+        #(
+          ir.Function(
+            name: name,
+            params: list.map(all_params, fn(n) { ir.Local(n, ir.TTerm) }),
+            result: [ir.TTerm],
+            locals: [],
+            body: body_expr,
+          ),
+          [],
+        ),
+      )
+    }
+    // The body reads `this` — split into a `this`-taking impl plus an exported
+    // wrapper that supplies the default `this` (globalThis).
+    True -> {
+      let impl_name = this_impl_name(name)
+      let impl_params = ["this", ..all_params]
+      let env =
+        list.fold(impl_params, dict.new(), fn(acc, n) {
+          dict.insert(acc, n, ir.Var(n))
+        })
+      use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
+      let impl =
+        ir.Function(
+          name: impl_name,
+          params: list.map(impl_params, fn(n) { ir.Local(n, ir.TTerm) }),
+          result: [ir.TTerm],
+          locals: [],
+          body: body_expr,
+        )
+      // `<name>/n (p…) = <name>%this/(n+1)(globalThis, p…)`.
+      let call =
+        ir.CallDirect(impl_name, [ir.Var("%gt"), ..list.map(all_params, ir.Var)])
+      let wrapper_body =
+        ir.Let(
+          ["%gt"],
+          ir.CallHost("js", "globalthis_new", []),
+          ir.Let(["%r"], call, ir.Return([ir.Var("%r")])),
+        )
+      let wrapper =
+        ir.Function(
+          name: name,
+          params: list.map(all_params, fn(n) { ir.Local(n, ir.TTerm) }),
+          result: [ir.TTerm],
+          locals: [],
+          body: wrapper_body,
+        )
+      Ok(#(wrapper, [impl]))
+    }
+  }
+}
+
+/// The internal implementation name for a `this`-taking function: `<name>%this`. The
+/// `%` byte can never appear in a JS identifier (nor in a lifted class/lambda name,
+/// which use `$`), so this never collides with a user function or a generated name.
+fn this_impl_name(name: String) -> String {
+  name <> "%this"
+}
+
+/// True when a function body references `this`. In this compiler's model a nested
+/// arrow OR function expression captures `this` lexically, so a `this` anywhere in the
+/// body (including inside such nested functions) makes the enclosing function's `this`
+/// observable — exactly the free-variable test `fv_lambda` already computes.
+fn function_reads_this(
+  params: List(String),
+  body: List(ast.Statement),
+) -> Bool {
+  list.contains(fv_lambda(params, body), "this")
 }
 
 fn lower_main(
