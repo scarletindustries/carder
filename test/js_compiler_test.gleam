@@ -6478,3 +6478,104 @@ pub fn iter_short_circuit_closes_underlying_test() {
     )
   to_float(call(m2, "f", [])) |> should.equal(1.0)
 }
+
+// ==== first-class constructors (wave 10) ====
+// Binding the built-in constructors (Array/Object/String/Number/Boolean/Function/
+// RegExp/Date/Map/Set) as first-class fun VALUES: a bare reference resolves (so
+// `typeof X === "function"` and `X` is assignable/passable), `X.prototype` is a
+// stable marker, `value.constructor` is the matching constructor, and `x
+// instanceof X` brands hold. Spec-driven against ECMA-262 (the intrinsics are
+// %Array%, %Object%, … each `typeof` "function").
+
+// A bare constructor reference has `typeof` "function" (each intrinsic ctor is a
+// callable object): §20.1.1 / §23.1.1 / §22.2.4 etc.
+pub fn ctor_typeof_test() {
+  val("typeof Array === \"function\"") |> should.equal(dyn(True))
+  val("typeof Object === \"function\"") |> should.equal(dyn(True))
+  val("typeof String === \"function\"") |> should.equal(dyn(True))
+  val("typeof Number === \"function\"") |> should.equal(dyn(True))
+  val("typeof Boolean === \"function\"") |> should.equal(dyn(True))
+  val("typeof Function === \"function\"") |> should.equal(dyn(True))
+  val("typeof RegExp === \"function\"") |> should.equal(dyn(True))
+  val("typeof Date === \"function\"") |> should.equal(dyn(True))
+  val("typeof Map === \"function\"") |> should.equal(dyn(True))
+  val("typeof Set === \"function\"") |> should.equal(dyn(True))
+}
+
+// A constructor reference is a stable value: `Array === Array` holds (fun identity),
+// so it can be compared / stored / passed as an argument.
+pub fn ctor_identity_test() {
+  val("Array === Array") |> should.equal(dyn(True))
+  val("Object === Object") |> should.equal(dyn(True))
+  val("Array === Object") |> should.equal(dyn(False))
+}
+
+// A constructor bound to a variable and CALLED (`let f = Array; f(1, 2, 3)`) builds
+// the same result as the direct `Array(1, 2, 3)` form (§23.1.1.1): a 3-element array.
+pub fn ctor_alias_call_test() {
+  let m = compile("function f() { let f = Array; return f(1, 2, 3).length; }")
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+  // const alias, single-argument length form: `Array(5)` is a length-5 array.
+  let m2 = compile("function f() { const A = Array; return A(5).length; }")
+  to_float(call(m2, "f", [])) |> should.equal(5.0)
+}
+
+// `X.prototype` is a STABLE per-constructor marker: `Array.prototype ===
+// Array.prototype` (identity) and `Array.prototype !== Object.prototype` (distinct).
+pub fn ctor_prototype_identity_test() {
+  val("Array.prototype === Array.prototype") |> should.equal(dyn(True))
+  val("Object.prototype === Object.prototype") |> should.equal(dyn(True))
+  val("Array.prototype === Object.prototype") |> should.equal(dyn(False))
+  val("typeof Array.prototype === \"object\"") |> should.equal(dyn(True))
+}
+
+// `value.constructor` is the matching constructor value for the built-in cell types
+// (§23.1.3.2 Array.prototype.constructor === Array, §20.1.3.1 Object.prototype.…).
+pub fn ctor_value_constructor_test() {
+  val("[].constructor === Array") |> should.equal(dyn(True))
+  val("({}).constructor === Object") |> should.equal(dyn(True))
+  val("(/a/).constructor === RegExp") |> should.equal(dyn(True))
+  val("[].constructor === Object") |> should.equal(dyn(False))
+}
+
+// `x instanceof X` with X a built-in constructor (RHS resolved via the brand
+// mechanism): an array is `instanceof Array` and `instanceof Object`; a plain
+// object is `instanceof Object` but NOT `instanceof Array` (§7.3.20 InstanceofOperator).
+pub fn ctor_instanceof_test() {
+  val("[] instanceof Array") |> should.equal(dyn(True))
+  val("[] instanceof Object") |> should.equal(dyn(True))
+  val("({}) instanceof Object") |> should.equal(dyn(True))
+  val("({}) instanceof Array") |> should.equal(dyn(False))
+  val("(/a/) instanceof RegExp") |> should.equal(dyn(True))
+}
+
+// The direct call-without-`new` coercions of `Object`/`String`/`Number`/`Boolean`:
+// `Object(x)` on an object is identity (§20.1.1.1 step 3), on undefined a fresh
+// object (step 2); the primitive constructors coerce their argument.
+pub fn ctor_call_coercions_test() {
+  let m = compile("function f() { var o = {}; return Object(o) === o; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+  val("typeof Object(undefined) === \"object\"") |> should.equal(dyn(True))
+  val("String(42) === \"42\"") |> should.equal(dyn(True))
+  val("Number(\"3.5\") === 3.5") |> should.equal(dyn(True))
+  val("Boolean(0) === false") |> should.equal(dyn(True))
+  val("Boolean(1) === true") |> should.equal(dyn(True))
+}
+
+// A constructor passed as a callback resolves as a value and is applied per element
+// (via the array-method call convention): `[1, 2, 3].map(String)` stringifies each.
+pub fn ctor_as_callback_test() {
+  let m = compile("function f() { return [1, 2, 3].map(String).join(\",\"); }")
+  call(m, "f", []) |> should.equal(dyn("1,2,3"))
+}
+
+// A closure that REFERENCES a constructor must NOT capture it as a free variable
+// (it resolves at use), so an `assert.throws`-style check over a closure that calls
+// a constructor compiles and runs: `Map()` without `new` is a TypeError (§24.1.1.1).
+pub fn ctor_in_closure_throws_test() {
+  let m =
+    compile(
+      "function check(fn) { try { fn(); } catch (e) { return 1; } return 0; } function f() { return check(function () { return Map(); }); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}

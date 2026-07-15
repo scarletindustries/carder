@@ -271,6 +271,11 @@ type Ctx {
     pending_label: Option(String),
     lambdas: Dict(ast.Span, Lambda),
     scope_mutated: List(String),
+    // names bound once (never reassigned) to a bare built-in constructor in this
+    // function scope (`let f = Array`) → the constructor name. A `f(args)` call is
+    // then routed to the constructor's own construct, since a constructor fun VALUE
+    // is arity-fixed and cannot serve a variadic `f(1, 2, 3)` through a closure call.
+    ctor_aliases: Dict(String, String),
     // TOP-LEVEL var/let/const names — a module-global store (via static_get/set with
     // class `module_name<>"$g"`) so a callback can mutate a top-level flag that
     // `main` then reads. A function-local of the same name shadows the global.
@@ -361,6 +366,7 @@ pub fn program(
       pending_label: None,
       lambdas:,
       scope_mutated: [],
+      ctor_aliases: dict.new(),
       globals: globals,
       top_level: False,
     )
@@ -735,7 +741,12 @@ fn lower_class_method(
   let env =
     list.fold(all, dict.new(), fn(acc, n) { dict.insert(acc, n, ir.Var(n)) })
   let stmts = list.append(default_prologue(defaults), body_stmts)
-  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
+  let ctx2 =
+    Ctx(
+      ..ctx,
+      scope_mutated: assigned_in(stmts),
+      ctor_aliases: ctor_aliases_of(stmts),
+    )
   use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
   Ok(ir.Function(
     name: fn_name,
@@ -1659,7 +1670,12 @@ fn lower_function(
       dict.insert(acc, n, ir.Var(n))
     })
   let stmts = list.append(default_prologue(defaults), block_stmts(body))
-  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts))
+  let ctx2 =
+    Ctx(
+      ..ctx,
+      scope_mutated: assigned_in(stmts),
+      ctor_aliases: ctor_aliases_of(stmts),
+    )
   use #(body_expr, _ctr) <- result_try(lower_body(stmts, env, ctx2, 0))
   Ok(ir.Function(
     name: name,
@@ -1674,7 +1690,13 @@ fn lower_main(
   stmts: List(ast.Statement),
   ctx: Ctx,
 ) -> Result(ir.Function, Error) {
-  let ctx2 = Ctx(..ctx, scope_mutated: assigned_in(stmts), top_level: True)
+  let ctx2 =
+    Ctx(
+      ..ctx,
+      scope_mutated: assigned_in(stmts),
+      ctor_aliases: ctor_aliases_of(stmts),
+      top_level: True,
+    )
   use #(body, _ctr) <- result_try(lower_body(stmts, dict.new(), ctx2, 0))
   Ok(ir.Function(
     name: "main",
@@ -3185,8 +3207,29 @@ fn lower_expr(
                         // global property.
                         False, "globalThis" ->
                           Ok(bind1(ir.CallHost("js", "globalthis_new", []), ctr))
+                        // A bare reference to a built-in CONSTRUCTOR
+                        // (`Array`/`Object`/`String`/`Number`/`Boolean`/`Function`/
+                        // `RegExp`/`Date`/`Map`/`Set`) resolves to the constructor as
+                        // a first-class fun VALUE (checked LAST, so a user-declared
+                        // binding of the same name shadows it), so `typeof Array` is
+                        // "function", `Array === Array`, and it can be assigned /
+                        // passed as an argument. The direct `Array(...)` / `new
+                        // Array(...)` / `Array.method(...)` forms are lowered
+                        // structurally elsewhere and never reach this fun.
                         False, _ ->
-                          Error(Unsupported("unbound identifier '" <> x <> "'"))
+                          case is_bindable_ctor(x) {
+                            True ->
+                              Ok(bind1(
+                                ir.CallHost("js", "builtin_ctor", [
+                                  ir.ConstBinary(<<x:utf8>>),
+                                ]),
+                                ctr,
+                              ))
+                            False ->
+                              Error(Unsupported(
+                                "unbound identifier '" <> x <> "'",
+                              ))
+                          }
                       }
                   }
               }
@@ -4166,80 +4209,101 @@ fn lower_call_fixed(
     ) -> lower_method(object, method, arguments, env, ctx, ctr)
     // f(args) where f is a top-level function → direct call.
     ast.Identifier(name: fname, ..) ->
-      case list.contains(ctx.funcs, fname) {
-        True -> {
-          use #(binds, argvals, ctr) <- result_try(lower_args(
-            arguments,
-            env,
-            ctx,
-            ctr,
-          ))
-          case dict.get(ctx.fn_rest, fname) {
-            // rest param: pass the fixed args (padded) + a rest array of the remainder.
-            Ok(fixed) -> {
-              let front = fit_args(list.take(argvals, fixed), fixed)
-              let #(bl, listv, ctr) =
-                build_list(list.drop(argvals, fixed), binds, ctr)
-              let #(ba, rest_arr, ctr) =
-                bind_after(bl, ir.CallHost("js", "new_array", [listv]), ctr)
-              Ok(bind_after(
-                ba,
-                ir.CallDirect(fname, list.append(front, [rest_arr])),
-                ctr,
-              ))
-            }
-            // BEAM funs are arity-strict; JS is not. Pad missing args with `undefined`
-            // (so defaults apply) and drop extras, matching the declared arity.
-            Error(Nil) -> {
-              let arity = case dict.get(ctx.fn_arity, fname) {
-                Ok(a) -> a
-                Error(Nil) -> list.length(argvals)
-              }
-              Ok(bind_after(
-                binds,
-                ir.CallDirect(fname, fit_args(argvals, arity)),
-                ctr,
-              ))
-            }
-          }
-        }
-        // f is a value (a closure in a variable) → CallClosure.
-        False ->
-          case dict.get(env, fname) {
-            Ok(fv) -> {
+      // A stable constructor alias (`let f = Array; f(1, 2, 3)`) routes the call to
+      // the constructor's construct — checked FIRST, since the alias's local
+      // binding shadows a same-named top-level function, and the constructor fun
+      // VALUE cannot be applied at an arbitrary arity through a closure call.
+      case dict.get(ctx.ctor_aliases, fname) {
+        Ok(ctor_name) -> lower_ctor_call(ctor_name, arguments, env, ctx, ctr)
+        Error(Nil) ->
+          case list.contains(ctx.funcs, fname) {
+            True -> {
               use #(binds, argvals, ctr) <- result_try(lower_args(
                 arguments,
                 env,
                 ctx,
                 ctr,
               ))
-              Ok(bind_after(binds, ir.CallClosure(fv, argvals), ctr))
+              case dict.get(ctx.fn_rest, fname) {
+                // rest param: pass the fixed args (padded) + a rest array of the remainder.
+                Ok(fixed) -> {
+                  let front = fit_args(list.take(argvals, fixed), fixed)
+                  let #(bl, listv, ctr) =
+                    build_list(list.drop(argvals, fixed), binds, ctr)
+                  let #(ba, rest_arr, ctr) =
+                    bind_after(bl, ir.CallHost("js", "new_array", [listv]), ctr)
+                  Ok(bind_after(
+                    ba,
+                    ir.CallDirect(fname, list.append(front, [rest_arr])),
+                    ctr,
+                  ))
+                }
+                // BEAM funs are arity-strict; JS is not. Pad missing args with `undefined`
+                // (so defaults apply) and drop extras, matching the declared arity.
+                Error(Nil) -> {
+                  let arity = case dict.get(ctx.fn_arity, fname) {
+                    Ok(a) -> a
+                    Error(Nil) -> list.length(argvals)
+                  }
+                  Ok(bind_after(
+                    binds,
+                    ir.CallDirect(fname, fit_args(argvals, arity)),
+                    ctr,
+                  ))
+                }
+              }
             }
-            Error(_) ->
-              case is_global(fname, ctx) {
-                // A module-global holding a function, called as `g(args)`.
-                True -> {
-                  let #(bg, fv, ctr) = bind1(global_read(fname, ctx), ctr)
+            // f is a value (a closure in a variable) → CallClosure.
+            False ->
+              case dict.get(env, fname) {
+                Ok(fv) -> {
                   use #(binds, argvals, ctr) <- result_try(lower_args(
                     arguments,
                     env,
                     ctx,
                     ctr,
                   ))
-                  Ok(bind_after(
-                    list.append(bg, binds),
-                    ir.CallClosure(fv, argvals),
-                    ctr,
-                  ))
+                  Ok(bind_after(binds, ir.CallClosure(fv, argvals), ctr))
                 }
-                False ->
-                  case is_global_fn(fname) {
-                    True -> lower_global_call(fname, arguments, env, ctx, ctr)
+                Error(_) ->
+                  case is_global(fname, ctx) {
+                    // A module-global holding a function, called as `g(args)`.
+                    True -> {
+                      let #(bg, fv, ctr) = bind1(global_read(fname, ctx), ctr)
+                      use #(binds, argvals, ctr) <- result_try(lower_args(
+                        arguments,
+                        env,
+                        ctx,
+                        ctr,
+                      ))
+                      Ok(bind_after(
+                        list.append(bg, binds),
+                        ir.CallClosure(fv, argvals),
+                        ctr,
+                      ))
+                    }
                     False ->
-                      case dynamic_code(fname) {
-                        True -> Error(dynamic_code_unsupported(fname))
+                      case is_global_fn(fname) {
+                        True ->
+                          lower_global_call(fname, arguments, env, ctx, ctr)
                         False ->
-                          Error(Unsupported("call to unknown '" <> fname <> "'"))
+                          // A direct call of a built-in constructor NAME with no
+                          // dedicated call lowering above (`Map()`/`Set()` throw
+                          // requires-`new`, `Date()` renders a string, `Function`
+                          // is the AOT boundary). `Array`/`Object`/`String`/…
+                          // were already routed earlier.
+                          case is_bindable_ctor(fname) {
+                            True ->
+                              lower_ctor_call(fname, arguments, env, ctx, ctr)
+                            False ->
+                              case dynamic_code(fname) {
+                                True -> Error(dynamic_code_unsupported(fname))
+                                False ->
+                                  Error(Unsupported(
+                                    "call to unknown '" <> fname <> "'",
+                                  ))
+                              }
+                          }
                       }
                   }
               }
@@ -4340,6 +4404,8 @@ fn is_global_fn(name: String) -> Bool {
     | "Number"
     | "Boolean"
     | "RegExp"
+    | // `Object(x)` called WITHOUT `new` (§20.1.1.1) — ToObject-ish coercion.
+      "Object"
     | "parseInt"
     | "parseFloat"
     | "isNaN"
@@ -4401,6 +4467,126 @@ fn is_error_ctor(name: String) -> Bool {
   }
 }
 
+/// The built-in constructors this compiler binds as first-class fun VALUES (wave
+/// 10): the wrapper/collection constructors that a program may reference as a
+/// value — `typeof Array === "function"`, `let f = Array`, `arr.constructor ===
+/// Array`, `Array.prototype`. Each resolves (as a bare identifier, checked LAST so
+/// a user binding shadows it) to `builtin_ctor(name)`. This is distinct from the
+/// error constructors (`is_error_ctor`, wave 4), `Symbol`/`WeakMap`/`WeakSet`
+/// (waves 6–7), and `globalThis` (wave 8), which have their own resolution.
+/// `Symbol`/`WeakMap`/`WeakSet`/`Promise` are intentionally NOT here.
+fn is_bindable_ctor(name: String) -> Bool {
+  case name {
+    "Array"
+    | "Object"
+    | "String"
+    | "Number"
+    | "Boolean"
+    | "Function"
+    | "RegExp"
+    | "Date"
+    | "Map"
+    | "Set" -> True
+    _ -> False
+  }
+}
+
+/// The stable constructor-alias map for a function scope: each name bound EXACTLY
+/// ONCE to a bare built-in-constructor identifier (`let f = Array`, `const O =
+/// Object`) and NEVER reassigned → the constructor name. Such an `f(args)` call is
+/// routed to the constructor's construct (see `lower_ctor_call`), because a
+/// constructor fun VALUE has a fixed arity and cannot serve a variadic `f(1, 2,
+/// 3)` through an arity-strict closure call. A name declared more than once, or
+/// reassigned, is left to the ordinary value/closure path (unaliased).
+fn ctor_aliases_of(stmts: List(ast.Statement)) -> Dict(String, String) {
+  let mutated = assigned_in(stmts)
+  let decls = ctor_alias_decls(stmts)
+  // Count declarations per name so a name declared twice is not aliased.
+  let counts =
+    list.fold(decls, dict.new(), fn(acc, pair) {
+      dict.upsert(acc, pair.0, fn(o) {
+        case o {
+          Some(n) -> n + 1
+          None -> 1
+        }
+      })
+    })
+  list.fold(decls, dict.new(), fn(acc, pair) {
+    let #(name, ctor) = pair
+    case dict.get(counts, name) == Ok(1) && !list.contains(mutated, name) {
+      True -> dict.insert(acc, name, ctor)
+      False -> acc
+    }
+  })
+}
+
+/// Every `NAME = <bindable-ctor identifier>` declarator in a statement list,
+/// recursing through control flow but NOT into nested functions (a flat function
+/// scope), as `#(name, ctorName)`. Only a simple identifier binding with a bare
+/// built-in-constructor initializer qualifies.
+fn ctor_alias_decls(stmts: List(ast.Statement)) -> List(#(String, String)) {
+  list.flat_map(stmts, ctor_alias_decls_stmt)
+}
+
+fn ctor_alias_decls_stmt(s: ast.Statement) -> List(#(String, String)) {
+  let here = case s {
+    ast.VariableDeclaration(declarations:, ..) ->
+      list.filter_map(declarations, fn(d) {
+        case d {
+          ast.VariableDeclarator(
+            id: ast.IdentifierPattern(name: n, ..),
+            init: Some(ast.Identifier(name: c, ..)),
+          ) ->
+            case is_bindable_ctor(c) {
+              True -> Ok(#(n, c))
+              False -> Error(Nil)
+            }
+          _ -> Error(Nil)
+        }
+      })
+    _ -> []
+  }
+  list.append(here, list.flat_map(child_stmts(s), ctor_alias_decls_stmt))
+}
+
+/// A call to a built-in constructor NAME used as a callee — either directly
+/// (`Array(1, 2, 3)`) or through a stable alias (`let f = Array; f(1, 2, 3)`). It
+/// routes to the same construct as the direct form: `Array` builds an array,
+/// `Function` is the ahead-of-time boundary, `Object`/`String`/`Number`/`Boolean`/
+/// `RegExp` go through `lower_global_call`'s call-without-`new` coercions, and
+/// `Date`/`Map`/`Set` (which have no plain-call construct of their own) apply the
+/// constructor fun VALUE — so `Map()`/`Set()` without `new` throw a TypeError
+/// (§24.1.1.1 / §24.2.1.1) and `Date()` renders the current instant.
+fn lower_ctor_call(
+  name: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case name {
+    "Array" -> lower_array_construct(arguments, env, ctx, ctr)
+    "Function" -> Error(dynamic_code_unsupported("Function"))
+    "Date" | "Map" | "Set" -> {
+      use #(binds, argvals, ctr) <- result_try(lower_args(
+        arguments,
+        env,
+        ctx,
+        ctr,
+      ))
+      let #(bf, fnv, ctr) =
+        bind_after(
+          binds,
+          ir.CallHost("js", "builtin_ctor", [ir.ConstBinary(<<name:utf8>>)]),
+          ctr,
+        )
+      let #(bl, listv, ctr) = build_list(argvals, bf, ctr)
+      Ok(bind_after(bl, ir.CallHost("js", "apply_fn", [fnv, listv]), ctr))
+    }
+    _ -> lower_global_call(name, arguments, env, ctx, ctr)
+  }
+}
+
 /// A global builtin function call: `String`/`Number`/`Boolean` coercions and
 /// `parseInt`/`parseFloat`/`isNaN`/`isFinite`.
 fn lower_global_call(
@@ -4428,6 +4614,10 @@ fn lower_global_call(
       Ok(bind_after(b2, bool_term(i), ctr))
     }
     "Boolean", [] -> Ok(#(binds, ir.ConstAtom("false"), ctr))
+    // `Object(x)` without `new` (§20.1.1.1): an object flows through; a nullish
+    // argument (or none) yields a fresh object; a primitive is returned as-is.
+    "Object", [x, ..] -> host("to_object", [x])
+    "Object", [] -> host("to_object", [undefined()])
     // `RegExp(pattern, flags)` called WITHOUT `new` — same construction as
     // `new RegExp(...)` per §22.2.3.1 (a v1 simplification always builds a fresh
     // RegExp rather than returning an existing regex argument unchanged).
@@ -5699,6 +5889,29 @@ fn lower_member(
         ir.CallHost("js", "str_proto_fn", [ir.ConstBinary(<<m:utf8>>)]),
         ctr,
       ))
+    // `X.prototype` (bare) for a bound built-in constructor — a STABLE
+    // per-constructor marker value, so `Array.prototype === Array.prototype` holds
+    // and `Array.prototype !== Object.prototype`. It is NOT a real prototype
+    // object. `X.prototype.<method>` (nested) is handled by the `.prototype.<name>`
+    // arms ABOVE (whose object is a MemberExpression), so this only backs the bare
+    // reference. Placed before the `Number.<const>` arm so `Number.prototype`
+    // resolves here rather than falling through to a member read of the ctor fun.
+    ast.Identifier(name: c, ..), ast.Identifier(name: "prototype", ..), False
+      if c == "Array"
+      || c == "Object"
+      || c == "String"
+      || c == "Number"
+      || c == "Boolean"
+      || c == "Function"
+      || c == "RegExp"
+      || c == "Date"
+      || c == "Map"
+      || c == "Set"
+    ->
+      Ok(bind1(
+        ir.CallHost("js", "builtin_prototype", [ir.ConstBinary(<<c:utf8>>)]),
+        ctr,
+      ))
     // Math.PI / Math.E / … — a compile-time numeric constant (Math is not a value).
     ast.Identifier(name: "Math", ..), ast.Identifier(name: c, ..), False ->
       case math_const(c) {
@@ -6197,6 +6410,12 @@ fn builtin_namespace_names() -> List(String) {
   [
     "Math", "JSON", "Object", "Number", "Array", "String", "Date", "Symbol",
     "Reflect", "Boolean",
+    // wave 10: the built-in constructors bound as first-class values — a closure
+    // that mentions one (`() => Array(x)`, `assert.throws(TypeError, () => Map())`)
+    // resolves it at use via `builtin_ctor`, so it must NOT be captured as a free
+    // variable (there is no enclosing binding to capture). RegExp/Function/Map/Set
+    // are added here; the rest are already listed as namespaces above.
+    "RegExp", "Function", "Map", "Set",
   ]
 }
 
