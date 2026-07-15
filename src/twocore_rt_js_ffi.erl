@@ -66,7 +66,7 @@
     new_object/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
-    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2,
+    array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
     apply_fn/2, func_call/2, func_apply/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
@@ -1982,6 +1982,21 @@ array_at(Recv, I) ->
         true -> maps:get(Idx, Map, undefined);
         false -> undefined
     end.
+
+%% `Array.prototype.<name>` as a first-class function VALUE (§23.1.3): the built-in
+%% method extracted off the prototype. In this model the method is UNBOUND — its
+%% `this` is supplied as the first argument — so the returned BEAM fun takes the
+%% receiver first and the method's own arguments after (e.g. `Fn(Arr, I)` for
+%% `at`). This makes `typeof Array.prototype.at` be "function" and the extracted
+%% method callable receiver-first. `Name` is the method name as a binary; only the
+%% methods the frontend routes here are known (an unknown name is a TypeError, as
+%% no such own method exists).
+array_proto_fn(<<"at">>) -> fun(This, I) -> array_at(This, I) end;
+array_proto_fn(<<"flat">>) -> fun(This, D) -> array_flat(This, D) end;
+array_proto_fn(<<"flatMap">>) -> fun(This, F) -> array_flat_map(This, F) end;
+array_proto_fn(<<"findLast">>) -> fun(This, F) -> array_find_last(This, F) end;
+array_proto_fn(<<"findLastIndex">>) -> fun(This, F) -> array_find_last_index(This, F) end;
+array_proto_fn(Name) -> type_error(Name).
 
 at_index(I, Len) ->
     N =
@@ -4378,8 +4393,18 @@ afindi(Fn, Arr, K, Len) ->
 
 %% arr.flatMap(fn) — map then flatten one level. Skips holes (present-element
 %% check), re-reads the live array, and bounds iteration by the entry length.
+%% Reject a non-callable callback with a TypeError, per the `If IsCallable(fn) is
+%% false, throw a TypeError` step that array iteration methods run BEFORE visiting
+%% any element (so an empty array still throws). Returns `ok` when `Fn` is callable.
+require_callable(Fn) ->
+    case is_function(Fn) of
+        true -> ok;
+        false -> not_callable(Fn)
+    end.
+
 array_flat_map(Recv, Fn) ->
     {Len, _Map} = arr_content(Recv),
+    require_callable(Fn),
     new_array(aflatmap(Fn, Recv, 0, Len)).
 aflatmap(_, _, K, Len) when K >= Len -> [];
 aflatmap(Fn, Arr, K, Len) ->
@@ -4392,6 +4417,7 @@ aflatmap(Fn, Arr, K, Len) ->
 %% visit every index from Len-1 down to 0 (a hole reads as undefined), live re-read.
 array_find_last(Recv, Fn) ->
     {Len, _Map} = arr_content(Recv),
+    require_callable(Fn),
     afind_last(Fn, Recv, Len - 1).
 afind_last(_, _, K) when K < 0 -> undefined;
 afind_last(Fn, Arr, K) ->
@@ -4403,6 +4429,7 @@ afind_last(Fn, Arr, K) ->
 
 array_find_last_index(Recv, Fn) ->
     {Len, _Map} = arr_content(Recv),
+    require_callable(Fn),
     afind_last_i(Fn, Recv, Len - 1).
 afind_last_i(_, _, K) when K < 0 -> -1;
 afind_last_i(Fn, Arr, K) ->

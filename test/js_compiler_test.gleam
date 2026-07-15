@@ -5,6 +5,7 @@
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/int
+import gleam/list
 import gleam/string
 import gleeunit/should
 import twocore/frontend/js
@@ -5795,4 +5796,62 @@ pub fn symbol_description_not_own_test() {
   let m =
     compile("function f(){ return Symbol().hasOwnProperty('description'); }")
   call(m, "f", []) |> should.equal(dyn(False))
+}
+
+// ==== Array (wave 8) ====
+
+// §23.1.3: `Array.prototype.<method>` is a callable (a built-in function), so
+// `typeof Array.prototype.at` etc. is "function". These methods are exposed as
+// first-class function values (unbound, receiver-first in this model).
+pub fn array_proto_method_is_function_test() {
+  val("typeof Array.prototype.at") |> should.equal(dyn("function"))
+  val("typeof Array.prototype.flat") |> should.equal(dyn("function"))
+  val("typeof Array.prototype.flatMap") |> should.equal(dyn("function"))
+  val("typeof Array.prototype.findLast") |> should.equal(dyn("function"))
+  val("typeof Array.prototype.findLastIndex") |> should.equal(dyn("function"))
+}
+
+// §23.1.3.12 Array.prototype.flatMap step 3 / §23.1.3.9 findLast step 3 /
+// §23.1.3.10 findLastIndex step 3: `If IsCallable(callbackfn) is false, throw a
+// TypeError` runs BEFORE any element is visited — so even an EMPTY array throws
+// when the callback is not callable (or absent).
+pub fn array_iteration_noncallable_throws_test() {
+  let cases = [
+    "function f(){ return [].flatMap({}); }",
+    "function f(){ return [].flatMap(0); }",
+    "function f(){ return [].flatMap(); }",
+    "function f(){ return [].flatMap(null); }",
+    "function f(){ return [].findLast({}); }",
+    "function f(){ return [].findLast(); }",
+    "function f(){ return [].findLastIndex(true); }",
+    "function f(){ return [].findLastIndex(); }",
+  ]
+  list.each(cases, fn(src) {
+    let m = compile(src)
+    let threw = case catch_apply(m, atom.create("f"), []) {
+      Error(_) -> True
+      Ok(_) -> False
+    }
+    threw |> should.equal(True)
+  })
+}
+
+// A callable predicate is still accepted (the guard does not reject functions):
+// flatMap flattens one level, findLast/findLastIndex scan from the end.
+pub fn array_iteration_callable_ok_test() {
+  num("[1, 2, 3].flatMap(x => [x, x * 2])[3]") |> should.equal(4.0)
+  num("[1, 2, 3, 4].findLast(x => x % 2 === 1)") |> should.equal(3.0)
+  num("[1, 2, 3, 4].findLastIndex(x => x % 2 === 1)") |> should.equal(2.0)
+}
+
+// §23.1.3.1 Array.prototype.at: relative indexing with ToIntegerOrInfinity and
+// holes reading as `undefined`. `a.at(-0)` is index 0; a hole and an out-of-range
+// index both yield `undefined`; a non-integer index is truncated toward zero.
+pub fn array_at_holes_and_coercion_test() {
+  // [0, 1, <hole>, 3]
+  num("[0, 1, , 3].at(2) === undefined ? -1 : 99") |> should.equal(-1.0)
+  num("[0, 1, , 3].at(-0)") |> should.equal(0.0)
+  num("[0, 1, , 3].at(-1)") |> should.equal(3.0)
+  num("[10, 20, 30].at(1.9)") |> should.equal(20.0)
+  num("[10, 20, 30].at(5) === undefined ? -1 : 99") |> should.equal(-1.0)
 }
