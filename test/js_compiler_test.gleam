@@ -7019,3 +7019,55 @@ pub fn map_get_or_insert_computed_calls_callback_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(11.0)
 }
+
+// ==== Reflect (wave 13) ====
+
+// §28.1.13 Reflect.set(target, key, V): with the receiver omitted the receiver
+// defaults to the target (step 4.a), so the value is written on the target and a
+// successful write reports the boolean `true`.
+pub fn reflect_set_default_receiver_test() {
+  let m =
+    compile(
+      "function f() { var o = { p: 43 };"
+      <> " var r = Reflect.set(o, 'p', 42);"
+      <> " return (r === true ? 1 : 0) * 1000 + o.p; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1042.0)
+}
+
+// §28.1.13 / 9.1.9.2 OrdinarySetWithOwnDescriptor step 5.c–f: when a distinct
+// receiver object is supplied the data write lands on the RECEIVER, the target is
+// left unchanged, and the operation still reports `true`.
+pub fn reflect_set_distinct_receiver_test() {
+  let m =
+    compile(
+      "function f() { var o = { p: 43 }; var rec = { p: 44 };"
+      <> " var r = Reflect.set(o, 'p', 42, rec);"
+      <> " return (r === true ? 1 : 0) * 100000 + o.p * 100 + rec.p; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(104_342.0)
+}
+
+// §28.1.13 / 9.1.9.2 step 5.b: a data-property write with a non-Object receiver
+// (here a primitive string) returns `false` and mutates nothing on the target.
+pub fn reflect_set_primitive_receiver_false_test() {
+  let m =
+    compile(
+      "function f() { var o = { p: 42 };"
+      <> " var r = Reflect.set(o, 'p', 43, 'not an object');"
+      <> " return (r === false ? 1 : 0) * 1000 + o.p; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1042.0)
+}
+
+// §28.1.13 / 9.1.9.2 step 5.a: a frozen target presents a non-writable data
+// descriptor, so the write is refused with `false` and the value is unchanged.
+pub fn reflect_set_frozen_target_false_test() {
+  let m =
+    compile(
+      "function f() { var o = { p: 1 }; Object.freeze(o);"
+      <> " var r = Reflect.set(o, 'p', 2);"
+      <> " return (r === false ? 1 : 0) * 1000 + o.p; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1001.0)
+}

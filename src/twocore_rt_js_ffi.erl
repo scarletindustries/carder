@@ -110,7 +110,7 @@
     object_prevent_extensions/1, object_is_extensible/1,
     object_seal/1, object_is_sealed/1,
     object_from_entries/1, object_is/2, object_has_own/2,
-    reflect_has/2, reflect_get/2, reflect_set/3, reflect_delete_property/2,
+    reflect_has/2, reflect_get/2, reflect_set/4, reflect_delete_property/2,
     reflect_own_keys/1, reflect_get_prototype_of/1, reflect_is_extensible/1,
     reflect_prevent_extensions/1, reflect_apply/3,
     json_stringify/3, json_parse/1,
@@ -1914,18 +1914,50 @@ reflect_get(Target, Key) when is_reference(Target) ->
 reflect_get(Target, _Key) ->
     type_error(Target).
 
-%% Reflect.set(target, propertyKey, V) (§28.1.13) -> JS boolean success. TypeError
-%% if target is not an Object. A frozen/non-writable target makes the write a no-op
-%% and reports `false`; otherwise the write succeeds and reports `true`. The optional
-%% `receiver` is not modelled.
-reflect_set(Target, Key, V) when is_reference(Target) ->
+%% Reflect.set(target, propertyKey, V, Receiver) (§28.1.13) -> JS boolean success.
+%% TypeError if `target` is not an Object. Implements the receiver-aware portion of
+%% OrdinarySetWithOwnDescriptor (9.1.9.2) that is observable in this v1 model:
+%%
+%%   * A frozen `target` presents a non-writable data descriptor, so the write is
+%%     refused and `false` is returned (step 5.a).
+%%   * `Type(Receiver)` must be Object; a primitive receiver (string/number/…) is
+%%     refused with `false` and nothing is written (step 5.b).
+%%   * Otherwise the value is written on the RECEIVER, not the target (steps 5.c–f):
+%%     with no explicit receiver the lowering passes `Receiver = target`, so an
+%%     ordinary `Reflect.set(o, k, v)` still mutates `o`; with a distinct receiver
+%%     object the value lands there and the target is left untouched.
+%%   * A frozen receiver (existing property non-writable) or a non-extensible
+%%     receiver that lacks the key (CreateDataProperty fails) reports `false`.
+%%
+%% Individual per-property writable/accessor descriptors and the prototype-chain
+%% walk of step 4 are not modelled (no descriptor surface in v1).
+reflect_set(Target, Key, V, Receiver) when is_reference(Target) ->
     case erlang:get({js_frozen, Target}) =:= true of
-        true -> false;
+        true ->
+            false;
         _ ->
-            set_prop(Target, Key, V),
-            true
+            case is_reference(Receiver) of
+                false ->
+                    false;
+                true ->
+                    case erlang:get({js_frozen, Receiver}) =:= true of
+                        true ->
+                            false;
+                        _ ->
+                            HasOwn = has_prop(Receiver, Key) =:= 1,
+                            NonExt =
+                                erlang:get({js_nonextensible, Receiver}) =:= true,
+                            case (not HasOwn) andalso NonExt of
+                                true ->
+                                    false;
+                                false ->
+                                    set_prop(Receiver, Key, V),
+                                    true
+                            end
+                    end
+            end
     end;
-reflect_set(Target, _Key, _V) ->
+reflect_set(Target, _Key, _V, _Receiver) ->
     type_error(Target).
 
 %% Reflect.deleteProperty(target, propertyKey) (§28.1.4) -> JS boolean success.

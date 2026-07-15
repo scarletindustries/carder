@@ -4858,7 +4858,11 @@ fn lower_static_call(
     // argument of get/set is not modelled here.
     "Reflect", "has", [t, k, ..] -> host("reflect_has", [t, k])
     "Reflect", "get", [t, k, ..] -> host("reflect_get", [t, k])
-    "Reflect", "set", [t, k, v, ..] -> host("reflect_set", [t, k, v])
+    // Reflect.set(target, propertyKey, V[, receiver]): a missing receiver
+    // defaults to `target` (§28.1.13 step 4.a), so the ordinary 3-arg form still
+    // writes on the target. A distinct receiver diverts the write there.
+    "Reflect", "set", [t, k, v, r, ..] -> host("reflect_set", [t, k, v, r])
+    "Reflect", "set", [t, k, v] -> host("reflect_set", [t, k, v, t])
     "Reflect", "deleteProperty", [t, k, ..] ->
       host("reflect_delete_property", [t, k])
     "Reflect", "ownKeys", [t, ..] -> host("reflect_own_keys", [t])
