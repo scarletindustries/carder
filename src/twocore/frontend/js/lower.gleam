@@ -5289,6 +5289,16 @@ fn lower_instance_method(
     // iteration with a callback
     "map", [f, ..] -> host("array_map", [f])
     "filter", [f, ..] -> host("array_filter", [f])
+    // Iterator Helpers (§27.1.4): terminal `toArray` and lazy `take`/`drop`
+    // operate on a generator/iterator receiver (map/filter/forEach/some/every/
+    // find/reduce reuse the same-named array entry points, which dispatch on a
+    // `{js_gen, _}` receiver in the runtime). A missing limit lowers to
+    // `undefined` so ToIntegerOrInfinity yields 0.
+    "toArray", _ -> host("iter_to_array", [])
+    "take", [n, ..] -> host("iter_take", [n])
+    "take", [] -> host("iter_take", [undefined()])
+    "drop", [n, ..] -> host("iter_drop", [n])
+    "drop", [] -> host("iter_drop", [undefined()])
     // forEach + Map/Set methods dispatch on the receiver type in the runtime and
     // delegate (with ALL args) to a same-named user method on a plain object.
     // generator `.next(v)` — advances a generator, or delegates to a user

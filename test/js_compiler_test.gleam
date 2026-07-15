@@ -6306,3 +6306,175 @@ pub fn split_limit_truncates_test() {
   num("'abcd'.split('', 2).length") |> should.equal(2.0)
   val("'abcd'.split('', 2).join('') ") |> should.equal(dyn(<<"ab">>))
 }
+
+// ==== Iterator (wave 9) ====
+// Iterator Helpers proposal (§27.1.4): map/filter/take/drop are LAZY wrappers over
+// an underlying iterator returning a new iterator; toArray/forEach/some/every/find/
+// reduce are terminal. Each is driven here over a generator source, whose `.next()`
+// yields `{value, done}`. Tests assert the spec's algorithm, not the current output.
+
+/// Compile a module that defines a 3-element generator `g` (yields 1, 2, 3)
+/// alongside the caller-supplied `body` (which must declare `function f`).
+fn iter_gen_mod(body: String) -> Atom {
+  compile("function* g() { yield 1; yield 2; yield 3; } " <> body)
+}
+
+// §27.1.4.19 toArray — every remaining value collected into a new array, in order.
+pub fn iter_to_array_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var a = g().toArray(); return a[0]*100 + a[1]*10 + a[2]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(123.0)
+  let m2 = iter_gen_mod("function f() { return g().toArray().length; }")
+  to_float(call(m2, "f", [])) |> should.equal(3.0)
+}
+
+// §27.1.4.12 map — yields mapper(value, counter) lazily; toArray realizes them.
+pub fn iter_map_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var a = g().map(v => v * 2).toArray(); return a[0]*100 + a[1]*10 + a[2]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(246.0)
+  // the counter is a 0-based ascending index passed as the 2nd argument.
+  let m2 =
+    iter_gen_mod(
+      "function f() { var a = g().map((v, i) => i).toArray(); return a[0]*100 + a[1]*10 + a[2]; }",
+    )
+  to_float(call(m2, "f", [])) |> should.equal(12.0)
+}
+
+// §27.1.4.12 map result is a live iterator drivable by `.next()`.
+pub fn iter_map_is_lazy_iterator_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var it = g().map(v => v * 10); return it.next().value; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(10.0)
+}
+
+// §27.1.4.5 filter — keeps only values whose predicate is truthy.
+pub fn iter_filter_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var a = g().filter(v => v > 1).toArray(); return a.length * 100 + a[0] * 10 + a[1]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(223.0)
+}
+
+// §27.1.4.17 take — yields at most n leading values.
+pub fn iter_take_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var a = g().take(2).toArray(); return a.length * 100 + a[0] * 10 + a[1]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(212.0)
+  // take beyond the length yields everything, not padding.
+  let m2 =
+    iter_gen_mod("function f() { return g().take(10).toArray().length; }")
+  to_float(call(m2, "f", [])) |> should.equal(3.0)
+}
+
+// §27.1.4.17 take(0) yields nothing.
+pub fn iter_take_zero_test() {
+  let m = iter_gen_mod("function f() { return g().take(0).toArray().length; }")
+  to_float(call(m, "f", [])) |> should.equal(0.0)
+}
+
+// §27.1.4.4 drop — skips the first n values, yields the rest.
+pub fn iter_drop_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var a = g().drop(1).toArray(); return a.length * 100 + a[0] * 10 + a[1]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(223.0)
+  // dropping past the end yields an empty iterator.
+  let m2 =
+    iter_gen_mod("function f() { return g().drop(10).toArray().length; }")
+  to_float(call(m2, "f", [])) |> should.equal(0.0)
+}
+
+// §27.1.4.17/.4: a negative limit is a RangeError (ToIntegerOrInfinity < 0).
+pub fn iter_take_negative_limit_throws_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { try { g().take(-1); return 0; } catch (e) { return e instanceof RangeError ? 1 : 2; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// §27.1.4.18 some — true iff the predicate is truthy for some value; short-circuits.
+pub fn iter_some_test() {
+  let m =
+    iter_gen_mod("function f() { return g().some(v => v === 2) ? 1 : 0; }")
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+  let m2 = iter_gen_mod("function f() { return g().some(v => v > 9) ? 1 : 0; }")
+  to_float(call(m2, "f", [])) |> should.equal(0.0)
+}
+
+// §27.1.4.18 some returns an actual boolean.
+pub fn iter_some_is_boolean_test() {
+  let m = iter_gen_mod("function f() { return typeof g().some(() => true); }")
+  call(m, "f", []) |> should.equal(dyn(<<"boolean">>))
+}
+
+// §27.1.4.6 every — true unless the predicate is falsy for some value.
+pub fn iter_every_test() {
+  let m = iter_gen_mod("function f() { return g().every(v => v > 0) ? 1 : 0; }")
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+  let m2 =
+    iter_gen_mod("function f() { return g().every(v => v < 3) ? 1 : 0; }")
+  to_float(call(m2, "f", [])) |> should.equal(0.0)
+}
+
+// §27.1.4.8 find — the first value whose predicate is truthy, else undefined.
+pub fn iter_find_test() {
+  let m = iter_gen_mod("function f() { return g().find(v => v === 2); }")
+  to_float(call(m, "f", [])) |> should.equal(2.0)
+  let m2 = iter_gen_mod("function f() { return typeof g().find(v => v > 9); }")
+  call(m2, "f", []) |> should.equal(dyn(<<"undefined">>))
+}
+
+// §27.1.4.7 forEach — invoked for each value; returns undefined.
+pub fn iter_for_each_result_test() {
+  let m = iter_gen_mod("function f() { return typeof g().forEach(() => {}); }")
+  call(m, "f", []) |> should.equal(dyn(<<"undefined">>))
+}
+
+// §27.1.4.16 reduce with an initial value: fold left seeded by init.
+pub fn iter_reduce_with_init_test() {
+  let m =
+    iter_gen_mod("function f() { return g().reduce((a, v) => a + v, 100); }")
+  to_float(call(m, "f", [])) |> should.equal(106.0)
+}
+
+// §27.1.4.16 reduce with no seed: the first value seeds the accumulator.
+pub fn iter_reduce_no_init_test() {
+  let m = iter_gen_mod("function f() { return g().reduce((a, v) => a + v); }")
+  to_float(call(m, "f", [])) |> should.equal(6.0)
+}
+
+// §27.1.4.16 step 5.b.i: reduce with no seed over an empty iterator is a TypeError.
+pub fn iter_reduce_empty_no_init_throws_test() {
+  let m =
+    compile(
+      "function* e() {} function f() { try { e().reduce((a, v) => a + v); return 0; } catch (x) { return x instanceof TypeError ? 1 : 2; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// §7.4.11 IteratorClose: a short-circuiting helper (some/find) closes the
+// underlying iterator, so a subsequent `.next()` reports done.
+pub fn iter_short_circuit_closes_underlying_test() {
+  let m =
+    iter_gen_mod(
+      "function f() { var it = g(); it.some(v => v === 1); return it.next().done ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+  let m2 =
+    iter_gen_mod(
+      "function f() { var it = g(); it.find(v => v === 1); return it.next().done ? 1 : 0; }",
+    )
+  to_float(call(m2, "f", [])) |> should.equal(1.0)
+}
