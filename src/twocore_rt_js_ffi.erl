@@ -6180,7 +6180,7 @@ str_slice(Str, Start, End) ->
 
 %% str.substring(start?, end?) — clamps negatives to 0 and swaps if start > end.
 str_substring(Str, Start, End) ->
-    Cps = cps(Str),
+    Cps = cps(str_this(Str)),
     Len = length(Cps),
     S0 = sub_index(Start, Len, 0),
     E0 = sub_index(End, Len, Len),
@@ -6227,9 +6227,13 @@ str_split(Str0, Sep, Limit) ->
 %% Object]"). This is what makes `String.prototype.trim.call(0)` yield "0",
 %% `.call(false)` yield "false", and `.call([1])` yield "1" once a generic `.call`
 %% forwards the receiver here.
+%% A Symbol receiver is a TypeError: ToString of a Symbol is abrupt (§7.1.17,
+%% ToString step 2), so `String.prototype.substring.call(Symbol())` throws.
 str_this(undefined) -> type_error(undefined);
 str_this(null) -> type_error(null);
 str_this(V) when is_binary(V) -> V;
+str_this({js_symbol, _, _}) ->
+    type_error(<<"Cannot convert a Symbol value to a string">>);
 str_this(V) -> to_string(V).
 
 %% ToUint32(limit) with `undefined` mapped to the spec's 2^32-1 default. NaN and
@@ -6323,8 +6327,9 @@ str_repeat(Str, N) ->
 %% ToIntegerOrInfinity clamped to [0, len] (undefined/NaN → 0). Returns false
 %% when `position` + prefix length would run past the end of the string.
 str_starts_with(Str, Prefix, Pos) ->
+    S = str_this(Str),
     P = to_string(Prefix),
-    Cps = cps(Str),
+    Cps = cps(S),
     Len = length(Cps),
     Start = str_pos_clamp(Pos, Len),
     PLen = length(cps(P)),
@@ -6338,8 +6343,9 @@ str_starts_with(Str, Prefix, Pos) ->
 %% is undefined it defaults to len; otherwise it is ToIntegerOrInfinity clamped
 %% to [0, len]. Returns false when the suffix would start before index 0.
 str_ends_with(Str, Suffix, EndPos) ->
+    Recv = str_this(Str),
     S = to_string(Suffix),
-    Cps = cps(Str),
+    Cps = cps(Recv),
     Len = length(Cps),
     End =
         case EndPos of
