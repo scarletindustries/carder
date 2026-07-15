@@ -5766,9 +5766,18 @@ is_nan_val(js_nan) -> true;
 is_nan_val(nan) -> true;
 is_nan_val(_) -> false.
 
+%% join(separator?) — ToString each element (holes / null / undefined render as
+%% the empty string) and interleave `separator`. Per ES §23.1.3.18 step 3, an
+%% `undefined` separator is NOT ToString'd to "undefined"; it defaults to the
+%% single comma ",", so `[1, 2].join(undefined)` is "1,2". Any other separator
+%% (including `null`) is ToString'd normally.
 array_join(Recv, Sep) ->
     {Len, Map} = arr_content(Recv),
-    SepBin = to_string(Sep),
+    SepBin =
+        case Sep of
+            undefined -> <<",">>;
+            _ -> to_string(Sep)
+        end,
     Parts = [array_elem_str(E) || E <- arr_list(Len, Map)],
     iolist_to_binary(lists:join(SepBin, Parts)).
 
