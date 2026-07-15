@@ -4473,7 +4473,9 @@ fn is_wellknown_symbol(name: String) -> Bool {
     | "search"
     | "split"
     | "isConcatSpreadable"
-    | "unscopables" -> True
+    | "unscopables"
+    | "dispose"
+    | "asyncDispose" -> True
     _ -> False
   }
 }
