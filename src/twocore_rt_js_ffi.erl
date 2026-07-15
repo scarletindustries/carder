@@ -2286,10 +2286,104 @@ date_new(Args) ->
 date_utc(Args) ->
     out_ms(make_time_value(Args)).
 
-%% `Date.parse(string)` (§21.4.3.2) — `ToString` then parse as ISO 8601; the time
-%% value (ms) or NaN when unparseable.
+%% `Date.parse(string)` (§21.4.3.2) — `ToString` then parse. First tries the ISO 8601
+%% Date Time String Format; when that fails it falls back to the two human-readable
+%% forms this implementation itself produces (`toString` and `toUTCString`), so that
+%% `Date.parse(d.toString())` and `Date.parse(d.toUTCString())` round-trip the time
+%% value exactly — §21.4.3.2 requires any string produced by these methods to parse
+%% back to the same value. Returns the time value (ms) or NaN when unparseable.
 date_parse(V) ->
-    out_ms(parse_iso(to_string(V))).
+    out_ms(parse_date_string(to_string(V))).
+
+%% Try the ISO form first (the primary Date Time String Format), then the
+%% `toUTCString` and `toString` fallbacks. The first match wins; `nan` if none apply.
+parse_date_string(Bin) ->
+    case parse_iso(Bin) of
+        nan ->
+            case parse_utc_string(Bin) of
+                nan -> parse_tostring(Bin);
+                Ms -> Ms
+            end;
+        Ms ->
+            Ms
+    end.
+
+%% Parse the `toUTCString` form `Www, DD Mon YYYY HH:mm:ss GMT` (§21.4.4.43) into an
+%% integer time value or `nan`. The zone is always GMT (UTC). The year is 4+ digits,
+%% optionally signed (expanded years).
+parse_utc_string(Bin) ->
+    RE =
+        "^[A-Za-z]{3}, ([0-9]{2}) ([A-Za-z]{3}) (-?[0-9]{4,6}) "
+        "([0-9]{2}):([0-9]{2}):([0-9]{2}) GMT$",
+    case re:run(Bin, RE, [{capture, all_but_first, binary}]) of
+        {match, [Ds, MonS, Ys, Hs, Mis, Ss]} ->
+            date_string_to_ms(Ys, MonS, Ds, Hs, Mis, Ss, 0);
+        nomatch ->
+            nan
+    end.
+
+%% Parse the `toString` form `Www Mon DD YYYY HH:mm:ss GMT±HHMM` (§21.4.4.41) into an
+%% integer time value or `nan`. The `±HHMM` offset is subtracted to reach UTC (this
+%% implementation always emits `+0000`, but a signed offset is accepted generally).
+parse_tostring(Bin) ->
+    RE =
+        "^[A-Za-z]{3} ([A-Za-z]{3}) ([0-9]{2}) (-?[0-9]{4,6}) "
+        "([0-9]{2}):([0-9]{2}):([0-9]{2}) GMT([+-][0-9]{4})$",
+    case re:run(Bin, RE, [{capture, all_but_first, binary}]) of
+        {match, [MonS, Ds, Ys, Hs, Mis, Ss, Off]} ->
+            date_string_to_ms(Ys, MonS, Ds, Hs, Mis, Ss, gmt_offset_ms(Off));
+        nomatch ->
+            nan
+    end.
+
+%% Build a UTC time value from the calendar fields captured from a human-readable Date
+%% string. `OffMs` is the millisecond offset east-of-UTC to SUBTRACT to reach UTC.
+%% Returns an integer time value, or `nan` if the month name is unknown or a field is
+%% out of range.
+date_string_to_ms(Ys, MonS, Ds, Hs, Mis, Ss, OffMs) ->
+    case month_from_abbr(MonS) of
+        nan ->
+            nan;
+        Mo ->
+            Y = signed_int(Ys),
+            D = binary_to_integer(Ds),
+            H = binary_to_integer(Hs),
+            Mi = binary_to_integer(Mis),
+            S = binary_to_integer(Ss),
+            case valid_iso(Mo, D, H, Mi, S) of
+                false ->
+                    nan;
+                true ->
+                    Day = days_from_civil(Y, Mo, D),
+                    Local =
+                        Day * ?MS_PER_DAY + H * 3600000 + Mi * 60000 + S * 1000,
+                    time_clip(Local - OffMs)
+            end
+    end.
+
+%% Milliseconds east-of-UTC for a `±HHMM` GMT offset (as emitted by `toTimeString`).
+gmt_offset_ms(<<Sign, H1, H0, M1, M0>>) ->
+    Mins = (H1 - $0) * 600 + (H0 - $0) * 60 + (M1 - $0) * 10 + (M0 - $0),
+    case Sign of
+        $- -> -Mins * 60000;
+        _ -> Mins * 60000
+    end.
+
+%% Three-letter English month abbreviation → 1-based month number, or `nan` if the
+%% abbreviation is not recognised (the inverse of `month_abbr/1`).
+month_from_abbr(<<"Jan">>) -> 1;
+month_from_abbr(<<"Feb">>) -> 2;
+month_from_abbr(<<"Mar">>) -> 3;
+month_from_abbr(<<"Apr">>) -> 4;
+month_from_abbr(<<"May">>) -> 5;
+month_from_abbr(<<"Jun">>) -> 6;
+month_from_abbr(<<"Jul">>) -> 7;
+month_from_abbr(<<"Aug">>) -> 8;
+month_from_abbr(<<"Sep">>) -> 9;
+month_from_abbr(<<"Oct">>) -> 10;
+month_from_abbr(<<"Nov">>) -> 11;
+month_from_abbr(<<"Dec">>) -> 12;
+month_from_abbr(_) -> nan.
 
 %% A Date instance method dispatched on the receiver's tag. When `Recv` is a Date
 %% cell the field/derived value is computed from its ms; otherwise the call DELEGATES
@@ -2588,8 +2682,26 @@ make_time_value(Args) ->
                     false -> Y0
                 end,
             Day = make_day(Yr, Mo, D),
-            Time = H * 3600000 + Mi * 60000 + S * 1000 + MilS,
-            time_clip(Day * ?MS_PER_DAY + Time)
+            time_clip(make_date(Day, H, Mi, S, MilS))
+    end.
+
+%% MakeTime + MakeDate (§21.4.1.13/.14) done with IEEE-754 double arithmetic, as the
+%% spec mandates: `Date.UTC`/`new Date(components)` perform the multiplications and
+%% additions on Numbers, so components far beyond 2^53 lose precision in a DEFINED way
+%% (e.g. `Date.UTC(1970,0,1,80063993375,29,1,-288230376151711740)` is 29312, not the
+%% exact bignum result). `Day` is the integer day count; H/Mi/S/MilS are integers
+%% already truncated by ToIntegerOrInfinity. The exact grouping matches the spec:
+%% MakeTime = ((h·msPerHour + m·msPerMinute) + s·msPerSecond) + milli, and
+%% MakeDate = day·msPerDay + time. A float overflow on an astronomically large year is
+%% caught and reported as `inf`, which TimeClip maps to NaN. Returns a float or `inf`.
+make_date(Day, H, Mi, S, MilS) ->
+    try
+        Time =
+            (float(H) * 3600000 + float(Mi) * 60000) + float(S) * 1000 +
+                float(MilS),
+        float(Day) * ?MS_PER_DAY + Time
+    catch
+        error:badarith -> inf
     end.
 
 %% `ToNumber(arg[I])` reduced to a finite integer, or the default when the argument is
