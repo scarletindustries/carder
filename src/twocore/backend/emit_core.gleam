@@ -4338,6 +4338,10 @@ fn resolve_js(op: String) -> Option(String) {
     "str_ends_with" -> Some("str_ends_with")
     "str_replace" -> Some("str_replace")
     "str_replace_all" -> Some("str_replace_all")
+    "str_is_well_formed" -> Some("str_is_well_formed")
+    "str_to_well_formed" -> Some("str_to_well_formed")
+    "str_locale_compare" -> Some("str_locale_compare")
+    "str_proto_fn" -> Some("str_proto_fn")
     // globals + statics
     "parse_int" -> Some("parse_int")
     "parse_float" -> Some("parse_float")

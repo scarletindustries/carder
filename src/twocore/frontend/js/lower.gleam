@@ -5328,6 +5328,16 @@ fn lower_instance_method(
     "codePointAt", [] -> host("str_code_point_at", [undefined()])
     "normalize", [form, ..] -> host("str_normalize", [form])
     "normalize", [] -> host("str_normalize", [undefined()])
+    // §22.1.3.9/.35: unpaired-surrogate predicate / repair. In this engine's
+    // code-point string model lone surrogates are already replaced with U+FFFD at
+    // creation, so isWellFormed is `true` and toWellFormed is the identity, but the
+    // runtime keeps the surrogate-aware algorithm. A non-string receiver delegates
+    // to a same-named user method.
+    "isWellFormed", _ -> host("str_is_well_formed", [])
+    "toWellFormed", _ -> host("str_to_well_formed", [])
+    // §22.1.3.10: default-locale (code-point lexicographic) comparison → -1/0/1.
+    "localeCompare", [that, ..] -> host("str_locale_compare", [that])
+    "localeCompare", [] -> host("str_locale_compare", [undefined()])
     "toUpperCase", _ -> host("str_upper", [])
     "toLowerCase", _ -> host("str_lower", [])
     // §22.1.3.22/24: without locale-sensitive data, toLocaleUpperCase /
@@ -5531,6 +5541,37 @@ fn lower_member(
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
   case object, property, computed {
+    // `String.prototype.<method>` referenced as a VALUE (e.g. `typeof
+    // String.prototype.at`). `String.prototype` is not a real object in this model, so
+    // the whole access resolves directly to the named builtin as a function value via
+    // the runtime `str_proto_fn` (so `typeof` is "function" and it can be applied /
+    // passed around). Only the fixed set of implemented string methods is routed here;
+    // any other name falls through to the ordinary (unbound-`String`) path.
+    ast.MemberExpression(
+      object: ast.Identifier(name: "String", ..),
+      property: ast.Identifier(name: "prototype", ..),
+      computed: False,
+      ..,
+    ),
+      ast.Identifier(name: m, ..),
+      False
+      if m == "at"
+      || m == "charAt"
+      || m == "charCodeAt"
+      || m == "codePointAt"
+      || m == "toUpperCase"
+      || m == "toLowerCase"
+      || m == "trim"
+      || m == "trimStart"
+      || m == "trimEnd"
+      || m == "isWellFormed"
+      || m == "toWellFormed"
+      || m == "localeCompare"
+    ->
+      Ok(bind1(
+        ir.CallHost("js", "str_proto_fn", [ir.ConstBinary(<<m:utf8>>)]),
+        ctr,
+      ))
     // Math.PI / Math.E / … — a compile-time numeric constant (Math is not a value).
     ast.Identifier(name: "Math", ..), ast.Identifier(name: c, ..), False ->
       case math_const(c) {

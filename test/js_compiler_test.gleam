@@ -5796,3 +5796,69 @@ pub fn symbol_description_not_own_test() {
     compile("function f(){ return Symbol().hasOwnProperty('description'); }")
   call(m, "f", []) |> should.equal(dyn(False))
 }
+
+// ==== String (wave 8) ====
+
+// §22.1.3.2 String.prototype.at(index): returns the one-code-point string at the
+// (ToInteger-coerced) index; a negative index counts from the end; an out-of-range
+// index yields `undefined`.
+pub fn string_at_wave8_test() {
+  val("\"12345\".at(0)") |> should.equal(dyn(<<"1">>))
+  val("\"12345\".at(4)") |> should.equal(dyn(<<"5">>))
+  // relative (negative) index: len + relativeIndex
+  val("\"12345\".at(-1)") |> should.equal(dyn(<<"5">>))
+  val("\"12345\".at(-5)") |> should.equal(dyn(<<"1">>))
+  // out of range → undefined (asserted via a boolean the runtime can compare)
+  num("\"12345\".at(5) === undefined ? 1 : 0") |> should.equal(1.0)
+  num("\"\".at(0) === undefined ? 1 : 0") |> should.equal(1.0)
+  // ToInteger coercion of a non-numeric index: false/""/null → 0, true/"1" → 1.
+  val("\"01\".at(false)") |> should.equal(dyn(<<"0">>))
+  val("\"01\".at(true)") |> should.equal(dyn(<<"1">>))
+  val("\"01\".at(\"1\")") |> should.equal(dyn(<<"1">>))
+}
+
+// `String.prototype.at` is reachable as a value and, per the method-existence checks
+// throughout test262, `typeof String.prototype.<method>` is "function".
+pub fn string_prototype_method_is_function_wave8_test() {
+  val("typeof String.prototype.at") |> should.equal(dyn(<<"function">>))
+  val("typeof String.prototype.toWellFormed")
+  |> should.equal(dyn(<<"function">>))
+  val("typeof String.prototype.isWellFormed")
+  |> should.equal(dyn(<<"function">>))
+  val("typeof String.prototype.localeCompare")
+  |> should.equal(dyn(<<"function">>))
+}
+
+// §22.1.3.35 String.prototype.toWellFormed(): a string that is already well-formed
+// (no unpaired surrogate — the only kind this code-point engine can store, since
+// lone surrogates are replaced with U+FFFD at creation) is returned unchanged.
+pub fn string_to_well_formed_wave8_test() {
+  val("\"abc\".toWellFormed()") |> should.equal(dyn(<<"abc">>))
+  // an astral character (a valid surrogate pair) is well-formed and preserved
+  num("\"a\\u{1F4A9}c\".toWellFormed() === \"a\\u{1F4A9}c\" ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+// §22.1.3.9 String.prototype.isWellFormed(): a string containing no unpaired
+// surrogate is well-formed → `true`.
+pub fn string_is_well_formed_wave8_test() {
+  val("\"abc\".isWellFormed()") |> should.equal(dyn(True))
+  val("\"a\\u{1F4A9}c\".isWellFormed()") |> should.equal(dyn(True))
+}
+
+// §22.1.3.10 String.prototype.localeCompare(that): with no locale data this is the
+// default code-point lexicographic ordering, returning -1/0/1 for before/equal/after
+// and treating a missing argument as `undefined` (ToString → "undefined").
+pub fn string_locale_compare_wave8_test() {
+  // 'a' (0x61) sorts before 'b' (0x62)
+  num("\"a\".localeCompare(\"b\")") |> should.equal(-1.0)
+  num("\"b\".localeCompare(\"a\")") |> should.equal(1.0)
+  num("\"a\".localeCompare(\"a\")") |> should.equal(0.0)
+  // lowercase sorts after uppercase (0x68 > 0x48)
+  num("\"h\".localeCompare(\"H\")") |> should.equal(1.0)
+  // anti-symmetry: str1.localeCompare(str2) === -str2.localeCompare(str1)
+  num("\"h\".localeCompare(\"H\") === -\"H\".localeCompare(\"h\") ? 1 : 0")
+  |> should.equal(1.0)
+  // a missing 'that' argument is treated as ToString(undefined) === "undefined"
+  num("\"undefined\".localeCompare() ? 0 : 1") |> should.equal(1.0)
+}
