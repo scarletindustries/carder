@@ -4241,6 +4241,7 @@ fn resolve_js(op: String) -> Option(String) {
     "apply_fn" -> Some("apply_fn")
     "func_call" -> Some("func_call")
     "func_apply" -> Some("func_apply")
+    "func_bind" -> Some("func_bind")
     "fit_list" -> Some("fit_list")
     "array_to_list" -> Some("array_to_list")
     "array_from" -> Some("array_from")
