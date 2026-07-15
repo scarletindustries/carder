@@ -1754,7 +1754,7 @@ set_prop_live(Recv, Key, V) ->
 %% no-ops (non-strict mode) — and return o. Frozen-ness is tracked in a SEPARATE
 %% process-dictionary entry keyed by the cell ref, so it never appears among the
 %% object's keys. A non-object primitive is returned unchanged (already immutable).
-object_freeze(O) when is_reference(O) ->
+object_freeze(O) when is_reference(O); is_function(O) ->
     erlang:put({js_frozen, O}, true),
     %% Freezing implies the object is also non-extensible and sealed
     %% (SetIntegrityLevel(frozen) first performs [[PreventExtensions]]), so
@@ -1767,7 +1767,7 @@ object_freeze(O) ->
 
 %% Object.isFrozen(o) -> JS boolean. A non-object primitive is frozen (true) per
 %% spec.
-object_is_frozen(O) when is_reference(O) ->
+object_is_frozen(O) when is_reference(O); is_function(O) ->
     erlang:get({js_frozen, O}) =:= true;
 object_is_frozen(_) ->
     true.
@@ -1777,17 +1777,18 @@ object_is_frozen(_) ->
 %% o. Non-extensibility is tracked in a SEPARATE process-dictionary entry keyed by
 %% the cell ref, so it never appears among the object's keys. A non-object
 %% primitive is returned unchanged (it can never gain properties anyway).
-object_prevent_extensions(O) when is_reference(O) ->
+object_prevent_extensions(O) when is_reference(O); is_function(O) ->
     erlang:put({js_nonextensible, O}, true),
     O;
 object_prevent_extensions(O) ->
     O.
 
 %% Object.isExtensible(o) -> Erlang boolean atom. True iff o is an object that has
-%% not been made non-extensible (via preventExtensions/seal/freeze). Per ES2015
-%% (§19.1.2.13) a non-object primitive is NOT extensible, so this returns `false`
-%% for it rather than throwing.
-object_is_extensible(O) when is_reference(O) ->
+%% not been made non-extensible (via preventExtensions/seal/freeze). Functions
+%% (including built-in constructors) ARE objects and are extensible by default. Per
+%% ES2015 (§19.1.2.13) a non-object primitive is NOT extensible, so this returns
+%% `false` for it rather than throwing.
+object_is_extensible(O) when is_reference(O); is_function(O) ->
     erlang:get({js_nonextensible, O}) =/= true;
 object_is_extensible(_) ->
     false.
@@ -1797,7 +1798,7 @@ object_is_extensible(_) ->
 %% writable), then return o. In this descriptor-free model configurability is
 %% tracked with a single per-object `js_sealed` flag. A non-object primitive is
 %% returned unchanged.
-object_seal(O) when is_reference(O) ->
+object_seal(O) when is_reference(O); is_function(O) ->
     erlang:put({js_nonextensible, O}, true),
     erlang:put({js_sealed, O}, true),
     O;
@@ -1810,7 +1811,7 @@ object_seal(O) ->
 %% sealed or frozen, OR when it is non-extensible and has no own properties (the
 %% integrity check is then vacuously satisfied). A non-object primitive is sealed
 %% (true) per spec.
-object_is_sealed(O) when is_reference(O) ->
+object_is_sealed(O) when is_reference(O); is_function(O) ->
     case erlang:get({js_nonextensible, O}) =:= true of
         false ->
             false;

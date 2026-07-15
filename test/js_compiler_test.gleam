@@ -6634,3 +6634,47 @@ pub fn string_char_case_wrapper_receiver_test() {
   val("(function(){ return (new String('a')).charAt(5); })()")
   |> should.equal(dyn(""))
 }
+
+// ==== Object (wave 11) ====
+
+// Per sec-object.isextensible / sec-object.isfrozen / sec-object.issealed, a
+// function is an ordinary object: it is extensible, and neither frozen nor sealed,
+// until an integrity operation is applied. Built-in constructors (Object, Array,
+// …) and user-defined functions must all report the object defaults, not the
+// non-object-primitive answers (which would be false / true / true respectively).
+pub fn integrity_of_functions_test() {
+  // A user function is an extensible, non-frozen, non-sealed object.
+  val("Object.isExtensible(function foo() {}) === true")
+  |> should.equal(dyn(True))
+  val("Object.isFrozen(function foo() {}) === false") |> should.equal(dyn(True))
+  val("Object.isSealed(function foo() {}) === false") |> should.equal(dyn(True))
+  // Built-in constructors are objects too.
+  val("Object.isExtensible(Object) === true") |> should.equal(dyn(True))
+  val("Object.isFrozen(Object) === false") |> should.equal(dyn(True))
+  val("Object.isSealed(Object) === false") |> should.equal(dyn(True))
+}
+
+// Object.preventExtensions / seal / freeze return their argument and flip the
+// derived integrity state; applied to a function they must be honoured just as for
+// a plain object (a function IS an object).
+pub fn integrity_ops_on_function_test() {
+  // preventExtensions makes a function non-extensible but not sealed/frozen
+  // (it still has no own configurable properties, so TestIntegrityLevel(sealed)
+  // holds vacuously → sealed reports true, but frozen stays false).
+  let m1 =
+    compile(
+      "function f() { var g = function () {}; Object.preventExtensions(g); return Object.isExtensible(g); }",
+    )
+  call(m1, "f", []) |> should.equal(dyn(False))
+  // freeze on a function: isFrozen becomes true, and the return value is the fn.
+  let m2 =
+    compile(
+      "function f() { var g = function () {}; return Object.freeze(g) === g; }",
+    )
+  call(m2, "f", []) |> should.equal(dyn(True))
+  let m3 =
+    compile(
+      "function f() { var g = function () {}; Object.freeze(g); return Object.isFrozen(g); }",
+    )
+  call(m3, "f", []) |> should.equal(dyn(True))
+}
