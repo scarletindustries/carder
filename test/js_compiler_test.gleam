@@ -6615,3 +6615,22 @@ pub fn string_split_wrapper_receiver_test() {
   )
   |> should.equal(1.0)
 }
+
+/// The char/index/case String methods coerce a `new String(...)` wrapper
+/// receiver to its boxed primitive (each is spec'd `S = ToString(this)`), so a
+/// wrapper behaves identically to the string primitive.
+pub fn string_char_case_wrapper_receiver_test() {
+  val("(function(){ return (new String('abc')).charAt(1); })()")
+  |> should.equal(dyn("b"))
+  num("(function(){ return (new String('abc')).charCodeAt(0); })()")
+  |> should.equal(97.0)
+  num("(function(){ return (new String('abc')).codePointAt(2); })()")
+  |> should.equal(99.0)
+  val("(function(){ return (new String('aBc')).toUpperCase(); })()")
+  |> should.equal(dyn("ABC"))
+  val("(function(){ return (new String('aBc')).toLowerCase(); })()")
+  |> should.equal(dyn("abc"))
+  // charAt out of range still yields "" on a wrapper receiver.
+  val("(function(){ return (new String('a')).charAt(5); })()")
+  |> should.equal(dyn(""))
+}
