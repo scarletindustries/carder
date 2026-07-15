@@ -53,7 +53,13 @@
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
 //// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
-//// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
+//// (a local binding of the same name shadows them); `globalThis` (§19.3.1) — the
+//// global object as a stable per-instance singleton cell (`typeof` "object", never
+//// null, `globalThis === globalThis` and `globalThis.globalThis === globalThis` by
+//// identity; top-level `this` resolves to it too; `globalThis.<name>` reads resolve
+//// to the already-bound global of that name; a user binding of the name shadows it;
+//// NO mutable global-property model — `globalThis.Array` etc. only reach globals that
+//// are themselves bound as values); and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`/`getOwnPropertyNames`/
 //// `freeze`/`isFrozen` (freeze makes direct property/element writes and `delete`
 //// non-strict no-ops; mutating array METHODS like `push` are NOT blocked — a v1
