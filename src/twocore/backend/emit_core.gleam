@@ -4205,6 +4205,8 @@ fn resolve_js(op: String) -> Option(String) {
     "cell_set" -> Some("cell_set")
     // objects
     "new_object" -> Some("new_object")
+    // globalThis — the global object as a stable per-instance singleton (§19.3.1)
+    "globalthis_new" -> Some("globalthis_new")
     "wrapper_new" -> Some("wrapper_new")
     // error constructors (§20.5 Error + the six NativeErrors)
     "error_make" -> Some("error_make")

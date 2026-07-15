@@ -231,6 +231,13 @@ pub fn cell_set(cell: Dynamic, v: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_object")
 pub fn new_object() -> Dynamic
 
+/// The `globalThis` value (§19.3.1): THE global object, returned as a stable
+/// per-instance singleton cell so that `globalThis === globalThis` and
+/// `globalThis.globalThis === globalThis` hold by reference identity. It is a
+/// cell, hence `typeof` "object" and never null.
+@external(erlang, "twocore_rt_js_ffi", "globalthis_new")
+pub fn globalthis_new() -> Dynamic
+
 /// `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive wrapper OBJECT.
 /// `kind` is the atom `number`/`string`/`boolean`; `x` is boxed after coercion
 /// (ToNumber/ToString/ToBoolean). Returns a cell (`typeof` "object") whose `valueOf`
