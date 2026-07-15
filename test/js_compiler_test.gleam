@@ -6775,3 +6775,79 @@ pub fn regexp_symbol_split_test() {
   val("/,/[Symbol.split]('a,b,c').join('|')") |> should.equal(dyn("a|b|c"))
   num("/,/[Symbol.split]('a,b,c', 2).length") |> should.equal(2.0)
 }
+
+// ==== this-binding + call/apply (wave 12) ====
+
+// §20.2.3.3 Function.prototype.call on an unbound built-in prototype METHOD value:
+// `Array.prototype.slice.call(receiver, …args)` runs `slice` with `receiver` as its
+// `this`, i.e. exactly `receiver.slice(…args)`. slice(1) of [1,2,3] is [2,3].
+pub fn array_proto_slice_call_test() {
+  val("Array.prototype.slice.call([1, 2, 3], 1).join(',')")
+  |> should.equal(dyn("2,3"))
+}
+
+// §20.2.3.1 Function.prototype.apply on the same unbound method value: the argument
+// array is spread, so `Array.prototype.slice.apply([1,2,3],[1])` == `[1,2,3].slice(1)`.
+pub fn array_proto_slice_apply_test() {
+  val("Array.prototype.slice.apply([1, 2, 3], [1]).join(',')")
+  |> should.equal(dyn("2,3"))
+}
+
+// §22.1.3.30 String.prototype.trim via `.call` with a string receiver: the receiver
+// is forwarded and trimmed. "  x  " → "x".
+pub fn string_proto_trim_call_test() {
+  val("String.prototype.trim.call('  x  ')") |> should.equal(dyn("x"))
+}
+
+// §22.1.3.30 with a NON-string primitive receiver: RequireObjectCoercible then
+// ToString — `.call(0)` trims "0" to "0"; `.call(false)` trims "false" to "false".
+pub fn string_proto_trim_call_coerces_test() {
+  val("String.prototype.trim.call(0)") |> should.equal(dyn("0"))
+  val("String.prototype.trim.call(false)") |> should.equal(dyn("false"))
+}
+
+// §22.1.3.30 RequireObjectCoercible: `.call(undefined)` / `.call(null)` throw a
+// TypeError (caught here to yield the sentinel "threw").
+pub fn string_proto_trim_call_coercible_throws_test() {
+  val(
+    "(function(){ try { String.prototype.trim.call(undefined); return 'no'; } catch (e) { return 'threw'; } })()",
+  )
+  |> should.equal(dyn("threw"))
+}
+
+// §20.1.3.2 Object.prototype.hasOwnProperty via `.call`: own-property test against
+// the forwarded receiver. {a:1} has own "a" (true) but not "b" (false).
+pub fn object_proto_has_own_call_test() {
+  num("Object.prototype.hasOwnProperty.call({ a: 1 }, 'a') ? 1 : 0")
+  |> should.equal(1.0)
+  num("Object.prototype.hasOwnProperty.call({ a: 1 }, 'b') ? 1 : 0")
+  |> should.equal(0.0)
+}
+
+// §23.1.3.20 Array.prototype.map thisArg with an INLINE function callback that reads
+// `this`: the callback runs with `this === thisArg`, so each element maps to
+// `thisArg.k`. map over [1,2,3] with {k:9} → [9,9,9].
+pub fn array_map_thisarg_inline_test() {
+  val("[1, 2, 3].map(function () { return this.k; }, { k: 9 }).join(',')")
+  |> should.equal(dyn("9,9,9"))
+}
+
+// §23.1.3.15 Array.prototype.forEach thisArg with an inline callback: the callback's
+// `this` is the passed object, so accumulating into `this.sum` mutates it. Sum of
+// [1,2,3] into {sum:0} → 6.
+pub fn array_foreach_thisarg_inline_test() {
+  let m =
+    compile(
+      "function f() { var o = { sum: 0 }; [1, 2, 3].forEach(function (x) { this.sum += x; }, o); return o.sum; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(6.0)
+}
+
+// An ARROW callback ignores `thisArg` (its `this` is lexical, §23.1.3.20 step calling
+// the callback with thisArg has no effect on an arrow). A top-level arrow's `this` is
+// `globalThis`, so reading `this.k` where the thisArg's `k` would be 9 must NOT be 9 —
+// here the arrow simply doubles, proving the thisArg path does not hijack arrows.
+pub fn array_map_thisarg_arrow_unaffected_test() {
+  val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
+  |> should.equal(dyn("2,4,6"))
+}

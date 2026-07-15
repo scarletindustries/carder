@@ -53,8 +53,13 @@
 //// empty array, per the spec's IsCallable step. `Array.prototype.<name>` for
 //// at/flat/flatMap/findLast/findLastIndex is a first-class function VALUE — an UNBOUND
 //// method whose `this` is passed as the first argument — so `typeof
-//// Array.prototype.at` is "function"; calling it via `.call(receiver, …)` is a v1 gap,
-//// since a plain function value drops its `thisArg`); string `.length`,
+//// Array.prototype.at` is "function". A STATIC `<Ctor>.prototype.<m>.call(recv, …args)`
+//// / `.apply(recv, [args])` on a built-in prototype method (Array/String/Object/…) IS
+//// supported: it is rewritten to the ordinary method call `recv.<m>(…args)`, forwarding
+//// the receiver first (`.apply` only when its argument array is a literal). A `.call`/
+//// `.apply` through a plain-function VALUE variable, or on a user function, still drops
+//// the `thisArg` (the function carries no receiver in this model) — a v1 gap; string
+//// `.length`,
 //// indexing, and methods (charAt/charCodeAt/codePointAt, toUpperCase/toLowerCase, indexOf/includes/slice/
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
@@ -176,6 +181,15 @@
 ////     non-deterministic case test may run when JS would not have reached it.
 ////   * A `break`/`continue` to a label attached to a `switch` or a plain block that is
 ////     nested OUTSIDE a loop targets the wrong construct; labels on loops work correctly.
+////   * The `thisArg` of an Array iteration method (`map`/`filter`/`forEach`/`some`/
+////     `every`/`find`/`findIndex`/`findLast`/`findLastIndex`) is honored ONLY when the
+////     callback is an INLINE `function () {…}` expression (its `this` capture is bound to
+////     the `thisArg`, like an object accessor's). A callback passed by NAME (a top-level
+////     function reference) ignores the `thisArg`: a top-level function carries no `this`
+////     parameter (its `this` resolves to `globalThis`), so binding a dynamic receiver
+////     would need `this` to become a call-time parameter of every plain function — a
+////     larger ABI change not yet made. An ARROW callback correctly ignores `thisArg`
+////     (lexical `this`).
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -5466,7 +5480,217 @@ fn lower_regex_symbol_method(
   }
 }
 
+/// `<Ctor>.prototype.<method>` — recognizes an UNBOUND built-in prototype method
+/// reference and returns `Some(method_name)`. `<Ctor>` must be a known built-in
+/// constructor namespace (Array/String/Object/…); this matches how `Array.prototype.X`
+/// is already treated as a built-in elsewhere in `lower_member` (no user-shadow check,
+/// consistent with that path). `None` for any other expression. Used to give
+/// `<Ctor>.prototype.<m>.call/apply` proper receiver-forwarding semantics.
+fn unbound_proto_method(object: ast.Expression) -> Option(String) {
+  case object {
+    ast.MemberExpression(
+      object: ast.MemberExpression(
+        object: ast.Identifier(name: ctor, ..),
+        property: ast.Identifier(name: "prototype", ..),
+        computed: False,
+        ..,
+      ),
+      property: ast.Identifier(name: method, ..),
+      computed: False,
+      ..,
+    ) ->
+      case is_builtin_ctor_namespace(ctor) {
+        True -> Some(method)
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+/// The built-in constructor namespaces whose `.prototype.<m>` we treat as an unbound
+/// method value (so `<Ctor>.prototype.<m>.call/apply` forwards the receiver first).
+fn is_builtin_ctor_namespace(name: String) -> Bool {
+  case name {
+    "Array"
+    | "String"
+    | "Object"
+    | "Number"
+    | "Boolean"
+    | "Date"
+    | "RegExp"
+    | "Map"
+    | "Set"
+    | "Function" -> True
+    _ -> False
+  }
+}
+
+/// The plain (non-spread, non-hole) element expressions of an array LITERAL, or
+/// `None` for anything else (a runtime array value, a hole, or a spread element) —
+/// the cases in which `<method>.apply(recv, arr)` cannot be statically unrolled.
+fn array_literal_elements(e: ast.Expression) -> Option(List(ast.Expression)) {
+  case e {
+    ast.ArrayExpression(elements:, ..) ->
+      list.try_fold(elements, [], fn(acc, el) {
+        case el {
+          Some(ast.SpreadElement(..)) -> Error(Nil)
+          Some(x) -> Ok([x, ..acc])
+          None -> Error(Nil)
+        }
+      })
+      |> option.from_result
+      |> option.map(list.reverse)
+    _ -> None
+  }
+}
+
+/// Dispatch an instance/method call, first intercepting a generic
+/// `<Ctor>.prototype.<m>.call(recv, …args)` / `.apply(recv, [args])` — an unbound
+/// built-in prototype method invoked with an explicit receiver. Per §20.2.3.3/.1 the
+/// unbound method must run with `recv` as its `this`, which in this receiver-first
+/// model is exactly the ordinary method call `recv.<m>(…args)`; rewriting to it reuses
+/// the full method-dispatch machinery and forwards the receiver correctly. A user
+/// function's `.call`/`.apply`, or an unbound value that is not a static
+/// `<Ctor>.prototype.<m>` reference, falls through to the runtime `func_call`/
+/// `func_apply` path (which — as documented — drops the plain-function `thisArg`).
+/// `.apply` is only unrolled when its argument array is a literal; otherwise it too
+/// falls through.
 fn lower_instance_method(
+  object: ast.Expression,
+  method: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case method, unbound_proto_method(object), arguments {
+    "call", Some(m), [recv, ..rest] ->
+      lower_instance_method(recv, m, rest, env, ctx, ctr)
+    "apply", Some(m), [recv, argarr] ->
+      case array_literal_elements(argarr) {
+        Some(elems) -> lower_instance_method(recv, m, elems, env, ctx, ctr)
+        None ->
+          lower_instance_method_thisarg(
+            object,
+            method,
+            arguments,
+            env,
+            ctx,
+            ctr,
+          )
+      }
+    _, _, _ ->
+      lower_instance_method_thisarg(object, method, arguments, env, ctx, ctr)
+  }
+}
+
+/// The runtime `(Recv, Fn)` op backing an Array iteration method that accepts a
+/// `thisArg` — the family §23.1.3.* whose callback is called with `this === thisArg`.
+/// `Some(op)` for a recognized iteration method; `None` otherwise. Callbacks run
+/// receiver-swapped in the runtime (the callback fun already carries its captured
+/// environment), so the ONLY hook for `thisArg` is the callback's `this` capture —
+/// see `lower_instance_method_thisarg`.
+fn array_this_iter_op(method: String) -> Option(String) {
+  case method {
+    "map" -> Some("array_map")
+    "filter" -> Some("array_filter")
+    "forEach" -> Some("array_foreach")
+    "some" -> Some("array_some")
+    "every" -> Some("array_every")
+    "find" -> Some("array_find")
+    "findIndex" -> Some("array_find_index")
+    "findLast" -> Some("array_find_last")
+    "findLastIndex" -> Some("array_find_last_index")
+    _ -> None
+  }
+}
+
+/// Bucket 1 (partial): thread the `thisArg` of an Array iteration method into an
+/// INLINE `function` callback that reads `this`. A regular function expression's
+/// `this` is a lexical capture in this model (like an arrow's), so — exactly as an
+/// object getter/setter binds `this` to the object at install
+/// (`lower_obj_accessor_closure`) — we bind the callback closure's `this` capture to
+/// the `thisArg` value instead of the enclosing `this`. The callback is then passed to
+/// the ordinary `(Recv, Fn)` iteration op unchanged.
+///
+/// SCOPE: this only covers an INLINE `function () {…}` callback (NOT an arrow, whose
+/// `this` is always lexical per spec, and NOT a callback passed by NAME). A `thisArg`
+/// for a named top-level-function callback (`arr.map(callbackfn, thisArg)` — the shape
+/// most test262 `this-arg` files use) is NOT handled: a top-level function carries no
+/// `this` parameter (its `this` resolves to `globalThis` at lower time), so binding a
+/// dynamic `thisArg` would require making `this` a call-time parameter of every plain
+/// function — a cross-cutting ABI change deferred to a future wave. Anything not
+/// matching the inline-function shape falls through to the generic dispatch (which
+/// drops the `thisArg`, the documented v1 behavior).
+fn lower_instance_method_thisarg(
+  object: ast.Expression,
+  method: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  case array_this_iter_op(method), arguments {
+    Some(op), [ast.FunctionExpression(span: cb_span, ..), thisarg] ->
+      case callback_captures_this(cb_span, ctx) {
+        True -> lower_this_iter(object, op, cb_span, thisarg, env, ctx, ctr)
+        False ->
+          lower_instance_method_generic(
+            object,
+            method,
+            arguments,
+            env,
+            ctx,
+            ctr,
+          )
+      }
+    _, _ ->
+      lower_instance_method_generic(object, method, arguments, env, ctx, ctr)
+  }
+}
+
+/// True when the collected callback lambda at `span` reads `this` (so a `thisArg` is
+/// observable and worth binding). `False` for an uncollected span or a callback that
+/// ignores `this` — in which case the `thisArg` is irrelevant and the generic path
+/// (which drops it) is already correct.
+fn callback_captures_this(span: ast.Span, ctx: Ctx) -> Bool {
+  case dict.get(ctx.lambdas, span) {
+    Ok(lam) -> list.contains(lam.captures, "this")
+    Error(Nil) -> False
+  }
+}
+
+/// Lower `recv.<iter>(function(){… this …}, thisArg)` to the `(Recv, Fn)` iteration
+/// op with the callback's `this` bound to `thisArg`. `op` is the runtime op name; the
+/// callback closure is built via `lower_obj_accessor_closure`, which fills the
+/// lambda's `this` capture with the supplied value (here `thisArg`) and resolves the
+/// rest of its captures from `env`.
+fn lower_this_iter(
+  object: ast.Expression,
+  op: String,
+  cb_span: ast.Span,
+  thisarg: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bo, recv, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+  use #(bt, tv, ctr) <- result_try(lower_expr(thisarg, env, ctx, ctr))
+  use #(bc, cbv, ctr) <- result_try(lower_obj_accessor_closure(
+    cb_span,
+    tv,
+    env,
+    ctx,
+    ctr,
+  ))
+  let pre = list.append(list.append(bo, bt), bc)
+  Ok(bind_after(pre, ir.CallHost("js", op, [recv, cbv]), ctr))
+}
+
+/// The ordinary instance-method dispatch (array/string/collection/Date/… methods and
+/// the delegated-user-method fallback). See `lower_instance_method` for the
+/// `.call`/`.apply` receiver-forwarding wrapper that fronts it.
+fn lower_instance_method_generic(
   object: ast.Expression,
   method: String,
   arguments: List(ast.Expression),
