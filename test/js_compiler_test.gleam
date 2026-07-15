@@ -6719,3 +6719,59 @@ pub fn array_last_index_of_present_undefined_from_test() {
   num("[1, 2, 1].lastIndexOf(2)") |> should.equal(1.0)
   num("[1, 2, 1].lastIndexOf(1)") |> should.equal(2.0)
 }
+
+// ==== RegExp (wave 11) ====
+
+// §22.2.6.8 RegExp.prototype[@@match] on a NON-global regex returns the same array
+// RegExpBuiltinExec produces: element 0 is the matched substring, `.index` the
+// match offset, `.input` the subject string, `.length` the capture-array length.
+pub fn regexp_symbol_match_nonglobal_test() {
+  val("/b./[Symbol.match]('abcd')[0]") |> should.equal(dyn("bc"))
+  num("/b./[Symbol.match]('abcd').index") |> should.equal(1.0)
+  val("/b./[Symbol.match]('abcd').input") |> should.equal(dyn("abcd"))
+  num("/b./[Symbol.match]('abcd').length") |> should.equal(1.0)
+}
+
+// §22.2.6.8 with the global flag: `lastIndex` is reset and every whole match is
+// collected into a fresh array (no `index`/`input`/capture properties).
+pub fn regexp_symbol_match_global_test() {
+  val("/\\d/g[Symbol.match]('a1b2c3').join(',')") |> should.equal(dyn("1,2,3"))
+}
+
+// No match → null (RegExpExec returns null, propagated by @@match).
+pub fn regexp_symbol_match_none_test() {
+  num("/z/[Symbol.match]('abc') === null ? 1 : 0") |> should.equal(1.0)
+}
+
+// §22.2.6.12 RegExp.prototype[@@search] returns the code-point index of the first
+// match, or -1 when there is none, ignoring the global/sticky/lastIndex state.
+pub fn regexp_symbol_search_test() {
+  num("/b/[Symbol.search]('abc')") |> should.equal(1.0)
+  num("/z/[Symbol.search]('abc')") |> should.equal(-1.0)
+}
+
+// §22.2.6.11 RegExp.prototype[@@replace] replaces the first match for a plain
+// regex and EVERY match for a global one; `$&` in the template expands to the
+// matched substring.
+pub fn regexp_symbol_replace_test() {
+  val("/o/[Symbol.replace]('foo', 'a')") |> should.equal(dyn("fao"))
+  val("/o/g[Symbol.replace]('foo', 'a')") |> should.equal(dyn("faa"))
+  val("/o/[Symbol.replace]('foo', '[$&]')") |> should.equal(dyn("f[o]o"))
+}
+
+// §22.2.6.11 with a function replacement: it is called with (matched, …captures,
+// position, string) and its ToString result is spliced in.
+pub fn regexp_symbol_replace_fn_test() {
+  let m =
+    compile(
+      "function f() { return /(\\w)o/[Symbol.replace]('foo', function (whole, g1) { return g1 + '!'; }); }",
+    )
+  call(m, "f", []) |> should.equal(dyn("f!o"))
+}
+
+// §22.2.6.14 RegExp.prototype[@@split] splits on the pattern; a `limit` bounds the
+// number of returned pieces.
+pub fn regexp_symbol_split_test() {
+  val("/,/[Symbol.split]('a,b,c').join('|')") |> should.equal(dyn("a|b|c"))
+  num("/,/[Symbol.split]('a,b,c', 2).length") |> should.equal(2.0)
+}

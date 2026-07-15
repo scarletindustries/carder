@@ -4200,6 +4200,23 @@ fn lower_call_fixed(
       computed: False,
       ..,
     ) -> lower_super_call(Some(method), arguments, env, ctx, ctr)
+    // `re[Symbol.match/replace/search/split](str, …)` — the RegExp reflection
+    // methods (§22.2.6.8/.11/.12/.14). A computed-key call whose key is one of
+    // these well-known symbols routes to the receiver-swapped String.prototype
+    // twin (see `lower_regex_symbol_method`).
+    ast.MemberExpression(
+      object:,
+      property: ast.MemberExpression(
+        object: ast.Identifier(name: "Symbol", ..),
+        property: ast.Identifier(name: sym, ..),
+        computed: False,
+        ..,
+      ),
+      computed: True,
+      ..,
+    )
+      if sym == "match" || sym == "replace" || sym == "search" || sym == "split"
+    -> lower_regex_symbol_method(sym, object, arguments, env, ctx, ctr)
     // recv.method(args) — method dispatch (array/string methods).
     ast.MemberExpression(
       object:,
@@ -5389,6 +5406,63 @@ fn object_ident_name(object: ast.Expression) -> String {
   case object {
     ast.Identifier(name:, ..) -> name
     _ -> ""
+  }
+}
+
+/// `re[Symbol.match/replace/search/split](string, …)` — the RegExp reflection
+/// methods (§22.2.6.8 `@@match`, §22.2.6.11 `@@replace`, §22.2.6.12 `@@search`,
+/// §22.2.6.14 `@@split`). Each is the receiver-swapped twin of the corresponding
+/// `String.prototype` method — indeed `String.prototype.match(re)` is *defined* as
+/// invoking `re[Symbol.match](s)` — so `re[Symbol.match](s)` computes exactly the
+/// same result as `s.match(re)`. We therefore route to the identical runtime op
+/// with the string as the receiver and the regex as the pattern argument, reusing
+/// the global/sticky-aware `lastIndex` handling those ops already implement.
+///
+/// `sym` is the well-known symbol's name ("match" | "replace" | "search" |
+/// "split"); `object` is the regex expression; `arguments` supply the string and,
+/// for replace/split, the replacement value / limit. A missing string argument
+/// lowers to `undefined`, which the runtime ToString-coerces to "undefined" per
+/// spec. Returns the same value shape as the mirrored String method (match: exec
+/// array or an array of matches or `null`; search: an index or -1; replace: the
+/// spliced string; split: the pieces array).
+fn lower_regex_symbol_method(
+  sym: String,
+  object: ast.Expression,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bo, re, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let pre = list.append(bo, ba)
+  let str = case argvals {
+    [s, ..] -> s
+    [] -> undefined()
+  }
+  case sym {
+    "match" ->
+      Ok(bind_after(pre, ir.CallHost("js", "str_match", [str, re]), ctr))
+    "search" ->
+      Ok(bind_after(pre, ir.CallHost("js", "str_search", [str, re]), ctr))
+    "split" -> {
+      let lim = case argvals {
+        [_, l, ..] -> l
+        _ -> undefined()
+      }
+      Ok(bind_after(pre, ir.CallHost("js", "str_split", [str, re, lim]), ctr))
+    }
+    // `@@replace` maps onto String.prototype.replace with a regex search: the
+    // runtime replaces the first match, or every match for a global regex, and
+    // resets `lastIndex` to 0 when global — exactly the `@@replace` algorithm.
+    "replace" -> {
+      let repl = case argvals {
+        [_, r, ..] -> r
+        _ -> undefined()
+      }
+      Ok(bind_after(pre, ir.CallHost("js", "str_replace", [str, re, repl]), ctr))
+    }
+    _ -> Error(Unsupported("RegExp[Symbol." <> sym <> "]"))
   }
 }
 
