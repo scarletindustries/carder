@@ -5367,7 +5367,10 @@ strip_leading_zeros(D) -> D.
 num_to_precision(N, P) ->
     case coerce_num(P) of
         nan ->
-            to_string(N);
+            %% precision undefined → ToString(thisNumberValue). Unwrap the receiver
+            %% first so `Number.prototype.toPrecision()` (this value +0) yields "0"
+            %% and `(new Number(7)).toPrecision(undefined)` yields "7".
+            to_string(this_number_value(N));
         Pn ->
             case coerce_num(this_number_value(N)) of
                 nan -> <<"NaN">>;
@@ -5489,14 +5492,21 @@ num_to_fixed(N, D) ->
 
 %% thisNumberValue(this value) for the Number.prototype formatting methods
 %% (§21.1.3): a `new Number(x)` wrapper object unwraps to its boxed primitive
-%% number; every other value (a primitive number, or anything else) passes through
-%% unchanged so the caller's `coerce_num` handles it. Per spec a non-Number
+%% number; the %NumberPrototype% object itself has a [[NumberData]] internal slot
+%% with value +0 (ES §21.1.4), so a method invoked as `Number.prototype.toFixed(…)`
+%% must see +0; every other value (a primitive number, or anything else) passes
+%% through unchanged so the caller's `coerce_num` handles it. Per spec a non-Number
 %% receiver is a TypeError, but exceptions on the receiver are not modelled here —
 %% a non-wrapper simply falls through to the ordinary numeric coercion.
 this_number_value(N) ->
     case cell_tag(N) of
-        {js_wrapper, number, Prim} -> Prim;
-        _ -> N
+        {js_wrapper, number, Prim} ->
+            Prim;
+        _ ->
+            case is_reference(N) andalso N =:= builtin_prototype(<<"Number">>) of
+                true -> 0.0;
+                false -> N
+            end
     end.
 
 %% Normalise negative zero to positive zero (any non-zero float is returned

@@ -6579,3 +6579,30 @@ pub fn ctor_in_closure_throws_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(1.0)
 }
+
+// ==== Number (wave 11) ====
+
+// The %NumberPrototype% object has a [[NumberData]] internal slot with value +0
+// (ES §21.1.4), so a formatting method invoked directly on `Number.prototype`
+// (thisNumberValue → +0) formats zero rather than coercing the marker object.
+pub fn number_prototype_thisnumbervalue_zero_test() {
+  // test262 built-ins/Number/prototype/{toExponential,toPrecision,toFixed}
+  let m =
+    compile(
+      "function f() { return Number.prototype.toExponential(0) + '|' + Number.prototype.toPrecision(1) + '|' + Number.prototype.toFixed(2) + '|' + Number.prototype.toPrecision(); }",
+    )
+  call(m, "f", [])
+  |> should.equal(dyn(<<"0e+0|0|0.00|0">>))
+}
+
+// toPrecision with an undefined precision returns ToString(thisNumberValue): a
+// `new Number(7)` wrapper unwraps to "7"; a primitive passes through
+// (test262 built-ins/Number/prototype/toPrecision/undefined-precision-arg).
+pub fn number_to_precision_undefined_arg_test() {
+  let m =
+    compile(
+      "function f() { var n = new Number(7); return n.toPrecision(undefined) + '|' + (39).toPrecision(undefined) + '|' + (42).toPrecision(); }",
+    )
+  call(m, "f", [])
+  |> should.equal(dyn(<<"7|39|42">>))
+}
