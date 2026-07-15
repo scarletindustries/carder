@@ -5266,9 +5266,15 @@ fn lower_instance_method(
     "every", [f, ..] -> host("array_every", [f])
     "find", [f, ..] -> host("array_find", [f])
     "findIndex", [f, ..] -> host("array_find_index", [f])
+    // A missing callback lowers to `undefined` so the runtime's IsCallable check
+    // (§23.1.3.12 / .9 / .10) fires and throws a TypeError, as the spec requires
+    // even for an empty array.
     "flatMap", [f, ..] -> host("array_flat_map", [f])
+    "flatMap", [] -> host("array_flat_map", [undefined()])
     "findLast", [f, ..] -> host("array_find_last", [f])
+    "findLast", [] -> host("array_find_last", [undefined()])
     "findLastIndex", [f, ..] -> host("array_find_last_index", [f])
+    "findLastIndex", [] -> host("array_find_last_index", [undefined()])
     "lastIndexOf", [x, from, ..] -> host("array_last_index_of", [x, from])
     "lastIndexOf", [x] -> host("array_last_index_of", [x, undefined()])
     "lastIndexOf", [] -> host("array_last_index_of", [undefined(), undefined()])
@@ -5522,6 +5528,17 @@ fn build_list(
   })
 }
 
+/// The `Array.prototype` method names exposed as first-class function values by
+/// `array_proto_fn` in the runtime. Kept in exact sync with that function's arms:
+/// each name here MUST have a matching clause there (an unlisted name would become a
+/// runtime TypeError when the value is constructed).
+fn is_array_proto_method(name: String) -> Bool {
+  case name {
+    "at" | "flat" | "flatMap" | "findLast" | "findLastIndex" -> True
+    _ -> False
+  }
+}
+
 fn lower_member(
   object: ast.Expression,
   property: ast.Expression,
@@ -5531,6 +5548,29 @@ fn lower_member(
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
   case object, property, computed {
+    // `Array.prototype.<name>` — the built-in array method as a first-class function
+    // VALUE (§23.1.3), so `typeof Array.prototype.at === "function"` and the method
+    // can be extracted. In this model it is an UNBOUND method (receiver-first); the
+    // runtime yields a fun taking the receiver as its first argument. `Array` is a
+    // namespace, not a binding, so this is the only way its prototype methods appear
+    // as values. An unknown name falls through to the ordinary member read.
+    ast.MemberExpression(
+      object: ast.Identifier(name: "Array", ..),
+      property: ast.Identifier(name: "prototype", ..),
+      computed: False,
+      ..,
+    ),
+      ast.Identifier(name: m, ..),
+      False
+    ->
+      case is_array_proto_method(m) {
+        True ->
+          Ok(bind1(
+            ir.CallHost("js", "array_proto_fn", [ir.ConstBinary(<<m:utf8>>)]),
+            ctr,
+          ))
+        False -> lower_member_get(object, property, computed, env, ctx, ctr)
+      }
     // Math.PI / Math.E / … — a compile-time numeric constant (Math is not a value).
     ast.Identifier(name: "Math", ..), ast.Identifier(name: c, ..), False ->
       case math_const(c) {

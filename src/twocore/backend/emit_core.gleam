@@ -4240,6 +4240,7 @@ fn resolve_js(op: String) -> Option(String) {
     "array_copy_within" -> Some("array_copy_within")
     "array_splice" -> Some("array_splice")
     "array_at" -> Some("array_at")
+    "array_proto_fn" -> Some("array_proto_fn")
     "str_pad_start" -> Some("str_pad_start")
     "str_pad_end" -> Some("str_pad_end")
     "string_from_char_code" -> Some("string_from_char_code")

@@ -428,6 +428,12 @@ pub fn array_splice(arr: Dynamic, args: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_at")
 pub fn array_at(recv: Dynamic, i: Dynamic) -> Dynamic
 
+/// `Array.prototype.<name>` as a first-class function value (the unbound method,
+/// receiver-first). `name` is the method name; yields a callable whose `typeof`
+/// is "function".
+@external(erlang, "twocore_rt_js_ffi", "array_proto_fn")
+pub fn array_proto_fn(name: Dynamic) -> Dynamic
+
 /// `str.padStart(n, pad)` / `padEnd` — pad to length `n` (default pad is a space).
 @external(erlang, "twocore_rt_js_ffi", "str_pad_start")
 pub fn str_pad_start(str: Dynamic, n: Dynamic, pad: Dynamic) -> Dynamic
