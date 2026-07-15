@@ -7019,9 +7019,12 @@ excluded_keys(_) ->
 %%   * anything else is treated as no replacer.
 %% `space` sets the indentation gap: a Number N yields min(10, floor(N)) spaces
 %% (0/negative → none); a String yields its first 10 code units; else none.
-%% Deviation: `this`-bound `toJSON`/replacer receivers and String/Number/Boolean
-%% wrapper objects are not modelled (this runtime has no such wrappers).
+%% String/Number/Boolean wrapper objects ARE unwrapped to their primitive per
+%% SerializeJSONProperty step 4 (see `json_unwrap_primitive`). A cyclical
+%% structure raises a TypeError (see `json_serialize_cell`). Deviation:
+%% `this`-bound `toJSON`/replacer receivers are still not modelled.
 json_stringify(V, Replacer, Space) ->
+    erlang:erase(json_stack),
     {RepFn, PropList} = json_replacer(Replacer),
     Gap = json_gap(Space),
     St = {RepFn, PropList, Gap},
@@ -7138,16 +7141,36 @@ json_call_tojson(Key, V, Stored) ->
     end.
 
 json_serialize_value(V, St, Indent) ->
-    case js_type(V) of
-        number -> json_num(V);
-        boolean -> to_string(V);
-        string -> json_str(V);
-        null -> <<"null">>;
-        undefined -> skip;
-        function -> skip;
-        object -> json_serialize_cell(V, St, Indent);
-        other -> skip
+    case json_unwrap_primitive(V) of
+        {primitive, Prim} ->
+            json_serialize_value(Prim, St, Indent);
+        no ->
+            case js_type(V) of
+                number -> json_num(V);
+                boolean -> to_string(V);
+                string -> json_str(V);
+                null -> <<"null">>;
+                undefined -> skip;
+                function -> skip;
+                object -> json_serialize_cell(V, St, Indent);
+                other -> skip
+            end
     end.
+
+%% SerializeJSONProperty steps 4.a–4.c: a Number/String/Boolean wrapper OBJECT
+%% (`new Number(n)` / `new String(s)` / `new Boolean(b)`) is serialized as its
+%% wrapped primitive [[NumberData]]/[[StringData]]/[[BooleanData]], NOT as an
+%% object — so `JSON.stringify(new Boolean(true))` yields `"true"`, not `"{}"`,
+%% and a wrapper nested inside an object/array or returned from a replacer/toJSON
+%% is serialized by its primitive too. Returns `{primitive, Prim}` for a wrapper
+%% cell, `no` for any other value.
+json_unwrap_primitive(V) when is_reference(V) ->
+    case erlang:get(?CELL_KEY(V)) of
+        {js_wrapper, _Kind, Prim} -> {primitive, Prim};
+        _ -> no
+    end;
+json_unwrap_primitive(_) ->
+    no.
 
 json_num(js_nan) -> <<"null">>;
 json_num(js_inf) -> <<"null">>;
@@ -7180,11 +7203,39 @@ unicode_escape(B) ->
 %% Serialize an object/array cell. Arrays and plain objects recurse; every other
 %% cell kind (regex, Map, Set, …) has no enumerable own properties and renders as
 %% an empty object `{}`, matching JSON.stringify on an ordinary object.
+%%
+%% SerializeJSONObject/SerializeJSONArray step 1: "If stack contains value, throw
+%% a TypeError exception because the structure is cyclical." The stack is the set
+%% of object/array cells currently being serialized (an ancestor chain), tracked
+%% in the process dictionary under `json_stack`. A cell is pushed on entry and
+%% popped on exit (via `after`, so it is restored on a thrown TypeError too), so a
+%% value that merely appears twice in DIFFERENT branches (a diamond, not a cycle)
+%% is NOT rejected. A truly cyclical reference recurses back to an ancestor still
+%% on the stack and raises `type_error`, which a JS `try`/`catch` observes as a
+%% TypeError — without this, a self-referential object looped forever.
 json_serialize_cell(Ref, St, Indent) ->
-    case erlang:get(?CELL_KEY(Ref)) of
-        {js_array, Len, _Map} -> json_serialize_array(Ref, Len, St, Indent);
-        M when is_map(M) -> json_serialize_object(Ref, M, St, Indent);
-        _ -> <<"{}">>
+    Stack =
+        case erlang:get(json_stack) of
+            undefined -> [];
+            L -> L
+        end,
+    case lists:member(Ref, Stack) of
+        true ->
+            type_error(Ref);
+        false ->
+            erlang:put(json_stack, [Ref | Stack]),
+            try
+                case erlang:get(?CELL_KEY(Ref)) of
+                    {js_array, Len, _Map} ->
+                        json_serialize_array(Ref, Len, St, Indent);
+                    M when is_map(M) ->
+                        json_serialize_object(Ref, M, St, Indent);
+                    _ ->
+                        <<"{}">>
+                end
+            after
+                erlang:put(json_stack, Stack)
+            end
     end.
 
 %% SerializeJSONArray: each index is serialized via SerializeJSONProperty (so the
