@@ -302,6 +302,21 @@ pub fn gen_next(gen: Dynamic, args: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "iter_array")
 pub fn iter_array(source: Dynamic) -> Dynamic
 
+/// Iterator.prototype.toArray — drain a generator/iterator receiver into a new
+/// array (§27.1.4.19).
+@external(erlang, "twocore_rt_js_ffi", "iter_to_array")
+pub fn iter_to_array(source: Dynamic) -> Dynamic
+
+/// Iterator.prototype.take — a lazy iterator yielding at most `limit` values
+/// (§27.1.4.17). A negative limit raises a RangeError.
+@external(erlang, "twocore_rt_js_ffi", "iter_take")
+pub fn iter_take(source: Dynamic, limit: Dynamic) -> Dynamic
+
+/// Iterator.prototype.drop — a lazy iterator skipping the first `limit` values
+/// (§27.1.4.4). A negative limit raises a RangeError.
+@external(erlang, "twocore_rt_js_ffi", "iter_drop")
+pub fn iter_drop(source: Dynamic, limit: Dynamic) -> Dynamic
+
 /// Read a static class field `Class.field` (`class` is the module-qualified name).
 /// Returns `undefined` if unset.
 @external(erlang, "twocore_rt_js_ffi", "static_get")

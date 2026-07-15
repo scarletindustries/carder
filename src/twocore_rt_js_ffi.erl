@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, iter_to_array/1, iter_take/2, iter_drop/2, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
@@ -1188,11 +1188,273 @@ drain_gen(Gen, Acc) ->
 %% ordinary iterator/cursor object with its own `next` still works).
 gen_next(Recv, Args) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
-        {js_gen, StepFn} -> call_cb(StepFn, [arg(Args, 0)]);
-        _ -> delegate(Recv, <<"next">>, Args)
+        {js_gen, StepFn} ->
+            %% Mark the generator RUNNING while its step executes so a re-entrant
+            %% `.next()` (a step that resumes its own generator) is rejected with a
+            %% TypeError — the "generator is already running" state (§27.5.3.3).
+            %% Restored to suspended afterwards (even on an exception) unless the
+            %% step CLOSED the generator in the meantime.
+            erlang:put(?CELL_KEY(Recv), {js_gen_running, StepFn}),
+            try
+                call_cb(StepFn, [arg(Args, 0)])
+            after
+                case erlang:get(?CELL_KEY(Recv)) of
+                    {js_gen_running, _} ->
+                        erlang:put(?CELL_KEY(Recv), {js_gen, StepFn});
+                    _ ->
+                        ok
+                end
+            end;
+        {js_gen_running, _} ->
+            type_error(<<"Generator is already running">>);
+        js_gen_done ->
+            iter_result(undefined, true);
+        _ ->
+            delegate(Recv, <<"next">>, Args)
     end;
 gen_next(Recv, Args) ->
     delegate(Recv, <<"next">>, Args).
+
+%% IteratorClose for a generator receiver (§7.4.11 as used by the Iterator
+%% helpers): permanently mark the generator DONE so any later `.next()` returns
+%% `{value: undefined, done: true}`. Called when a helper short-circuits (e.g.
+%% `some`/`find` on a truthy predicate, `take` at its limit). A non-generator
+%% receiver is left untouched (this engine models plain-object iterators without a
+%% `return` method).
+iter_close(Recv) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_gen, _} -> erlang:put(?CELL_KEY(Recv), js_gen_done);
+        {js_gen_running, _} -> erlang:put(?CELL_KEY(Recv), js_gen_done);
+        _ -> ok
+    end,
+    undefined;
+iter_close(_) ->
+    undefined.
+
+%% ── Iterator helper methods (Iterator Helpers proposal, §27.1.4) ─────────────
+%% These drive an UNDERLYING iterator — a generator cell, or any object with a
+%% `next` method (via `gen_next`) — per the Iterator Helpers proposal. The
+%% TERMINAL helpers (toArray/forEach/some/every/find/reduce) eagerly consume the
+%% source; the LAZY helpers (map/filter/take/drop) return a NEW generator cell
+%% whose step closure pulls from the source on demand. The receiver is dispatched
+%% to these from the array-method entry points when it is a `{js_gen, _}` cell.
+
+%% Advance the underlying iterator one step. Returns `done` when it is exhausted,
+%% or `{value, V}` for the next yielded value. Per IteratorStep, a `next()` result
+%% that is not an Object is a TypeError.
+iter_step(Recv) ->
+    R = gen_next(Recv, []),
+    case is_reference(R) of
+        true ->
+            case truthy(get_prop(R, <<"done">>)) of
+                1 -> done;
+                0 -> {value, get_prop(R, <<"value">>)}
+            end;
+        false ->
+            type_error(R)
+    end.
+
+%% toArray — collect every remaining value of the iterator into a new array
+%% (§27.1.4.19).
+iter_to_array(Recv) ->
+    new_array(iter_collect(Recv, [])).
+iter_collect(Recv, Acc) ->
+    case iter_step(Recv) of
+        done -> lists:reverse(Acc);
+        {value, V} -> iter_collect(Recv, [V | Acc])
+    end.
+
+%% forEach(fn) — call `fn(value, counter)` for each value; returns undefined
+%% (§27.1.4.7). The counter is a 0-based ascending index.
+iter_for_each(Recv, Fn) ->
+    require_callable(Fn),
+    ifeach(Recv, Fn, 0).
+ifeach(Recv, Fn, N) ->
+    case iter_step(Recv) of
+        done -> undefined;
+        {value, V} ->
+            call_cb(Fn, [V, N]),
+            ifeach(Recv, Fn, N + 1)
+    end.
+
+%% some(fn) — the JS boolean `true` if `fn(value, counter)` is truthy for any
+%% value (short-circuiting on the first truthy result), else `false` (§27.1.4.18).
+iter_some(Recv, Fn) ->
+    require_callable(Fn),
+    isome(Recv, Fn, 0).
+isome(Recv, Fn, N) ->
+    case iter_step(Recv) of
+        done -> false;
+        {value, V} ->
+            case truthy(call_cb(Fn, [V, N])) of
+                1 ->
+                    iter_close(Recv),
+                    true;
+                0 ->
+                    isome(Recv, Fn, N + 1)
+            end
+    end.
+
+%% every(fn) — the JS boolean `true` unless `fn(value, counter)` is falsy for some
+%% value (short-circuiting on the first falsy result) (§27.1.4.6).
+iter_every(Recv, Fn) ->
+    require_callable(Fn),
+    ievery(Recv, Fn, 0).
+ievery(Recv, Fn, N) ->
+    case iter_step(Recv) of
+        done -> true;
+        {value, V} ->
+            case truthy(call_cb(Fn, [V, N])) of
+                0 ->
+                    iter_close(Recv),
+                    false;
+                1 ->
+                    ievery(Recv, Fn, N + 1)
+            end
+    end.
+
+%% find(fn) — the first value for which `fn(value, counter)` is truthy, else
+%% undefined (§27.1.4.8).
+iter_find(Recv, Fn) ->
+    require_callable(Fn),
+    ifind(Recv, Fn, 0).
+ifind(Recv, Fn, N) ->
+    case iter_step(Recv) of
+        done -> undefined;
+        {value, V} ->
+            case truthy(call_cb(Fn, [V, N])) of
+                1 ->
+                    iter_close(Recv),
+                    V;
+                0 ->
+                    ifind(Recv, Fn, N + 1)
+            end
+    end.
+
+%% reduce(fn, init) — left fold seeded by `init`; the reducer is called with
+%% `(accumulator, value, counter)`, counter 0-based (§27.1.4.16).
+iter_reduce(Recv, Fn, Init) ->
+    require_callable(Fn),
+    ireduce(Recv, Fn, Init, 0).
+ireduce(Recv, Fn, Acc, N) ->
+    case iter_step(Recv) of
+        done -> Acc;
+        {value, V} -> ireduce(Recv, Fn, call_cb(Fn, [Acc, V, N]), N + 1)
+    end.
+
+%% reduce(fn) — no seed: the first value seeds the accumulator and the fold
+%% continues from counter 1. An empty iterator throws a TypeError (§27.1.4.16
+%% step 5.b.i).
+iter_reduce1(Recv, Fn) ->
+    require_callable(Fn),
+    case iter_step(Recv) of
+        done -> type_error(<<"Reduce of empty iterator with no initial value">>);
+        {value, V} -> ireduce(Recv, Fn, V, 1)
+    end.
+
+%% map(fn) — a LAZY iterator yielding `fn(value, counter)` for each source value
+%% (§27.1.4.12). The counter lives in a cell captured by the step closure.
+iter_map(Recv, Fn) ->
+    require_callable(Fn),
+    St = cell_new(0),
+    gen_make(fun(_Sent) -> imap_step(Recv, Fn, St) end).
+imap_step(Recv, Fn, St) ->
+    case iter_step(Recv) of
+        done -> iter_result(undefined, true);
+        {value, V} ->
+            N = cell_get(St),
+            cell_set(St, N + 1),
+            iter_result(call_cb(Fn, [V, N]), false)
+    end.
+
+%% filter(fn) — a LAZY iterator yielding the source values for which
+%% `fn(value, counter)` is truthy (§27.1.4.5).
+iter_filter(Recv, Fn) ->
+    require_callable(Fn),
+    St = cell_new(0),
+    gen_make(fun(_Sent) -> ifilter_step(Recv, Fn, St) end).
+ifilter_step(Recv, Fn, St) ->
+    case iter_step(Recv) of
+        done -> iter_result(undefined, true);
+        {value, V} ->
+            N = cell_get(St),
+            cell_set(St, N + 1),
+            case truthy(call_cb(Fn, [V, N])) of
+                1 -> iter_result(V, false);
+                0 -> ifilter_step(Recv, Fn, St)
+            end
+    end.
+
+%% take(n) — a LAZY iterator yielding at most `n` source values (§27.1.4.17). `n`
+%% is ToIntegerOrInfinity(limit); a negative limit throws a RangeError.
+iter_take(Recv, Limit) ->
+    St = cell_new(iter_limit(Limit)),
+    gen_make(fun(_Sent) -> itake_step(Recv, St) end).
+itake_step(Recv, St) ->
+    case cell_get(St) of
+        inf ->
+            itake_yield(Recv, St, inf);
+        Rem when Rem =< 0 ->
+            %% Limit reached: close the underlying iterator (§27.1.4.17 step 5.b.i).
+            iter_close(Recv),
+            iter_result(undefined, true);
+        Rem ->
+            itake_yield(Recv, St, Rem)
+    end.
+itake_yield(Recv, St, Rem) ->
+    case iter_step(Recv) of
+        done -> iter_result(undefined, true);
+        {value, V} ->
+            case Rem of
+                inf -> ok;
+                _ -> cell_set(St, Rem - 1)
+            end,
+            iter_result(V, false)
+    end.
+
+%% drop(n) — a LAZY iterator that skips the first `n` source values, then yields
+%% the rest (§27.1.4.4). `n` is ToIntegerOrInfinity(limit); negative → RangeError.
+iter_drop(Recv, Limit) ->
+    St = cell_new({drop, iter_limit(Limit)}),
+    gen_make(fun(_Sent) -> idrop_step(Recv, St) end).
+idrop_step(Recv, St) ->
+    case cell_get(St) of
+        {drop, inf} ->
+            case iter_step(Recv) of
+                done -> iter_result(undefined, true);
+                {value, _} -> idrop_step(Recv, St)
+            end;
+        {drop, Rem} when Rem > 0 ->
+            case iter_step(Recv) of
+                done -> iter_result(undefined, true);
+                {value, _} ->
+                    cell_set(St, {drop, Rem - 1}),
+                    idrop_step(Recv, St)
+            end;
+        _ ->
+            case iter_step(Recv) of
+                done -> iter_result(undefined, true);
+                {value, V} -> iter_result(V, false)
+            end
+    end.
+
+%% ToIntegerOrInfinity for take/drop's limit, per §27.1.4.17/.4 step 3-5: NaN → 0,
+%% ±Infinity preserved, otherwise truncate toward zero; a negative result throws a
+%% RangeError.
+iter_limit(Limit) ->
+    case coerce_num(Limit) of
+        nan -> 0;
+        inf -> inf;
+        neg_inf -> range_error(<<"Iterator limit must not be negative">>);
+        N when is_integer(N), N < 0 -> range_error(<<"Iterator limit must not be negative">>);
+        N when is_integer(N) -> N;
+        N when is_float(N) ->
+            T = trunc(N),
+            case T < 0 of
+                true -> range_error(<<"Iterator limit must not be negative">>);
+                false -> T
+            end
+    end.
 
 %% Static class fields live in the process dictionary keyed by a module-qualified
 %% class name (`ModuleName$Class`, unique per compiled JS module) so two modules
@@ -3311,6 +3573,10 @@ js_m_foreach(Recv, Args) ->
                     end,
                     set_foreach(Recv, Fn, -1),
                     undefined;
+                {js_gen, _} ->
+                    %% Iterator.prototype.forEach — call fn(value, counter) for
+                    %% every value the generator yields (§27.1.4.7).
+                    iter_for_each(Recv, Fn);
                 _ ->
                     delegate(Recv, <<"forEach">>, Args)
             end
@@ -4337,8 +4603,13 @@ call_cb(Fn, Args) ->
 %% the callback adds beyond the original length are never visited. The result has
 %% the same length as the source. Callback: (element, index, array).
 array_map(Recv, Fn) ->
-    {Len, _Map} = arr_content(Recv),
-    cell_new({js_array, Len, amap(Fn, Recv, 0, Len, #{})}).
+    case cell_tag(Recv) of
+        {js_gen, _} ->
+            iter_map(Recv, Fn);
+        _ ->
+            {Len, _Map} = arr_content(Recv),
+            cell_new({js_array, Len, amap(Fn, Recv, 0, Len, #{})})
+    end.
 amap(_, _, K, Len, Acc) when K >= Len -> Acc;
 amap(Fn, Arr, K, Len, Acc) ->
     case arr_index(Arr, K) of
@@ -4350,8 +4621,13 @@ amap(Fn, Arr, K, Len, Acc) ->
 %% visited), live re-read each step, iteration bounded by the entry length. The
 %% result is a DENSE array of the kept elements. Callback: (element, index, array).
 array_filter(Recv, Fn) ->
-    {Len, _Map} = arr_content(Recv),
-    new_array(afilter(Fn, Recv, 0, Len)).
+    case cell_tag(Recv) of
+        {js_gen, _} ->
+            iter_filter(Recv, Fn);
+        _ ->
+            {Len, _Map} = arr_content(Recv),
+            new_array(afilter(Fn, Recv, 0, Len))
+    end.
 afilter(_, _, K, Len) when K >= Len -> [];
 afilter(Fn, Arr, K, Len) ->
     case arr_index(Arr, K) of
@@ -4407,8 +4683,13 @@ arr_get_live(Recv, I) ->
 %% bound `Len` is fixed at entry so elements the callback appends beyond the
 %% original length are never visited. Callback: (accumulator, element, index, array).
 array_reduce(Recv, Fn, Init) ->
-    {Len, _Map} = arr_content(Recv),
-    areduce(Fn, Recv, 0, Len, Init).
+    case cell_tag(Recv) of
+        {js_gen, _} ->
+            iter_reduce(Recv, Fn, Init);
+        _ ->
+            {Len, _Map} = arr_content(Recv),
+            areduce(Fn, Recv, 0, Len, Init)
+    end.
 areduce(_, _, K, Len, Acc) when K >= Len -> Acc;
 areduce(Fn, Arr, K, Len, Acc) ->
     case arr_index(Arr, K) of
@@ -4419,6 +4700,11 @@ areduce(Fn, Arr, K, Len, Acc) ->
 %% reduce(fn) — no seed: the first present element seeds the accumulator and the
 %% fold continues after it. An array with no present element in range → TypeError.
 array_reduce1(Recv, Fn) ->
+    case cell_tag(Recv) of
+        {js_gen, _} -> iter_reduce1(Recv, Fn);
+        _ -> array_reduce1_arr(Recv, Fn)
+    end.
+array_reduce1_arr(Recv, Fn) ->
     {Len, _Map} = arr_content(Recv),
     case reduce_seed_l(Recv, 0, Len) of
         error -> type_error(Recv);
@@ -4464,8 +4750,13 @@ reduce_seed_r(Arr, K) ->
 %% some(fn) — true if the callback is truthy for any present element. Skips holes,
 %% re-reads the live array, and bounds iteration by the length captured at entry.
 array_some(Recv, Fn) ->
-    {Len, _Map} = arr_content(Recv),
-    asome(Fn, Recv, 0, Len).
+    case cell_tag(Recv) of
+        {js_gen, _} ->
+            iter_some(Recv, Fn);
+        _ ->
+            {Len, _Map} = arr_content(Recv),
+            asome(Fn, Recv, 0, Len)
+    end.
 asome(_, _, K, Len) when K >= Len -> false;
 asome(Fn, Arr, K, Len) ->
     case arr_index(Arr, K) of
@@ -4481,8 +4772,13 @@ asome(Fn, Arr, K, Len) ->
 %% every(fn) — true unless the callback is falsy for some present element. Skips
 %% holes, re-reads the live array, bounds iteration by the entry length.
 array_every(Recv, Fn) ->
-    {Len, _Map} = arr_content(Recv),
-    aevery(Fn, Recv, 0, Len).
+    case cell_tag(Recv) of
+        {js_gen, _} ->
+            iter_every(Recv, Fn);
+        _ ->
+            {Len, _Map} = arr_content(Recv),
+            aevery(Fn, Recv, 0, Len)
+    end.
 aevery(_, _, K, Len) when K >= Len -> true;
 aevery(Fn, Arr, K, Len) ->
     case arr_index(Arr, K) of
@@ -4499,8 +4795,13 @@ aevery(Fn, Arr, K, Len) ->
 %% Visits EVERY index in [0, Len) (no hole skip; a hole reads as undefined) and
 %% re-reads the live array each step.
 array_find(Recv, Fn) ->
-    {Len, _Map} = arr_content(Recv),
-    afind(Fn, Recv, 0, Len).
+    case cell_tag(Recv) of
+        {js_gen, _} ->
+            iter_find(Recv, Fn);
+        _ ->
+            {Len, _Map} = arr_content(Recv),
+            afind(Fn, Recv, 0, Len)
+    end.
 afind(_, _, K, Len) when K >= Len -> undefined;
 afind(Fn, Arr, K, Len) ->
     X = arr_get_live(Arr, K),
