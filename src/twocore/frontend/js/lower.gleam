@@ -59,7 +59,13 @@
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
 //// `String`/`Number`/`Boolean`; the global constants `NaN`/`Infinity`/`undefined`
-//// (a local binding of the same name shadows them); and the statics `Array.isArray`/`of`/`from`,
+//// (a local binding of the same name shadows them); `globalThis` (§19.3.1) — the
+//// global object as a stable per-instance singleton cell (`typeof` "object", never
+//// null, `globalThis === globalThis` and `globalThis.globalThis === globalThis` by
+//// identity; top-level `this` resolves to it too; `globalThis.<name>` reads resolve
+//// to the already-bound global of that name; a user binding of the name shadows it;
+//// NO mutable global-property model — `globalThis.Array` etc. only reach globals that
+//// are themselves bound as values); and the statics `Array.isArray`/`of`/`from`,
 //// `Object.keys`/`values`/`entries`/`assign`/`fromEntries`/`getOwnPropertyNames`/
 //// `freeze`/`isFrozen` (freeze makes direct property/element writes and `delete`
 //// non-strict no-ops; mutating array METHODS like `push` are NOT blocked — a v1
@@ -3171,6 +3177,14 @@ fn lower_expr(
                         // passed around / applied to build a Symbol.
                         False, "Symbol" ->
                           Ok(bind1(ir.CallHost("js", "symbol_ctor", []), ctr))
+                        // `globalThis` (§19.3.1) — THE global object, a stable
+                        // per-instance singleton cell: `typeof` "object", never
+                        // null, and `globalThis === globalThis` by identity. A
+                        // user-declared binding of the same name shadows it
+                        // (checked LAST), matching the writable/configurable
+                        // global property.
+                        False, "globalThis" ->
+                          Ok(bind1(ir.CallHost("js", "globalthis_new", []), ctr))
                         False, _ ->
                           Error(Unsupported("unbound identifier '" <> x <> "'"))
                       }
@@ -3204,7 +3218,10 @@ fn lower_expr(
     ast.ThisExpression(..) ->
       case dict.get(env, "this") {
         Ok(v) -> Ok(#([], v, ctr))
-        Error(Nil) -> Error(Unsupported("`this` outside a method"))
+        // No lexical `this` binding → top-level (script) `this`, which per
+        // §9.4.2 / sloppy-mode function invocation is the global object. Resolve
+        // it to the same `globalThis` singleton so `this === globalThis` holds.
+        Error(Nil) -> Ok(bind1(ir.CallHost("js", "globalthis_new", []), ctr))
       }
     ast.MemberExpression(object:, property:, computed:, ..) ->
       lower_member(object, property, computed, env, ctx, ctr)
@@ -5590,6 +5607,14 @@ fn lower_member(
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  // `globalThis` is only the built-in global object when the program has NOT
+  // declared its own binding of that name (a local, a top-level var/let/const, or
+  // a top-level function); such a binding shadows it, per its writable/configurable
+  // global property, so `.name` is then an ordinary property access.
+  let globalthis_shadowed =
+    dict.has_key(env, "globalThis")
+    || is_global("globalThis", ctx)
+    || list.contains(ctx.funcs, "globalThis")
   case object, property, computed {
     // `Array.prototype.<name>` — the built-in array method as a first-class function
     // VALUE (§23.1.3), so `typeof Array.prototype.at === "function"` and the method
@@ -5670,6 +5695,16 @@ fn lower_member(
           ))
         False -> lower_member_get(object, property, computed, env, ctx, ctr)
       }
+    // `globalThis.<name>` (§19.3.1) — a property READ off the global object
+    // resolves to the already-bound global of that name (`globalThis.globalThis`
+    // is the global object itself, `globalThis.NaN`/`Infinity`/`undefined` the
+    // global values, etc.). We desugar to lowering the bare identifier `<name>`,
+    // reusing the whole global-resolution path, so the read shares identity with
+    // the direct reference. Skipped when `globalThis` is user-shadowed (a local or
+    // module-global binding), where `.name` is an ordinary property access.
+    ast.Identifier(name: "globalThis", ..), ast.Identifier(..), False
+      if !globalthis_shadowed
+    -> lower_expr(property, env, ctx, ctr)
     _, _, _ ->
       // `C.staticField` — read the static storage, walking the inheritance chain
       // (receiver first) so an own value written on a subclass shadows the

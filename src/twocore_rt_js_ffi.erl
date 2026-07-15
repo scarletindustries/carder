@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
@@ -1020,6 +1020,27 @@ cell_set(Ref, _) ->
 %% A fresh empty object: a cell holding an empty map (binary keys → values).
 new_object() ->
     cell_new(#{}).
+
+%% The `globalThis` value (§19.3.1): THE global object, obtained as a stable
+%% per-instance SINGLETON so that every evaluation of the `globalThis` identifier
+%% (and top-level `this`) yields the SAME reference. Identity matters — the spec
+%% requires `globalThis === globalThis` and `globalThis.globalThis === globalThis`,
+%% which only holds if a single cell backs every access. Being a cell it is
+%% `typeof` "object" (never null). The singleton is memoised in this process's
+%% dictionary under a fixed key (namespaced so it cannot collide with a `?CELL_KEY`
+%% ref key or an instance key), created lazily on first reference. A full mutable
+%% global-object property model is out of scope: property reads such as
+%% `globalThis.Array` are resolved by the lowerer against the already-bound globals,
+%% not stored in this cell's map.
+globalthis_new() ->
+    case erlang:get(js_globalthis_singleton) of
+        undefined ->
+            Ref = cell_new(#{}),
+            erlang:put(js_globalthis_singleton, Ref),
+            Ref;
+        Ref ->
+            Ref
+    end.
 
 %% `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive WRAPPER object:
 %% a cell holding `{js_wrapper, Kind, Prim}` where `Kind` is the atom `number`/`string`/

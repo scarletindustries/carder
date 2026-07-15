@@ -6079,3 +6079,51 @@ pub fn string_locale_compare_wave8_test() {
   // a missing 'that' argument is treated as ToString(undefined) === "undefined"
   num("\"undefined\".localeCompare() ? 0 : 1") |> should.equal(1.0)
 }
+
+// ==== globalThis (wave 8) ====
+
+// §19.3.1: `globalThis` is THE global object. It is an object (a cell), so its
+// `typeof` is "object" (never "undefined"/"function") and it is not null.
+pub fn global_this_typeof_object_test() {
+  let m = compile("function f(){ return typeof globalThis; }")
+  call(m, "f", []) |> should.equal(dyn(<<"object">>))
+  // not null
+  num("globalThis === null ? 1 : 0") |> should.equal(0.0)
+}
+
+// §19.3.1: identity — the global object is a single stable value, so a self
+// strict-equality is true (mirrors global-object.js's `this === globalThis`).
+pub fn global_this_identity_test() {
+  num("globalThis === globalThis ? 1 : 0") |> should.equal(1.0)
+}
+
+// §19.3.1: `globalThis.globalThis` is the global object itself (the global object
+// has a `globalThis` property that points back at it), so it strict-equals
+// `globalThis` (mirrors global-object.js's second assertion).
+pub fn global_this_self_property_test() {
+  num("globalThis.globalThis === globalThis ? 1 : 0") |> should.equal(1.0)
+}
+
+// §9.4.2 / sloppy-mode invocation: top-level (script) `this` is the global
+// object, so `this === globalThis` (mirrors global-object.js's first assertion).
+pub fn global_this_top_level_this_test() {
+  num("this === globalThis ? 1 : 0") |> should.equal(1.0)
+}
+
+// §19.3.1: reading a global VALUE off `globalThis` resolves to the same bound
+// global — `globalThis.Infinity` is the global `Infinity`, and `globalThis.NaN`
+// is NaN (so it is not strict-equal to itself, per IEEE-754 / §7.2.15).
+pub fn global_this_value_property_reads_test() {
+  num("globalThis.Infinity === Infinity ? 1 : 0") |> should.equal(1.0)
+  num("globalThis.NaN === globalThis.NaN ? 1 : 0") |> should.equal(0.0)
+  let m = compile("function f(){ return typeof globalThis.undefined; }")
+  call(m, "f", []) |> should.equal(dyn(<<"undefined">>))
+}
+
+// The `globalThis` name is writable/configurable as a global property: a program
+// may declare its own binding, which shadows the built-in global object both as a
+// bare reference and as the base of a `.name` access.
+pub fn global_this_shadowing_test() {
+  let m = compile("function f(){ var globalThis = 42; return globalThis; }")
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
