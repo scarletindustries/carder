@@ -6127,3 +6127,32 @@ pub fn global_this_shadowing_test() {
   let m = compile("function f(){ var globalThis = 42; return globalThis; }")
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
+
+// ==== String (wave 9) ====
+
+// §22.1.3.21 String.prototype.split ( separator, limit ): step 6 coerces
+// `limit` with ToUint32 and step 8 short-circuits — "If lim = 0, return A" (an
+// empty array) — regardless of the separator. ToUint32 sends NaN, ±0, ±Infinity
+// (and thus `undefined`→NaN, `false`→0) to 0, and reduces other numbers modulo
+// 2^32, so `2**32` also yields a 0 limit and an empty result.
+pub fn split_limit_zero_test() {
+  let s = "'undefined is not a function'"
+  num(s <> ".split(undefined, 0).length") |> should.equal(0.0)
+  num(s <> ".split(undefined, false).length") |> should.equal(0.0)
+  num(s <> ".split(undefined, NaN).length") |> should.equal(0.0)
+  num(s <> ".split(undefined, null).length") |> should.equal(0.0)
+  num(s <> ".split(undefined, 2 ** 32).length") |> should.equal(0.0)
+  num(s <> ".split(undefined, 2 ** 33).length") |> should.equal(0.0)
+}
+
+// A positive `limit` truncates the split to its leading `lim` substrings, while
+// an omitted or larger limit returns every substring (§22.1.3.21 steps 6-8, 14).
+pub fn split_limit_truncates_test() {
+  num("'a,b,c,d'.split(',', 2).length") |> should.equal(2.0)
+  val("'a,b,c,d'.split(',', 2).join('|')") |> should.equal(dyn(<<"a|b">>))
+  num("'a,b,c,d'.split(',').length") |> should.equal(4.0)
+  num("'a,b,c,d'.split(',', 10).length") |> should.equal(4.0)
+  // Empty-string separator with a limit truncates the per-code-point split.
+  num("'abcd'.split('', 2).length") |> should.equal(2.0)
+  val("'abcd'.split('', 2).join('') ") |> should.equal(dyn(<<"ab">>))
+}

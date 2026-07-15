@@ -817,9 +817,10 @@ pub fn str_lower(str: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "str_substring")
 pub fn str_substring(str: Dynamic, start: Dynamic, end: Dynamic) -> Dynamic
 
-/// `str.split(sep?)` → an array of substrings (no arg → `[str]`; "" → the characters).
+/// `str.split(sep?, limit?)` → an array of substrings (no sep → `[str]`; "" →
+/// the characters). `limit` is coerced with ToUint32; `0` yields `[]`.
 @external(erlang, "twocore_rt_js_ffi", "str_split")
-pub fn str_split(str: Dynamic, sep: Dynamic) -> Dynamic
+pub fn str_split(str: Dynamic, sep: Dynamic, limit: Dynamic) -> Dynamic
 
 /// `str.trim()` / `trimStart()` / `trimEnd()`.
 @external(erlang, "twocore_rt_js_ffi", "str_trim")
