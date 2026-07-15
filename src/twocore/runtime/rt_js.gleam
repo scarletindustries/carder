@@ -260,6 +260,28 @@ pub fn error_make(name: Dynamic, msg_arg: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "error_ctor")
 pub fn error_ctor(name: Dynamic) -> Dynamic
 
+/// A built-in constructor (`Array`/`Object`/`String`/`Number`/`Boolean`/
+/// `Function`/`RegExp`/`Date`/`Map`/`Set`) as a first-class fun VALUE — so a BARE
+/// `Array` reference has `typeof` "function" and can be assigned/passed. The fun
+/// closes over the (binary) `name`, so two references to the same constructor are
+/// fun-identical (`Array === Array`, `[].constructor === Array`). Applied, it does
+/// the constructor's call-without-`new` coercion.
+@external(erlang, "twocore_rt_js_ffi", "builtin_ctor")
+pub fn builtin_ctor(name: Dynamic) -> Dynamic
+
+/// A built-in constructor's `.prototype` as a STABLE per-constructor marker cell,
+/// memoised per `name` so `Array.prototype === Array.prototype` holds by identity.
+/// Not a real prototype object (it carries no methods); `X.prototype.<method>` is
+/// routed to the dedicated proto-fn ops by the frontend before this.
+@external(erlang, "twocore_rt_js_ffi", "builtin_prototype")
+pub fn builtin_prototype(name: Dynamic) -> Dynamic
+
+/// `Object(x)` (call without `new`, §20.1.1.1) — ToObject-ish: an object flows
+/// through unchanged, `undefined`/`null` yield a fresh object, a primitive is
+/// returned as-is (no wrapper boxing in v1).
+@external(erlang, "twocore_rt_js_ffi", "to_object")
+pub fn to_object(x: Dynamic) -> Dynamic
+
 /// `Error.isError(v)` (§20.5.2.1) → `1` when `v` is a genuine Error value (a cell
 /// with an [[ErrorData]] slot, i.e. one made by `new Error`/a NativeError/a caught
 /// engine error), `0` for every primitive and every ordinary object merely shaped

@@ -64,6 +64,7 @@
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
     new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, error_is_error/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, iter_to_array/1, iter_take/2, iter_drop/2, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    builtin_ctor/1, builtin_prototype/1, to_object/1,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
@@ -1053,6 +1054,78 @@ wrapper_new(number, X) -> cell_new({js_wrapper, number, to_number(X)});
 wrapper_new(string, X) -> cell_new({js_wrapper, string, to_string(X)});
 wrapper_new(boolean, X) -> cell_new({js_wrapper, boolean, truthy(X) =:= 1}).
 
+%% The constructor NAME (binary) for a primitive-wrapper kind, used to resolve a
+%% wrapper's `.constructor` to the matching built-in constructor VALUE.
+wrapper_ctor_name(number) -> <<"Number">>;
+wrapper_ctor_name(string) -> <<"String">>;
+wrapper_ctor_name(boolean) -> <<"Boolean">>.
+
+%% ─────────────── built-in constructors as first-class values ───────────────
+%% A built-in constructor (`Array`, `Object`, `String`, `Number`, `Boolean`,
+%% `Function`, `RegExp`, `Date`, `Map`, `Set`) as a first-class fun VALUE, so a
+%% BARE `Array` reference has `typeof` "function" and can be assigned / passed as
+%% an argument. The fun closes over the (binary) constructor `Name`, so two
+%% references to the SAME constructor are fun-identical under `=:=` — this is what
+%% makes `Array === Array` and `[].constructor === Array` hold by identity.
+%%
+%% The direct `Array(...)` / `new Array(...)` / `Array.method(...)` forms are all
+%% lowered structurally by the frontend and NEVER reach this fun; it is applied
+%% only when the constructor is used as a stored/callback VALUE (through
+%% `call_cb`, which fits the single argument). Applied, it performs the
+%% call-without-`new` coercion (`builtin_ctor_apply/2`).
+builtin_ctor(Name) ->
+    N = to_string(Name),
+    fun(X) -> builtin_ctor_apply(N, X) end.
+
+%% The call-WITHOUT-`new` behaviour of a built-in constructor VALUE applied to a
+%% single argument (the arity `call_cb` fits it to). Each mirrors the spec's
+%% call form where cheap: `Array(x)` builds an array (a single Number is a
+%% length), `String`/`Number`/`Boolean` coerce, `RegExp` compiles. `Object(x)`
+%% is ToObject-ish: an object flows through unchanged, `undefined`/`null` yield a
+%% fresh object, and a primitive is returned as-is (no wrapper boxing in v1).
+%% `Map`/`Set` require `new` (a plain call is a TypeError, per §24.1.1.1 /
+%% §24.2.1.1). `Function` stays an ahead-of-time boundary. `Date()` renders the
+%% current instant as a string (§21.4.2.1 step 1).
+builtin_ctor_apply(<<"Array">>, X) -> array_construct([X]);
+builtin_ctor_apply(<<"Object">>, X) -> to_object(X);
+builtin_ctor_apply(<<"String">>, X) -> to_string(X);
+builtin_ctor_apply(<<"Number">>, X) -> to_number(X);
+builtin_ctor_apply(<<"Boolean">>, X) -> case truthy(X) of 1 -> true; _ -> false end;
+builtin_ctor_apply(<<"RegExp">>, X) -> regex_construct(X, undefined);
+builtin_ctor_apply(<<"Date">>, _X) -> date_to_string(date_now());
+builtin_ctor_apply(<<"Map">>, _X) -> type_error(<<"Constructor Map requires 'new'">>);
+builtin_ctor_apply(<<"Set">>, _X) -> type_error(<<"Constructor Set requires 'new'">>);
+builtin_ctor_apply(<<"Function">>, _X) ->
+    type_error(<<"Function constructor is not supported (ahead-of-time compiler)">>);
+builtin_ctor_apply(_Name, X) -> X.
+
+%% ToObject-ish for the `Object(x)` call form: an existing object (a cell) flows
+%% through unchanged; `undefined`/`null` yield a fresh empty object (§20.1.1.1
+%% step 2); a primitive is returned as-is (a full wrapper object is out of scope).
+to_object(undefined) -> new_object();
+to_object(null) -> new_object();
+to_object(X) when is_reference(X) -> X;
+to_object(X) -> X.
+
+%% A built-in constructor's `.prototype` as a STABLE per-constructor marker cell,
+%% memoised in the process dictionary under a fixed `{js_builtin_prototype, Name}`
+%% key so `Array.prototype === Array.prototype` holds by reference identity (and
+%% `Array.prototype !== Object.prototype`). It is NOT a real prototype object — it
+%% carries no methods. `X.prototype.<method>` is routed to the dedicated proto-fn
+%% ops by the frontend BEFORE this, so this backs only the bare `X.prototype`
+%% value (identity, `typeof` "object").
+builtin_prototype(Name) ->
+    N = to_string(Name),
+    Key = {js_builtin_prototype, N},
+    case erlang:get(Key) of
+        undefined ->
+            Ref = cell_new(#{}),
+            erlang:put(Key, Ref),
+            Ref;
+        Ref ->
+            Ref
+    end.
+
 %% ───────────────────────── error objects ─────────────────────────
 %% A JS error VALUE (from `new TypeError(m)` / `TypeError(m)`) is a cell holding
 %% `{js_err, Name, Message}` — both binaries. It is a JS-level value that flows
@@ -1537,9 +1610,15 @@ get_prop({js_symbol, _Id, Desc}, Key) ->
 get_prop(Recv, Key) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, Len, Map} ->
-            array_get(Len, Map, Key);
+            case Key of
+                %% `arr.constructor` is the `Array` constructor VALUE (§23.1.3.2),
+                %% fun-identical to a bare `Array` reference.
+                <<"constructor">> -> builtin_ctor(<<"Array">>);
+                _ -> array_get(Len, Map, Key)
+            end;
         {js_regex, _, Flags, Src} ->
             case Key of
+                <<"constructor">> -> builtin_ctor(<<"RegExp">>);
                 <<"source">> -> Src;
                 <<"flags">> -> canonical_flags(Flags);
                 <<"global">> -> has_flag(Flags, $g);
@@ -1556,11 +1635,13 @@ get_prop(Recv, Key) when is_reference(Recv) ->
         {js_map, _, D} ->
             case Key of
                 <<"size">> -> maps:size(D);
+                <<"constructor">> -> builtin_ctor(<<"Map">>);
                 _ -> undefined
             end;
         {js_set, _, D} ->
             case Key of
                 <<"size">> -> maps:size(D);
+                <<"constructor">> -> builtin_ctor(<<"Set">>);
                 _ -> undefined
             end;
         %% a generator object: arbitrary property reads are `undefined` (`.next`
@@ -1569,10 +1650,17 @@ get_prop(Recv, Key) when is_reference(Recv) ->
             undefined;
         %% a primitive wrapper: a String wrapper exposes the string primitive's
         %% `.length` / index reads; Number/Boolean wrappers have no own data props.
+        %% `.constructor` is the matching constructor VALUE for every wrapper kind.
         {js_wrapper, string, Str} ->
-            string_prop(Str, Key);
-        {js_wrapper, _Kind, _Prim} ->
-            undefined;
+            case Key of
+                <<"constructor">> -> builtin_ctor(<<"String">>);
+                _ -> string_prop(Str, Key)
+            end;
+        {js_wrapper, Kind, _Prim} ->
+            case Key of
+                <<"constructor">> -> builtin_ctor(wrapper_ctor_name(Kind));
+                _ -> undefined
+            end;
         %% an error exposes its own `name`/`message` data properties (§20.5.3);
         %% every other read (`stack`, `cause`, `constructor`, …) is `undefined`
         %% in this v1 model, which has no error prototype chain.
@@ -1583,7 +1671,13 @@ get_prop(Recv, Key) when is_reference(Recv) ->
                 _ -> undefined
             end;
         M when is_map(M) ->
-            resolve_get(maps:get(prop_key(Key), M, undefined));
+            %% A plain object's `.constructor` (absent an own one) is the `Object`
+            %% constructor VALUE, so `({}).constructor === Object` holds. An own
+            %% `constructor` property (rare) still wins.
+            case Key =:= <<"constructor">> andalso not maps:is_key(<<"constructor">>, M) of
+                true -> builtin_ctor(<<"Object">>);
+                false -> resolve_get(maps:get(prop_key(Key), M, undefined))
+            end;
         _ ->
             type_error(Recv)
     end;
@@ -1943,10 +2037,41 @@ delete_prop_live(Recv, Key) ->
             true
     end.
 
+%% Every cell IS an Object, so `x instanceof Object` (compiled to a has_prop for
+%% the `@@is_Object` brand) is true for every reference — array, plain object,
+%% Map/Set, RegExp, Date, error, wrapper, and class instance alike. Matched ahead
+%% of the tag dispatch so a single clause covers them all.
+has_prop(Recv, <<"@@is_Object">>) when is_reference(Recv) ->
+    1;
 %% key in recv → 1|0 (own properties only, like get_prop).
 has_prop(Recv, Key) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, _Len, Map} -> array_has(Map, Key);
+        %% Every Map cell IS a Map instance → `x instanceof Map` is the `@@is_Map`
+        %% brand; a RegExp/Date cell likewise. (A non-brand `key in x` is 0, as for
+        %% Set — these built-ins have no enumerable own string properties here.)
+        {js_map, _, _} ->
+            case Key of
+                <<"@@is_Map">> -> 1;
+                _ -> 0
+            end;
+        {js_regex, _, _, _} ->
+            case Key of
+                <<"@@is_RegExp">> -> 1;
+                _ -> 0
+            end;
+        {js_date, _} ->
+            case Key of
+                <<"@@is_Date">> -> 1;
+                _ -> 0
+            end;
+        %% A primitive-wrapper OBJECT (`new String("x")` / `new Number(1)` /
+        %% `new Boolean(true)`) is `instanceof` its own kind's constructor.
+        {js_wrapper, Kind, _} ->
+            case Key of
+                <<"@@is_", N/binary>> -> bool_int(N =:= wrapper_ctor_name(Kind));
+                _ -> 0
+            end;
         %% Every Set cell IS a Set instance, so `x instanceof Set` (compiled to a
         %% has_prop for the `@@is_Set` brand) is true for any Set cell.
         {js_set, _, _} ->
