@@ -6176,3 +6176,18 @@ pub fn array_change_by_copy_wave9_test() {
   )
   |> should.equal(1.0)
 }
+
+// ==== RegExp (wave 9) ====
+
+// The `RegExp.prototype.flags` getter (§22.2.6.4) assembles the flag string in a
+// single canonical order — d, g, i, m, s, u, v, y — by reading each individual
+// flag property, independent of the order the flags were supplied at
+// construction. (test262 built-ins/RegExp/prototype/flags/return-order.)
+pub fn regex_flags_canonical_order_test() {
+  val("new RegExp(\"\", \"yusmigd\").flags") |> should.equal(dyn(<<"dgimsuy">>))
+  val("new RegExp(\"\", \"dgimsuy\").flags") |> should.equal(dyn(<<"dgimsuy">>))
+  // A regex literal reports its flags in canonical order too, not source order.
+  val("/a/ig.flags") |> should.equal(dyn(<<"gi">>))
+  val("/a/g.flags") |> should.equal(dyn(<<"g">>))
+  val("/a/.flags") |> should.equal(dyn(<<"">>))
+}
