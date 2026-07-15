@@ -5789,7 +5789,7 @@ nth_char(_, _, OutOfRange) ->
 %% a non-numeric or fractional argument is coerced ('abcd'.charAt('2') → 'c',
 %% 'abc'.charAt(1.9) → 'b'), not silently treated as index 0.
 str_char_at(Str, Pos) ->
-    case char_at_index(Pos, cps(Str)) of
+    case char_at_index(Pos, cps(str_this(Str))) of
         {ok, C} -> from_cps([C]);
         error -> <<>>
     end.
@@ -5797,7 +5797,7 @@ str_char_at(Str, Pos) ->
 %% str.charCodeAt(pos) → the code point at index `pos` as a number, or NaN when
 %% out of range. `pos` is ToIntegerOrInfinity, exactly as in str_char_at.
 str_char_code_at(Str, Pos) ->
-    case char_at_index(Pos, cps(Str)) of
+    case char_at_index(Pos, cps(str_this(Str))) of
         {ok, C} -> C;
         error -> js_nan
     end.
@@ -5833,14 +5833,14 @@ str_code_point_at(Str, I) ->
             neg_inf -> -1;
             N -> trunc(as_float(N))
         end,
-    Cps = cps(Str),
+    Cps = cps(str_this(Str)),
     case Idx >= 0 andalso Idx < length(Cps) of
         true -> lists:nth(Idx + 1, Cps);
         false -> undefined
     end.
 
-str_upper(Str) -> unicode:characters_to_binary(string:uppercase(Str)).
-str_lower(Str) -> unicode:characters_to_binary(string:lowercase(Str)).
+str_upper(Str) -> unicode:characters_to_binary(string:uppercase(str_this(Str))).
+str_lower(Str) -> unicode:characters_to_binary(string:lowercase(str_this(Str))).
 
 %% str.isWellFormed() — §22.1.3.9. Returns the JS boolean `true` when the string
 %% contains no unpaired UTF-16 surrogate, else `false`. Implemented at the code-point
@@ -6028,11 +6028,26 @@ sub_index(V, Len, _Default) ->
 %% lim = 0, return A"). An `undefined` limit means 2^32-1 (effectively
 %% unbounded). A larger limit truncates the raw split to that many leading
 %% substrings.
-str_split(Str, Sep, Limit) ->
+str_split(Str0, Sep, Limit) ->
+    Str = str_this(Str0),
     case split_limit(Limit) of
         0 -> new_array([]);
         Lim -> new_array(split_take(str_split_all(Str, Sep), Lim))
     end.
+
+%% Coerce a String-method `this` receiver to its primitive string binary. Per
+%% the String.prototype algorithms (`S = ToString(RequireObjectCoercible(this))`,
+%% e.g. §22.1.3.21 split step 2), a `new String(x)` WRAPPER object must be treated
+%% as its boxed string primitive. This unwraps a `{js_wrapper, string, Prim}` cell
+%% to `Prim` (already a binary) and returns any plain string unchanged, so
+%% `new String("a-b").split("-")` behaves identically to `"a-b".split("-")`.
+str_this(V) when is_reference(V) ->
+    case erlang:get(?CELL_KEY(V)) of
+        {js_wrapper, string, Prim} -> Prim;
+        _ -> V
+    end;
+str_this(V) ->
+    V.
 
 %% ToUint32(limit) with `undefined` mapped to the spec's 2^32-1 default. NaN and
 %% ±Infinity coerce to 0; any other number is truncated toward zero and reduced
