@@ -856,6 +856,26 @@ pub fn str_replace(str: Dynamic, search: Dynamic, repl: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "str_replace_all")
 pub fn str_replace_all(str: Dynamic, search: Dynamic, repl: Dynamic) -> Dynamic
 
+/// `str.isWellFormed()` (§22.1.3.9) — `true`/`false` JS boolean: whether the string
+/// contains no unpaired UTF-16 surrogate.
+@external(erlang, "twocore_rt_js_ffi", "str_is_well_formed")
+pub fn str_is_well_formed(str: Dynamic) -> Dynamic
+
+/// `str.toWellFormed()` (§22.1.3.35) — a copy with every unpaired surrogate replaced
+/// by U+FFFD.
+@external(erlang, "twocore_rt_js_ffi", "str_to_well_formed")
+pub fn str_to_well_formed(str: Dynamic) -> Dynamic
+
+/// `str.localeCompare(that)` (§22.1.3.10) — default-locale (code-point lexicographic)
+/// ordering: the JS number -1/0/1 for before/equal/after.
+@external(erlang, "twocore_rt_js_ffi", "str_locale_compare")
+pub fn str_locale_compare(str: Dynamic, that: Dynamic) -> Dynamic
+
+/// `String.prototype.<method>` referenced as a value — the underlying builtin as a
+/// function value (so `typeof String.prototype.at` is "function").
+@external(erlang, "twocore_rt_js_ffi", "str_proto_fn")
+pub fn str_proto_fn(name: Dynamic) -> Dynamic
+
 // ───────────────────────── globals / statics ─────────────────────────
 
 /// `parseInt(str, radix)` — leading integer (auto-detects `0x`; default radix 10).

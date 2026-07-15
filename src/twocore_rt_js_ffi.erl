@@ -98,6 +98,8 @@
     str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
     str_trim_end/1, str_repeat/2, str_starts_with/3, str_ends_with/3,
     str_replace/3, str_replace_all/3,
+    str_is_well_formed/1, str_to_well_formed/1, str_locale_compare/2,
+    str_proto_fn/1,
     parse_int/2, parse_float/1, is_nan/1, is_finite/1, is_nullish/1,
     number_is_nan/1, number_is_finite/1, number_is_integer/1,
     number_is_safe_integer/1,
@@ -5255,6 +5257,69 @@ str_code_point_at(Str, I) ->
 
 str_upper(Str) -> unicode:characters_to_binary(string:uppercase(Str)).
 str_lower(Str) -> unicode:characters_to_binary(string:lowercase(Str)).
+
+%% str.isWellFormed() — §22.1.3.9. Returns the JS boolean `true` when the string
+%% contains no unpaired UTF-16 surrogate, else `false`. Implemented at the code-point
+%% level: a code point in the surrogate range 0xD800..0xDFFF can only appear when it
+%% was an unpaired surrogate in the source (a valid pair is decoded to its astral code
+%% point). Note the v1 code-point deviation: this engine replaces lone surrogates with
+%% U+FFFD when a string is created, so in practice every stored string is well-formed
+%% and this predicate returns `true` — the surrogate scan is kept for correctness.
+str_is_well_formed(Str) ->
+    case has_lone_surrogate(cps(Str)) of
+        true -> false;
+        false -> true
+    end.
+
+has_lone_surrogate([C | _Rest]) when C >= 16#D800, C =< 16#DFFF -> true;
+has_lone_surrogate([_ | Rest]) -> has_lone_surrogate(Rest);
+has_lone_surrogate([]) -> false.
+
+%% str.toWellFormed() — §22.1.3.35. Returns a copy of the string with every unpaired
+%% surrogate code point replaced by U+FFFD (REPLACEMENT CHARACTER). Per the v1
+%% code-point deviation lone surrogates are already replaced with U+FFFD at string
+%% creation, so this is effectively the identity; the explicit replacement keeps the
+%% algorithm correct for any code point that reaches it in the surrogate range.
+str_to_well_formed(Str) ->
+    from_cps([replace_surrogate(C) || C <- cps(Str)]).
+
+replace_surrogate(C) when C >= 16#D800, C =< 16#DFFF -> 16#FFFD;
+replace_surrogate(C) -> C.
+
+%% str.localeCompare(that) — §22.1.3.10 / sec-string.prototype.localecompare. With no
+%% locale/collator support this uses the default (code-unit, i.e. code-point for the
+%% BMP) lexicographic ordering: returns the JS number -1 when `Str` sorts before
+%% `That`, 1 when after, and 0 when they are equal. `That` is coerced with ToString.
+str_locale_compare(Str, That) ->
+    ThatStr = to_string(That),
+    A = cps(Str),
+    B = cps(ThatStr),
+    if
+        A < B -> -1;
+        A > B -> 1;
+        true -> 0
+    end.
+
+%% `String.prototype.<method>` referenced as a VALUE (e.g. `typeof
+%% String.prototype.at`, or passing the method around). Returns the underlying
+%% builtin as a bare BEAM closure so `typeof` reports "function" and a direct
+%% application `String.prototype.at(str, i)` reaches the implementation. NOTE: like
+%% every function in this model the closure carries no bound receiver, so
+%% `String.prototype.at.call(thisArg, …)` forwards only the trailing arguments (the
+%% `thisArg` is dropped by Function.prototype.call) — a documented v1 limitation.
+%% Only the fixed set of string methods routed here (see `lower`) is exposed.
+str_proto_fn(<<"at">>) -> fun array_at/2;
+str_proto_fn(<<"charAt">>) -> fun str_char_at/2;
+str_proto_fn(<<"charCodeAt">>) -> fun str_char_code_at/2;
+str_proto_fn(<<"codePointAt">>) -> fun str_code_point_at/2;
+str_proto_fn(<<"toUpperCase">>) -> fun str_upper/1;
+str_proto_fn(<<"toLowerCase">>) -> fun str_lower/1;
+str_proto_fn(<<"trim">>) -> fun str_trim/1;
+str_proto_fn(<<"trimStart">>) -> fun str_trim_start/1;
+str_proto_fn(<<"trimEnd">>) -> fun str_trim_end/1;
+str_proto_fn(<<"isWellFormed">>) -> fun str_is_well_formed/1;
+str_proto_fn(<<"toWellFormed">>) -> fun str_to_well_formed/1;
+str_proto_fn(<<"localeCompare">>) -> fun str_locale_compare/2.
 
 %% str.normalize(form) — Unicode normalization; form defaults to "NFC". An
 %% unrecognized form is a RangeError, per spec.
