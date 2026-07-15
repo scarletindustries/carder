@@ -433,6 +433,15 @@ pub fn func_call(f: Dynamic, args: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "func_apply")
 pub fn func_apply(f: Dynamic, args: Dynamic) -> Dynamic
 
+/// `f.bind(thisArg, ...boundArgs)` — return a new function that prepends
+/// `boundArgs` to its own call arguments and applies `f` (partial application).
+/// `thisArg` is ignored (plain functions carry no receiver here), and the bound
+/// function does not carry `f`'s own `length`/`name`/`prototype` properties.
+/// `args` is the full call argument list `[thisArg, ...boundArgs]`; a
+/// non-function receiver delegates to a same-named user `bind` method.
+@external(erlang, "twocore_rt_js_ffi", "func_bind")
+pub fn func_bind(f: Dynamic, args: Dynamic) -> Dynamic
+
 /// Pad (with undefined) or truncate an argument list to exactly `n` elements, so a
 /// spread `new C(...args)` can call the fixed-arity constructor.
 @external(erlang, "twocore_rt_js_ffi", "fit_list")

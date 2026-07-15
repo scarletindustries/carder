@@ -68,7 +68,7 @@
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
-    apply_fn/2, func_call/2, func_apply/2, fit_list/2, array_to_list/1,
+    apply_fn/2, func_call/2, func_apply/2, func_bind/2, fit_list/2, array_to_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     date_new/1, date_utc/1, date_parse/1, date_call/3,
@@ -4872,6 +4872,56 @@ func_apply(F, AllArgs) when is_function(F) ->
     call_cb(F, apply_arg_list(ArgArray));
 func_apply(Recv, AllArgs) ->
     delegate(Recv, <<"apply">>, AllArgs).
+
+%% Function.prototype.bind(thisArg, ...boundArgs) — §20.2.3.2. Returns a new
+%% function (a "bound function exotic object") that, when called, prepends the
+%% saved `boundArgs` to the call's own arguments and applies the target. This
+%% compiler models a plain function as a bare BEAM closure with no bound
+%% receiver, so `thisArg` (the head of `AllArgs`) is DROPPED — matching the
+%% documented treatment of `this` for call/apply; only the partial-application
+%% (bound-argument) behavior is modelled. The returned closure's declared arity
+%% is the target's [[Length]] minus the number of bound arguments, floored at 0
+%% (the spec's SetFunctionLength result) so that a caller supplying the
+%% remaining expected arguments forwards them all; extra trailing arguments are
+%% dropped by arity-fitting, exactly as a direct call would. The bound function
+%% NEVER carries the target's own properties (`length`/`name`/`prototype`) —
+%% those need a full function-object model this compiler does not have. A
+%% non-function receiver delegates to a same-named user `bind` method.
+func_bind(F, AllArgs) when is_function(F) ->
+    Bound =
+        case AllArgs of
+            [] -> [];
+            [_This | Rest] -> Rest
+        end,
+    {arity, TargetArity} = erlang:fun_info(F, arity),
+    Remaining = max(0, TargetArity - length(Bound)),
+    make_bound(F, Bound, Remaining);
+func_bind(Recv, AllArgs) ->
+    delegate(Recv, <<"bind">>, AllArgs).
+
+%% Build the bound-function closure of arity `R` (the remaining parameter count).
+%% BEAM closures are fixed-arity, so we emit one clause per small arity; each
+%% forwards its own arguments after the captured `Bound` list to `call_cb`
+%% (which arity-fits the concatenation to the target). Arities above the
+%% enumerated range fall back to an arity-0 closure that still applies the bound
+%% arguments (a call supplying that many extra positional arguments to a bound
+%% function is vanishingly rare in practice).
+make_bound(F, Bound, 0) ->
+    fun() -> call_cb(F, Bound) end;
+make_bound(F, Bound, 1) ->
+    fun(A1) -> call_cb(F, Bound ++ [A1]) end;
+make_bound(F, Bound, 2) ->
+    fun(A1, A2) -> call_cb(F, Bound ++ [A1, A2]) end;
+make_bound(F, Bound, 3) ->
+    fun(A1, A2, A3) -> call_cb(F, Bound ++ [A1, A2, A3]) end;
+make_bound(F, Bound, 4) ->
+    fun(A1, A2, A3, A4) -> call_cb(F, Bound ++ [A1, A2, A3, A4]) end;
+make_bound(F, Bound, 5) ->
+    fun(A1, A2, A3, A4, A5) -> call_cb(F, Bound ++ [A1, A2, A3, A4, A5]) end;
+make_bound(F, Bound, 6) ->
+    fun(A1, A2, A3, A4, A5, A6) -> call_cb(F, Bound ++ [A1, A2, A3, A4, A5, A6]) end;
+make_bound(F, Bound, _) ->
+    fun() -> call_cb(F, Bound) end.
 
 %% CreateListFromArrayLike for Function.prototype.apply: null/undefined → no args;
 %% otherwise the array's elements in order.

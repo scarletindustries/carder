@@ -5823,6 +5823,11 @@ fn lower_instance_method_generic(
     // every argument after `thisArg`; `.apply` spreads the array in its second arg.
     "call", _ -> coll("func_call")
     "apply", _ -> coll("func_apply")
+    // Function.prototype.bind(thisArg, ...boundArgs) — return a partially-applied
+    // function. Like call/apply, `thisArg` is ignored (functions carry no receiver
+    // in this model); only the bound-argument prefix is modelled. A non-function
+    // receiver delegates to a same-named user `bind` method in the runtime.
+    "bind", _ -> coll("func_bind")
     "forEach", _ -> coll("js_m_foreach")
     "get", _ -> coll("js_m_get")
     "set", _ -> coll("js_m_set")

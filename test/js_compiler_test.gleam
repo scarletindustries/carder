@@ -7167,3 +7167,46 @@ pub fn generator_return_underlying_closed_map_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(1.0)
 }
+
+// ==== Function (wave 13) ====
+
+// §20.2.3.2 Function.prototype.bind — partial application. `add.bind(thisArg, 10)`
+// returns a function that prepends the bound argument `10` to its own arguments, so
+// calling it with `5` computes `add(10, 5)` === 15. `thisArg` is ignored in this
+// model (plain functions carry no receiver), which does not affect this result.
+pub fn function_bind_partial_application_test() {
+  let m =
+    compile(
+      "function add(a, b) { return a + b; } function f() { var g = add.bind(null, 10); return g(5); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(15.0)
+}
+
+// §20.2.3.2 — a fully-bound function (all target parameters supplied as bound
+// arguments) ignores any later call arguments: `add.bind(null, 10, 20)()` === 30.
+pub fn function_bind_all_args_test() {
+  let m =
+    compile(
+      "function add(a, b) { return a + b; } function f() { var g = add.bind(null, 10, 20); return g(); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(30.0)
+}
+
+// §20.2.3.2 — binding with no bound arguments still yields a callable that forwards
+// every call argument to the target: `mul.bind(null)(6, 7)` === 42.
+pub fn function_bind_no_bound_args_test() {
+  let m =
+    compile(
+      "function mul(a, b) { return a * b; } function f() { var g = mul.bind({}); return g(6, 7); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(42.0)
+}
+
+// §20.2.3.2 — the result of `bind` is itself a function value, so `typeof` on it is
+// "function" (test262 bind/15.3.4.5-8-1).
+pub fn function_bind_typeof_test() {
+  num(
+    "typeof (function (a) { return a; }).bind(null, 1) === \"function\" ? 1 : 0",
+  )
+  |> should.equal(1.0)
+}
