@@ -6061,19 +6061,21 @@ str_split(Str0, Sep, Limit) ->
         Lim -> new_array(split_take(str_split_all(Str, Sep), Lim))
     end.
 
-%% Coerce a String-method `this` receiver to its primitive string binary. Per
-%% the String.prototype algorithms (`S = ToString(RequireObjectCoercible(this))`,
-%% e.g. §22.1.3.21 split step 2), a `new String(x)` WRAPPER object must be treated
-%% as its boxed string primitive. This unwraps a `{js_wrapper, string, Prim}` cell
-%% to `Prim` (already a binary) and returns any plain string unchanged, so
-%% `new String("a-b").split("-")` behaves identically to `"a-b".split("-")`.
-str_this(V) when is_reference(V) ->
-    case erlang:get(?CELL_KEY(V)) of
-        {js_wrapper, string, Prim} -> Prim;
-        _ -> V
-    end;
-str_this(V) ->
-    V.
+%% Coerce a String-method `this` receiver to its primitive string binary, per the
+%% String.prototype algorithm `S = ToString(RequireObjectCoercible(this))` (e.g.
+%% §22.1.3.21 split step 2, §22.1.3.30 trim). RequireObjectCoercible: `undefined`/
+%% `null` throw a TypeError (so `String.prototype.trim.call(undefined)` throws, as the
+%% spec requires). A plain string passes through unchanged; everything else — a
+%% `new String(x)` (and other primitive) WRAPPER cell, an array, a plain object, or a
+%% bare number/boolean primitive — is `to_string`-coerced (which unwraps a wrapper to
+%% its boxed primitive, joins an array, and renders a plain object as "[object
+%% Object]"). This is what makes `String.prototype.trim.call(0)` yield "0",
+%% `.call(false)` yield "false", and `.call([1])` yield "1" once a generic `.call`
+%% forwards the receiver here.
+str_this(undefined) -> type_error(undefined);
+str_this(null) -> type_error(null);
+str_this(V) when is_binary(V) -> V;
+str_this(V) -> to_string(V).
 
 %% ToUint32(limit) with `undefined` mapped to the spec's 2^32-1 default. NaN and
 %% ±Infinity coerce to 0; any other number is truncated toward zero and reduced
@@ -6114,9 +6116,9 @@ str_split_all(Str, Sep) ->
 %% The JS whitespace set differs from Erlang's `string:trim` default (it must
 %% include U+FEFF and U+00A0 and excludes non-WhiteSpace Unicode spaces), so we
 %% trim against the ECMAScript set explicitly.
-str_trim(Str) -> from_cps(trim_trailing(trim_leading(cps(Str)))).
-str_trim_start(Str) -> from_cps(trim_leading(cps(Str))).
-str_trim_end(Str) -> from_cps(trim_trailing(cps(Str))).
+str_trim(Str) -> from_cps(trim_trailing(trim_leading(cps(str_this(Str))))).
+str_trim_start(Str) -> from_cps(trim_leading(cps(str_this(Str)))).
+str_trim_end(Str) -> from_cps(trim_trailing(cps(str_this(Str)))).
 
 trim_leading([C | Rest]) ->
     case is_js_ws(C) of
