@@ -68,7 +68,7 @@
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
-    apply_fn/2, func_call/2, func_apply/2, func_bind/2, fit_list/2, array_to_list/1,
+    apply_fn/2, func_call/2, func_apply/2, func_bind/2, fit_list/2, array_to_list/1, apply_arg_list/1,
     str_pad_start/3, str_pad_end/3, string_from_char_code/1,
     string_from_code_point/1, string_raw/2, date_now/0,
     date_new/1, date_utc/1, date_parse/1, date_call/3,
@@ -4924,7 +4924,9 @@ make_bound(F, Bound, _) ->
     fun() -> call_cb(F, Bound) end.
 
 %% CreateListFromArrayLike for Function.prototype.apply: null/undefined → no args;
-%% otherwise the array's elements in order.
+%% otherwise the array's elements in order. Exported so the JS lowering can turn a
+%% `f.apply(thisArg, argArray)` on a user function into an `apply_fn` over the
+%% `this`-baked callback closure (wave 14).
 apply_arg_list(undefined) -> [];
 apply_arg_list(null) -> [];
 apply_arg_list(Arr) -> array_to_list(Arr).

@@ -451,6 +451,13 @@ pub fn fit_list(args: Dynamic, n: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_to_list")
 pub fn array_to_list(arr: Dynamic) -> Dynamic
 
+/// CreateListFromArrayLike for `Function.prototype.apply` (§20.2.3.1): a
+/// null/undefined/absent argument array yields no arguments, an array yields its
+/// elements in order. Behind a `f.apply(thisArg, argArray)` on a user function whose
+/// `this`-baked callback closure is then applied to these arguments (wave 14).
+@external(erlang, "twocore_rt_js_ffi", "apply_arg_list")
+pub fn apply_arg_list(arr: Dynamic) -> Dynamic
+
 /// `Array.from(x)` — a new array from an array/string/array-like.
 @external(erlang, "twocore_rt_js_ffi", "array_from")
 pub fn array_from(x: Dynamic) -> Dynamic

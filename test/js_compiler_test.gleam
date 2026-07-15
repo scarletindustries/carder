@@ -7210,3 +7210,121 @@ pub fn function_bind_typeof_test() {
   )
   |> should.equal(1.0)
 }
+
+// ==== this parameter (wave 14) ====
+
+// §23.1.3.19 Array.prototype.map with an INLINE function callback + object thisArg:
+// the callback runs with `this === thisArg`, so each element maps to `thisArg.k`.
+pub fn wave14_map_inline_thisarg_test() {
+  val("[1, 2, 3].map(function () { return this.k; }, { k: 9 }).join(',')")
+  |> should.equal(dyn("9,9,9"))
+}
+
+// §23.1.3.15 Array.prototype.forEach with an inline callback + object thisArg mutates
+// the thisArg: `this.n++` over [1,2] into { n: 0 } leaves n === 2.
+pub fn wave14_foreach_inline_thisarg_mutates_test() {
+  let m =
+    compile(
+      "function f() { var o = { n: 0 }; [1, 2].forEach(function () { this.n++; }, o); return o.n; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(2.0)
+}
+
+// §23.1.3.15 forEach with a NAMED top-level callback + object thisArg (the test262
+// `*-5-*` shape): the callback runs with `this === thisArg`. Mirrors
+// Array/prototype/forEach/15.4.4.18-5-9.
+pub fn wave14_foreach_named_thisarg_identity_test() {
+  let m =
+    compile(
+      "var result = false; var o = {}; function cb(val, idx, obj) { result = this === o; } function run() { [11].forEach(cb, o); return result ? 1 : 0; }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(1.0)
+}
+
+// §23.1.3.19 map with a NAMED callback + object thisArg reads through `this`: each
+// element maps to `this.base + element`.
+pub fn wave14_map_named_thisarg_test() {
+  let m =
+    compile(
+      "function addBase(x) { return this.base + x; } function run() { return [1, 2, 3].map(addBase, { base: 10 }).join(','); }",
+    )
+  call(m, "run", []) |> should.equal(dyn("11,12,13"))
+}
+
+// §20.2.3.3 Function.prototype.call: a NAMED top-level function invoked with a real
+// thisArg runs with that receiver as `this`. `f.call({ v: 5 })` → 5.
+pub fn wave14_named_call_thisarg_test() {
+  let m =
+    compile(
+      "function getv() { return this.v; } function run() { return getv.call({ v: 5 }); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(5.0)
+}
+
+// §20.2.3.3 call forwards arguments AFTER the thisArg: `add.call({ base: 100 }, 5)`
+// runs with `this.base === 100` and the first call argument 5 → 105.
+pub fn wave14_named_call_thisarg_and_args_test() {
+  let m =
+    compile(
+      "function add(x) { return this.base + x; } function run() { return add.call({ base: 100 }, 5); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(105.0)
+}
+
+// §20.2.3.1 Function.prototype.apply on a NAMED function: the (absent) argument array
+// yields no arguments, and `this` is the supplied receiver. `f.apply({ v: 6 })` → 6.
+pub fn wave14_named_apply_thisarg_test() {
+  let m =
+    compile(
+      "function getv() { return this.v; } function run() { return getv.apply({ v: 6 }); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(6.0)
+}
+
+// §20.2.3.1 apply spreads its argument array after the thisArg: `add.apply({ base: 1
+// }, [2, 3])` runs with `this.base === 1` and arguments 2, 3 → 1 + 2 + 3 === 6.
+pub fn wave14_named_apply_thisarg_args_test() {
+  let m =
+    compile(
+      "function add(a, b) { return this.base + a + b; } function run() { return add.apply({ base: 1 }, [2, 3]); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(6.0)
+}
+
+// §20.2.3.2 Function.prototype.bind fixes `this`: the bound function runs with the
+// bound receiver no matter how it is later called. `getv.bind({ v: 8 })()` → 8.
+pub fn wave14_named_bind_thisarg_test() {
+  let m =
+    compile(
+      "function getv() { return this.v; } function run() { var g = getv.bind({ v: 8 }); return g(); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(8.0)
+}
+
+// An ARROW inside a class method reads the METHOD's `this` lexically (it does NOT get
+// its own `this`), so it sees the instance field the constructor set.
+pub fn wave14_arrow_in_method_sees_method_this_test() {
+  let m =
+    compile(
+      "class C { constructor() { this.n = 7; } run() { var f = () => this.n; return f(); } } function run() { return new C().run(); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(7.0)
+}
+
+// A directly-called top-level function's `this` is unchanged from before wave 14: the
+// sloppy-mode global object, so `this === globalThis`. No regression for a plain call.
+pub fn wave14_plain_direct_call_this_is_global_test() {
+  let m =
+    compile(
+      "function f() { return this === globalThis ? 1 : 0; } function run() { return f(); }",
+    )
+  to_float(call(m, "run", [])) |> should.equal(1.0)
+}
+
+// An ARROW callback ignores a thisArg (its `this` is lexical), so a top-level arrow's
+// `this` stays globalThis and the thisArg's `k` is NOT observed — the arrow just
+// doubles. Confirms the wave-14 named-callback path does not hijack arrows.
+pub fn wave14_arrow_callback_ignores_thisarg_test() {
+  val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
+  |> should.equal(dyn("2,4,6"))
+}
