@@ -5696,13 +5696,33 @@ fn lower_instance_method(
   ctx: Ctx,
   ctr: Int,
 ) -> Result(#(List(Bind), ir.Value, Int), Error) {
-  case method, unbound_proto_method(object), arguments {
-    "call", Some(m), [recv, ..rest] ->
-      lower_instance_method(recv, m, rest, env, ctx, ctr)
-    "apply", Some(m), [recv, argarr] ->
-      case array_literal_elements(argarr) {
-        Some(elems) -> lower_instance_method(recv, m, elems, env, ctx, ctr)
-        None ->
+  // `f.call/apply/bind(thisArg, …)` where `f` is a top-level function that reads
+  // `this` (wave 14): dispatch to `f%this` with the supplied `thisArg` as the
+  // function's `this`, per §20.2.3.1/.2/.3. A function that ignores `this`, or a
+  // `.call`/`.apply` through a plain-function VALUE variable, is not matched here and
+  // keeps the runtime `func_call`/`func_apply` path (which drops the `thisArg`).
+  case named_this_fn(object, env, ctx), method {
+    Some(fname), "call" -> lower_named_call(fname, arguments, env, ctx, ctr)
+    Some(fname), "apply" -> lower_named_apply(fname, arguments, env, ctx, ctr)
+    Some(fname), "bind" -> lower_named_bind(fname, arguments, env, ctx, ctr)
+    _, _ ->
+      case method, unbound_proto_method(object), arguments {
+        "call", Some(m), [recv, ..rest] ->
+          lower_instance_method(recv, m, rest, env, ctx, ctr)
+        "apply", Some(m), [recv, argarr] ->
+          case array_literal_elements(argarr) {
+            Some(elems) -> lower_instance_method(recv, m, elems, env, ctx, ctr)
+            None ->
+              lower_instance_method_thisarg(
+                object,
+                method,
+                arguments,
+                env,
+                ctx,
+                ctr,
+              )
+          }
+        _, _, _ ->
           lower_instance_method_thisarg(
             object,
             method,
@@ -5712,9 +5732,92 @@ fn lower_instance_method(
             ctr,
           )
       }
-    _, _, _ ->
-      lower_instance_method_thisarg(object, method, arguments, env, ctx, ctr)
   }
+}
+
+/// `f.call(thisArg, …args)` on a top-level function `fname` reading `this` — a direct
+/// call of `fname%this` with `thisArg` first and the remaining arguments fitted to the
+/// function's declared arity (missing → `undefined`, extras dropped), per §20.2.3.3.
+fn lower_named_call(
+  fname: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(tv, callargs) = case argvals {
+    [t, ..rest] -> #(t, rest)
+    [] -> #(undefined(), [])
+  }
+  Ok(bind_after(
+    ba,
+    ir.CallDirect(this_impl_name(fname), [
+      tv,
+      ..fit_args(callargs, this_fn_arity(ctx, fname))
+    ]),
+    ctr,
+  ))
+}
+
+/// `f.apply(thisArg, argArray)` on a top-level function `fname` reading `this`
+/// (§20.2.3.1). Builds a `this`-baked closure over `fname%this` and applies it to the
+/// elements of `argArray` (a `null`/`undefined`/absent array → no arguments), so the
+/// call runs with `this === thisArg` regardless of whether `argArray` is a literal or a
+/// runtime value.
+fn lower_named_apply(
+  fname: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(tv, argarr) = case argvals {
+    [t, a, ..] -> #(t, a)
+    [t] -> #(t, undefined())
+    [] -> #(undefined(), undefined())
+  }
+  let #(bcl, cbv, ctr) =
+    bind_after(
+      ba,
+      ir.MakeClosure(this_impl_name(fname), [tv], this_fn_arity(ctx, fname)),
+      ctr,
+    )
+  // CreateListFromArrayLike: null/undefined → []; an array → its elements.
+  let #(bl, listv, ctr) =
+    bind_after(bcl, ir.CallHost("js", "apply_arg_list", [argarr]), ctr)
+  Ok(bind_after(bl, ir.CallHost("js", "apply_fn", [cbv, listv]), ctr))
+}
+
+/// `f.bind(thisArg, …boundArgs)` on a top-level function `fname` reading `this`
+/// (§20.2.3.2). Returns a closure over `fname%this` whose captured leading argument is
+/// `thisArg` followed by the bound-argument prefix, so a later call prepends nothing
+/// more than its own arguments. `this` is therefore FIXED to `thisArg` for the bound
+/// function. Bound arguments beyond the function's arity are dropped (the function
+/// ignores them); the bound function carries no `length`/`name`/`prototype` (a v1 gap).
+fn lower_named_bind(
+  fname: String,
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let #(tv, boundargs) = case argvals {
+    [t, ..rest] -> #(t, rest)
+    [] -> #(undefined(), [])
+  }
+  let arity = this_fn_arity(ctx, fname)
+  // Cap the captured bound args to the function's arity so the `MakeClosure` capture
+  // count + remaining arity stays exactly the impl's `this`+params arity.
+  let bound_capped = list.take(boundargs, arity)
+  let remaining = arity - list.length(bound_capped)
+  Ok(bind_after(
+    ba,
+    ir.MakeClosure(this_impl_name(fname), [tv, ..bound_capped], remaining),
+    ctr,
+  ))
 }
 
 /// The runtime `(Recv, Fn)` op backing an Array iteration method that accepts a
@@ -5777,9 +5880,79 @@ fn lower_instance_method_thisarg(
             ctr,
           )
       }
+    // A NAMED callback that is a top-level function reading `this` (wave 14): bake the
+    // `thisArg` as the `this` argument of its `%this` implementation, so the callback
+    // runs with `this === thisArg` (§23.1.3.*). An arrow / this-less callback, or a
+    // callback that is a local value, is not matched here and keeps the generic path
+    // (which correctly ignores the `thisArg`).
+    Some(op), [callback, thisarg] ->
+      case named_this_fn(callback, env, ctx) {
+        Some(fname) ->
+          lower_named_this_iter(object, op, fname, thisarg, env, ctx, ctr)
+        None ->
+          lower_instance_method_generic(
+            object,
+            method,
+            arguments,
+            env,
+            ctx,
+            ctr,
+          )
+      }
     _, _ ->
       lower_instance_method_generic(object, method, arguments, env, ctx, ctr)
   }
+}
+
+/// `Some(name)` when `object` is a bare reference to a top-level function that has a
+/// `%this` implementation (its body reads `this`) and is NOT shadowed by a local
+/// binding — the case where a dynamic receiver can be threaded to the function's
+/// `this` by targeting `<name>%this`. `None` otherwise (an arrow, a local value, or a
+/// function that ignores `this`).
+fn named_this_fn(object: ast.Expression, env: Env, ctx: Ctx) -> Option(String) {
+  case object {
+    ast.Identifier(name:, ..) ->
+      case !dict.has_key(env, name) && list.contains(ctx.this_fns, name) {
+        True -> Some(name)
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+/// The JS user-parameter count of top-level function `name` (0 if unknown) — the
+/// arity a callback closure / `.call`-style dispatch fits its arguments to. The
+/// `%this` implementation has one MORE parameter (the leading `this`).
+fn this_fn_arity(ctx: Ctx, name: String) -> Int {
+  case dict.get(ctx.fn_arity, name) {
+    Ok(a) -> a
+    Error(Nil) -> 0
+  }
+}
+
+/// Lower `recv.<iter>(namedFn, thisArg)` where `namedFn` is a top-level function that
+/// reads `this`: build a zero-argument-adaptive closure over `namedFn%this` whose
+/// captured leading argument is `thisArg`, so each callback invocation runs with
+/// `this === thisArg`. The closure is then handed to the ordinary `(Recv, Fn)`
+/// iteration op unchanged.
+fn lower_named_this_iter(
+  object: ast.Expression,
+  op: String,
+  fname: String,
+  thisarg: ast.Expression,
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(bo, recv, ctr) <- result_try(lower_expr(object, env, ctx, ctr))
+  use #(bt, tv, ctr) <- result_try(lower_expr(thisarg, env, ctx, ctr))
+  let #(bc, cbv, ctr) =
+    bind_after(
+      list.append(bo, bt),
+      ir.MakeClosure(this_impl_name(fname), [tv], this_fn_arity(ctx, fname)),
+      ctr,
+    )
+  Ok(bind_after(bc, ir.CallHost("js", op, [recv, cbv]), ctr))
 }
 
 /// True when the collected callback lambda at `span` reads `this` (so a `thisArg` is
