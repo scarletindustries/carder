@@ -6127,3 +6127,51 @@ pub fn global_this_shadowing_test() {
   let m = compile("function f(){ var globalThis = 42; return globalThis; }")
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
+
+// ==== Date (wave 9) ====
+
+// §21.4.3.2 (Date.parse): any string produced by `toString`/`toUTCString`/
+// `toISOString` of a Date must parse back to the SAME time value. Mirrors
+// test262 built-ins/Date/parse/zero.js for the zero instant.
+pub fn date_parse_round_trip_zero_test() {
+  let m =
+    compile(
+      "function f() { var z = new Date(0);"
+      <> " return Date.parse(z.toString()) === 0"
+      <> " && Date.parse(z.toUTCString()) === 0"
+      <> " && Date.parse(z.toISOString()) === 0 ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// §21.4.3.2: the round-trip must hold for an arbitrary non-zero instant too, not
+// just the epoch — parse ∘ (toString | toUTCString | toISOString) is the identity
+// on the millisecond value.
+pub fn date_parse_round_trip_nonzero_test() {
+  let m =
+    compile(
+      "function f() { var d = new Date(1483142400000);"
+      <> " return Date.parse(d.toString()) === 1483142400000"
+      <> " && Date.parse(d.toUTCString()) === 1483142400000"
+      <> " && Date.parse(d.toISOString()) === 1483142400000 ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// §21.4.1.14 MakeDate / §21.4.1.13 MakeTime: the component arithmetic is performed
+// on IEEE-754 doubles, so components far beyond 2^53 lose precision in a defined
+// way. Mirrors test262 built-ins/Date/UTC/fp-evaluation-order.js.
+pub fn date_utc_fp_evaluation_order_test() {
+  num("Date.UTC(1970, 0, 1, 80063993375, 29, 1, -288230376151711740)")
+  |> should.equal(29_312.0)
+  num("Date.UTC(1970, 0, 213503982336, 0, 0, 0, -18446744073709552000)")
+  |> should.equal(34_447_360.0)
+}
+
+// A normal in-range instant is UNAFFECTED by the float arithmetic (every valid time
+// value is below 2^53, so it is represented exactly): Date.UTC still yields the exact
+// integer millisecond count.
+pub fn date_utc_ordinary_value_unchanged_test() {
+  num("Date.UTC(2016, 11, 31)") |> should.equal(1_483_142_400_000.0)
+  num("Date.UTC(1970, 0, 1, 0, 0, 0, 0)") |> should.equal(0.0)
+}
