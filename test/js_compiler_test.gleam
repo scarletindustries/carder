@@ -6901,3 +6901,36 @@ pub fn map_group_by_non_callable_throws_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(1.0)
 }
+
+// Map.prototype.getOrInsertComputed(key, callbackfn) step 3: a non-callable
+// callbackfn is a TypeError, thrown for an ABSENT key (the callback would otherwise
+// be invoked). Catch returns 1 (upsert proposal, sec-map.prototype.getorinsertcomputed).
+pub fn map_get_or_insert_computed_non_callable_throws_test() {
+  let m =
+    compile(
+      "function f() { var x = new Map(); try { x.getOrInsertComputed(1, 1); } catch (e) { return 1; } return 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// The IsCallable check precedes the key lookup, so getOrInsertComputed throws even
+// when the key is ALREADY present (the callback is never consulted). Insert key 1,
+// then call with a non-callable second argument → TypeError, catch returns 1.
+pub fn map_get_or_insert_computed_present_key_still_throws_test() {
+  let m =
+    compile(
+      "function f() { var x = new Map(); x.set(1, 'foo'); try { x.getOrInsertComputed(1, 1); } catch (e) { return 1; } return 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// With a callable callbackfn and an absent key, getOrInsertComputed calls
+// callbackfn(key), stores the result, and returns it. Key 1 absent → callback
+// returns key + 10 = 11, which is inserted and returned.
+pub fn map_get_or_insert_computed_calls_callback_test() {
+  let m =
+    compile(
+      "function f() { var x = new Map(); return x.getOrInsertComputed(1, function (k) { return k + 10; }); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(11.0)
+}

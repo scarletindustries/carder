@@ -3778,12 +3778,19 @@ js_m_get_or_insert(Recv, Args) ->
 js_m_get_or_insert_computed(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, D} ->
+            %% Map.prototype.getOrInsertComputed step 3: a non-callable callbackfn is a
+            %% TypeError, thrown BEFORE the key lookup — so it fires even when the key
+            %% is already present (and thus the callback would never be invoked).
+            Fn = arg(Args, 1),
+            case is_function(Fn) of
+                true -> ok;
+                false -> not_callable(Fn)
+            end,
             K = mapkey_norm(arg(Args, 0)),
             case maps:get(K, D, undefined) of
                 {_Seq, V} ->
                     V;
                 undefined ->
-                    Fn = arg(Args, 1),
                     Value = call_cb(Fn, [K]),
                     {js_map, Next2, D2} = cell_tag(Recv),
                     {Next3, Seq} =
@@ -3805,11 +3812,17 @@ js_m_get_or_insert_computed(Recv, Args) ->
                 false ->
                     type_error(K);
                 true ->
+                    %% Step 4 (after CanBeHeldWeakly): a non-callable callbackfn is a
+                    %% TypeError, thrown before the lookup so a present key still throws.
+                    Fn = arg(Args, 1),
+                    case is_function(Fn) of
+                        true -> ok;
+                        false -> not_callable(Fn)
+                    end,
                     case maps:get(K, D, undefined) of
                         {_Seq, V} ->
                             V;
                         undefined ->
-                            Fn = arg(Args, 1),
                             Value = call_cb(Fn, [K]),
                             {js_weakmap, Next2, D2} = cell_tag(Recv),
                             {Next3, Seq} =
