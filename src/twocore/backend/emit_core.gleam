@@ -4211,6 +4211,7 @@ fn resolve_js(op: String) -> Option(String) {
     // error constructors (§20.5 Error + the six NativeErrors)
     "error_make" -> Some("error_make")
     "error_ctor" -> Some("error_ctor")
+    "error_is_error" -> Some("error_is_error")
     "get_prop" -> Some("get_prop")
     "set_prop" -> Some("set_prop")
     "gen_make" -> Some("gen_make")

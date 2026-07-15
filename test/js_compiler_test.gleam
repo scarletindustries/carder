@@ -6127,3 +6127,41 @@ pub fn global_this_shadowing_test() {
   let m = compile("function f(){ var globalThis = 42; return globalThis; }")
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
+
+// ==== Error (wave 9) ====
+
+// §20.5.2.1 Error.isError — the predicate tests the [[ErrorData]] internal slot,
+// not the object's shape. A genuine error VALUE (from `new Error` or a
+// NativeError, called with or without `new`) has the slot, so isError is true.
+pub fn error_is_error_true_on_real_errors_test() {
+  num("Error.isError(new Error('x')) ? 1 : 0") |> should.equal(1.0)
+  num("Error.isError(Error('x')) ? 1 : 0") |> should.equal(1.0)
+  num("Error.isError(new TypeError()) ? 1 : 0") |> should.equal(1.0)
+  num("Error.isError(new RangeError('r')) ? 1 : 0") |> should.equal(1.0)
+}
+
+// §20.5.2.1 — every primitive is a non-object, so Error.isError returns false;
+// a missing argument is `undefined`, so a no-arg call is false too (mirrors the
+// test262 built-ins/Error/isError/primitives.js cases).
+pub fn error_is_error_false_on_primitives_test() {
+  num("Error.isError() ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(undefined) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(null) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(true) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(false) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(0) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(42) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(NaN) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError(Infinity) ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError('') ? 1 : 0") |> should.equal(0.0)
+  num("Error.isError('foo') ? 1 : 0") |> should.equal(0.0)
+}
+
+// §20.5.2.1 — an ordinary object merely SHAPED like an error (own name/message
+// properties) lacks the [[ErrorData]] slot, so Error.isError is false. This is the
+// spec's slot-not-shape rule (mirrors isError/fake-errors.js's intent).
+pub fn error_is_error_false_on_fake_error_object_test() {
+  num("Error.isError({ name: 'Error', message: '' }) ? 1 : 0")
+  |> should.equal(0.0)
+  num("Error.isError([]) ? 1 : 0") |> should.equal(0.0)
+}

@@ -260,6 +260,13 @@ pub fn error_make(name: Dynamic, msg_arg: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "error_ctor")
 pub fn error_ctor(name: Dynamic) -> Dynamic
 
+/// `Error.isError(v)` (§20.5.2.1) → `1` when `v` is a genuine Error value (a cell
+/// with an [[ErrorData]] slot, i.e. one made by `new Error`/a NativeError/a caught
+/// engine error), `0` for every primitive and every ordinary object merely shaped
+/// like an error. Returns an i32 the caller wraps into a JS boolean.
+@external(erlang, "twocore_rt_js_ffi", "error_is_error")
+pub fn error_is_error(x: Dynamic) -> Int
+
 /// Classify a caught BEAM `reason` for a JS `try`/`catch`: when it is the runtime's
 /// INTERNAL engine-error convention `{js_error, Kind, Detail}` (a `type_error` /
 /// `range_error` / … raised by a bad primitive op), CONVERT it to a JS-level error VALUE

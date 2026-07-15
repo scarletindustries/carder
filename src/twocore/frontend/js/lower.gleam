@@ -4148,6 +4148,7 @@ fn lower_call_fixed(
       || ns == "Date"
       || ns == "Symbol"
       || ns == "Reflect"
+      || ns == "Error"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
     // `super.method(args)` — call the superclass's method on the current `this`.
     ast.MemberExpression(
@@ -4644,6 +4645,23 @@ fn lower_static_call(
       host("reflect_apply", [t, this, undefined()])
     "Reflect", "apply", [t] ->
       host("reflect_apply", [t, undefined(), undefined()])
+    // Error.isError(v) (§20.5.2.1) — true iff `v` is a genuine Error value (has an
+    // [[ErrorData]] slot); a primitive or a plain object shaped like an error is
+    // false. A missing argument is `undefined`, so `Error.isError()` is false.
+    "Error", "isError", [x, ..] -> {
+      let #(b2, i, ctr) =
+        bind_after(binds, ir.CallHost("js", "error_is_error", [x]), ctr)
+      Ok(bind_after(b2, bool_term(i), ctr))
+    }
+    "Error", "isError", [] -> {
+      let #(b2, i, ctr) =
+        bind_after(
+          binds,
+          ir.CallHost("js", "error_is_error", [undefined()]),
+          ctr,
+        )
+      Ok(bind_after(b2, bool_term(i), ctr))
+    }
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }
