@@ -7350,3 +7350,58 @@ pub fn wave15_array_join_undefined_separator_test() {
   // undefined ELEMENTS render as "" while the default separator stays ","
   val("[0, undefined, 3].join(undefined)") |> should.equal(dyn("0,,3"))
 }
+
+// ==== String (wave 15) ====
+
+/// §22.1.3.22/.7/.24 RequireObjectCoercible: a String.prototype method invoked
+/// with a `null`/`undefined` `this` (via `.call`) throws a TypeError before any
+/// argument is inspected. Encodes test262 startsWith/endsWith `this-is-null` and
+/// `this-is-undefined`.
+pub fn string_method_this_not_coercible_throws_test() {
+  let cases = [
+    "String.prototype.startsWith.call(null, '')",
+    "String.prototype.startsWith.call(undefined, '')",
+    "String.prototype.endsWith.call(null, '')",
+    "String.prototype.endsWith.call(undefined, '')",
+    "String.prototype.substring.call(null)",
+    "String.prototype.substring.call(undefined)",
+  ]
+  list.each(cases, fn(expr) {
+    let m = compile("function f() { return " <> expr <> "; }")
+    let threw = case catch_apply(m, atom.create("f"), []) {
+      Error(_) -> True
+      Ok(_) -> False
+    }
+    threw |> should.equal(True)
+  })
+}
+
+/// ToString(this) is abrupt when `this` is a Symbol (§7.1.17 step 2), so a
+/// String.prototype method called on a Symbol receiver throws a TypeError.
+/// Encodes test262 substring/startsWith/endsWith `this-value-tostring-throws-symbol`
+/// and `return-abrupt-from-this-as-symbol`. Asserts the thrown value is a
+/// TypeError, not merely that it throws.
+pub fn string_method_symbol_this_throws_typeerror_test() {
+  let cases = [
+    "String.prototype.substring.call(Symbol())",
+    "String.prototype.startsWith.call(Symbol(), '')",
+    "String.prototype.endsWith.call(Symbol(), '')",
+  ]
+  list.each(cases, fn(expr) {
+    let m =
+      compile(
+        "function f() { try { "
+        <> expr
+        <> "; return \"no throw\"; } catch (e) { return e.name; } }",
+      )
+    call(m, "f", []) |> should.equal(dyn("TypeError"))
+  })
+}
+
+/// A well-formed string receiver still produces the ordinary result — the
+/// RequireObjectCoercible/ToString guard does not perturb the normal path.
+pub fn string_method_this_guard_preserves_normal_test() {
+  val("'hello'.startsWith('he') ? 'y' : 'n'") |> should.equal(dyn("y"))
+  val("'hello'.endsWith('lo') ? 'y' : 'n'") |> should.equal(dyn("y"))
+  val("'hello'.substring(1, 3)") |> should.equal(dyn("el"))
+}
