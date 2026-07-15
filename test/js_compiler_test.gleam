@@ -6127,3 +6127,52 @@ pub fn global_this_shadowing_test() {
   let m = compile("function f(){ var globalThis = 42; return globalThis; }")
   to_float(call(m, "f", [])) |> should.equal(42.0)
 }
+
+// ==== Array (wave 9) ====
+
+// ES2023 change-array-by-copy methods (§23.1.3) — each returns a NEW array and
+// leaves the receiver unmutated. These lock the spec contract of the toSorted/
+// toReversed/toSpliced/with cluster, plus the now-catchable reduce/reduceRight/
+// copyWithin edge cases, against regression.
+pub fn array_change_by_copy_wave9_test() {
+  // §23.1.3.34 toSorted: default comparator sorts by ToString (so 10 < 2), and
+  // the receiver is NOT mutated (a[0] is still 10 afterwards).
+  num(
+    "(function(){var a=[10,2,1];var b=a.toSorted();return b[0]===1&&b[1]===10&&b[2]===2&&a[0]===10?1:0})()",
+  )
+  |> should.equal(1.0)
+  // toSorted with a user comparator orders numerically.
+  num("[3,1,2].toSorted(function(a,b){return a-b})[0]") |> should.equal(1.0)
+  // §23.1.3.33 toReversed: a reversed copy; receiver untouched.
+  num(
+    "(function(){var a=[1,2,3];var b=a.toReversed();return b[0]===3&&a[0]===1?1:0})()",
+  )
+  |> should.equal(1.0)
+  // §23.1.3.39 with: replaces one element in a copy.
+  num("[1,2,3].with(1,9)[1]") |> should.equal(9.0)
+  // A negative index counts from the end (len + index).
+  num("[1,2,3].with(-1,9)[2]") |> should.equal(9.0)
+  // An index outside [0, len) is a RangeError — reachable/catchable now.
+  num("(function(){try{[1,2,3].with(5,9)}catch(e){return 1}return 0})()")
+  |> should.equal(1.0)
+  // §23.1.3.35 toSpliced: removes/inserts in a copy, receiver length unchanged.
+  num(
+    "(function(){var a=[1,2,3,4];var b=a.toSpliced(1,2,9);return b.length===3&&b[1]===9&&a.length===4?1:0})()",
+  )
+  |> should.equal(1.0)
+  // §23.1.3.24 reduce: empty array with no initial value throws a TypeError.
+  num(
+    "(function(){try{[].reduce(function(a,b){return a})}catch(e){return 1}return 0})()",
+  )
+  |> should.equal(1.0)
+  // §23.1.3.25 reduceRight: same TypeError on empty-with-no-initial.
+  num(
+    "(function(){try{[].reduceRight(function(a,b){return a})}catch(e){return 1}return 0})()",
+  )
+  |> should.equal(1.0)
+  // §23.1.3.4 copyWithin(target, start): in-place block copy, returns the array.
+  num(
+    "(function(){var a=[1,2,3,4,5];a.copyWithin(0,3);return a[0]===4&&a[1]===5&&a[2]===3?1:0})()",
+  )
+  |> should.equal(1.0)
+}
