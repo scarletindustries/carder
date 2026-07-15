@@ -1102,6 +1102,13 @@ pub fn object_is(x: Dynamic, y: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_has_own")
 pub fn object_has_own(obj: Dynamic, key: Dynamic) -> Dynamic
 
+/// `Object.groupBy(items, callbackfn)` → a fresh null-prototype object whose keys
+/// are the ToPropertyKey-coerced callback results and whose values are Arrays of
+/// the elements that produced each key (encounter order). A non-callable
+/// `callbackfn` throws a TypeError before any element is read.
+@external(erlang, "twocore_rt_js_ffi", "object_group_by")
+pub fn object_group_by(items: Dynamic, callbackfn: Dynamic) -> Dynamic
+
 /// `Reflect.has(target, key)` → JS boolean; whether `target` (which must be an
 /// object, else TypeError) has the property `key` (own-property only in v1).
 @external(erlang, "twocore_rt_js_ffi", "reflect_has")

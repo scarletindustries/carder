@@ -110,6 +110,7 @@
     object_prevent_extensions/1, object_is_extensible/1,
     object_seal/1, object_is_sealed/1,
     object_from_entries/1, object_is/2, object_has_own/2,
+    object_group_by/2,
     reflect_has/2, reflect_get/2, reflect_set/4, reflect_delete_property/2,
     reflect_own_keys/1, reflect_get_prototype_of/1, reflect_is_extensible/1,
     reflect_prevent_extensions/1, reflect_apply/3,
@@ -3449,6 +3450,36 @@ group_into_map(M, Fn, [E | Es], I) ->
         false -> js_m_set(M, [K, new_array([E])])
     end,
     group_into_map(M, Fn, Es, I + 1).
+
+%% Object.groupBy(items, callbackfn) (sec-object.groupby) — group the iterable's
+%% elements into a fresh null-prototype plain object. GroupBy is driven with
+%% coercion = PROPERTY, so each callback result is run through ToPropertyKey: for
+%% every non-Symbol value that is ToPrimitive(hint string) then ToString, so a
+%% number key `4` becomes "4" and an object with a `toString` contributes its
+%% string form (mirroring `to_string_dispatch` then `to_string`). Elements sharing
+%% a key are collected, in encounter order, into that key's Array. A non-callable
+%% `callbackfn` throws a TypeError (GroupBy step 2) before any element is read.
+%% NOTE: this v1 object model iterates own keys in the backing map's order, not the
+%% spec's first-encounter insertion order, so `Object.keys` on the result follows
+%% that documented deviation.
+object_group_by(Items, Fn) ->
+    case is_function(Fn) of
+        true -> ok;
+        false -> not_callable(Fn)
+    end,
+    O = new_object(),
+    group_into_object(O, Fn, array_from_elems(Items, undefined), 0),
+    O.
+
+group_into_object(_O, _Fn, [], _I) ->
+    ok;
+group_into_object(O, Fn, [E | Es], I) ->
+    K = to_string(to_string_dispatch(call_cb(Fn, [E, I]))),
+    case has_prop(O, K) =:= 1 of
+        true -> array_push(get_prop(O, K), [E]);
+        false -> set_prop(O, K, new_array([E]))
+    end,
+    group_into_object(O, Fn, Es, I + 1).
 
 %% A WeakMap is a cell `{js_weakmap, Next, Data}`, mirroring the ordinary Map cell so
 %% the shared collection-method dispatch (`js_m_set`/`get`/`has`/`delete`) can reuse

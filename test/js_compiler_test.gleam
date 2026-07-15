@@ -7478,3 +7478,64 @@ pub fn json_shared_ref_no_false_cycle_test() {
     compile("function f() { var x = { a: 1 }; return JSON.stringify([x, x]); }")
   call(m, "f", []) |> should.equal(dyn("[{\"a\":1},{\"a\":1}]"))
 }
+
+// ==== Object (wave 15) ====
+
+// Object.groupBy(items, cb) buckets elements into a new object whose values are
+// Arrays of the elements that produced each key, in encounter order
+// (sec-object.groupby / GroupBy). Keys 'odd' → [1, 3], 'even' → [2].
+pub fn wave15_object_groupby_buckets_test() {
+  let m =
+    compile(
+      "function f() { var o = Object.groupBy([1, 2, 3], function(i){ return i % 2 === 0 ? 'even' : 'odd'; }); return o['odd'].length * 100 + o['odd'][0] * 10 + o['odd'][1] + o['even'][0]; }",
+    )
+  // odd.length=2 → 200, odd[0]=1 → 10, odd[1]=3 → 3, even[0]=2 → 2 = 215
+  to_float(call(m, "f", [])) |> should.equal(215.0)
+}
+
+// A numeric callback result is run through ToPropertyKey, so key `1` becomes the
+// string property "1" (GroupBy with coercion = property). Lengths 1 → ['a','c'].
+pub fn wave15_object_groupby_numeric_key_coerced_test() {
+  let m =
+    compile(
+      "function f() { var o = Object.groupBy(['a', 'bb', 'c'], function(s){ return s.length; }); return o['1'].length * 10 + o['2'].length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(21.0)
+}
+
+// ToPropertyKey uses ToString, so 1, '1' and an object whose toString() returns 1
+// all collapse to the single key "1" (sec-object.groupby toPropertyKey case).
+pub fn wave15_object_groupby_topropertykey_test() {
+  let m =
+    compile(
+      "function f() { var s = { toString: function(){ return 1; } }; var o = Object.groupBy([1, '1', s], function(v){ return v; }); return o['1'].length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(3.0)
+}
+
+// A non-callable callback throws a TypeError before any element is read
+// (GroupBy step 2 / IsCallable).
+pub fn wave15_object_groupby_noncallable_throws_test() {
+  let m =
+    compile(
+      "function f() { try { Object.groupBy([], null); return 0; } catch (e) { return e.name === 'TypeError' ? 1 : 0; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// The result is a null-prototype object: it has no inherited hasOwnProperty and
+// Object.getPrototypeOf reports null (sec-object.groupby step 2).
+pub fn wave15_object_groupby_null_prototype_test() {
+  let m =
+    compile(
+      "function f() { var o = Object.groupBy([1], function(x){ return x; }); return (Object.getPrototypeOf(o) === null && o.hasOwnProperty === undefined) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// Object.hasOwn(obj, key) (sec-object.hasown) reports own properties, true for a
+// present key and false for an absent one.
+pub fn wave15_object_hasown_test() {
+  val("Object.hasOwn({ a: 1 }, 'a')") |> should.equal(dyn(True))
+  val("Object.hasOwn({ a: 1 }, 'b')") |> should.equal(dyn(False))
+}
