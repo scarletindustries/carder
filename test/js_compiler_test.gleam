@@ -6851,3 +6851,57 @@ pub fn array_map_thisarg_arrow_unaffected_test() {
   val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
   |> should.equal(dyn("2,4,6"))
 }
+
+// ==== Boolean (wave 13) ====
+
+// ToBoolean (ECMA-262 §7.1.2) — the abstract-operation truthiness table exposed
+// through `Boolean(x)` (§20.3.1.1). Falsy: `undefined`, `null`, `+0`/`-0`, `NaN`,
+// the empty string, and `false` itself; every other value — including a non-empty
+// string such as `"false"`, any object (`{}`/`[]`), and non-zero/±Infinity numbers
+// — is truthy. `Boolean()` with no argument coerces the absent (`undefined`)
+// argument and is therefore `false`.
+pub fn boolean_toboolean_coercion_test() {
+  val("Boolean('')") |> should.equal(dyn(False))
+  val("Boolean('false')") |> should.equal(dyn(True))
+  val("Boolean(0)") |> should.equal(dyn(False))
+  val("Boolean(-0)") |> should.equal(dyn(False))
+  val("Boolean(NaN)") |> should.equal(dyn(False))
+  val("Boolean(Infinity)") |> should.equal(dyn(True))
+  val("Boolean(-Infinity)") |> should.equal(dyn(True))
+  val("Boolean(null)") |> should.equal(dyn(False))
+  val("Boolean(undefined)") |> should.equal(dyn(False))
+  val("Boolean([])") |> should.equal(dyn(True))
+  val("Boolean({})") |> should.equal(dyn(True))
+  val("Boolean()") |> should.equal(dyn(False))
+}
+
+// Boolean.prototype.valueOf (§20.3.3.3) returns the receiver's [[BooleanData]] as a
+// primitive boolean; Boolean.prototype.toString (§20.3.3.2) returns "true"/"false"
+// per that value. A `new Boolean(x)` wrapper boxes ToBoolean(x); with no argument
+// the boxed value defaults to `false`. `typeof (new Boolean(...))` is "object".
+pub fn boolean_wrapper_valueof_tostring_test() {
+  val("typeof (new Boolean(true))") |> should.equal(dyn("object"))
+  val("(new Boolean()).valueOf()") |> should.equal(dyn(False))
+  val("(new Boolean(0)).valueOf()") |> should.equal(dyn(False))
+  val("(new Boolean(NaN)).valueOf()") |> should.equal(dyn(False))
+  val("(new Boolean('')).valueOf()") |> should.equal(dyn(False))
+  val("(new Boolean(-1)).valueOf()") |> should.equal(dyn(True))
+  val("(new Boolean([])).valueOf()") |> should.equal(dyn(True))
+  val("(new Boolean()).toString()") |> should.equal(dyn("false"))
+  val("(new Boolean(1)).toString()") |> should.equal(dyn("true"))
+}
+
+// The prototype methods can be applied to a wrapper receiver via `.call` (§20.3.3):
+// `thisBooleanValue` reads the wrapper's [[BooleanData]] regardless of how the
+// method is invoked, so a detached `Boolean.prototype.valueOf`/`toString` yields the
+// same primitive/string as the direct call above.
+pub fn boolean_prototype_method_call_receiver_test() {
+  val("Boolean.prototype.valueOf.call(new Boolean(false))")
+  |> should.equal(dyn(False))
+  val("Boolean.prototype.valueOf.call(new Boolean(1))")
+  |> should.equal(dyn(True))
+  val("Boolean.prototype.toString.call(new Boolean(true))")
+  |> should.equal(dyn("true"))
+  val("Boolean.prototype.toString.call(new Boolean(0))")
+  |> should.equal(dyn("false"))
+}
