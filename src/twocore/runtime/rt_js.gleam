@@ -622,6 +622,13 @@ pub fn new_map(init: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "new_set")
 pub fn new_set(init: Dynamic) -> Dynamic
 
+/// `Map.groupBy(items, callbackfn)` — group the elements of the iterable `items`
+/// into a new Map keyed by `callbackfn(value, index)` (SameValueZero key equality,
+/// no ToPropertyKey coercion). Each value is an Array of the grouped elements in
+/// iteration order. A non-callable `callbackfn` throws a TypeError.
+@external(erlang, "twocore_rt_js_ffi", "map_group_by")
+pub fn map_group_by(items: Dynamic, callbackfn: Dynamic) -> Dynamic
+
 /// `new WeakMap(init?)` — optionally seeded from an array of `[key, value]` pairs;
 /// a non-object key in the iterable throws a TypeError (§24.3.1.1). Keys are held
 /// strongly (no real weak references are modelled).

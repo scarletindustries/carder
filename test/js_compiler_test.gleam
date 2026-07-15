@@ -6936,3 +6936,86 @@ pub fn symbol_dispose_not_in_registry_test() {
     )
   call(n, "f", []) |> should.equal(dyn(True))
 }
+
+// ==== MapSet (wave 13) ====
+
+// Map.groupBy(items, cb) (sec-map.groupby): elements are grouped into a new Map
+// keyed by the callback result, each value an Array of elements in iteration order.
+// Grouping [1,2,3] by parity → key "odd" holds [1,3] (length 2), "even" holds [2]
+// (length 1). Encode both lengths in one number so a single assertion covers them.
+pub fn map_group_by_basic_test() {
+  let m =
+    compile(
+      "function f() { var g = Map.groupBy([1, 2, 3], function (i) { return i % 2 === 0 ? 'even' : 'odd'; }); return g.get('odd').length * 10 + g.get('even').length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(21.0)
+}
+
+// GroupBy key coercion is COLLECTION (SameValueZero), so -0 and +0 collapse to one
+// key: Map.groupBy([-0, +0], i => i) has size 1 (sec-map.groupby → GroupBy). The
+// grouped value keeps both original elements, so the group's length is 2.
+pub fn map_group_by_negative_zero_test() {
+  let m =
+    compile(
+      "function f() { var g = Map.groupBy([-0, 0], function (i) { return i; }); return g.size * 10 + g.get(0).length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(12.0)
+}
+
+// Map.groupBy iterates any iterable via the iterator protocol: a string is iterated
+// by code point, so 'abc' yields three distinct single-char keys → size 3.
+pub fn map_group_by_string_iterable_test() {
+  num("Map.groupBy('abc', function (c) { return c; }).size === 3 ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+// COLLECTION coercion does NOT apply ToPropertyKey, so a number key and the equal
+// string key stay distinct: grouping [1, '1'] by identity yields two groups
+// (sec-map.groupby, unlike Object.groupBy which coerces to property keys).
+pub fn map_group_by_number_vs_string_key_test() {
+  num("Map.groupBy([1, '1'], function (v) { return v; }).size === 2 ? 1 : 0")
+  |> should.equal(1.0)
+}
+
+// GroupBy step 2: a non-callable callbackfn is a TypeError, thrown before any element
+// is visited. The throw is catchable, so the catch block runs and returns 1.
+pub fn map_group_by_non_callable_throws_test() {
+  let m =
+    compile(
+      "function f() { try { Map.groupBy([1, 2], 5); } catch (e) { return 1; } return 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// Map.prototype.getOrInsertComputed(key, callbackfn) step 3: a non-callable
+// callbackfn is a TypeError, thrown for an ABSENT key (the callback would otherwise
+// be invoked). Catch returns 1 (upsert proposal, sec-map.prototype.getorinsertcomputed).
+pub fn map_get_or_insert_computed_non_callable_throws_test() {
+  let m =
+    compile(
+      "function f() { var x = new Map(); try { x.getOrInsertComputed(1, 1); } catch (e) { return 1; } return 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// The IsCallable check precedes the key lookup, so getOrInsertComputed throws even
+// when the key is ALREADY present (the callback is never consulted). Insert key 1,
+// then call with a non-callable second argument → TypeError, catch returns 1.
+pub fn map_get_or_insert_computed_present_key_still_throws_test() {
+  let m =
+    compile(
+      "function f() { var x = new Map(); x.set(1, 'foo'); try { x.getOrInsertComputed(1, 1); } catch (e) { return 1; } return 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// With a callable callbackfn and an absent key, getOrInsertComputed calls
+// callbackfn(key), stores the result, and returns it. Key 1 absent → callback
+// returns key + 10 = 11, which is inserted and returned.
+pub fn map_get_or_insert_computed_calls_callback_test() {
+  let m =
+    compile(
+      "function f() { var x = new Map(); return x.getOrInsertComputed(1, function (k) { return k + 10; }); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(11.0)
+}
