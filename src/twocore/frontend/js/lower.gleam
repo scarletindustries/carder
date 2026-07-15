@@ -4206,6 +4206,7 @@ fn lower_call_fixed(
       || ns == "Symbol"
       || ns == "Reflect"
       || ns == "Error"
+      || ns == "Map"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
     // `super.method(args)` — call the superclass's method on the current `this`.
     ast.MemberExpression(
@@ -4802,6 +4803,12 @@ fn lower_static_call(
     "JSON", "parse", [s, ..] -> host("json_parse", [s])
     "Array", "from", [x] -> host("array_from", [x])
     "Array", "from", [x, mapfn, ..] -> host("array_from_map", [x, mapfn])
+    // Map.groupBy(items, callbackfn) (sec-map.groupby) — group the iterable's
+    // elements into a new Map keyed by the callback result (SameValueZero, no
+    // ToPropertyKey). A missing callback lowers to `undefined` so the runtime's
+    // IsCallable check throws a TypeError (GroupBy step 2).
+    "Map", "groupBy", [items, cb, ..] -> host("map_group_by", [items, cb])
+    "Map", "groupBy", [items] -> host("map_group_by", [items, undefined()])
     "String", "fromCharCode", _ -> {
       let #(binds2, listv, ctr) = build_list(argvals, binds, ctr)
       Ok(bind_after(

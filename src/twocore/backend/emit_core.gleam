@@ -4292,6 +4292,7 @@ fn resolve_js(op: String) -> Option(String) {
     "js_m_get_or_insert" -> Some("js_m_get_or_insert")
     "js_m_get_or_insert_computed" -> Some("js_m_get_or_insert_computed")
     "js_m_foreach" -> Some("js_m_foreach")
+    "map_group_by" -> Some("map_group_by")
     "js_m_keys" -> Some("js_m_keys")
     "js_m_values" -> Some("js_m_values")
     "js_m_entries" -> Some("js_m_entries")
