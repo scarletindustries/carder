@@ -540,9 +540,15 @@ pub fn array_find_last(arr: Dynamic, fn_: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "array_find_last_index")
 pub fn array_find_last_index(arr: Dynamic, fn_: Dynamic) -> Dynamic
 
-/// `arr.lastIndexOf(x)` — last strict-equal index, or `-1`.
+/// `arr.lastIndexOf(x, fromIndex)` — last strict-equal index at or before the
+/// PRESENT `fromIndex` (coerced via ToIntegerOrInfinity), or `-1`.
 @external(erlang, "twocore_rt_js_ffi", "array_last_index_of")
 pub fn array_last_index_of(arr: Dynamic, x: Dynamic, from: Dynamic) -> Dynamic
+
+/// `arr.lastIndexOf(x)` with NO `fromIndex` argument — scans from the last
+/// index. Distinct from an explicit `undefined` fromIndex, which scans from 0.
+@external(erlang, "twocore_rt_js_ffi", "array_last_index_of_end")
+pub fn array_last_index_of_end(arr: Dynamic, x: Dynamic) -> Dynamic
 
 /// `num.toFixed(d)` — a fixed-point string with `d` decimals.
 @external(erlang, "twocore_rt_js_ffi", "num_to_fixed")

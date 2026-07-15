@@ -73,7 +73,8 @@
     string_from_code_point/1, string_raw/2, date_now/0,
     date_new/1, date_utc/1, date_parse/1, date_call/3,
     array_flat_map/2, array_find_last/2, array_find_last_index/2,
-    array_last_index_of/3, num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
+    array_last_index_of/3, array_last_index_of_end/2,
+    num_to_fixed/2, num_to_exponential/2, num_to_precision/2,
     to_string_dispatch/1, num_to_string_radix/2,
     new_regex/2, regex_construct/2, regex_test/2, regex_exec/2, regex_source/1,
     regex_flags/1,
@@ -5144,8 +5145,22 @@ array_last_index_of(Recv, X, From) ->
     Cap = last_idx_from(From, Len),
     alast_idx(Recv, min(Cap, Len - 1), X).
 
-last_idx_from(undefined, Len) ->
-    Len - 1;
+%% lastIndexOf(searchElement) with NO fromIndex argument (§22.1.3.17 step: "If
+%% fromIndex is present … else let n be len - 1"). This is DISTINCT from an
+%% explicit `undefined` fromIndex: an absent argument scans from the last index,
+%% whereas a present `undefined` coerces via ToIntegerOrInfinity to 0 and scans
+%% only index 0. Lowering routes the arity-1 (and no-arg) call here so the two
+%% cases are not conflated. A string receiver keeps the String.prototype path.
+array_last_index_of_end(Recv, X) when is_binary(Recv) ->
+    str_last_index_of(Recv, X, undefined);
+array_last_index_of_end(Recv, X) ->
+    {Len, _Map} = arr_content(Recv),
+    alast_idx(Recv, Len - 1, X).
+
+%% Resolve a PRESENT fromIndex argument to the starting scan index for
+%% lastIndexOf. Per §22.1.3.17, `undefined` (and any NaN) is ToIntegerOrInfinity
+%% → 0; -Infinity yields -1 (empty scan); a negative index counts from the end.
+%% The absent-argument case is handled separately by array_last_index_of_end/2.
 last_idx_from(From, Len) ->
     case coerce_num(From) of
         nan -> 0;
