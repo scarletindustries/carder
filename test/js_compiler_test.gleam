@@ -6851,3 +6851,73 @@ pub fn array_map_thisarg_arrow_unaffected_test() {
   val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
   |> should.equal(dyn("2,4,6"))
 }
+
+// ==== Iterator (wave 13) ====
+
+pub fn generator_expression_iife_yields_test() {
+  // A generator FUNCTION EXPRESSION invoked immediately (`(function*(){…})()`)
+  // must produce a real generator object (not `undefined`, as it did before the
+  // expression form was transformed). Driving it with `.next()` yields each value
+  // in order, then `{done:true}` (§27.5). Regression for `(function*(){…})()`.
+  let m =
+    compile(
+      "function f() { let it = (function*(){ yield 10; yield 20; })(); "
+      <> "let a = it.next(); let b = it.next(); let c = it.next(); "
+      <> "return a.value + b.value * 10 + (c.done === true ? 1000 : 0); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1210.0)
+}
+
+pub fn generator_expression_empty_exhausted_some_test() {
+  // Mirrors test/built-ins/Iterator/prototype/some/iterator-already-exhausted.js:
+  // an already-exhausted iterator returns `false` from `.some` for any predicate,
+  // because there are no remaining values to test (§27.1.4.18).
+  let m =
+    compile(
+      "function f() { let it = (function*(){})(); it.next(); "
+      <> "let a = it.some(function(x){ return true; }); "
+      <> "let b = it.some(function(x){ return false; }); "
+      <> "return (a === false && b === false) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+pub fn generator_expression_empty_exhausted_toarray_test() {
+  // Mirrors Iterator/prototype/toArray/iterator-already-exhausted.js: `.toArray`
+  // on an exhausted iterator yields an empty array (§27.1.4.19).
+  let m =
+    compile(
+      "function f() { let it = (function*(){})(); it.next(); "
+      <> "return it.toArray().length; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(0.0)
+}
+
+pub fn generator_expression_exhausted_every_find_reduce_test() {
+  // every → true (vacuously) and find → undefined on an exhausted iterator
+  // (§27.1.4.6 / .8); reduce with an initial value returns that seed unchanged
+  // (§27.1.4.16).
+  let m =
+    compile(
+      "function f() { let it = (function*(){})(); it.next(); "
+      <> "let e = it.every(function(x){ return false; }); "
+      <> "let g = (function*(){})(); g.next(); "
+      <> "let fd = g.find(function(x){ return true; }); "
+      <> "let h = (function*(){})(); h.next(); "
+      <> "let rd = h.reduce(function(a, x){ return a + x; }, 42); "
+      <> "return (e === true && fd === undefined && rd === 42) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+pub fn generator_expression_map_take_toarray_test() {
+  // The lazy helpers compose over a generator-expression source: map doubles each
+  // value, take limits to two, toArray collects them (§27.1.4.12 / .17 / .19).
+  let m =
+    compile(
+      "function f() { let it = (function*(){ yield 1; yield 2; yield 3; yield 4; })(); "
+      <> "let arr = it.map(function(x){ return x * 2; }).take(2).toArray(); "
+      <> "return arr.length * 100 + arr[0] * 10 + arr[1]; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(224.0)
+}
