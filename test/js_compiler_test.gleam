@@ -6905,3 +6905,34 @@ pub fn boolean_prototype_method_call_receiver_test() {
   val("Boolean.prototype.toString.call(new Boolean(0))")
   |> should.equal(dyn("false"))
 }
+
+// ==== Symbol (wave 13) ====
+
+// Explicit Resource Management (ES2026) adds two well-known Symbols, `Symbol.dispose`
+// (§ Symbol.dispose) and `Symbol.asyncDispose`. Like every other well-known Symbol they
+// must EXIST as fixed unique values: `typeof` is "symbol", each is `===` only to itself,
+// and the two are distinct from each other and from other well-known Symbols.
+pub fn symbol_dispose_wellknown_test() {
+  val("typeof Symbol.dispose") |> should.equal(dyn("symbol"))
+  val("typeof Symbol.asyncDispose") |> should.equal(dyn("symbol"))
+  val("Symbol.dispose === Symbol.dispose") |> should.equal(dyn(True))
+  val("Symbol.asyncDispose === Symbol.asyncDispose") |> should.equal(dyn(True))
+  val("Symbol.dispose === Symbol.asyncDispose") |> should.equal(dyn(False))
+  val("Symbol.dispose === Symbol.iterator") |> should.equal(dyn(False))
+}
+
+// §20.4.2.7 Symbol.keyFor: a well-known Symbol was NOT created via the global
+// registry (`Symbol.for`), so it has no registered key — `Symbol.keyFor` returns
+// undefined for it. (test262: built-ins/Symbol/{dispose,asyncDispose}/no-key.js.)
+pub fn symbol_dispose_not_in_registry_test() {
+  let m =
+    compile(
+      "function f(){ return Symbol.keyFor(Symbol.dispose) === undefined; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+  let n =
+    compile(
+      "function f(){ return Symbol.keyFor(Symbol.asyncDispose) === undefined; }",
+    )
+  call(n, "f", []) |> should.equal(dyn(True))
+}
