@@ -5543,9 +5543,13 @@ fn lower_instance_method(
     "findLast", [] -> host("array_find_last", [undefined()])
     "findLastIndex", [f, ..] -> host("array_find_last_index", [f])
     "findLastIndex", [] -> host("array_find_last_index", [undefined()])
+    // A PRESENT fromIndex (even `undefined`) coerces via ToIntegerOrInfinity, so
+    // `x.lastIndexOf(v, undefined)` scans from index 0; but an ABSENT fromIndex
+    // scans from the last index. Route the two cases to distinct ops so the
+    // runtime does not conflate them (§22.1.3.17).
     "lastIndexOf", [x, from, ..] -> host("array_last_index_of", [x, from])
-    "lastIndexOf", [x] -> host("array_last_index_of", [x, undefined()])
-    "lastIndexOf", [] -> host("array_last_index_of", [undefined(), undefined()])
+    "lastIndexOf", [x] -> host("array_last_index_of_end", [x])
+    "lastIndexOf", [] -> host("array_last_index_of_end", [undefined()])
     "toFixed", [d, ..] -> host("num_to_fixed", [d])
     "toFixed", [] -> host("num_to_fixed", [undefined()])
     "toExponential", [d, ..] -> host("num_to_exponential", [d])

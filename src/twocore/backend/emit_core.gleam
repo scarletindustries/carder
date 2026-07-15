@@ -4265,6 +4265,7 @@ fn resolve_js(op: String) -> Option(String) {
     "array_find_last" -> Some("array_find_last")
     "array_find_last_index" -> Some("array_find_last_index")
     "array_last_index_of" -> Some("array_last_index_of")
+    "array_last_index_of_end" -> Some("array_last_index_of_end")
     "num_to_fixed" -> Some("num_to_fixed")
     "num_to_exponential" -> Some("num_to_exponential")
     "num_to_precision" -> Some("num_to_precision")

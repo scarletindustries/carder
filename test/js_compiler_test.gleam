@@ -6579,3 +6579,17 @@ pub fn ctor_in_closure_throws_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(1.0)
 }
+
+// ==== Array (wave 11) ====
+
+// Array.prototype.lastIndexOf (§22.1.3.17): a PRESENT `fromIndex` of `undefined`
+// is coerced via ToIntegerOrInfinity → 0, so the scan starts at index 0 only —
+// distinct from an ABSENT fromIndex, which starts from the last index. For
+// [1, 2, 1]: lastIndexOf(2, undefined) === -1 (index 0 holds 1), while
+// lastIndexOf(2) (absent) === 1, and lastIndexOf(1) === 2.
+pub fn array_last_index_of_present_undefined_from_test() {
+  num("[1, 2, 1].lastIndexOf(2, undefined)") |> should.equal(-1.0)
+  num("[1, 2, 1].lastIndexOf(1, undefined)") |> should.equal(0.0)
+  num("[1, 2, 1].lastIndexOf(2)") |> should.equal(1.0)
+  num("[1, 2, 1].lastIndexOf(1)") |> should.equal(2.0)
+}
