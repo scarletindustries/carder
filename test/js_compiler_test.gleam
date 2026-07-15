@@ -5796,3 +5796,114 @@ pub fn symbol_description_not_own_test() {
     compile("function f(){ return Symbol().hasOwnProperty('description'); }")
   call(m, "f", []) |> should.equal(dyn(False))
 }
+
+// ==== Reflect (wave 8) ====
+
+// §28.1.9 Reflect.has(target, key) → boolean [[HasProperty]]. Own property → true,
+// absent → false. Mirrors Reflect/has/return-value semantics.
+pub fn reflect_has_test() {
+  val("Reflect.has({ a: 1 }, 'a')") |> should.equal(dyn(True))
+  val("Reflect.has({ a: 1 }, 'b')") |> should.equal(dyn(False))
+}
+
+// §28.1.6 Reflect.get(target, key) → the property value (undefined when absent),
+// unlike a throwing access. Mirrors Reflect/get/return-value.
+pub fn reflect_get_test() {
+  num("Reflect.get({ a: 5 }, 'a')") |> should.equal(5.0)
+  val("Reflect.get({ a: 5 }, 'missing') === undefined")
+  |> should.equal(dyn(True))
+}
+
+// §28.1.13 Reflect.set(target, key, V) → boolean success and performs the write.
+// Mirrors Reflect/set/set-value-on-data-descriptor (3-argument form).
+pub fn reflect_set_test() {
+  let m =
+    compile(
+      "function f(){ let o = { p: 43 };"
+      <> " let ok = Reflect.set(o, 'p', 42); return ok === true && o.p === 42; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §28.1.4 Reflect.deleteProperty(target, key) → boolean success; the property is
+// gone afterwards. Mirrors Reflect/deleteProperty/return-value.
+pub fn reflect_delete_property_test() {
+  let m =
+    compile(
+      "function f(){ let o = { p: 1 };"
+      <> " let ok = Reflect.deleteProperty(o, 'p');"
+      <> " return ok === true && Reflect.has(o, 'p') === false; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §28.1.11 Reflect.ownKeys(target) → an Array of the target's own keys. Mirrors
+// Reflect/ownKeys/return-on-corresponding-order (string keys only here).
+pub fn reflect_own_keys_test() {
+  num("Reflect.ownKeys({ a: 1, b: 2, c: 3 }).length") |> should.equal(3.0)
+  val("Reflect.ownKeys({ a: 1, b: 2 }).indexOf('a') >= 0")
+  |> should.equal(dyn(True))
+}
+
+// §28.1.10 Reflect.isExtensible(target) → boolean; a fresh object is extensible,
+// and false after preventExtensions. Mirrors Reflect/isExtensible/return-boolean.
+pub fn reflect_is_extensible_test() {
+  val("Reflect.isExtensible({})") |> should.equal(dyn(True))
+  let m =
+    compile(
+      "function f(){ let o = {}; Reflect.preventExtensions(o);"
+      <> " return Reflect.isExtensible(o); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(False))
+}
+
+// §28.1.12 Reflect.preventExtensions(target) → boolean success (true) and makes the
+// object non-extensible. Mirrors Reflect/preventExtensions/return-true.
+pub fn reflect_prevent_extensions_test() {
+  let m =
+    compile(
+      "function f(){ let o = {}; let ok = Reflect.preventExtensions(o);"
+      <> " return ok === true && Reflect.isExtensible(o) === false; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §28.1.1 Reflect.apply(target, thisArgument, argumentsList) → Call(target, …args).
+// Mirrors Reflect/apply/apply-function-arguments.
+pub fn reflect_apply_test() {
+  let m =
+    compile(
+      "function f(){ let add = (a, b) => a + b;"
+      <> " return Reflect.apply(add, undefined, [3, 4]); }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(7.0)
+}
+
+// §28.1 step 1 of get/set/has/… : "If Type(target) is not Object, throw a
+// TypeError" — UNLIKE the coercing Object.* statics. Mirrors the many
+// Reflect/*/target-is-not-object-throws cases (caught as a TypeError value).
+pub fn reflect_target_not_object_throws_test() {
+  let m =
+    compile(
+      "function f(){ try { Reflect.get(1, 'p'); return 'no'; }"
+      <> " catch (e) { return e.name; } }",
+    )
+  call(m, "f", []) |> should.equal(dyn("TypeError"))
+  let n =
+    compile(
+      "function f(){ try { Reflect.has(null, 'p'); return 'no'; }"
+      <> " catch (e) { return e.name; } }",
+    )
+  call(n, "f", []) |> should.equal(dyn("TypeError"))
+}
+
+// §28.1.1 step 1: Reflect.apply throws a TypeError when target is not callable.
+// Mirrors Reflect/apply/target-is-not-callable-throws.
+pub fn reflect_apply_not_callable_throws_test() {
+  let m =
+    compile(
+      "function f(){ try { Reflect.apply(42, undefined, []); return 'no'; }"
+      <> " catch (e) { return e.name; } }",
+    )
+  call(m, "f", []) |> should.equal(dyn("TypeError"))
+}

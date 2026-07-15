@@ -4362,6 +4362,16 @@ fn resolve_js(op: String) -> Option(String) {
     "object_from_entries" -> Some("object_from_entries")
     "object_is" -> Some("object_is")
     "object_has_own" -> Some("object_has_own")
+    // Reflect namespace
+    "reflect_has" -> Some("reflect_has")
+    "reflect_get" -> Some("reflect_get")
+    "reflect_set" -> Some("reflect_set")
+    "reflect_delete_property" -> Some("reflect_delete_property")
+    "reflect_own_keys" -> Some("reflect_own_keys")
+    "reflect_get_prototype_of" -> Some("reflect_get_prototype_of")
+    "reflect_is_extensible" -> Some("reflect_is_extensible")
+    "reflect_prevent_extensions" -> Some("reflect_prevent_extensions")
+    "reflect_apply" -> Some("reflect_apply")
     "json_stringify" -> Some("json_stringify")
     "json_parse" -> Some("json_parse")
     // URI encode / decode globals
