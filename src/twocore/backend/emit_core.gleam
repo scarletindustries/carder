@@ -4371,6 +4371,13 @@ fn resolve_js(op: String) -> Option(String) {
     "decode_uri" -> Some("decode_uri")
     "global_escape" -> Some("global_escape")
     "global_unescape" -> Some("global_unescape")
+    // Symbol (primitive + well-known symbols + global registry)
+    "symbol_make" -> Some("symbol_make")
+    "symbol_ctor" -> Some("symbol_ctor")
+    "symbol_no_new" -> Some("symbol_no_new")
+    "symbol_wellknown" -> Some("symbol_wellknown")
+    "symbol_for" -> Some("symbol_for")
+    "symbol_key_for" -> Some("symbol_key_for")
     // lists / console / misc
     "empty_list" -> Some("empty_list")
     "console_log" -> Some("console_log")

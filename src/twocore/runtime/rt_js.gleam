@@ -1023,3 +1023,39 @@ pub fn console_log(args: Dynamic) -> Dynamic
 /// it; it never returns.)
 @external(erlang, "twocore_rt_js_ffi", "not_callable")
 pub fn not_callable(v: Dynamic) -> Dynamic
+
+// ───────────────────────── Symbol ─────────────────────────
+
+/// `Symbol(description)` — a fresh unique Symbol value (`{js_symbol, Id, Desc}`).
+/// `desc` is the raw description argument, or the `undefined` atom when none was
+/// given (an `undefined` description means the Symbol has no description; any other
+/// value is coerced with ToString). `typeof` of the result is "symbol", and two
+/// `Symbol()` results are never `===` even with equal descriptions.
+@external(erlang, "twocore_rt_js_ffi", "symbol_make")
+pub fn symbol_make(desc: Dynamic) -> Dynamic
+
+/// The bare `Symbol` identifier as a first-class fun VALUE — so `typeof Symbol` is
+/// "function". Applied, it constructs a Symbol from its single description argument.
+@external(erlang, "twocore_rt_js_ffi", "symbol_ctor")
+pub fn symbol_ctor() -> Dynamic
+
+/// `new Symbol()` — the Symbol constructor is not new-able (§20.4.1.1 step 1); ALWAYS
+/// raises a TypeError. (Typed as returning `Dynamic`; it never returns.)
+@external(erlang, "twocore_rt_js_ffi", "symbol_no_new")
+pub fn symbol_no_new() -> Dynamic
+
+/// A well-known Symbol (§20.4.2.x): a single fixed unique value per `name` (the atom
+/// `iterator`/`asyncIterator`/`hasInstance`/…). Its description is `"Symbol.<name>"`.
+@external(erlang, "twocore_rt_js_ffi", "symbol_wellknown")
+pub fn symbol_wellknown(name: Dynamic) -> Dynamic
+
+/// `Symbol.for(key)` — the GlobalSymbolRegistry lookup: returns the same Symbol for
+/// equal (ToString'd) keys, creating and registering one on first use.
+@external(erlang, "twocore_rt_js_ffi", "symbol_for")
+pub fn symbol_for(key: Dynamic) -> Dynamic
+
+/// `Symbol.keyFor(sym)` — the registry key `sym` was registered under (via
+/// `Symbol.for`), or `undefined` if it is not a registered Symbol. A non-Symbol
+/// argument is a TypeError.
+@external(erlang, "twocore_rt_js_ffi", "symbol_key_for")
+pub fn symbol_key_for(sym: Dynamic) -> Dynamic

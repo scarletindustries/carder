@@ -3157,6 +3157,11 @@ fn lower_expr(
                         // without `new` throws a TypeError, per §24.4.1.1).
                         False, "WeakSet" ->
                           Ok(bind1(ir.CallHost("js", "weakset_ctor", []), ctr))
+                        // A bare `Symbol` reference resolves to the Symbol factory as a
+                        // fun VALUE, so `typeof Symbol` is "function" and it can be
+                        // passed around / applied to build a Symbol.
+                        False, "Symbol" ->
+                          Ok(bind1(ir.CallHost("js", "symbol_ctor", []), ctr))
                         False, _ ->
                           Error(Unsupported("unbound identifier '" <> x <> "'"))
                       }
@@ -4115,6 +4120,7 @@ fn lower_call_fixed(
       || ns == "JSON"
       || ns == "String"
       || ns == "Date"
+      || ns == "Symbol"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
     // `super.method(args)` — call the superclass's method on the current `this`.
     ast.MemberExpression(
@@ -4316,9 +4322,34 @@ fn is_global_fn(name: String) -> Bool {
     | "decodeURI"
     | "escape"
     | "unescape"
+    | // `Symbol(desc)` — the Symbol factory (called without `new`; `new Symbol()` throws).
+      "Symbol"
     | // `WeakSet` — routed so a call WITHOUT `new` throws a TypeError (§24.4.1.1).
       "WeakSet" -> True
     _ -> is_error_ctor(name)
+  }
+}
+
+/// The well-known Symbols (§20.4.2) this compiler exposes as fixed unique values off
+/// the `Symbol` namespace (`Symbol.iterator`, `Symbol.asyncIterator`, …). Only
+/// `Symbol.iterator` carries real behavior (the iterator protocol); the rest merely
+/// need to EXIST as distinct Symbol values so tests referencing them compile and run.
+fn is_wellknown_symbol(name: String) -> Bool {
+  case name {
+    "iterator"
+    | "asyncIterator"
+    | "hasInstance"
+    | "toPrimitive"
+    | "toStringTag"
+    | "species"
+    | "match"
+    | "matchAll"
+    | "replace"
+    | "search"
+    | "split"
+    | "isConcatSpreadable"
+    | "unscopables" -> True
+    _ -> False
   }
 }
 
@@ -4387,6 +4418,10 @@ fn lower_global_call(
     // NewTarget, so a plain call always throws a TypeError (the arguments are
     // still evaluated for side effects via `binds`).
     "WeakSet", _ -> host("weakset_no_new", [])
+    // `Symbol(desc)` (§20.4.1.1) — a fresh unique Symbol; `desc` (if any) is coerced
+    // to a string, an omitted/undefined description leaving the Symbol description-less.
+    "Symbol", [x, ..] -> host("symbol_make", [x])
+    "Symbol", [] -> host("symbol_make", [undefined()])
     "isNaN", [x, ..] -> host("is_nan", [x])
     "isNaN", [] -> host("is_nan", [undefined()])
     "isFinite", [x, ..] -> host("is_finite", [x])
@@ -4552,6 +4587,13 @@ fn lower_static_call(
     // Date.parse(string) — ToString then ISO-parse to a time value (or NaN).
     "Date", "parse", [s, ..] -> host("date_parse", [s])
     "Date", "parse", [] -> host("date_parse", [undefined()])
+    // Symbol.for(key) — the GlobalSymbolRegistry lookup (same Symbol per equal key).
+    "Symbol", "for", [k, ..] -> host("symbol_for", [k])
+    "Symbol", "for", [] -> host("symbol_for", [undefined()])
+    // Symbol.keyFor(sym) — the key a registered Symbol was created under, else
+    // undefined; a non-Symbol argument throws a TypeError (§20.4.2.7 step 1).
+    "Symbol", "keyFor", [s, ..] -> host("symbol_key_for", [s])
+    "Symbol", "keyFor", [] -> host("symbol_key_for", [undefined()])
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }
@@ -4674,6 +4716,10 @@ fn lower_new(
     // `new RegExp(pattern, flags)` — a built-in RegExp (see `lower_regex_new`).
     ast.Identifier(name: "RegExp", ..) ->
       lower_regex_new(arguments, env, ctx, ctr)
+    // `new Symbol()` — the Symbol constructor is not new-able (§20.4.1.1 step 1); the
+    // runtime raises a TypeError.
+    ast.Identifier(name: "Symbol", ..) ->
+      Ok(bind1(ir.CallHost("js", "symbol_no_new", []), ctr))
     // `new Number(x)` / `new String(x)` / `new Boolean(x)` — a primitive WRAPPER object
     // boxing the coerced primitive (unlike `Number(x)`/`String(x)`/`Boolean(x)` WITHOUT
     // `new`, which stay primitives via `lower_global_call`).
@@ -5496,6 +5542,19 @@ fn lower_member(
       case number_const(c, ctr) {
         Some(result) -> Ok(result)
         None -> lower_member_get(object, property, computed, env, ctx, ctr)
+      }
+    // `Symbol.iterator` / `Symbol.asyncIterator` / … — a well-known Symbol (§20.4.2),
+    // each a single fixed unique value obtained from the runtime. `Symbol.iterator` is
+    // the load-bearing one (the iterator protocol); the rest merely need to EXIST as
+    // distinct values. `Symbol` is a namespace here, not a value.
+    ast.Identifier(name: "Symbol", ..), ast.Identifier(name: c, ..), False ->
+      case is_wellknown_symbol(c) {
+        True ->
+          Ok(bind1(
+            ir.CallHost("js", "symbol_wellknown", [ir.ConstAtom(c)]),
+            ctr,
+          ))
+        False -> lower_member_get(object, property, computed, env, ctx, ctr)
       }
     _, _, _ ->
       // `C.staticField` — read the static storage, walking the inheritance chain
