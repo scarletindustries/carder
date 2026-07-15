@@ -106,6 +106,9 @@
     object_prevent_extensions/1, object_is_extensible/1,
     object_seal/1, object_is_sealed/1,
     object_from_entries/1, object_is/2, object_has_own/2,
+    reflect_has/2, reflect_get/2, reflect_set/3, reflect_delete_property/2,
+    reflect_own_keys/1, reflect_get_prototype_of/1, reflect_is_extensible/1,
+    reflect_prevent_extensions/1, reflect_apply/3,
     json_stringify/3, json_parse/1,
     encode_uri_component/1, encode_uri/1,
     decode_uri_component/1, decode_uri/1,
@@ -1489,6 +1492,95 @@ object_has_own(Recv, _Key) ->
         symbol -> false;
         _ -> type_error(Recv)
     end.
+
+%% ───────────────────────── Reflect ─────────────────────────
+%% The Reflect namespace (§28.1). Every method's first step is "If Type(target) is
+%% not Object, throw a TypeError" — UNLIKE the matching Object.* static, which
+%% ToObject-coerces a primitive. So each op guards `is_reference(Target)` (the model's
+%% object representation) and calls type_error/1 for any primitive, then delegates to
+%% the same core property machinery used elsewhere. This v1 model has own properties
+%% only (no prototype chain), so [[HasProperty]]/[[Get]] reduce to own-key lookups.
+
+%% Reflect.has(target, propertyKey) (§28.1.9) -> JS boolean. TypeError if target is
+%% not an Object. The key is passed through unchanged (has_prop normalizes a number
+%% key like `obj[k]` does); this converts the 1/0 result to the boolean atom the spec
+%% requires (a VALUE, not a predicate). Own-property only here (no inherited keys in v1).
+reflect_has(Target, Key) when is_reference(Target) ->
+    has_prop(Target, Key) =:= 1;
+reflect_has(Target, _Key) ->
+    type_error(Target).
+
+%% Reflect.get(target, propertyKey) (§28.1.6) -> the property value (or undefined).
+%% TypeError if target is not an Object. The optional `receiver` (accessor `this`)
+%% is not modelled; getters here are already receiver-bound by get_prop.
+reflect_get(Target, Key) when is_reference(Target) ->
+    get_prop(Target, Key);
+reflect_get(Target, _Key) ->
+    type_error(Target).
+
+%% Reflect.set(target, propertyKey, V) (§28.1.13) -> JS boolean success. TypeError
+%% if target is not an Object. A frozen/non-writable target makes the write a no-op
+%% and reports `false`; otherwise the write succeeds and reports `true`. The optional
+%% `receiver` is not modelled.
+reflect_set(Target, Key, V) when is_reference(Target) ->
+    case erlang:get({js_frozen, Target}) =:= true of
+        true -> false;
+        _ ->
+            set_prop(Target, Key, V),
+            true
+    end;
+reflect_set(Target, _Key, _V) ->
+    type_error(Target).
+
+%% Reflect.deleteProperty(target, propertyKey) (§28.1.4) -> JS boolean success.
+%% TypeError if target is not an Object. delete_prop already returns the boolean
+%% atom (false for a frozen/sealed non-configurable own property, true otherwise).
+reflect_delete_property(Target, Key) when is_reference(Target) ->
+    delete_prop(Target, Key);
+reflect_delete_property(Target, _Key) ->
+    type_error(Target).
+
+%% Reflect.ownKeys(target) (§28.1.11) -> an Array of the target's own property keys.
+%% TypeError if target is not an Object. Reuses object_keys (the own-key list); the
+%% array-index-first / creation-order guarantees follow from the backing map, a v1
+%% ordering limitation shared with Object.keys.
+reflect_own_keys(Target) when is_reference(Target) ->
+    object_keys(Target);
+reflect_own_keys(Target) ->
+    type_error(Target).
+
+%% Reflect.getPrototypeOf(target) (§28.1.8) -> the target's prototype, or null.
+%% TypeError if target is not an Object. This v1 model tracks no prototype chain, so
+%% an ordinary object reports `null` (LIMITED: it cannot return the real
+%% Object.prototype). The value of this op is the enforced TypeError on primitives.
+reflect_get_prototype_of(Target) when is_reference(Target) ->
+    null;
+reflect_get_prototype_of(Target) ->
+    type_error(Target).
+
+%% Reflect.isExtensible(target) (§28.1.10) -> JS boolean. TypeError if target is not
+%% an Object (UNLIKE Object.isExtensible, which returns false for a primitive).
+reflect_is_extensible(Target) when is_reference(Target) ->
+    object_is_extensible(Target);
+reflect_is_extensible(Target) ->
+    type_error(Target).
+
+%% Reflect.preventExtensions(target) (§28.1.12) -> JS boolean success. TypeError if
+%% target is not an Object. Marks the object non-extensible and reports `true`.
+reflect_prevent_extensions(Target) when is_reference(Target) ->
+    object_prevent_extensions(Target),
+    true;
+reflect_prevent_extensions(Target) ->
+    type_error(Target).
+
+%% Reflect.apply(target, thisArgument, argumentsList) (§28.1.1) -> the call result.
+%% TypeError if target is not callable. Reuses func_apply, whose raw-argument
+%% convention is `[thisArg, argArray | _]`; a null/undefined argumentsList is the
+%% empty list (CreateListFromArrayLike).
+reflect_apply(Target, ThisArgument, ArgumentsList) when is_function(Target) ->
+    func_apply(Target, [ThisArgument, ArgumentsList]);
+reflect_apply(Target, _ThisArgument, _ArgumentsList) ->
+    type_error(Target).
 
 %% Define an own DATA property `Key = V` on `Obj`, storing directly and
 %% unconditionally — bypassing set_prop's accessor check so it overwrites any

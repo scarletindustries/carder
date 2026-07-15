@@ -996,6 +996,56 @@ pub fn object_is(x: Dynamic, y: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "object_has_own")
 pub fn object_has_own(obj: Dynamic, key: Dynamic) -> Dynamic
 
+/// `Reflect.has(target, key)` → JS boolean; whether `target` (which must be an
+/// object, else TypeError) has the property `key` (own-property only in v1).
+@external(erlang, "twocore_rt_js_ffi", "reflect_has")
+pub fn reflect_has(target: Dynamic, key: Dynamic) -> Dynamic
+
+/// `Reflect.get(target, key)` → the value of `target[key]` (or `undefined`);
+/// `target` must be an object, else TypeError. The optional `receiver` is ignored.
+@external(erlang, "twocore_rt_js_ffi", "reflect_get")
+pub fn reflect_get(target: Dynamic, key: Dynamic) -> Dynamic
+
+/// `Reflect.set(target, key, value)` → JS boolean success; `target` must be an
+/// object, else TypeError. A frozen target reports `false`. `receiver` is ignored.
+@external(erlang, "twocore_rt_js_ffi", "reflect_set")
+pub fn reflect_set(target: Dynamic, key: Dynamic, value: Dynamic) -> Dynamic
+
+/// `Reflect.deleteProperty(target, key)` → JS boolean success; `target` must be an
+/// object, else TypeError. A frozen/sealed non-configurable property reports `false`.
+@external(erlang, "twocore_rt_js_ffi", "reflect_delete_property")
+pub fn reflect_delete_property(target: Dynamic, key: Dynamic) -> Dynamic
+
+/// `Reflect.ownKeys(target)` → an array of `target`'s own property keys; `target`
+/// must be an object, else TypeError.
+@external(erlang, "twocore_rt_js_ffi", "reflect_own_keys")
+pub fn reflect_own_keys(target: Dynamic) -> Dynamic
+
+/// `Reflect.getPrototypeOf(target)` → the prototype, or `null` (this v1 model has
+/// no prototype chain, so an ordinary object reports `null`); `target` must be an
+/// object, else TypeError.
+@external(erlang, "twocore_rt_js_ffi", "reflect_get_prototype_of")
+pub fn reflect_get_prototype_of(target: Dynamic) -> Dynamic
+
+/// `Reflect.isExtensible(target)` → JS boolean; `target` must be an object, else
+/// TypeError (unlike `Object.isExtensible`, which does not throw on a primitive).
+@external(erlang, "twocore_rt_js_ffi", "reflect_is_extensible")
+pub fn reflect_is_extensible(target: Dynamic) -> Dynamic
+
+/// `Reflect.preventExtensions(target)` → JS boolean success (`true`); `target` must
+/// be an object, else TypeError.
+@external(erlang, "twocore_rt_js_ffi", "reflect_prevent_extensions")
+pub fn reflect_prevent_extensions(target: Dynamic) -> Dynamic
+
+/// `Reflect.apply(target, thisArgument, argumentsList)` → the call result; `target`
+/// must be callable, else TypeError. `argumentsList` is spread as the arguments.
+@external(erlang, "twocore_rt_js_ffi", "reflect_apply")
+pub fn reflect_apply(
+  target: Dynamic,
+  this_argument: Dynamic,
+  arguments_list: Dynamic,
+) -> Dynamic
+
 /// `JSON.stringify(value, replacer, space)` → a JSON string, or `undefined` when
 /// the root value serializes to nothing. `replacer` is a filter/transform (an
 /// Array PropertyList or a callable), `space` the indentation gap; pass

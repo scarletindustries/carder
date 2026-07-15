@@ -323,9 +323,12 @@ pub fn program(
   // A closure referencing a top-level global (or a top-level function) must NOT
   // treat it as a captured free variable — it resolves through the global store /
   // function table at use, not by capture. So both are excluded from captures.
+  // The built-in static namespaces (`Math`/`JSON`/`Reflect`/…) are likewise
+  // resolved structurally at their call site, so they too are excluded (a closure
+  // like `() => Reflect.get(t, k)` has no `Reflect` binding to capture).
   use lambdas <- result_try(collect_lambdas(
     scan,
-    list.append(fn_names, globals),
+    list.flatten([fn_names, globals, builtin_namespace_names()]),
   ))
   let fn_arity =
     dict.from_list(list.map(decls, fn(d) { #(d.0, list.length(d.1)) }))
@@ -4127,6 +4130,7 @@ fn lower_call_fixed(
       || ns == "String"
       || ns == "Date"
       || ns == "Symbol"
+      || ns == "Reflect"
     -> lower_static_call(ns, method, arguments, env, ctx, ctr)
     // `super.method(args)` — call the superclass's method on the current `this`.
     ast.MemberExpression(
@@ -4600,6 +4604,29 @@ fn lower_static_call(
     // undefined; a non-Symbol argument throws a TypeError (§20.4.2.7 step 1).
     "Symbol", "keyFor", [s, ..] -> host("symbol_key_for", [s])
     "Symbol", "keyFor", [] -> host("symbol_key_for", [undefined()])
+    // Reflect namespace (§28.1): the non-descriptor reflective operations. Each
+    // throws a TypeError when its target is not an Object (unlike the coercing
+    // Object.* statics), enforced in the runtime op. The optional `receiver`
+    // argument of get/set is not modelled here.
+    "Reflect", "has", [t, k, ..] -> host("reflect_has", [t, k])
+    "Reflect", "get", [t, k, ..] -> host("reflect_get", [t, k])
+    "Reflect", "set", [t, k, v, ..] -> host("reflect_set", [t, k, v])
+    "Reflect", "deleteProperty", [t, k, ..] ->
+      host("reflect_delete_property", [t, k])
+    "Reflect", "ownKeys", [t, ..] -> host("reflect_own_keys", [t])
+    "Reflect", "getPrototypeOf", [t, ..] ->
+      host("reflect_get_prototype_of", [t])
+    "Reflect", "isExtensible", [t, ..] -> host("reflect_is_extensible", [t])
+    "Reflect", "preventExtensions", [t, ..] ->
+      host("reflect_prevent_extensions", [t])
+    // Reflect.apply(target, thisArgument, argumentsList); a missing thisArgument /
+    // argumentsList defaults to `undefined` (argumentsList undefined → no args).
+    "Reflect", "apply", [t, this, args, ..] ->
+      host("reflect_apply", [t, this, args])
+    "Reflect", "apply", [t, this] ->
+      host("reflect_apply", [t, this, undefined()])
+    "Reflect", "apply", [t] ->
+      host("reflect_apply", [t, undefined(), undefined()])
     _, _, _ -> Error(Unsupported(ns <> "." <> method <> "(…)"))
   }
 }
@@ -6050,6 +6077,22 @@ fn global_const(name: String) -> Option(ir.Value) {
 /// the global.
 fn is_global(name: String, ctx: Ctx) -> Bool {
   list.contains(ctx.globals, name)
+}
+
+/// The identifier names of the built-in static namespaces (`Math`, `JSON`,
+/// `Reflect`, …). Each is recognised structurally at its call site
+/// (`Namespace.method(...)`) rather than resolved as a runtime value, so a closure
+/// body that mentions one must NOT try to capture it as a free variable (there is
+/// no binding to capture — capturing would raise "closure capture of unbound").
+/// This mirrors how top-level function names and module-globals are excluded from
+/// captures: they are resolved at use, not threaded in. A user binding that shadows
+/// one of these names is not modelled (the same limitation already applies to using
+/// such a name with `.method()` at the top level).
+fn builtin_namespace_names() -> List(String) {
+  [
+    "Math", "JSON", "Object", "Number", "Array", "String", "Date", "Symbol",
+    "Reflect", "Boolean",
+  ]
 }
 
 /// The `#(classKey, fieldKey)` constants addressing global `name` in the shared
