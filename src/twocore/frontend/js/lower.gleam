@@ -48,7 +48,13 @@
 ////
 //// Builtins: the `Math` namespace (functions + constants); array methods (push/pop/
 //// shift/unshift, map/filter/forEach/reduce/reduceRight/some/every/find/findIndex,
-//// indexOf/includes/join/slice/concat/reverse/sort, flat/fill/at); string `.length`,
+//// indexOf/includes/join/slice/concat/reverse/sort, flat/fill/at; flatMap/findLast/
+//// findLastIndex reject a non-callable callback with a TypeError up front, even on an
+//// empty array, per the spec's IsCallable step. `Array.prototype.<name>` for
+//// at/flat/flatMap/findLast/findLastIndex is a first-class function VALUE — an UNBOUND
+//// method whose `this` is passed as the first argument — so `typeof
+//// Array.prototype.at` is "function"; calling it via `.call(receiver, …)` is a v1 gap,
+//// since a plain function value drops its `thisArg`); string `.length`,
 //// indexing, and methods (charAt/charCodeAt/codePointAt, toUpperCase/toLowerCase, indexOf/includes/slice/
 //// substring, split/trim/repeat/startsWith/endsWith/replace/replaceAll, padStart/
 //// padEnd/at); the global functions `parseInt`/`parseFloat`/`isNaN`/`isFinite`/
