@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, error_is_error/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
     array_from/1, array_from_map/2, array_flat/2, array_fill/4, array_copy_within/4, array_splice/2, array_at/2, array_proto_fn/1,
@@ -1081,6 +1081,21 @@ error_make(Name, MsgArg) ->
 error_ctor(Name) ->
     N = to_string(Name),
     fun(Msg) -> cell_new({js_err, N, error_message([Msg])}) end.
+
+%% Error.isError(v) → 1|0 (§20.5.2.1). Returns 1 only when `v` is a genuine Error
+%% VALUE — a cell holding `{js_err, Name, Msg}`, i.e. an object with an [[ErrorData]]
+%% internal slot (what `new Error`/`new TypeError`/… and a caught engine error
+%% produce). Every other value — a primitive (number, string, boolean, undefined,
+%% null, symbol) or an ordinary object merely SHAPED like an error (a plain object
+%% with `name`/`message`/`stack` own properties, a "fake error") — yields 0, because
+%% the slot, not the shape, is what the predicate tests.
+error_is_error(Recv) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        {js_err, _, _} -> 1;
+        _ -> 0
+    end;
+error_is_error(_) ->
+    0.
 
 %% js_error_to_value(Reason) -> {ok, [ErrCell]} | {error, nil}
 %% Classify a caught BEAM error `Reason` for a JS `try`/`catch` and, when it is the
