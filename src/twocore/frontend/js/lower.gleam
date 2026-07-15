@@ -116,7 +116,11 @@
 //// future direction could hand a dynamic string off to an embedded arc VM, but that
 //// is explicitly out of scope — the focus is making the AOT path excellent.)
 ////
-//// Not yet (a clean `Unsupported` error / panic): generators/async, and a
+//// Generators (`function* g(){ … }`) lower to a resumable state machine driven by
+//// `.next()` — both the DECLARATION form and the function-EXPRESSION form (e.g. an
+//// immediately-invoked `(function*(){ … })()`), which the pre-pass rewrites the same
+//// way; async is still unsupported.
+//// Not yet (a clean `Unsupported` error / panic): async, and a
 //// `return`/`break`/`continue` inside a `try`/`finally` body (it would bypass the
 //// finally, so it is rejected). Static
 //// field initializers run when the module's `main/0` runs (like any top-level
@@ -5805,6 +5809,9 @@ fn lower_instance_method_generic(
     // generator `.next(v)` — advances a generator, or delegates to a user
     // `next` method on an ordinary iterator object.
     "next", _ -> coll("gen_next")
+    // generator `.return(v)` — closes a generator (§27.5.1.4), yielding
+    // `{value: v, done: true}`; delegates to a user `return` method otherwise.
+    "return", _ -> coll("gen_return")
     // Object.prototype.hasOwnProperty(key) — own-property test (no prototype
     // chain in this model), returning a JS boolean.
     "hasOwnProperty", [k, ..] -> host("object_has_own", [k])
@@ -7224,6 +7231,18 @@ fn lambda_nodes_expr(e: ast.Expression) -> List(RawLambda) {
   case e {
     ast.ArrowFunctionExpression(span:, params:, body:, ..) -> {
       let stmts = arrow_body_stmts(body)
+      [RawLambda(span, params, stmts), ..lambda_nodes_stmts(stmts)]
+    }
+    ast.FunctionExpression(span:, params:, body:, is_generator: True, ..) -> {
+      // A generator function EXPRESSION (e.g. `(function*(){ … })()`): rewrite its
+      // body to the resumable state machine, exactly as a generator DECLARATION is
+      // rewritten in `as_function_decl`. On an unsupported generator shape, fall
+      // back to the original body so the surviving `yield` reports a clean
+      // Unsupported error during lowering (rather than silently mis-collecting).
+      let stmts = case transform_generator(params, body) {
+        Ok(new_body) -> block_stmts(new_body)
+        Error(_) -> block_stmts(body)
+      }
       [RawLambda(span, params, stmts), ..lambda_nodes_stmts(stmts)]
     }
     ast.FunctionExpression(span:, params:, body:, ..) -> {

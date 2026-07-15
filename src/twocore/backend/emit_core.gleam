@@ -4220,6 +4220,7 @@ fn resolve_js(op: String) -> Option(String) {
     "set_prop" -> Some("set_prop")
     "gen_make" -> Some("gen_make")
     "gen_next" -> Some("gen_next")
+    "gen_return" -> Some("gen_return")
     "iter_array" -> Some("iter_array")
     "iter_to_array" -> Some("iter_to_array")
     "iter_take" -> Some("iter_take")
