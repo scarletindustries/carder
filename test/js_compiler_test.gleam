@@ -7328,3 +7328,25 @@ pub fn wave14_arrow_callback_ignores_thisarg_test() {
   val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
   |> should.equal(dyn("2,4,6"))
 }
+
+// ==== Array (wave 15) ====
+
+// Array.prototype.join — an `undefined` separator defaults to "," (ES §23.1.3.18
+// step 3), it is NOT ToString'd to "undefined". `join()` with no argument behaves
+// the same. A `null` separator, by contrast, IS ToString'd (to "null"), and holes /
+// null / undefined ELEMENTS render as the empty string.
+pub fn wave15_array_join_undefined_separator_test() {
+  // explicit `undefined` separator -> comma, not "undefined"
+  val("[0, 1, 2, 3].join(undefined)") |> should.equal(dyn("0,1,2,3"))
+  // a variable that is undefined at runtime -> same default
+  let m = compile("function f() { var s; return [1, 2].join(s); }")
+  call(m, "f", []) |> should.equal(dyn("1,2"))
+  // no argument -> comma default
+  val("[1, 2, 3].join()") |> should.equal(dyn("1,2,3"))
+  // null separator is ToString'd normally
+  val("[1, 2, 3].join(null)") |> should.equal(dyn("1null2null3"))
+  // an explicit separator still wins
+  val("[1, 2, 3].join('-')") |> should.equal(dyn("1-2-3"))
+  // undefined ELEMENTS render as "" while the default separator stays ","
+  val("[0, undefined, 3].join(undefined)") |> should.equal(dyn("0,,3"))
+}
