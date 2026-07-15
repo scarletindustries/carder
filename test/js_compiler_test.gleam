@@ -7328,3 +7328,36 @@ pub fn wave14_arrow_callback_ignores_thisarg_test() {
   val("[1, 2, 3].map((x) => x * 2, { k: 9 }).join(',')")
   |> should.equal(dyn("2,4,6"))
 }
+
+// ==== Number (wave 15) ====
+
+// `Number.prototype.toString()` — `Number.prototype` is itself a Number object whose
+// [[NumberData]] is +0 (ES2023 §21.1.3), so §21.1.3.6 renders it as "0" for an absent
+// radix (base 10). test262 S15.7.4.2_A1_T01.
+pub fn number_proto_tostring_default_test() {
+  val("Number.prototype.toString()") |> should.equal(dyn("0"))
+}
+
+// The same value with an explicit radix of 10 or `undefined` is still base 10 → "0".
+// test262 S15.7.4.2_A1_T02 / _A1_T03.
+pub fn number_proto_tostring_radix10_and_undefined_test() {
+  val("Number.prototype.toString(10)") |> should.equal(dyn("0"))
+  val("Number.prototype.toString(undefined)") |> should.equal(dyn("0"))
+}
+
+// For every radix 2..36 the digit for 0 is "0", so `Number.prototype.toString(r)`
+// is "0" throughout the whole legal radix range. test262 S15.7.4.2_A2_T01..T34.
+pub fn number_proto_tostring_all_radixes_test() {
+  val("Number.prototype.toString(2)") |> should.equal(dyn("0"))
+  val("Number.prototype.toString(8)") |> should.equal(dyn("0"))
+  val("Number.prototype.toString(16)") |> should.equal(dyn("0"))
+  val("Number.prototype.toString(36)") |> should.equal(dyn("0"))
+}
+
+// A plain number renders its own value in the requested radix (§21.1.3.6): the radix
+// path is unaffected by the Number.prototype receiver special-case above.
+pub fn number_tostring_radix_plain_value_test() {
+  val("(255).toString(16)") |> should.equal(dyn("ff"))
+  val("(5).toString(2)") |> should.equal(dyn("101"))
+  val("(-1).toString(2)") |> should.equal(dyn("-1"))
+}

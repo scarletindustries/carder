@@ -4358,6 +4358,24 @@ fn lower_call_fixed(
     )
       if sym == "match" || sym == "replace" || sym == "search" || sym == "split"
     -> lower_regex_symbol_method(sym, object, arguments, env, ctx, ctr)
+    // `Number.prototype.toString(radix)` — `Number.prototype` is itself a Number
+    // object whose [[NumberData]] is +0 (ES2023 §21.1.3), so per §21.1.3.6 it
+    // renders as "0" in every radix (2–36) and for an absent/undefined/10 radix.
+    // Route it through `num_to_string_radix` with a literal 0 receiver; without
+    // this the receiver is the opaque `builtin_prototype("Number")` marker, whose
+    // ToNumber is NaN, so toString falls through to the generic object form
+    // "[object Object]".
+    ast.MemberExpression(
+      object: ast.MemberExpression(
+        object: ast.Identifier(name: "Number", ..),
+        property: ast.Identifier(name: "prototype", ..),
+        computed: False,
+        ..,
+      ),
+      property: ast.Identifier(name: "toString", ..),
+      computed: False,
+      ..,
+    ) -> lower_number_proto_tostring(arguments, env, ctx, ctr)
     // recv.method(args) — method dispatch (array/string methods).
     ast.MemberExpression(
       object:,
@@ -5537,6 +5555,37 @@ fn lower_method(
         None -> lower_instance_method(object, method, arguments, env, ctx, ctr)
       }
   }
+}
+
+/// `Number.prototype.toString(radix)` — render the [[NumberData]] of
+/// `Number.prototype`, which is +0 (ES2023 §21.1.3), in `radix`.
+///
+/// Parameters: `arguments` is the call's argument list; the first argument (if
+/// present) is the radix and any excess is ignored. An absent or `undefined`
+/// radix means base 10 (§21.1.3.6 step 3).
+///
+/// Returns the lowered `#(binds, value, ctr)` for a `num_to_string_radix` call
+/// whose receiver is a literal 0, so the result is always the string "0"
+/// regardless of the radix (0 is the same digit in every base). Never returns
+/// `Error` for this shape (the radix expression itself may still error while
+/// lowering, propagated via `result_try`).
+fn lower_number_proto_tostring(
+  arguments: List(ast.Expression),
+  env: Env,
+  ctx: Ctx,
+  ctr: Int,
+) -> Result(#(List(Bind), ir.Value, Int), Error) {
+  use #(ba, argvals, ctr) <- result_try(lower_args(arguments, env, ctx, ctr))
+  let radix = case argvals {
+    [r, ..] -> r
+    [] -> undefined()
+  }
+  let #(bz, zero, ctr) = number_literal(0.0, ctr)
+  Ok(bind_after(
+    list.append(ba, bz),
+    ir.CallHost("js", "num_to_string_radix", [zero, radix]),
+    ctr,
+  ))
 }
 
 /// The arity of `C.method` if `C` is a known class with static method `method`.
