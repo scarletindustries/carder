@@ -110,7 +110,9 @@
     encode_uri_component/1, encode_uri/1,
     decode_uri_component/1, decode_uri/1,
     global_escape/1, global_unescape/1,
-    empty_list/0, console_log/1, not_callable/1
+    empty_list/0, console_log/1, not_callable/1,
+    symbol_make/1, symbol_ctor/0, symbol_no_new/0, symbol_wellknown/1,
+    symbol_for/1, symbol_key_for/1
 ]).
 
 %% The pdict key of a cell (namespaced so it can never collide with
@@ -147,6 +149,10 @@ js_type(undefined) -> undefined;
 js_type(null) -> null;
 js_type(V) when is_reference(V) -> object;
 js_type(V) when is_function(V) -> function;
+%% a Symbol value: a `{js_symbol, Id, Desc}` tuple (Id unique — user symbols use a
+%% process-unique integer, well-known symbols a `{wk, Name}` tag). Structural tuple
+%% equality gives Symbol identity for free in `strict_eq`.
+js_type({js_symbol, _, _}) -> symbol;
 js_type(_) -> other.
 
 %% Normalize a JS number into the internal numeric domain
@@ -889,6 +895,7 @@ type_of(V) ->
         null -> <<"object">>;
         function -> <<"function">>;
         object -> <<"object">>;
+        symbol -> <<"symbol">>;
         other -> <<"object">>
     end.
 
@@ -1130,6 +1137,12 @@ iter_array(X) when is_reference(X) ->
     case erlang:get(?CELL_KEY(X)) of
         {js_gen, _} -> new_array(drain_gen(X, []));
         {js_array, _, _} -> X;
+        %% A Set iterates its elements in insertion order (its default iterator is
+        %% Set.prototype.values, §24.2.3.10).
+        {js_set, _, _} -> new_array(set_elems(X));
+        %% A Map iterates its `[key, value]` entries in insertion order (its default
+        %% iterator is Map.prototype.entries, §24.1.3.12).
+        {js_map, _, _} -> new_array(map_entry_arrays(X));
         _ -> new_array([])
     end;
 iter_array(X) when is_binary(X) ->
@@ -1199,6 +1212,25 @@ prop_key(K) ->
 %% recv[key] — the stored value, or `undefined` when absent. Dispatches on the
 %% cell content: a `{js_array,…}` is an array (integer indices + `length`), a
 %% map is a plain object. No prototype chain yet (v1: own properties only).
+%% `x[Symbol.iterator]` — resolve to the built-in iterator-producing method bound to
+%% `x` (arrays, strings, Maps, Sets, generators). A non-iterable receiver has no such
+%% method, so this yields `undefined` (and `x[Symbol.iterator]()` then throws, as JS
+%% does when the method is missing). This is a v1 shortcut for the well-known
+%% Symbol.iterator only — there is NO general symbol-keyed property store.
+get_prop(Recv, {js_symbol, {wk, iterator}, _}) ->
+    builtin_iter_fn(Recv);
+%% Any OTHER symbol key: no general symbol-keyed property store in v1, so reading one
+%% is `undefined` (reading an absent property is not a throw).
+get_prop(_Recv, {js_symbol, _, _}) ->
+    undefined;
+%% Reading a data property OFF a Symbol value: only `description` is exposed
+%% (Symbol.prototype.description, §20.4.3.2). Every other read is `undefined`
+%% (no Symbol prototype-chain data properties in v1).
+get_prop({js_symbol, _Id, Desc}, Key) ->
+    case Key of
+        <<"description">> -> Desc;
+        _ -> undefined
+    end;
 get_prop(Recv, Key) when is_reference(Recv) ->
     case erlang:get(?CELL_KEY(Recv)) of
         {js_array, Len, Map} ->
@@ -1451,6 +1483,10 @@ object_has_own(Recv, _Key) ->
         number -> false;
         boolean -> false;
         function -> false;
+        %% ToObject(Symbol) succeeds — a Symbol wrapper owns no string keys, so
+        %% `Symbol().hasOwnProperty("description")` is false (description lives on the
+        %% prototype, §20.4.3.2).
+        symbol -> false;
         _ -> type_error(Recv)
     end.
 
@@ -1730,7 +1766,15 @@ array_from_map(X, Fn) ->
 array_from_elems(X, Fn) when is_binary(X) ->
     from_map_list([from_cps([C]) || C <- cps(X)], Fn, 0);
 array_from_elems(X, Fn) when is_reference(X) ->
-    from_map_index(X, Fn, 0, arr_from_length(X));
+    %% An iterable source (Set / Map / generator) is materialized through its iterator
+    %% protocol (§23.1.2.1 step 5); anything else is treated as an array-like read by
+    %% integer index up to ToLength(length).
+    case cell_tag(X) of
+        {js_set, _, _} -> from_map_list(set_elems(X), Fn, 0);
+        {js_map, _, _} -> from_map_list(map_entry_arrays(X), Fn, 0);
+        {js_gen, _} -> from_map_list(drain_gen(X, []), Fn, 0);
+        _ -> from_map_index(X, Fn, 0, arr_from_length(X))
+    end;
 array_from_elems(_X, _Fn) ->
     [].
 
@@ -2761,6 +2805,83 @@ weakset_ctor() ->
 weakset_no_new() ->
     type_error(<<"Constructor WeakSet requires 'new'">>).
 
+%% ───────────────────────── Symbol ─────────────────────────
+%% A Symbol is a `{js_symbol, Id, Desc}` tuple. `Id` is the identity: a user Symbol
+%% gets a process-unique monotonic integer (so two `Symbol()` calls are never equal,
+%% even with the same description); a well-known Symbol gets a `{wk, Name}` tag (so
+%% `Symbol.iterator === Symbol.iterator`); a registered Symbol (`Symbol.for`) reuses
+%% the same tuple for the same string key. `Desc` is the string description or the
+%% `undefined` atom. Structural tuple equality gives Symbol identity for `===`/`==`
+%% (see `strict_eq`), and `js_type` maps the tuple to the `symbol` type.
+
+%% `Symbol(description)` (§20.4.1.1): a fresh unique Symbol. NewTarget must be
+%% undefined (enforced at the call site — `new Symbol()` routes to `symbol_no_new`).
+%% Per step 2, an `undefined` description yields NO description; otherwise the
+%% description is ToString(description).
+symbol_make(Desc) ->
+    D =
+        case Desc of
+            undefined -> undefined;
+            _ -> to_string_dispatch(Desc)
+        end,
+    {js_symbol, erlang:unique_integer([positive, monotonic]), D}.
+
+%% The bare `Symbol` identifier as a first-class value: a function object, so
+%% `typeof Symbol` is "function". Applied as a plain function it constructs a Symbol
+%% from its (single) description argument, mirroring `Symbol(desc)`.
+symbol_ctor() ->
+    fun(Desc) -> symbol_make(Desc) end.
+
+%% `new Symbol()` (§20.4.1.1 step 1): the Symbol constructor is not new-able — a
+%% TypeError is thrown.
+symbol_no_new() ->
+    type_error(<<"Symbol is not a constructor">>).
+
+%% A well-known Symbol (§20.4.2.x) — a single fixed unique value per `Name` (an atom
+%% such as `iterator`, `asyncIterator`, `hasInstance`, …). Its identity is the
+%% `{wk, Name}` tag, and its description is `"Symbol.<name>"` per the spec table, so
+%% `Symbol.iterator.toString()` is `"Symbol(Symbol.iterator)"`.
+symbol_wellknown(Name) when is_atom(Name) ->
+    {js_symbol, {wk, Name}, <<"Symbol.", (atom_to_binary(Name, utf8))/binary>>}.
+
+%% `Symbol.for(key)` (§20.4.2.2): the GlobalSymbolRegistry lookup — returns the
+%% existing Symbol registered under ToString(key), creating (and registering) a fresh
+%% one on the first request for that key. The registry lives in the process
+%% dictionary; a forward entry maps the string key to the Symbol and a reverse entry
+%% maps the Symbol's Id to the key (for `Symbol.keyFor`).
+symbol_for(Key) ->
+    K = to_string_dispatch(Key),
+    case erlang:get({js_symbol_registry, K}) of
+        undefined ->
+            Sym = {js_symbol, erlang:unique_integer([positive, monotonic]), K},
+            erlang:put({js_symbol_registry, K}, Sym),
+            erlang:put({js_symbol_registry_rev, sym_id(Sym)}, K),
+            Sym;
+        Sym ->
+            Sym
+    end.
+
+%% `Symbol.keyFor(sym)` (§20.4.2.7): the registry key a Symbol was registered under
+%% via `Symbol.for`, or `undefined` if it is not a registered Symbol (this includes
+%% every `Symbol()` and every well-known Symbol). A non-Symbol argument is a
+%% TypeError (step 1).
+symbol_key_for({js_symbol, _, _} = Sym) ->
+    case erlang:get({js_symbol_registry_rev, sym_id(Sym)}) of
+        undefined -> undefined;
+        K -> K
+    end;
+symbol_key_for(NotSym) ->
+    type_error(NotSym).
+
+sym_id({js_symbol, Id, _}) -> Id.
+
+%% SymbolDescriptiveString (§20.4.3.3.1): `"Symbol(" ++ desc ++ ")"`, an absent
+%% description contributing the empty string.
+symbol_to_string({js_symbol, _, undefined}) ->
+    <<"Symbol()">>;
+symbol_to_string({js_symbol, _, Desc}) ->
+    <<"Symbol(", Desc/binary, ")">>.
+
 %% SameValueZero key canonicalization. An integral float becomes the equal integer
 %% (unifying `1`/`1.0` and collapsing `-0.0` to `0`); every other term (non-integral
 %% float, string, boolean, ref, the `js_nan`/`js_inf`/`js_neg_inf` sentinels) is left as
@@ -3118,6 +3239,8 @@ js_m_keys(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, _} -> make_map_iter(Recv, key);
         {js_set, _, _} -> make_set_iter(Recv, value);
+        %% Array.prototype.keys (§23.1.3.17) — a CreateArrayIterator over indices.
+        {js_array, _, _} -> make_array_iter(Recv, key);
         _ -> delegate(Recv, <<"keys">>, Args)
     end.
 
@@ -3125,6 +3248,8 @@ js_m_values(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, _} -> make_map_iter(Recv, value);
         {js_set, _, _} -> make_set_iter(Recv, value);
+        %% Array.prototype.values (§23.1.3.36) — a CreateArrayIterator over elements.
+        {js_array, _, _} -> make_array_iter(Recv, value);
         _ -> delegate(Recv, <<"values">>, Args)
     end.
 
@@ -3132,6 +3257,8 @@ js_m_entries(Recv, Args) ->
     case cell_tag(Recv) of
         {js_map, _, _} -> make_map_iter(Recv, entry);
         {js_set, _, _} -> make_set_iter(Recv, entry);
+        %% Array.prototype.entries (§23.1.3.4) — CreateArrayIterator over `[index, value]`.
+        {js_array, _, _} -> make_array_iter(Recv, entry);
         _ -> delegate(Recv, <<"entries">>, Args)
     end.
 
@@ -3333,6 +3460,89 @@ iter_result(Val, Done) ->
     set_prop(O, <<"value">>, Val),
     set_prop(O, <<"done">>, Done),
     O.
+
+%% CreateArrayIterator (§23.1.5.1): a LIVE `{value, done}` cursor over an array cell,
+%% driven by `.next()`. `Kind` selects the yield — `key` (index), `value` (element), or
+%% `entry` (a fresh `[index, element]` array). The length is re-read on every step so an
+%% array grown/shrunk mid-iteration is honoured (the iterator stops once the index
+%% reaches the current length); holes read as `undefined`.
+make_array_iter(Recv, Kind) ->
+    Cursor = cell_new(0),
+    gen_make(fun(_Arg) ->
+        case cell_get(Cursor) of
+            %% Once the index has caught up to the length the iterator LATCHES done
+            %% (§23.1.5.2.1 sets [[ArrayIteratorNextIndex]] handling to completed), so
+            %% elements pushed AFTER exhaustion are never visited.
+            done ->
+                iter_result(undefined, true);
+            I ->
+                {Len, Map} = arr_content(Recv),
+                case I < Len of
+                    false ->
+                        cell_set(Cursor, done),
+                        iter_result(undefined, true);
+                    true ->
+                        cell_set(Cursor, I + 1),
+                        Val =
+                            case Kind of
+                                key -> I;
+                                value -> maps:get(I, Map, undefined);
+                                entry ->
+                                    new_array([I, maps:get(I, Map, undefined)])
+                            end,
+                        iter_result(Val, false)
+                end
+        end
+    end).
+
+%% CreateStringIterator (§22.1.5.1): a LIVE `{value, done}` cursor over a string that
+%% yields each Unicode code point as a one-code-point string (surrogate pairs stay
+%% whole — this code-point model has no lone surrogates). Backing store: the remaining
+%% code-point list in a cell.
+make_string_iter(Str) ->
+    Cursor = cell_new(cps(Str)),
+    gen_make(fun(_Arg) ->
+        case cell_get(Cursor) of
+            [] ->
+                iter_result(undefined, true);
+            [C | Rest] ->
+                cell_set(Cursor, Rest),
+                iter_result(from_cps([C]), false)
+        end
+    end).
+
+%% A Map cell's entries as a list of fresh `[key, value]` arrays in insertion order
+%% (ascending Seq). The keys are the SameValueZero-normalized keys the Map stores
+%% (matching Map.prototype.entries / .forEach). A non-Map yields the empty list.
+map_entry_arrays(Recv) ->
+    case cell_tag(Recv) of
+        {js_map, _, D} ->
+            Sorted = lists:sort(
+                fun({_, {A, _}}, {_, {B, _}}) -> A =< B end, maps:to_list(D)
+            ),
+            [new_array([K, V]) || {K, {_, V}} <- Sorted];
+        _ ->
+            []
+    end.
+
+%% `x[Symbol.iterator]` — the built-in iterator-producing method for a built-in
+%% iterable, as a zero-argument BEAM fun (so `x[Symbol.iterator]()` applies it to
+%% produce a fresh iterator). Arrays/Sets/Maps/strings each return a fresh cursor;
+%% an iterator object (a generator cell, e.g. the result of `.values()`) returns
+%% ITSELF, since an iterator's own `[Symbol.iterator]` is the identity (§27.1.5.1.1).
+%% Any non-iterable receiver has no such method — `undefined`.
+builtin_iter_fn(Recv) when is_binary(Recv) ->
+    fun() -> make_string_iter(Recv) end;
+builtin_iter_fn(Recv) when is_reference(Recv) ->
+    case cell_tag(Recv) of
+        {js_array, _, _} -> fun() -> make_array_iter(Recv, value) end;
+        {js_set, _, _} -> fun() -> make_set_iter(Recv, value) end;
+        {js_map, _, _} -> fun() -> make_map_iter(Recv, entry) end;
+        {js_gen, _} -> fun() -> Recv end;
+        _ -> undefined
+    end;
+builtin_iter_fn(_) ->
+    undefined.
 
 %% The cell's tagged content, or `undefined` for a non-reference (so the delegate path
 %% is taken for primitives / plain values).
@@ -3911,6 +4121,9 @@ array_spread_into(Target, Value) when is_reference(Value) ->
         %% Spreading a Set yields its elements in insertion order (the Set is an
         %% iterable whose iterator is Set.prototype.values).
         {js_set, _, _} -> array_push(Target, set_elems(Value));
+        %% Spreading a Map yields its `[key, value]` entries in insertion order (the
+        %% Map's default iterator is Map.prototype.entries).
+        {js_map, _, _} -> array_push(Target, map_entry_arrays(Value));
         _ -> type_error(Value)
     end;
 array_spread_into(Target, Value) when is_binary(Value) ->
@@ -4253,6 +4466,10 @@ to_string_dispatch(Recv) when is_reference(Recv) ->
                 _ -> to_string(Recv)
             end
     end;
+%% `sym.toString()` — SymbolDescriptiveString (§20.4.3.3): "Symbol(" + desc + ")",
+%% desc defaulting to the empty string when the Symbol has no description.
+to_string_dispatch({js_symbol, _, _} = Sym) ->
+    symbol_to_string(Sym);
 to_string_dispatch(Recv) ->
     to_string(Recv).
 

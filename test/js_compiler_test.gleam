@@ -5596,3 +5596,203 @@ pub fn weakset_requires_new_test() {
   }
   threw |> should.equal(True)
 }
+
+// ==== Symbol + iterators (wave 7) ====
+
+// §20.4.1.1: `Symbol(desc)` produces a value whose `typeof` is "symbol", and every
+// call yields a FRESH unique value — two Symbols are never `===` even with the same
+// description; a Symbol is `===` only to itself.
+pub fn symbol_typeof_and_uniqueness_test() {
+  val("typeof Symbol()") |> should.equal(dyn("symbol"))
+  val("typeof Symbol('x')") |> should.equal(dyn("symbol"))
+  // distinct identities, even with equal descriptions
+  val("Symbol('x') === Symbol('x')") |> should.equal(dyn(False))
+  val("Symbol() === Symbol()") |> should.equal(dyn(False))
+  // a Symbol is strictly equal to itself
+  let m = compile("function f(){ let s = Symbol('a'); return s === s; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §20.4.3.2 Symbol.prototype.description: the description string, or `undefined` when
+// the Symbol was created with no (or an `undefined`) description. `Symbol(desc)`
+// coerces a non-string description via ToString.
+pub fn symbol_description_test() {
+  val("Symbol('foo').description") |> should.equal(dyn("foo"))
+  // no description → undefined
+  let m = compile("function f(){ return Symbol().description === undefined; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+  // a number description is ToString'd
+  val("Symbol(42).description") |> should.equal(dyn("42"))
+}
+
+// §20.4.3.3 Symbol.prototype.toString → SymbolDescriptiveString: "Symbol(" + desc +
+// ")", an absent description contributing the empty string.
+pub fn symbol_to_string_test() {
+  val("Symbol('foo').toString()") |> should.equal(dyn("Symbol(foo)"))
+  val("Symbol().toString()") |> should.equal(dyn("Symbol()"))
+}
+
+// §20.4.1.1 step 1: the Symbol constructor is not new-able — `new Symbol()` throws a
+// TypeError.
+pub fn symbol_no_new_test() {
+  let m = compile("function f(){ return new Symbol(); }")
+  let threw = case catch_apply(m, atom.create("f"), []) {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  threw |> should.equal(True)
+}
+
+// §20.4.2.2 / §20.4.2.7: the GlobalSymbolRegistry — `Symbol.for(key)` returns the
+// SAME Symbol for equal keys, and `Symbol.keyFor` recovers the registered key.
+pub fn symbol_for_registry_test() {
+  val("Symbol.for('k') === Symbol.for('k')") |> should.equal(dyn(True))
+  // a registry Symbol is distinct from an ordinary Symbol of the same description
+  val("Symbol.for('k') === Symbol('k')") |> should.equal(dyn(False))
+  // keyFor recovers the key; a non-registered Symbol yields undefined
+  val("Symbol.keyFor(Symbol.for('hi'))") |> should.equal(dyn("hi"))
+  let m =
+    compile("function f(){ return Symbol.keyFor(Symbol('x')) === undefined; }")
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §20.4.2.5: `Symbol.iterator` is a single fixed well-known Symbol — `typeof` "symbol"
+// and equal to itself; `typeof Symbol` is "function".
+pub fn symbol_iterator_wellknown_test() {
+  val("typeof Symbol.iterator") |> should.equal(dyn("symbol"))
+  val("Symbol.iterator === Symbol.iterator") |> should.equal(dyn(True))
+  val("typeof Symbol") |> should.equal(dyn("function"))
+  // distinct well-known symbols are not equal
+  val("Symbol.iterator === Symbol.asyncIterator") |> should.equal(dyn(False))
+}
+
+// §24.2.3.10 (Set is iterable): `for (const x of set)` visits the elements in
+// insertion order via the Set's default (values) iterator.
+pub fn for_of_set_test() {
+  let m =
+    compile(
+      "function f(){ let s = 0; for (const x of new Set([1,2,3])) { s += x; } return s; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(6))
+}
+
+// §24.1.3.12 (Map is iterable): `for (const [k,v] of map)` visits `[key,value]`
+// entries in insertion order.
+pub fn for_of_map_entries_test() {
+  let m =
+    compile(
+      "function f(){ let m = new Map([['a',1],['b',2]]); let s = ''; let t = 0;"
+      <> " for (const e of m) { s += e[0]; t += e[1]; } return s + t; }",
+    )
+  call(m, "f", []) |> should.equal(dyn("ab3"))
+}
+
+// Spread over a Map iterator (`[...map.keys()]`) drains the live iterator into an array.
+pub fn spread_map_keys_test() {
+  let m =
+    compile(
+      "function f(){ let m = new Map([['a',1],['b',2]]); let ks = [...m.keys()];"
+      <> " return ks.length + ks[0] + ks[1]; }",
+    )
+  call(m, "f", []) |> should.equal(dyn("2ab"))
+}
+
+// §23.1.2.1 Array.from over a string uses the string's iterator — one element per
+// code point.
+pub fn array_from_string_test() {
+  let m =
+    compile(
+      "function f(){ let a = Array.from('ab'); return a.length + a[0] + a[1]; }",
+    )
+  call(m, "f", []) |> should.equal(dyn("2ab"))
+  // Array.from over a Set materializes its elements.
+  let n =
+    compile("function f(){ return Array.from(new Set([5,6,7])).join('-'); }")
+  call(n, "f", []) |> should.equal(dyn("5-6-7"))
+}
+
+// §23.1.3.36 Array.prototype.values via `arr[Symbol.iterator]()`: a proper iterator
+// object whose `.next()` yields `{value, done}`, then `{value: undefined, done: true}`
+// once exhausted.
+pub fn array_symbol_iterator_next_test() {
+  let m =
+    compile(
+      "function f(){ let it = [10,20][Symbol.iterator]();"
+      <> " let a = it.next(); let b = it.next(); let c = it.next();"
+      <> " return (a.value === 10 && a.done === false) && (b.value === 20 && b.done === false)"
+      <> " && (c.value === undefined && c.done === true); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §23.1.3.4/.17/.36 Array.prototype.entries/keys/values: each returns a live iterator.
+// `entries()` yields `[index, value]` pairs; the iterator is itself iterable (its own
+// `[Symbol.iterator]` returns itself, so `for-of` over it works).
+pub fn array_entries_keys_values_test() {
+  // `.entries()` yields `[index, value]` pairs (read by index — for-of destructuring
+  // bindings are a separate, unsupported frontend feature).
+  let m =
+    compile(
+      "function f(){ let out = ''; for (const e of ['a','b'].entries()) { out += e[0] + e[1]; } return out; }",
+    )
+  call(m, "f", []) |> should.equal(dyn("0a1b"))
+  // keys → indices
+  let k = compile("function f(){ return [...['x','y','z'].keys()].join(','); }")
+  call(k, "f", []) |> should.equal(dyn("0,1,2"))
+  // values → elements, drained via the iterator's own [Symbol.iterator]
+  let v =
+    compile(
+      "function f(){ let s=0; for (const x of [4,5,6].values()) s+=x; return s; }",
+    )
+  call(v, "f", []) |> should.equal(dyn(15))
+}
+
+// The iterator object returned by a collection's `.keys()`/`.values()`/`.entries()`
+// is itself iterable: `it[Symbol.iterator]() === it` (§27.1.5.1.1).
+pub fn iterator_is_self_iterable_test() {
+  let m =
+    compile(
+      "function f(){ let it = new Set([1]).values(); return it[Symbol.iterator]() === it; }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §23.1.5.2.1: an array iterator LATCHES "done" — an element pushed AFTER the
+// iterator is exhausted is NOT visited, but one pushed while it is still live IS.
+pub fn array_iterator_done_latch_test() {
+  let m =
+    compile(
+      "function f(){ let a = []; let it = a.values(); a.push('a');"
+      <> " let r1 = it.next(); let r2 = it.next(); a.push('b'); let r3 = it.next();"
+      <> " return (r1.value === 'a' && r1.done === false)"
+      <> " && (r2.value === undefined && r2.done === true)"
+      <> " && (r3.value === undefined && r3.done === true); }",
+    )
+  call(m, "f", []) |> should.equal(dyn(True))
+}
+
+// §20.4.1.1 step 2 / §20.4.2.2 step 1: the Symbol description is ToString(desc), so a
+// description object's own `toString` is honored (by both `Symbol` and `Symbol.for`).
+pub fn symbol_description_object_coercion_test() {
+  let m =
+    compile(
+      "function f(){ let o = { toString() { return 'coerced'; } };"
+      <> " return Symbol(o).description; }",
+    )
+  call(m, "f", []) |> should.equal(dyn("coerced"))
+  // Symbol.for keys on the ToString of its argument too.
+  let n =
+    compile(
+      "function f(){ let o = { toString() { return 'k9'; } };"
+      <> " return Symbol.for(o) === Symbol.for('k9'); }",
+    )
+  call(n, "f", []) |> should.equal(dyn(True))
+}
+
+// §20.4.3.2: `description` is NOT an own property of a Symbol (it lives on the
+// prototype), so `Symbol().hasOwnProperty('description')` is false and does not throw.
+pub fn symbol_description_not_own_test() {
+  let m =
+    compile("function f(){ return Symbol().hasOwnProperty('description'); }")
+  call(m, "f", []) |> should.equal(dyn(False))
+}
