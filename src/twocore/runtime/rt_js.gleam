@@ -1084,10 +1084,17 @@ pub fn reflect_has(target: Dynamic, key: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "reflect_get")
 pub fn reflect_get(target: Dynamic, key: Dynamic) -> Dynamic
 
-/// `Reflect.set(target, key, value)` → JS boolean success; `target` must be an
-/// object, else TypeError. A frozen target reports `false`. `receiver` is ignored.
+/// `Reflect.set(target, key, value, receiver)` → JS boolean success; `target`
+/// must be an object, else TypeError. A frozen target reports `false`. The write
+/// lands on `receiver` (defaulting to `target` when the JS call omits it): a
+/// primitive receiver or a non-writable/non-extensible receiver reports `false`.
 @external(erlang, "twocore_rt_js_ffi", "reflect_set")
-pub fn reflect_set(target: Dynamic, key: Dynamic, value: Dynamic) -> Dynamic
+pub fn reflect_set(
+  target: Dynamic,
+  key: Dynamic,
+  value: Dynamic,
+  receiver: Dynamic,
+) -> Dynamic
 
 /// `Reflect.deleteProperty(target, key)` → JS boolean success; `target` must be an
 /// object, else TypeError. A frozen/sealed non-configurable property reports `false`.
