@@ -185,15 +185,21 @@
 ////     non-deterministic case test may run when JS would not have reached it.
 ////   * A `break`/`continue` to a label attached to a `switch` or a plain block that is
 ////     nested OUTSIDE a loop targets the wrong construct; labels on loops work correctly.
-////   * The `thisArg` of an Array iteration method (`map`/`filter`/`forEach`/`some`/
-////     `every`/`find`/`findIndex`/`findLast`/`findLastIndex`) is honored ONLY when the
-////     callback is an INLINE `function () {…}` expression (its `this` capture is bound to
-////     the `thisArg`, like an object accessor's). A callback passed by NAME (a top-level
-////     function reference) ignores the `thisArg`: a top-level function carries no `this`
-////     parameter (its `this` resolves to `globalThis`), so binding a dynamic receiver
-////     would need `this` to become a call-time parameter of every plain function — a
-////     larger ABI change not yet made. An ARROW callback correctly ignores `thisArg`
-////     (lexical `this`).
+////   * `this` as a call-time value (wave 14): a top-level `function` whose body reads
+////     `this` is lowered as a `<name>%this` impl that takes `this` as an explicit
+////     LEADING parameter, with the exported `<name>/n` a thin wrapper forwarding the
+////     sloppy-mode default (`globalThis`). So the `thisArg` of an Array iteration
+////     method (`map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`findLast`/
+////     `findLastIndex`) IS honored both for an INLINE `function () {…}` callback (its
+////     `this` capture is bound to the `thisArg`, like an object accessor's) AND for a
+////     callback passed by NAME (the `thisArg` is baked as the `%this` argument of the
+////     named function's impl). `f.call(t, …)` / `f.apply(t, …)` / `f.bind(t, …)` on a
+////     named top-level function likewise thread `t` as its `this`. An ARROW callback
+////     correctly ignores `thisArg` (lexical `this`). STILL DROPPED (a v1 gap needing a
+////     value-level receiver): a `thisArg` for a callback held in a VARIABLE (a
+////     function-expression value, or `let g = f; g` / `g.call(t)`) — the value carries
+////     no overridable `this` — and sloppy-mode `this`→global boxing / primitive-`this`
+////     boxing for a directly-invoked function (its default `this` is `globalThis`).
 
 import arc/parser/ast
 import gleam/dict.{type Dict}
@@ -5677,15 +5683,18 @@ fn array_literal_elements(e: ast.Expression) -> Option(List(ast.Expression)) {
   }
 }
 
-/// Dispatch an instance/method call, first intercepting a generic
+/// Dispatch an instance/method call. First intercepts `f.call/apply/bind(thisArg, …)`
+/// where `f` is a top-level function that reads `this` (wave 14): the `thisArg` is
+/// threaded to `f`'s `%this` implementation so the receiver reaches its `this` (see
+/// `lower_named_call`/`lower_named_apply`/`lower_named_bind`). Then intercepts a generic
 /// `<Ctor>.prototype.<m>.call(recv, …args)` / `.apply(recv, [args])` — an unbound
 /// built-in prototype method invoked with an explicit receiver. Per §20.2.3.3/.1 the
 /// unbound method must run with `recv` as its `this`, which in this receiver-first
 /// model is exactly the ordinary method call `recv.<m>(…args)`; rewriting to it reuses
-/// the full method-dispatch machinery and forwards the receiver correctly. A user
-/// function's `.call`/`.apply`, or an unbound value that is not a static
-/// `<Ctor>.prototype.<m>` reference, falls through to the runtime `func_call`/
-/// `func_apply` path (which — as documented — drops the plain-function `thisArg`).
+/// the full method-dispatch machinery and forwards the receiver correctly. A `.call`/
+/// `.apply` through a plain-function VALUE variable, or an unbound value that is not a
+/// static `<Ctor>.prototype.<m>` reference, falls through to the runtime `func_call`/
+/// `func_apply` path (which — as documented — drops that value's `thisArg`, a v1 gap).
 /// `.apply` is only unrolled when its argument array is a literal; otherwise it too
 /// falls through.
 fn lower_instance_method(
@@ -5841,23 +5850,22 @@ fn array_this_iter_op(method: String) -> Option(String) {
   }
 }
 
-/// Bucket 1 (partial): thread the `thisArg` of an Array iteration method into an
-/// INLINE `function` callback that reads `this`. A regular function expression's
-/// `this` is a lexical capture in this model (like an arrow's), so — exactly as an
-/// object getter/setter binds `this` to the object at install
-/// (`lower_obj_accessor_closure`) — we bind the callback closure's `this` capture to
-/// the `thisArg` value instead of the enclosing `this`. The callback is then passed to
-/// the ordinary `(Recv, Fn)` iteration op unchanged.
+/// Thread the `thisArg` of an Array iteration method into a callback that reads
+/// `this`, for the two shapes that carry a bindable receiver:
+///   * an INLINE `function () {…}` callback — its `this` is a lexical capture in this
+///     model, so (exactly as an object getter/setter binds `this` to the object at
+///     install, `lower_obj_accessor_closure`) we bind the callback closure's `this`
+///     capture to the `thisArg` value instead of the enclosing `this`;
+///   * a callback passed by NAME that is a top-level function reading `this` (wave 14) —
+///     we bake the `thisArg` as the `this` argument of the function's `%this` impl (the
+///     shape most test262 `this-arg` files use, e.g. `arr.forEach(callbackfn, thisArg)`).
+/// The resulting callback closure is handed to the ordinary `(Recv, Fn)` iteration op
+/// unchanged.
 ///
-/// SCOPE: this only covers an INLINE `function () {…}` callback (NOT an arrow, whose
-/// `this` is always lexical per spec, and NOT a callback passed by NAME). A `thisArg`
-/// for a named top-level-function callback (`arr.map(callbackfn, thisArg)` — the shape
-/// most test262 `this-arg` files use) is NOT handled: a top-level function carries no
-/// `this` parameter (its `this` resolves to `globalThis` at lower time), so binding a
-/// dynamic `thisArg` would require making `this` a call-time parameter of every plain
-/// function — a cross-cutting ABI change deferred to a future wave. Anything not
-/// matching the inline-function shape falls through to the generic dispatch (which
-/// drops the `thisArg`, the documented v1 behavior).
+/// SCOPE: an ARROW callback is not matched (its `this` is always lexical per spec, so
+/// the `thisArg` is correctly ignored). A callback held in a VARIABLE (a
+/// function-expression value) also falls through to the generic dispatch, which drops
+/// the `thisArg` — a v1 gap (a value carries no overridable `this`).
 fn lower_instance_method_thisarg(
   object: ast.Expression,
   method: String,
