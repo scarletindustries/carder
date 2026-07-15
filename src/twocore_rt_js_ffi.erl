@@ -95,7 +95,7 @@
     array_to_reversed/1, array_to_sorted/2, array_with/3, array_to_spliced/2,
     str_char_at/2, str_char_code_at/2, str_code_point_at/2, str_normalize/2,
     str_upper/1, str_lower/1,
-    str_substring/3, str_split/2, str_trim/1, str_trim_start/1,
+    str_substring/3, str_split/3, str_trim/1, str_trim_start/1,
     str_trim_end/1, str_repeat/2, str_starts_with/3, str_ends_with/3,
     str_replace/3, str_replace_all/3,
     str_is_well_formed/1, str_to_well_formed/1, str_locale_compare/2,
@@ -5596,17 +5596,50 @@ sub_index(V, Len, _Default) ->
     min(max(N, 0), Len).
 
 %% str.split(sep?) → array. No arg → [str]; "" → the characters; else split on `sep`.
-str_split(Str, undefined) ->
-    new_array([Str]);
-str_split(Str, Sep) when is_reference(Sep) ->
+%% str.split(separator, limit) — §22.1.3.21. `limit` bounds the number of
+%% substrings in the result: it is coerced with ToUint32, and when the limit is
+%% 0 the result is an empty array regardless of the separator (spec step 8: "If
+%% lim = 0, return A"). An `undefined` limit means 2^32-1 (effectively
+%% unbounded). A larger limit truncates the raw split to that many leading
+%% substrings.
+str_split(Str, Sep, Limit) ->
+    case split_limit(Limit) of
+        0 -> new_array([]);
+        Lim -> new_array(split_take(str_split_all(Str, Sep), Lim))
+    end.
+
+%% ToUint32(limit) with `undefined` mapped to the spec's 2^32-1 default. NaN and
+%% ±Infinity coerce to 0; any other number is truncated toward zero and reduced
+%% modulo 2^32.
+split_limit(undefined) -> 16#FFFFFFFF;
+split_limit(Limit) ->
+    case coerce_num(Limit) of
+        nan -> 0;
+        inf -> 0;
+        neg_inf -> 0;
+        Num -> trunc(as_float(Num)) band 16#FFFFFFFF
+    end.
+
+%% Keep at most `Lim` leading elements of the raw split list.
+split_take(List, Lim) when Lim >= length(List) -> List;
+split_take(List, Lim) -> lists:sublist(List, Lim).
+
+%% The full (unlimited) split of `Str` by `Sep`, as an Erlang list of the
+%% substrings a limit would then bound. Mirrors the previous unlimited split:
+%% `undefined`/non-regex-reference separators yield the whole string; an empty
+%% string separator splits into individual code points; a regex delegates to
+%% `str_split_regex`; any other value is coerced with ToString.
+str_split_all(Str, undefined) ->
+    [Str];
+str_split_all(Str, Sep) when is_reference(Sep) ->
     case is_regex(Sep) of
-        true -> str_split_regex(Str, Sep);
-        false -> new_array([Str])
+        true -> array_to_list(str_split_regex(Str, Sep));
+        false -> [Str]
     end;
-str_split(Str, Sep) ->
+str_split_all(Str, Sep) ->
     case to_string(Sep) of
-        <<>> -> new_array([from_cps([C]) || C <- cps(Str)]);
-        SepBin -> new_array(binary:split(Str, SepBin, [global]))
+        <<>> -> [from_cps([C]) || C <- cps(Str)];
+        SepBin -> binary:split(Str, SepBin, [global])
     end.
 
 %% str.trim() / trimStart() / trimEnd() — remove leading and/or trailing runs
