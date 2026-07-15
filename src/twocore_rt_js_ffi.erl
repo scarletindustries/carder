@@ -63,7 +63,7 @@
     bit_and/2, bit_or/2, bit_xor/2, bit_not/1, shl/2, shr/2, ushr/2, pow/2,
     math_unary/2, math_binary/3, math_reduce/2, math_random/0,
     cell_new/1, cell_get/1, cell_set/2,
-    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, error_is_error/1, js_error_to_value/1, gen_make/1, gen_next/2, iter_array/1, iter_to_array/1, iter_take/2, iter_drop/2, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
+    new_object/0, globalthis_new/0, wrapper_new/2, error_make/2, error_ctor/1, error_is_error/1, js_error_to_value/1, gen_make/1, gen_next/2, gen_return/2, iter_array/1, iter_to_array/1, iter_take/2, iter_drop/2, get_prop/2, set_prop/3, define_data/3, define_accessor/4,
     builtin_ctor/1, builtin_prototype/1, to_object/1,
     static_get/2, static_get_chain/2, static_set/3, has_prop/2, delete_prop/2,
     new_array/1, array_construct/1, array_push/2, array_pop/1, is_array/1, array_spread_into/2,
@@ -1303,6 +1303,36 @@ gen_next(Recv, Args) when is_reference(Recv) ->
     end;
 gen_next(Recv, Args) ->
     delegate(Recv, <<"next">>, Args).
+
+%% `gen.return(v)` — Generator.prototype.return (§27.5.1.4). Closes the generator
+%% (as if a `return v` ran at the current suspend point) and returns the result
+%% object `{value: v, done: true}`; `v` defaults to `undefined`. A subsequent
+%% `.next()`/iterator-helper on the closed generator then sees it exhausted. The
+%% generators modelled here have no observable `try`/`finally`, so closing is a
+%% simple state transition to DONE. A non-generator receiver delegates to a user
+%% `return` method (a plain-object iterator implementing the optional return step);
+%% a receiver without one is a non-reference/absent-method — left to `delegate`.
+gen_return(Recv, Args) when is_reference(Recv) ->
+    case erlang:get(?CELL_KEY(Recv)) of
+        Tag when
+            Tag =:= js_gen_done orelse
+                (is_tuple(Tag) andalso
+                    (element(1, Tag) =:= js_gen orelse
+                        element(1, Tag) =:= js_gen_running))
+        ->
+            %% Replace the step with a permanently-DONE step and keep the `{js_gen,_}`
+            %% tag, so both `.next()` and the iterator helpers (which dispatch on that
+            %% tag) treat the closed generator as an empty iterator.
+            erlang:put(
+                ?CELL_KEY(Recv),
+                {js_gen, fun(_Sent) -> iter_result(undefined, true) end}
+            ),
+            iter_result(arg(Args, 0), true);
+        _ ->
+            delegate(Recv, <<"return">>, Args)
+    end;
+gen_return(Recv, Args) ->
+    delegate(Recv, <<"return">>, Args).
 
 %% IteratorClose for a generator receiver (§7.4.11 as used by the Iterator
 %% helpers): permanently mark the generator DONE so any later `.next()` returns

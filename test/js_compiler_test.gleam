@@ -6921,3 +6921,29 @@ pub fn generator_expression_map_take_toarray_test() {
     )
   to_float(call(m, "f", [])) |> should.equal(224.0)
 }
+
+pub fn generator_return_closes_test() {
+  // Generator.prototype.return (§27.5.1.4): `.return(v)` closes the generator and
+  // yields `{value: v, done: true}`; a following `.next()` sees it exhausted.
+  let m =
+    compile(
+      "function f() { let it = (function*(){ yield 1; yield 2; })(); "
+      <> "let r = it.return(99); let n = it.next(); "
+      <> "return (r.value === 99 && r.done === true && n.done === true) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+pub fn generator_return_underlying_closed_map_test() {
+  // Mirrors Iterator/prototype/map/underlying-iterator-closed.js: closing the
+  // source with `.return()` BEFORE building a `.map` helper means the mapped
+  // iterator produces nothing — its first `.next()` is `{value:undefined,done:true}`.
+  let m =
+    compile(
+      "function f() { let it = (function*(){ yield 0; yield 1; yield 2; })(); "
+      <> "it.return(); let mapped = it.map(function(){ return 0; }); "
+      <> "let r = mapped.next(); "
+      <> "return (r.value === undefined && r.done === true) ? 1 : 0; }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}

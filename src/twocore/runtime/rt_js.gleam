@@ -326,6 +326,11 @@ pub fn gen_make(step: Dynamic) -> Dynamic
 @external(erlang, "twocore_rt_js_ffi", "gen_next")
 pub fn gen_next(gen: Dynamic, args: Dynamic) -> Dynamic
 
+/// `gen.return(v)` — close a generator and yield `{value: v, done: true}` (or
+/// delegate to a user `return` method on a plain iterator object).
+@external(erlang, "twocore_rt_js_ffi", "gen_return")
+pub fn gen_return(gen: Dynamic, args: Dynamic) -> Dynamic
+
 /// Materialize the source of a `for-of` as an array: arrays and strings pass
 /// through, a generator is drained to an array, anything else becomes empty.
 @external(erlang, "twocore_rt_js_ffi", "iter_array")

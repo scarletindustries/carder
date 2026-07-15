@@ -5796,6 +5796,9 @@ fn lower_instance_method_generic(
     // generator `.next(v)` — advances a generator, or delegates to a user
     // `next` method on an ordinary iterator object.
     "next", _ -> coll("gen_next")
+    // generator `.return(v)` — closes a generator (§27.5.1.4), yielding
+    // `{value: v, done: true}`; delegates to a user `return` method otherwise.
+    "return", _ -> coll("gen_return")
     // Object.prototype.hasOwnProperty(key) — own-property test (no prototype
     // chain in this model), returning a JS boolean.
     "hasOwnProperty", [k, ..] -> host("object_has_own", [k])
