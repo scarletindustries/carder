@@ -5855,3 +5855,50 @@ pub fn array_at_holes_and_coercion_test() {
   num("[10, 20, 30].at(1.9)") |> should.equal(20.0)
   num("[10, 20, 30].at(5) === undefined ? -1 : 99") |> should.equal(-1.0)
 }
+
+// ==== MapSet (wave 8) ====
+
+// §23.1.5.2.1 %MapIteratorPrototype%.next: a Map iterator reflects entries added
+// AFTER it is created but BEFORE it reports done, yet once it has reported done it
+// detaches from the map ([[Map]] becomes undefined) so a later addition is never
+// surfaced by a repeated next() call. Mirrors the Set iterator's done-latching.
+pub fn map_iterator_sticky_done_test() {
+  let m =
+    compile(
+      "function f(){"
+      <> " var mp = new Map(); mp.set('a', 1); mp.set('b', 2);"
+      <> " var it = mp.entries();"
+      <> " var r1 = it.next();"
+      <> " mp.set('c', 3);"
+      <> " var r2 = it.next();"
+      <> " var r3 = it.next();"
+      <> " var r4 = it.next();"
+      <> " mp.set('d', 4);"
+      <> " var r5 = it.next();"
+      <> " return (r1.value[0] === 'a' && r1.value[1] === 1 && r1.done === false"
+      <> "   && r2.value[0] === 'b' && r3.value[0] === 'c'"
+      <> "   && r4.value === undefined && r4.done === true"
+      <> "   && r5.value === undefined && r5.done === true) ? 1 : 0;"
+      <> "}",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+}
+
+// §23.1.3.5 Map.prototype.forEach step 3: if the callback is not callable, throw a
+// TypeError BEFORE visiting any entry (so even a non-empty map is not a silent
+// no-op). Mirrors the Set.prototype.forEach non-callable guard.
+pub fn map_foreach_non_callable_throws_test() {
+  let m =
+    compile(
+      "function f(){ try { var mp = new Map(); mp.set(1, 1); mp.forEach(0); return 0; }"
+      <> " catch (e) { return (e instanceof TypeError) ? 1 : 2; } }",
+    )
+  to_float(call(m, "f", [])) |> should.equal(1.0)
+  // A non-callable callback on an EMPTY map must still throw (not silently return).
+  let n =
+    compile(
+      "function f(){ try { new Map().forEach(null); return 0; }"
+      <> " catch (e) { return (e instanceof TypeError) ? 1 : 2; } }",
+    )
+  to_float(call(n, "f", [])) |> should.equal(1.0)
+}

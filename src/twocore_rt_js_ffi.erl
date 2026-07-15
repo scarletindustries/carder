@@ -3178,6 +3178,13 @@ js_m_foreach(Recv, Args) ->
         0 ->
             case cell_tag(Recv) of
                 {js_map, _, _} ->
+                    %% §23.1.3.5 step 3: reject a non-callable callbackfn with a
+                    %% TypeError BEFORE visiting any entry (an empty map is not a
+                    %% licence to skip the check).
+                    case is_function(Fn) of
+                        true -> ok;
+                        false -> not_callable(Fn)
+                    end,
                     map_foreach(Recv, Fn, -1),
                     undefined;
                 {js_set, _, _} ->
@@ -3427,19 +3434,28 @@ set_is_superset_of(Recv, Args) ->
 make_map_iter(Recv, Kind) ->
     Cursor = cell_new(-1),
     gen_make(fun(_Arg) ->
-        Last = cell_get(Cursor),
-        case next_map_entry(Recv, Last) of
-            none ->
+        case cell_get(Cursor) of
+            %% §23.1.5.2.1 step 4/step 11.b.iii: once the map's entries are
+            %% exhausted the iterator sets [[Map]] to undefined and thereafter
+            %% always reports done, so entries added AFTER exhaustion are never
+            %% visited (mirrors make_set_iter's done-latching).
+            done ->
                 iter_result(undefined, true);
-            {Seq, K, V} ->
-                cell_set(Cursor, Seq),
-                Val =
-                    case Kind of
-                        key -> K;
-                        value -> V;
-                        entry -> new_array([K, V])
-                    end,
-                iter_result(Val, false)
+            Last ->
+                case next_map_entry(Recv, Last) of
+                    none ->
+                        cell_set(Cursor, done),
+                        iter_result(undefined, true);
+                    {Seq, K, V} ->
+                        cell_set(Cursor, Seq),
+                        Val =
+                            case Kind of
+                                key -> K;
+                                value -> V;
+                                entry -> new_array([K, V])
+                            end,
+                        iter_result(Val, false)
+                end
         end
     end).
 
