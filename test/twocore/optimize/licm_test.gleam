@@ -239,8 +239,8 @@ fn sumk_module() -> ir.Module {
 }
 
 fn run(m: ir.Module, export: String, args: List(Int)) -> pipeline.RunResult {
-  let assert Ok(core) = pipeline.ir_to_core(m, profiles.safe())
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, profiles.safe())
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   let out = pipeline.invoke_instance(proc, export, args)
   pipeline.stop_instance(proc)

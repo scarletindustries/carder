@@ -12,7 +12,6 @@
 ////   in one bottom-up pass.
 //// - **Gating** — OFF by default (byte-identical Core); ON only under `lazy_mask`.
 
-import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import twocore/backend/build_beam
@@ -20,7 +19,6 @@ import twocore/backend/core_erlang.{
   type CExpr, type CModule, CApply, CAtom, CCall, CFun, CInt, CModule, CVar,
   FName, FunDef,
 }
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/runtime/instance
 import twocore/runtime/profiles
@@ -175,7 +173,6 @@ fn mask_mod(name: String, body: CExpr) -> CModule {
 
 /// Print, compile, and load `cm`; return the loaded module atom.
 fn load(cm: CModule) -> Atom {
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }

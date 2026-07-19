@@ -191,8 +191,8 @@ pub fn unchecked_nodes_run_like_checked_on_beam_test() {
   // At the freeze the unchecked nodes lower via the CHECKED path, so a module using them returns the
   // identical value as the checked equivalent (little-endian round-trip through memory).
   let m = unchecked_roundtrip_module()
-  let assert Ok(core) = pipeline.ir_to_core(m, profiles.safe())
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, profiles.safe())
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   let out = pipeline.invoke_instance(proc, "rt", [0, 305_419_896])
   pipeline.stop_instance(proc)

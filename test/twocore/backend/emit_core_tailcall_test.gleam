@@ -17,7 +17,6 @@
 //// fire in order, an imported `return_call` is value-correct, and an even/odd program compiles +
 //// runs correctly under the AGGRESSIVE inliner (proving the inliner excludes tail-call bodies).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
@@ -30,7 +29,6 @@ import twocore/backend/core_erlang.{
   CCons, CFun, CInt, CLet, CNil, CTuple, CVar, FName, FunDef, PAtom, PTuple,
   PVar,
 }
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/middle/ir_opt
@@ -115,8 +113,7 @@ fn body_of(module: ir.Module, b: instance.Binding, name: String) -> CExpr {
 /// Emit `module` (under `b`), compile it, and load it; return the loaded module atom.
 fn load(module: ir.Module, b: instance.Binding) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, b)
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 

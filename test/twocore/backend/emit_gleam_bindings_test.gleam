@@ -15,14 +15,12 @@
 //// The pure unit tests (no toolchain) pin determinism, the three-file drop, the no-`.beam`-atom-
 //// collision module name, and the Stateless vs Threaded surface shapes (R19).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
 import gleam/string
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/backend/emit_gleam_bindings
 import twocore/backend/iface
@@ -168,8 +166,7 @@ fn module_b() -> ir.Module {
 /// Returns the loaded module atom (= `m.name`). A `let assert` here is the test's success contract.
 fn load(m: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(m, profiles.portable())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 

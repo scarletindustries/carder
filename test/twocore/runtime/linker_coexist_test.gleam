@@ -106,8 +106,8 @@ fn state_module(name: String) -> ir.Module {
 /// compile/build failure is a genuine test failure, not an expected path.
 fn build(name: String, binding: Binding) -> BitArray {
   let m = state_module(name)
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   beam
 }
 

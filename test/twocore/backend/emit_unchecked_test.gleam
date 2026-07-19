@@ -194,8 +194,8 @@ fn run_module(
   export: String,
   args: List(Int),
 ) -> pipeline.RunResult {
-  let assert Ok(c) = pipeline.ir_to_core(m, binding)
-  let assert Ok(beam) = pipeline.core_to_beam(c, m.name)
+  let assert Ok(c) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(beam) = pipeline.cmod_to_beam(c)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   let out = pipeline.invoke_instance(proc, export, args)
   pipeline.stop_instance(proc)

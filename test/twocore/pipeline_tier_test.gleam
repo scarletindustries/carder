@@ -151,8 +151,8 @@ fn run_one(
   export: String,
   args: List(Int),
 ) -> pipeline.RunResult {
-  let assert Ok(core) = pipeline.ir_to_core(module, binding)
-  let assert Ok(beam) = pipeline.core_to_beam(core, module.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(module, binding)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, module.name)
   let result = pipeline.invoke_instance(proc, export, args)
   pipeline.stop_instance(proc)
@@ -183,8 +183,8 @@ fn atomics_capped() -> Binding {
 /// P4-08 §C — cross-invoke threading.)
 pub fn threaded_state_persists_across_invokes_test() {
   let m = global_module()
-  let assert Ok(core) = pipeline.ir_to_core(m, threaded())
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, threaded())
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   // get reads the constant init 7.
   assert pipeline.invoke_instance(proc, "get", []) == pipeline.Returned([7])
@@ -207,8 +207,8 @@ pub fn threaded_pure_export_returns_value_test() {
 /// returns `X`, threaded across invokes (spec `exec/memory` little-endian round-trip).
 pub fn threaded_memory_roundtrip_test() {
   let m = memory_module()
-  let assert Ok(core) = pipeline.ir_to_core(m, threaded())
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, threaded())
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   let _ = pipeline.invoke_instance(proc, "store32", [0, 305_419_896])
   assert pipeline.invoke_instance(proc, "load32", [0])
@@ -230,7 +230,8 @@ pub fn atomics_build_links_and_runs_test() {
   assert string.contains(core, "twocore@runtime@rt_mem_atomics")
   assert !string.contains(core, "'twocore@runtime@rt_mem':")
   // and it runs — the tier-O backend round-trips a store/load.
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   let _ = pipeline.invoke_instance(proc, "store32", [0, 305_419_896])
   assert pipeline.invoke_instance(proc, "load32", [0])

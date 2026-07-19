@@ -41,7 +41,6 @@
 //// in-tree and always run. Because the Erlang and Elixir bindings present WASM values as the same
 //// BEAM terms, ONE differential body (`run_beam`) drives both.
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
@@ -53,7 +52,6 @@ import gleam/string
 import simplifile
 import twocore/backend/bindings
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/backend/emit_elixir_bindings
 import twocore/backend/emit_erlang_bindings
@@ -324,14 +322,12 @@ fn setup() -> #(String, String, Oracle) {
 
   // Compile the matrix module; load its code AND get an Int-oracle instance process.
   let assert Ok(cm) = emit_core.emit_module(m, profiles.portable())
-  let core = core_printer.print_module(cm)
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cm)
   let assert Ok(int_proc) = pipeline.instantiate(beam, m.name)
 
   // Load the stateless module's code (its binding dispatches into it; no oracle proc needed).
   let assert Ok(cmp) = emit_core.emit_module(mp, profiles.portable())
-  let core_p = core_printer.print_module(cmp)
-  let assert Ok(_) = build_beam.compile_and_load(bit_array.from_string(core_p))
+  let assert Ok(_) = build_beam.compile_and_load(cmp)
 
   // The term-ABI oracle process (for v128 / multi-value / externref — the non-Int rows).
   let assert Ok(term_proc) = start_instance(atom.create(m.name))
@@ -1152,8 +1148,7 @@ pub fn deterministic_emit_test() {
 pub fn folder_driver_shipped_path_test() {
   let m = matrix_module()
   let assert Ok(cm) = emit_core.emit_module(m, profiles.portable())
-  let assert Ok(beam) =
-    pipeline.core_to_beam(core_printer.print_module(cm), m.name)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cm)
 
   let dir_a = scratch_dir("a")
   let langs = [bindings.Gleam, bindings.Erlang, bindings.Elixir]

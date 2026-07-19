@@ -22,7 +22,6 @@
 //// the evidence. Spec: variable/memory instructions
 //// <https://webassembly.github.io/spec/core/exec/instructions.html>.
 
-import gleam/bit_array
 import gleam/erlang/atom
 import gleam/int
 import twocore/backend/build_beam
@@ -41,8 +40,8 @@ fn compile_load(name: String, binding: Binding) -> atom.Atom {
   let assert Ok(m0) = pipeline.source_to_ir(bytes)
   let m =
     ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(mod) = build_beam.compile_and_load(cmod)
   mod
 }
 

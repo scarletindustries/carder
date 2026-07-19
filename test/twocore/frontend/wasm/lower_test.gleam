@@ -19,7 +19,6 @@ import gleam/option
 import gleam/set
 import gleeunit/should
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/frontend/wasm/ast
 import twocore/frontend/wasm/decode
@@ -54,8 +53,7 @@ fn build(bytes: BitArray) -> ir.Module {
 /// Emit `irm` to Core text, compile it, and load it into the test VM (D10).
 fn load(irm: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(irm, instance.safe_default())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 
