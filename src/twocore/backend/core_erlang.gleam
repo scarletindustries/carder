@@ -122,6 +122,13 @@ pub type CExpr {
   /// A lambda, printed `fun (V1, V2) -> Body`. `vars` are raw binder names
   /// (printer legalizes); on a `FunDef` RHS this is the function body.
   CFun(vars: List(String), body: CExpr)
+  /// A same-module function VALUE reference, printed `'f'/N` (a bare `FName`
+  /// as an expression). Distinct from `CApply` (which applies it) — this is
+  /// the fun VALUE without a wrapping `fun(…) -> apply 'f'/N(…)` lambda.
+  /// Used by `MakeClosure(f, [], N)` under the js profile so a zero-capture
+  /// closure is the target function directly (BEAM stores it as a local-fun
+  /// entry with no wrapper body — one dispatch instead of two on every call).
+  CFunRef(name: FName)
   /// A `let`, printed `let X = Arg in Body` when `vars` has length 1, or
   /// `let <V1,V2,…> = Arg in Body` otherwise (length 0 or ≥ 2 → value-list
   /// form). The value-list arity MUST match what `arg` produces or `core_lint`

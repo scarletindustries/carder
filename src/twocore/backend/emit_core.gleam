@@ -84,8 +84,9 @@ import gleam/string
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase,
-  CClause, CCons, CFloat, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
-  CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
+  CClause, CCons, CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop,
+  CTry, CTuple, CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple,
+  PVar,
 }
 import twocore/ir.{
   type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
@@ -199,6 +200,11 @@ pub type EmitError {
   /// (the frontend's) will grow this op set; a new op is registered by adding one literal arm to
   /// `resolve_js` (and the `ir_lower` "js" admit + the `rt_js` impl).
   UnknownJsOp(op: String)
+  /// A `js_profile: True` `CallHost("js", op, …)` whose `JsOpKind` needs `Threading(cur)` (JRead/
+  /// JMut/JMutUnit) but reached a `NoState` context (SPEC§7.M9 §9.5 / R12). FAIL-CLOSED — the
+  /// profile guarantees every function is state-reaching, so this is a backend defence, never a
+  /// panic.
+  JsProfileRequiresThreaded(op: String)
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -254,11 +260,15 @@ type Ctx {
 ///
 /// - `KReturn`: yield as the function result (a Core value list). Trivial; inlined.
 /// - `KJump(target)`: tail-apply a materialised join-point `letrec` function.
+/// - `KValues`: yield the values as a bare Core value-list expression, for
+///   binding by an ENCLOSING `let` (perf6 `emit_block` let-case lowering).
+///   NoState only. Trivial; inlined.
 /// - `KBind(names, body, next)`: bind the values to `names`, then emit `body` under
 ///   `next`.
 type Cont {
   KReturn
   KJump(target: FName)
+  KValues
   KBind(names: List(String), body: Expr, next: Cont)
 }
 
@@ -293,13 +303,17 @@ type LabelEntry {
 
 /// Mutable-threaded emission state: a monotonic gensym `counter`, the reserved variable
 /// names (`vars`) and reserved function atoms (`fns`) that gensym must avoid, and the
-/// scoped label stack (`labels`).
+/// scoped label stack (`labels`). `float`: perf6 letrec-floating sink — `Some(#(arity,
+/// defs))` inside a `emit_block` let-case scope emitting multi-value `<st,v..>` leaves;
+/// `defs` collects the inner `l_miss`-cont letrecs to be hoisted above the enclosing
+/// multi-value `let` (Core `letrec…in E` is single-value, so they cannot nest inline).
 type EmitState {
   EmitState(
     counter: Int,
     vars: Set(String),
     fns: Set(String),
     labels: List(LabelEntry),
+    float: Option(#(Int, List(FunDef))),
   )
 }
 
@@ -376,7 +390,7 @@ pub fn emit_module(
     |> dict.from_list
   // The state-reaching call-graph closure (§A.3) — computed ONCE, keyed on only under
   // `Threaded`. Under `Cell` it is inert (every function keeps its Phase-1 shape).
-  let fn_state_reaching = state_reaching_closure(module.functions)
+  let fn_state_reaching = state_reaching_closure(module.functions, binding)
   let ctx =
     Ctx(
       binding: binding,
@@ -390,8 +404,16 @@ pub fn emit_module(
       ref_global_names: reference_global_names(module),
       tag_index: build_tag_index(module),
     )
+  // perf5 richards-gate: seed each function's fresh-var counter at a
+  // module-unique offset so cerl_inline (enabled in twocore_codegen_ffi)
+  // never sees the same `VgN`/`jN` name across two module functions —
+  // it treats a re-bound name in an inlinee as `undefined_var`. 100_000
+  // per fn is > any single fn's var count.
   use defs <- result.try(
-    list.try_map(module.functions, fn(f) { emit_function(f, ctx) }),
+    list.index_map(module.functions, fn(f, i) {
+      emit_function(f, ctx, i * 100_000)
+    })
+    |> list.try_map(fn(r) { r }),
   )
   use #(export_names, wrappers) <- result.try(emit_exports(module.exports, ctx))
   // The generated instantiation entry (E5) — seeds the fresh per-instance cell and runs
@@ -649,11 +671,21 @@ const wrapper_state_param = "est"
 /// record threaded as the LEADING parameter and paired with the outgoing record on return
 /// (§B.1). A PURE function (and every function under `Cell`) keeps its Phase-1 `'f'/n` shape
 /// (channel `NoState`), so pure numeric leaves pay nothing.
-fn emit_function(f: Function, ctx: Ctx) -> Result(FunDef, EmitError) {
+fn emit_function(
+  f: Function,
+  ctx: Ctx,
+  counter_seed: Int,
+) -> Result(FunDef, EmitError) {
   let reserved_vars = collect_vars(f)
   let reserved_fns = set.from_list(dict.keys(ctx.fn_arity))
   let state0 =
-    EmitState(counter: 0, vars: reserved_vars, fns: reserved_fns, labels: [])
+    EmitState(
+      counter: counter_seed,
+      vars: reserved_vars,
+      fns: reserved_fns,
+      labels: [],
+      float: None,
+    )
   case is_threaded(ctx) && set.contains(ctx.fn_state_reaching, f.name) {
     True -> {
       let #(st0, state1) = fresh_var(state0)
@@ -814,19 +846,32 @@ fn nth(xs: List(a), index: Int) -> Result(a, Nil) {
 /// `expr_touches_state` (below) is NOT the descriptor's input (a pure-*bodied* export that
 /// `CallDirect`s a memory helper is emitted at `n+1` and threads `St`, which only the transitive
 /// closure captures). Promoting it changes no emitted output (same callers, same result).
-pub fn state_reaching_closure(functions: List(Function)) -> Set(String) {
-  let seeds =
-    list.filter_map(functions, fn(f) {
-      case expr_touches_state(f.body) {
-        True -> Ok(f.name)
-        False -> Error(Nil)
-      }
-    })
-    |> set.from_list
-  let edges =
-    list.map(functions, fn(f) { #(f.name, direct_callees(f.body, set.new())) })
-    |> dict.from_list
-  reaching_fixpoint(functions, edges, seeds)
+pub fn state_reaching_closure(
+  functions: List(Function),
+  binding: Binding,
+) -> Set(String) {
+  case binding.js_profile {
+    // Under `js_profile` EVERY function threads `St` (SPEC§9.6) — closures/throws/CallHost("js")
+    // all thread, so the fixpoint is trivially the full set. Short-circuit avoids seeding
+    // `expr_touches_state` with JS nodes (which would perturb the `False` path — SPEC§9.7).
+    True -> set.from_list(list.map(functions, fn(f) { f.name }))
+    False -> {
+      let seeds =
+        list.filter_map(functions, fn(f) {
+          case expr_touches_state(f.body) {
+            True -> Ok(f.name)
+            False -> Error(Nil)
+          }
+        })
+        |> set.from_list
+      let edges =
+        list.map(functions, fn(f) {
+          #(f.name, direct_callees(f.body, set.new()))
+        })
+        |> dict.from_list
+      reaching_fixpoint(functions, edges, seeds)
+    }
+  }
 }
 
 /// The monotone fixpoint over the `CallDirect` edge graph: add any function whose callee set
@@ -1160,7 +1205,7 @@ fn emit(
     // `Throw`/`ThrowRef` are BOTTOM transfers (like `Trap`/`Return`) — they drop `cont`; `Try`
     // installs a Core Erlang `try…catch` (the `CTry` node) around its body. EH ships CELL-ONLY
     // (T6): no state travels in the thrown term. A tag-free module reaches NONE of these. ──
-    ir.Throw(tag, args) -> emit_throw(tag, args, state, ctx)
+    ir.Throw(tag, args) -> emit_throw(tag, args, sc, state, ctx)
     ir.Try(result, body, handlers) ->
       emit_try(result, body, handlers, cont, sc, state, ctx)
     ir.ThrowRef(exnref) -> emit_throw_ref(exnref, state)
@@ -1240,6 +1285,7 @@ fn emit_term_op(
       )
     ir.MakeCons, [h, t] ->
       apply_cont(cont, [CCons(emit_value(h), emit_value(t))], sc, state, ctx)
+    ir.MakeNil, [] -> apply_cont(cont, [CNil], sc, state, ctx)
     ir.ListHead, [l] ->
       apply_cont(
         cont,
@@ -1503,9 +1549,9 @@ fn emit_num_term(
 /// panic. `arity = 0` yields a nullary `fun () -> apply 'fn_name'/m(captures…)`; `captures = []`
 /// yields a plain `fun` forwarding all args.
 ///
-/// NOTE: the closure body is the UN-threaded direct call. A state-threaded build whose closure
-/// target is state-reaching is out of scope — Phase-8 closures arise only in the direct-IR JS
-/// path, which threads no instance state (K7); no WASM module produces this node.
+/// Under `js_profile: True` with a state-reaching target, the closure is lifted to `fun/(arity+1)`
+/// taking `St` first and forwarding to the target's threaded `m+arity+1` form (M9§6). Otherwise
+/// the body is the UN-threaded direct call (no WASM module produces this node — K7).
 fn emit_make_closure(
   fn_name: String,
   captures: List(Value),
@@ -1522,16 +1568,62 @@ fn emit_make_closure(
       case fn_params == expected {
         False -> Error(ArityMismatch(expected, fn_params))
         True -> {
-          let #(param_names, state2) = fresh_n_vars(state, arity)
-          let body =
-            CApply(
-              FName(fn_name, fn_params),
-              list.append(
-                list.map(captures, emit_value),
-                list.map(param_names, CVar),
-              ),
-            )
-          apply_cont(cont, [CFun(param_names, body)], sc, state2, ctx)
+          let target_threaded =
+            is_threaded(ctx)
+            && ctx.binding.js_profile
+            && set.contains(ctx.fn_state_reaching, fn_name)
+          case target_threaded {
+            False -> {
+              let #(param_names, state2) = fresh_n_vars(state, arity)
+              let body =
+                CApply(
+                  FName(fn_name, fn_params),
+                  list.append(
+                    list.map(captures, emit_value),
+                    list.map(param_names, CVar),
+                  ),
+                )
+              apply_cont(cont, [CFun(param_names, body)], sc, state2, ctx)
+            }
+            True ->
+              case captures {
+                // perf5 richards-gate: zero-capture js closure IS the target
+                // fn — a bare `'f'/(arity+1)` fun-ref instead of a wrapper
+                // `fun(St,A..) -> apply 'f'/N(St,A..)`. Every richards
+                // prototype method has captures=[]; the wrapper cost ~40k
+                // extra fun-apply/run (`-js_main/3-anonymous-N-` rows in the
+                // per-jsf profile). twocore_codegen_ffi catches any residual
+                // beam_ssa_opt type-lattice crash and retries `no_type_opt`.
+                // Spike: arc/test/emit_2core_cfunref_spike.gleam.
+                [] if perf5_cfunref_zero_capture ->
+                  apply_cont(
+                    cont,
+                    [core_erlang.CFunRef(FName(fn_name, arity + 1))],
+                    sc,
+                    state,
+                    ctx,
+                  )
+                _ -> {
+                  let #(st_param, s1) = fresh_var(state)
+                  let #(param_names, s2) = fresh_n_vars(s1, arity)
+                  let body =
+                    CApply(FName(fn_name, list.length(captures) + arity + 1), [
+                      CVar(st_param),
+                      ..list.append(
+                        list.map(captures, emit_value),
+                        list.map(param_names, CVar),
+                      )
+                    ])
+                  apply_cont(
+                    cont,
+                    [CFun([st_param, ..param_names], body)],
+                    sc,
+                    s2,
+                    ctx,
+                  )
+                }
+              }
+          }
         }
       }
     }
@@ -1543,12 +1635,13 @@ fn emit_make_closure(
 /// data-named `apply(Mod, Fn, Args)`, never the list-spreading `erlang:apply/2`). EFFECTFUL
 /// barrier (it transfers to arbitrary code, like `CallIndirect`), yielding ONE value.
 ///
-/// State-NEUTRAL under `Threading(cur)`: a native BEAM fun does not carry our `InstanceState`, so
-/// `cur` flows through unchanged (like `CallHost`/`CallImport`). The single result is disposed
-/// through `cont` by `apply_cont_call` with `r = 1` — which under `Threading` re-pairs the value
-/// with `cur` at a tail `KReturn`, and under `NoState`/`KReturn` yields the `apply` straight
-/// through (a single value packaged is itself, §apply_cont_call). A callee arity mismatch is a
-/// BEAM `badarity` error at RUN time (the IR carries no static fun arity — K1).
+/// Under `js_profile: False` this is state-NEUTRAL (a native BEAM fun does not carry our
+/// `InstanceState`; `cur` flows through unchanged and `apply_cont_call` with `r = 1` disposes the
+/// single result). Under `js_profile: True` + `Threading(cur)` the target is a `fun(St,…)->{V,St'}`
+/// closure built by `emit_make_closure`, so `St` is PREPENDED to the args and the `{V,St'}` result
+/// is unpacked exactly like a threaded direct call (§emit_call_direct): tail `KReturn` passes the
+/// pair straight through; non-tail goes via `emit_threaded_call_unpack`. Arity mismatch is a BEAM
+/// `badarity` at RUN time (the IR carries no static fun arity — K1).
 fn emit_call_closure(
   callee: Value,
   args: List(Value),
@@ -1557,8 +1650,20 @@ fn emit_call_closure(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let applied = CApplyExpr(emit_value(callee), list.map(args, emit_value))
-  apply_cont_call(cont, applied, 1, sc, state, ctx)
+  let cargs = list.map(args, emit_value)
+  case ctx.binding.js_profile, sc {
+    False, _ | True, NoState -> {
+      let applied = CApplyExpr(emit_value(callee), cargs)
+      apply_cont_call(cont, applied, 1, sc, state, ctx)
+    }
+    True, Threading(cur) -> {
+      let applied = CApplyExpr(emit_value(callee), [CVar(cur), ..cargs])
+      case cont {
+        KReturn -> Ok(#(applied, state))
+        _ -> emit_threaded_call_unpack(applied, 1, cont, state, ctx)
+      }
+    }
+  }
 }
 
 /// Lower `Return(vs)` (the non-continuation transfer). Under `NoState` it yields the bare
@@ -2020,6 +2125,71 @@ fn emit_value_state_pair(
   ))
 }
 
+/// Rebind the threaded `InstanceState` from a `JMutUnit` call that returns bare `St'` (SPEC§7.M9
+/// §9.5): fresh `St2 = <call>`, then continue with ZERO values under `Threading(St2)`. Distinct
+/// from `emit_threaded_record_effect` — no `Result` unwrap (the JS runtime never `{error,_}`s).
+/// arc's `anf.host_unit` wraps every JMutUnit CallHost in `Let([r], _, body)` (r discarded), so
+/// a `KBind([_], …)` cont is fed one dummy `undefined` to satisfy the arity check.
+fn emit_state_rebind(
+  call: CExpr,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(st2, state2) = fresh_var(state)
+  let vals = case cont {
+    KBind([_], _, _) -> [CAtom("undefined")]
+    _ -> []
+  }
+  use #(rest, state3) <- result.try(apply_cont(
+    cont,
+    vals,
+    Threading(st2),
+    state2,
+    ctx,
+  ))
+  Ok(#(CLet([st2], call, rest), state3))
+}
+
+/// Rebind the threaded `InstanceState` from a `JMutMiss` call that returns
+/// bare `St' | miss`: bind `R = <call>`, then `St2 = if is_atom(R) -> cur;
+/// else -> R`, and continue with `[R]` under `Threading(St2)`. The caller's
+/// own `IsAtom(R)` test distinguishes hit (tuple) from miss (atom); on miss
+/// sc is unchanged so the slow-path JMut sees the pre-call St. No `#(V,St')`
+/// tuple is allocated on the hit path.
+fn emit_state_rebind_or_miss(
+  call: CExpr,
+  cur: String,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(rvar, state2) = fresh_var(state)
+  let #(st2, state3) = fresh_var(state2)
+  use #(rest, state4) <- result.try(apply_cont(
+    cont,
+    [CVar(rvar)],
+    Threading(st2),
+    state3,
+    ctx,
+  ))
+  Ok(#(
+    CLet(
+      [rvar],
+      call,
+      CLet(
+        [st2],
+        CCase(CCall(CAtom("erlang"), CAtom("is_atom"), [CVar(rvar)]), [
+          CClause([PAtom("true")], CAtom("true"), CVar(cur)),
+          CClause([PAtom("false")], CAtom("true"), CVar(rvar)),
+        ]),
+        rest,
+      ),
+    ),
+    state4,
+  ))
+}
+
 /// Sequence a threaded RECORD-rebinding effect: reduce a trapping
 /// `Result(InstanceState, TrapReason)` producer to the record on `{ok,S}` (raise on
 /// `{error,E}`), bind it to a fresh state var, and continue under `Threading(new)` disposing
@@ -2090,10 +2260,58 @@ fn apply_cont(
         Threading(cur) ->
           Ok(#(CTuple([function_return(vals), CVar(cur)]), state))
       }
+    KValues ->
+      // perf6 emit_block/emit_if let-case. Under `state.float=None` (single-
+      // value context — a `letrec` fun body, or emit_if let-case): yield ONE
+      // Core value (bare under NoState arity=1, else a `{st,r..}` tuple) for
+      // the enclosing `let <t> = … in case t of {..} -> cont` to destructure.
+      // Under `state.float=Some` (perf6 letrec-floating — emit_block let-case
+      // opened a multi-value scope): yield a zero-cost `<st,r..>` values-list;
+      // the enclosing multi-value `let <st,r..> = …` binds it directly with
+      // NO heap tuple. Nested l_miss letrecs are floated above that `let`
+      // (see `materialize_if`), which is what makes the values-list legal.
+      case sc, vals, state.float {
+        NoState, [single], _ -> Ok(#(single, state))
+        NoState, _, Some(_) -> Ok(#(value_list(vals), state))
+        NoState, _, None -> Ok(#(CTuple(vals), state))
+        Threading(cur), _, Some(_) ->
+          Ok(#(value_list([CVar(cur), ..vals]), state))
+        Threading(cur), _, None -> Ok(#(CTuple([CVar(cur), ..vals]), state))
+      }
     KJump(target) ->
-      case sc {
-        NoState -> Ok(#(CApply(target, vals), state))
-        Threading(cur) -> Ok(#(CApply(target, [CVar(cur), ..vals]), state))
+      case sc, state.float {
+        NoState, None -> Ok(#(CApply(target, vals), state))
+        Threading(cur), None ->
+          Ok(#(CApply(target, [CVar(cur), ..vals]), state))
+        // Multi-value scope: `target` is a floated l_miss cont whose fun body
+        // was emitted under float=None → it returns a `{st,r..}` TUPLE (fun
+        // bodies are single-value). Destructure it back to a values-list so
+        // this case-leaf's arity matches the sibling `<st,v>` hit-leaves.
+        // Cold-path only (l_miss); the `let+case` cost is off the hit path.
+        _, Some(#(arity, _)) -> {
+          let call = case sc {
+            NoState -> CApply(target, vals)
+            Threading(cur) -> CApply(target, [CVar(cur), ..vals])
+          }
+          let n = case sc {
+            NoState -> arity
+            Threading(_) -> arity + 1
+          }
+          case n {
+            1 -> Ok(#(call, state))
+            _ -> {
+              let #(t, state2) = fresh_var(state)
+              let #(outs, state3) = fresh_n_vars(state2, n)
+              let clause =
+                CClause(
+                  [PTuple(list.map(outs, PVar))],
+                  CAtom("true"),
+                  value_list(list.map(outs, CVar)),
+                )
+              Ok(#(CLet([t], call, CCase(CVar(t), [clause])), state3))
+            }
+          }
+        }
       }
     KBind(names, body, next) ->
       case list.length(names) == list.length(vals) {
@@ -2216,6 +2434,112 @@ fn fresh_n_vars(state: EmitState, n: Int) -> #(List(String), EmitState) {
 /// live record to the value list (`apply_cont`'s `KJump` prepend), so the branches' differing
 /// records UNIFY at the merge — the natural functional join, in constant stack (the join
 /// `apply` stays a tail call). Under `NoState` the Phase-2/3 join is emitted verbatim.
+///
+/// A `KBind` that is an IDENTITY (`KBind([r..], Values([Var(r)..]), next)` — a
+/// pure trampoline) or is SMALL (`cont_inline_weight` under the js-profile
+/// threshold) is NOT materialised: the raw `KBind` is passed to every arm and
+/// `apply_cont` inlines it there. BEAM does not inline across the
+/// letrec→function boundary, so a chain of `ir.If` inside a hot loop would
+/// otherwise become a chain of separate BEAM functions joined by `call_only`
+/// — measured at ~4ns/edge, which the obj≤20µs budget cannot absorb. The
+/// weight bound caps duplication (each If doubles the copies of its
+/// continuation).
+fn strip_identity_binds(cont: Cont) -> Cont {
+  case cont {
+    KBind(names, Values(vs), next) ->
+      case is_identity_bind(names, vs) {
+        True -> strip_identity_binds(next)
+        False -> cont
+      }
+    _ -> cont
+  }
+}
+
+fn is_identity_bind(names: List(String), vs: List(Value)) -> Bool {
+  case names, vs {
+    [], [] -> True
+    [n, ..ns], [Var(v), ..rest] if n == v -> is_identity_bind(ns, rest)
+    _, _ -> False
+  }
+}
+
+/// True iff `cont`, after identity-strip, is not a `KBind` — i.e. applying it
+/// emits at most one `apply`/tuple/value with no further body emit.
+fn is_trivial_cont(cont: Cont) -> Bool {
+  case strip_identity_binds(cont) {
+    KBind(_, _, _) -> False
+    _ -> True
+  }
+}
+
+/// Rough size of `body` for the inline-vs-materialize decision. Counts one per
+/// IR node on the SPINE (Let / TermOp / Values / …). Any branching construct
+/// (If / Block / Loop / Switch / Try) — and any node whose lowering calls
+/// `materialize` on its own cont — returns a weight > any threshold, so a
+/// KBind body containing one is never inlined (that would nest another
+/// `materialize` under an already-duplicated cont and blow up quadratically).
+/// Hits the perf5 hot pattern: the l_join of a `share()` in tail position is
+/// `KBind([r,tc], Values([Var(r)]), KReturn)` — weight 1, always inlined.
+fn cont_inline_weight(body: Expr, budget: Int) -> Int {
+  case budget < 0 {
+    True -> budget
+    False ->
+      case body {
+        Values(_) -> budget - 1
+        Return(_) -> budget - 1
+        Break(_, _) -> budget - 1
+        Continue(_, _) -> budget - 1
+        Trap(_) -> budget - 1
+        Let(_, rhs, tail) ->
+          case rhs_is_linear(rhs) {
+            True -> cont_inline_weight(tail, budget - 1)
+            False -> -1
+          }
+        // Branching / label-introducing constructs each call materialize on
+        // THEIR cont — inlining a body containing one would duplicate that
+        // whole subtree per arm. Everything else (Return / MemStore / Gc /
+        // Try / …) is either rare or itself materialises, so bail.
+        _ -> -1
+      }
+  }
+}
+
+/// A Let RHS whose lowering is a single value/op (no control flow, no nested
+/// materialize). Matches the `bind`/`host`/`make_tuple`/`tuple_get` shapes
+/// anf.gleam actually emits between bind_ifs.
+fn rhs_is_linear(rhs: Expr) -> Bool {
+  case rhs {
+    Values(_) -> True
+    TermOp(_, _) | ir.TermTest(_, _) | ir.NumTerm(_, _, _) -> True
+    Convert(_, _) | MapOp(_, _) -> True
+    CallHost(_, _, _) -> True
+    MakeClosure(_, _, _) | CallClosure(_, _) -> True
+    CallDirect(_, _) | CallIndirect(_, _, _, _) -> True
+    Num(_, _) -> True
+    _ -> False
+  }
+}
+
+/// js-profile inline threshold (perf5): a KBind whose body's linear-spine
+/// weight is ≤ this AND whose `next` is trivial is duplicated into every arm
+/// instead of materialised as a letrec join. Measured on richards: the
+/// compiled module carries ~500k letrec-`apply`/run at ~4ns each ≈ 2ms —
+/// most of the 3.3ms→2.2ms gap. Threshold 6 covers `Values`, short Let-chains
+/// (`refresh_this_c()` = 2 Lets), and the `is_miss` re-read tail after a
+/// method-call `share`, without inlining anything containing an If.
+const cont_inline_threshold = 6
+
+/// perf5 spike gate: when True, `MakeClosure(f, [], N)` under the js profile
+/// emits a bare `'f'/(N+1)` CFunRef instead of an eta-wrapping `fun(…)→apply`.
+/// The originally-observed OTP-29 beam_ssa_opt `ssa_opt_type_start` badmatch
+/// on the fun-type lattice does NOT reproduce on OTP 29 / erts-17.0.1 for the
+/// saved richards CFunRef .core (arc/.local/richards_funref.core, 84 refs);
+/// twocore_codegen_ffi.erl now catches any residual OTP-internal crash and
+/// retries with `no_type_opt` so a future/variant repro degrades to slower
+/// codegen instead of a hard failure. Flip to False + rerun v8v7_probe to
+/// bisect. Spike: arc/test/emit_2core_cfunref_spike.gleam.
+pub const perf5_cfunref_zero_capture = True
+
 fn materialize(
   cont: Cont,
   arity: Int,
@@ -2223,48 +2547,94 @@ fn materialize(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
-  case cont {
+  materialize_if(cont, arity, sc, state, ctx, force_inline: False)
+}
+
+/// `materialize` with an override: `force_inline: True` skips the letrec even
+/// for a large body — used by `emit_if` when one arm diverges (Break/Return),
+/// so `cont` is provably reached from ONE arm and its body is emitted once
+/// regardless of size.
+fn materialize_if(
+  cont: Cont,
+  arity: Int,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+  force_inline force_inline: Bool,
+) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
+  case strip_identity_binds(cont) {
     KReturn -> Ok(#(None, KReturn, state))
     KJump(t) -> Ok(#(None, KJump(t), state))
-    KBind(names, body, next) ->
+    KValues -> Ok(#(None, KValues, state))
+    KBind(names, body, next) as kb ->
+      // js-profile only: inline a small linear-spine cont whose own next is
+      // already trivial. Both arms of the caller If/Block re-emit `body`,
+      // which is bounded (no nested If — `cont_inline_weight` rejects those)
+      // and `next` is KReturn/KJump so no further KBind duplication.
       case list.length(names) == arity {
         False -> Error(ArityMismatch(arity, list.length(names)))
         True ->
+      // Only inline when the caller GUARANTEES `cont` is reached from ONE
+      // exit (`force_inline`, i.e. emit_if with one arm diverging).
+      // A weight-gated inline (`is_trivial_cont(next) &&
+      // cont_inline_weight ≤ N`) is UNSOUND for multi-exit callers
+      // (Block/Switch/2-arm-If): `apply_cont` re-emits `body`'s IR
+      // VERBATIM at every exit, so its `names` and `body`'s ANF binder
+      // names are bound multiple times in nested scopes — Core Erlang
+      // tolerates the shadow, but the `inline` compile pass we now enable
+      // (twocore_codegen_ffi) trips `cerl_inline` `undefined_var` on it.
+      case
+        force_inline
+        || {
+          ctx.binding.js_profile
+          && is_trivial_cont(next)
+          && cont_inline_weight(body, cont_inline_threshold) >= 0
+        }
+      {
+        True -> Ok(#(None, kb, state))
+        False ->
           case sc {
             NoState -> {
               let #(jname, state2) = fresh_fn(state)
               let fname = FName(jname, arity)
+              let outer_float = state2.float
               use #(jbody, state3) <- result.try(emit(
                 body,
                 next,
                 NoState,
-                state2,
+                EmitState(..state2, float: None),
                 ctx,
               ))
-              Ok(#(
-                Some(FunDef(fname, CFun(names, jbody))),
-                KJump(fname),
-                state3,
-              ))
+              float_or_wrap(
+                FunDef(fname, CFun(names, jbody)),
+                fname,
+                EmitState(..state3, float: outer_float),
+              )
             }
             Threading(_) -> {
               let #(jname, state2) = fresh_fn(state)
               let #(st_join, state3) = fresh_var(state2)
               let fname = FName(jname, arity + 1)
+              // Fun body is single-value: emit under float=None so its
+              // KValues leaves yield a `{st,r..}` tuple. Any float sink
+              // opened INSIDE `body` (nested emit_block let-case) is
+              // independent — restored to None when that scope closes.
+              let outer_float = state3.float
               use #(jbody, state4) <- result.try(emit(
                 body,
                 next,
                 Threading(st_join),
-                state3,
+                EmitState(..state3, float: None),
                 ctx,
               ))
-              Ok(#(
-                Some(FunDef(fname, CFun([st_join, ..names], jbody))),
-                KJump(fname),
-                state4,
-              ))
+              float_or_wrap(
+                FunDef(fname, CFun([st_join, ..names], jbody)),
+                fname,
+                EmitState(..state4, float: outer_float),
+              )
             }
           }
+      }
       }
   }
 }
@@ -2292,9 +2662,10 @@ fn wrap_join(maybe_def: Option(FunDef), inner: CExpr) -> CExpr {
 /// - SINGLE DEF: the letrec binds exactly one def (2core emits exactly one for joins/loops/try).
 /// - NON-RECURSIVE: `Fbody` never applies `'J'/n`. A loop's back-edge (`Continue`) self-applies its
 ///   `'L'` head, so loops are recognised recursive and left intact.
-/// - SINGLE-USE: `'J'/n` is applied EXACTLY ONCE across the whole enclosing function body. In this
-///   AST an `FName` can ONLY appear as a `CApply` target (there is no first-class funref-to-`FName`
-///   node — a closure applies a `CVar`/inline `fun` via `CApplyExpr`), so "applied once" is the
+/// - SINGLE-USE: `'J'/n` is applied EXACTLY ONCE across the whole enclosing function body. The only
+///   other node naming an `FName` is `CFunRef` (a bare `'f'/N` value emitted for a zero-capture
+///   `MakeClosure`), which references WITHOUT applying and is thus invisible to the apply counts —
+///   `scan_joins` PINS any funref'd name. Together, "applied once and never funref'd" is the
 ///   COMPLETE single-use condition: no other reference kind can leak the name.
 /// - NOT TRY-PINNED: the def is not applied as a `CTry` `arg`. `emit_try` deliberately hoists its
 ///   protected body into a nullary local fun so the try `Arg` stays a single `apply`; inlining it
@@ -2351,6 +2722,9 @@ fn join_inlinable(fname: FName, info: JoinInfo) -> Bool {
 fn scan_joins(expr: CExpr, scope: Set(FName), acc: JoinInfo) -> JoinInfo {
   case expr {
     CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> acc
+    // A funref REFERENCES an `FName` without applying it, so it is invisible to `counts`. PIN the
+    // name: inlining would drop the `letrec` and leave this ref dangling.
+    CFunRef(fname) -> JoinInfo(..acc, pinned: set.insert(acc.pinned, fname))
     CCons(h, t) -> scan_joins(t, scope, scan_joins(h, scope, acc))
     CTuple(es) -> list.fold(es, acc, fn(a, e) { scan_joins(e, scope, a) })
     CBinary(segs) ->
@@ -2433,6 +2807,7 @@ fn inline_expr(
 ) -> CExpr {
   case expr {
     CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CFunRef(_) -> expr
     CCons(h, t) -> CCons(inline_expr(h, info, env), inline_expr(t, info, env))
     CTuple(es) -> CTuple(list.map(es, fn(e) { inline_expr(e, info, env) }))
     CBinary(segs) ->
@@ -2575,6 +2950,7 @@ fn mask_def(def: FunDef) -> FunDef {
 fn mask_expr(expr: CExpr) -> CExpr {
   case expr {
     CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CFunRef(_) -> expr
     CCons(h, t) -> CCons(mask_expr(h), mask_expr(t))
     CTuple(es) -> CTuple(list.map(es, mask_expr))
     CBinary(segs) ->
@@ -2648,6 +3024,27 @@ fn as_masked(node: CExpr) -> Option(#(CExpr, Int)) {
 /// Build the reduced single-mask node `call 'erlang':'band'(x, M)`.
 fn band_lit(x: CExpr, mask: Int) -> CExpr {
   CCall(CAtom("erlang"), CAtom("band"), [x, CInt(mask)])
+}
+
+/// perf6 letrec-floating: if a multi-value let-case scope is open, push `def`
+/// into its sink (to be hoisted above the enclosing multi-value `let` by
+/// `emit_block`) and return `None` so the caller's `wrap_join` is a no-op —
+/// a `CLetrec` here would make the case-leaf single-value and break arity.
+/// Otherwise fall through to the normal in-place `Some(def)` wrap.
+fn float_or_wrap(
+  def: FunDef,
+  fname: FName,
+  state: EmitState,
+) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
+  case state.float {
+    Some(#(ar, defs)) ->
+      Ok(#(
+        None,
+        KJump(fname),
+        EmitState(..state, float: Some(#(ar, [def, ..defs]))),
+      ))
+    None -> Ok(#(Some(def), KJump(fname), state))
+  }
 }
 
 // ─────────────────────────────── numeric ops (the chokepoint) ───────────────────────────────
@@ -4082,21 +4479,88 @@ fn emit_call_host(
   case capability == js_capability {
     // The reserved JS runtime boundary (K6): a build-fixed literal dispatch to `rt_js`.
     True ->
-      case resolve_js(name) {
-        Some(fn_name) ->
-          // A vetted `rt_js` op yields exactly ONE value (K6/Phase-1). State-neutral: the JS
-          // runtime boundary never touches the instance record, so `cur` flows through unchanged.
-          apply_cont_call(
-            cont,
-            CCall(CAtom(ctx.binding.js_runtime_module), CAtom(fn_name), cargs),
-            1,
-            sc,
-            state,
-            ctx,
-          )
-        // Fail-closed (D3a): an unrecognised op resolves to no function — the dispatch is a
-        // literal `case`, not a data-driven target, so no `call`/`apply` is emitted.
-        None -> Error(UnknownJsOp(name))
+      case ctx.binding.js_profile {
+        // ── js_profile: False → Phase-8 legacy path (BYTE-IDENTICAL to before M9) ──
+        False ->
+          case resolve_js_legacy(name) {
+            Some(fn_name) ->
+              // A vetted `rt_js` op yields exactly ONE value (K6/Phase-1). State-neutral: the JS
+              // runtime boundary never touches the instance record, so `cur` flows through unchanged.
+              apply_cont_call(
+                cont,
+                CCall(
+                  CAtom(ctx.binding.js_runtime_module),
+                  CAtom(fn_name),
+                  cargs,
+                ),
+                1,
+                sc,
+                state,
+                ctx,
+              )
+            // Fail-closed (D3a): an unrecognised op resolves to no function — the dispatch is a
+            // literal `case`, not a data-driven target, so no `call`/`apply` is emitted.
+            None -> Error(UnknownJsOp(name))
+          }
+        // ── js_profile: True → SPEC§7.M9 §9.5 4-way JsOpKind dispatch to split rt_js_* ──
+        True ->
+          case resolve_js(name) {
+            None -> Error(UnknownJsOp(name))
+            Some(#(rtmod, fn_name, kind)) -> {
+              let mod_atom = js_module_atom(ctx.binding, rtmod)
+              case kind, sc {
+                // JPure: no St; single value; sc unchanged.
+                JPure, _ ->
+                  apply_cont_call(
+                    cont,
+                    CCall(CAtom(mod_atom), CAtom(fn_name), cargs),
+                    1,
+                    sc,
+                    state,
+                    ctx,
+                  )
+                // JRead: St prepended; bare-V return; sc UNCHANGED (R9 — no rebind).
+                JRead, Threading(cur) ->
+                  apply_cont_call(
+                    cont,
+                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
+                    1,
+                    sc,
+                    state,
+                    ctx,
+                  )
+                // JMut: St prepended; `#(V, St')` return (R1); rebinds sc.
+                JMut, Threading(cur) ->
+                  emit_value_state_pair(
+                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
+                    cont,
+                    state,
+                    ctx,
+                  )
+                // JMutMiss: St prepended; bare `St' | miss` return; rebinds sc
+                // to result unless atom (then sc stays cur).
+                JMutMiss, Threading(cur) ->
+                  emit_state_rebind_or_miss(
+                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
+                    cur,
+                    cont,
+                    state,
+                    ctx,
+                  )
+                // JMutUnit: St prepended; bare-St' return; rebinds sc, zero values.
+                JMutUnit, Threading(cur) ->
+                  emit_state_rebind(
+                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
+                    cont,
+                    state,
+                    ctx,
+                  )
+                // js_profile:True but sc=NoState is unreachable (§9.6 short-circuits so every
+                // function threads); fail closed with a typed error rather than panic (R12).
+                _, NoState -> Error(JsProfileRequiresThreaded(name))
+              }
+            }
+          }
       }
     False ->
       case resolve_stdlib(capability, name) {
@@ -4134,7 +4598,307 @@ fn emit_call_host(
 /// with `ir_lower.js_capability` (the admit gate) and `specs/phase-8/05-js-runtime-boundary.md`.
 const js_capability: String = "js"
 
-/// The build-fixed JS-runtime op → `rt_js` function-name map (Phase-8 unit 05, K6). A LITERAL
+/// The Phase-9 M9 split-module axis (SPEC§7.M9 §9.3): each variant names one `Binding.js_*_module`
+/// field, so `resolve_js` returns a variant and `js_module_atom` links it to the concrete BEAM
+/// atom at emission time (D3a — the target atom is build-fixed via `Binding`, never data-derived).
+type JsRtModule {
+  JsStore
+  JsVal
+  /// `twocore_rt_js_val_ffi` — the wire-form guard shim. Routes `truthy`
+  /// there directly so ToBoolean is one guard-dispatch, no {k_*,…} boxing.
+  JsValFfi
+  JsObj
+  /// The own-data-property FFI shim itself — routes hot-path probes there
+  /// directly (skipping the Gleam `@external` wrapper's extra dispatch).
+  JsObjFfi
+  /// The `erlang` module — for BIFs the emitted code calls DIRECTLY (loader
+  /// lowers `call 'erlang':'get'/1` to a `bif1` instruction, so no `call_ext`
+  /// dispatch). Build-fixed atom (D3a).
+  JsErlang
+  JsOps
+  /// `twocore_rt_js_ops_ffi` — hot-path `==` probe (JPure, no ToPrimitive).
+  JsOpsFfi
+  JsCall
+  /// The call-path FFI shim itself — routes hot-path method-call / construct
+  /// probes there directly (skipping the Gleam `@external` wrapper's dispatch).
+  JsCallFfi
+  JsClass
+  JsAsync
+  JsGc
+  JsBuiltins
+  JsInspect
+  /// `twocore_rt_js_math_ffi` — Math.* direct-dispatch fast paths (JPure,
+  /// JsVal→JsVal|miss). Skips the Math-object property lookup on raytrace's
+  /// hot sqrt/floor/abs/pow/min/max calls.
+  JsMathFfi
+}
+
+/// The Phase-9 M9 op-kind classification (SPEC§7.M9 §9.3 / R1/R9): how a `CallHost("js", op, …)`
+/// interacts with the threaded `InstanceState` under `js_profile: True`. Drives the 4-way dispatch
+/// in `emit_call_host`'s `"js"` arm.
+type JsOpKind {
+  /// Pure — takes NO `St`, returns bare `V`. `sc` flows through unchanged.
+  JPure
+  /// Read-only — takes `St`, returns bare `V`. `sc` UNCHANGED (R9 — no rebind).
+  JRead
+  /// Mutating — takes `St`, returns `#(V, St')` (R1 — value first). Rebinds via
+  /// `emit_value_state_pair`.
+  JMut
+  /// Mutating with miss — takes `St`, returns bare `St' | miss`. On atom `miss`
+  /// sc stays `cur`; otherwise rebinds to the result. Caller sees the bare
+  /// result (tuple on hit / atom on miss) so `IsAtom` distinguishes them.
+  /// Saves the `#(V, St')` alloc a `JMut` would cost per hit.
+  JMutMiss
+  /// Mutating, unit-valued — takes `St`, returns bare `St'`. Rebinds via `emit_state_rebind`.
+  JMutUnit
+}
+
+/// Map a `JsRtModule` variant to its concrete `Binding.js_*_module` atom (SPEC§7.M9 §9.3 / D3a).
+/// The ONLY place a `JsRtModule` becomes a `call` target atom — a literal `case`, so the linked
+/// module is always one of the build-fixed `Binding` fields (never a data-derived atom).
+fn js_module_atom(binding: Binding, m: JsRtModule) -> String {
+  case m {
+    JsStore -> binding.js_store_module
+    JsVal -> binding.js_val_module
+    JsValFfi -> "twocore_rt_js_val_ffi"
+    JsObj -> binding.js_obj_module
+    JsObjFfi -> "twocore_rt_js_obj_ffi"
+    JsErlang -> "erlang"
+    JsOps -> binding.js_ops_module
+    JsOpsFfi -> "twocore_rt_js_ops_ffi"
+    JsCall -> binding.js_call_module
+    JsCallFfi -> "twocore_rt_js_call_ffi"
+    JsClass -> binding.js_class_module
+    JsAsync -> binding.js_async_module
+    JsGc -> binding.js_gc_module
+    JsBuiltins -> binding.js_builtins_module
+    JsInspect -> binding.js_inspect_module
+    JsMathFfi -> "twocore_rt_js_math_ffi"
+  }
+}
+
+/// The Phase-9 M9 build-fixed JS-runtime op → `#(module, fn, kind)` map (SPEC§8 / R8/R9/R12).
+/// A LITERAL `case` (D3a): the target module + fn are compile-time atoms via `js_module_atom` —
+/// no `op` value can reach an arbitrary `Mod:Fn`. `None` → `UnknownJsOp` (fail-closed, never
+/// panic). Active only under `js_profile: True`; the `False` path uses `resolve_js_legacy`.
+fn resolve_js(op: String) -> Option(#(JsRtModule, String, JsOpKind)) {
+  case op {
+    // ── rt_js_store (M1) ──
+    "cell_new" -> Some(#(JsStore, "t_cell_new", JMut))
+    "cell_get" -> Some(#(JsStore, "t_cell_get", JRead))
+    "cell_set" -> Some(#(JsStore, "t_cell_set", JMutUnit))
+    "pin_root" -> Some(#(JsStore, "t_pin_root", JMutUnit))
+    "tuple_set" -> Some(#(JsStore, "t_tuple_set", JMutUnit))
+    "console_log" -> Some(#(JsStore, "t_console_write", JMutUnit))
+    // ── rt_js_gc (M2) ──
+    "collect" -> Some(#(JsGc, "t_collect", JMutUnit))
+    // ── rt_js_val (M3) ──
+    "to_primitive" -> Some(#(JsVal, "t_to_primitive", JMut))
+    "to_number" -> Some(#(JsVal, "t_to_number", JMut))
+    "to_string" -> Some(#(JsVal, "t_to_string", JMut))
+    "to_property_key" -> Some(#(JsVal, "t_to_property_key", JMut))
+    // JPure §7.1.19 fast probe (l-jread-reclass): primitive int/str/sym →
+    // wire key with no St; `miss` on Handle/rare and the emitter falls to
+    // JMut `to_property_key`. Saves the {V,St'} alloc + rebind on hit.
+    "to_property_key_fast" ->
+      Some(#(JsValFfi, "t_to_property_key_fast", JPure))
+    "to_object" -> Some(#(JsVal, "t_to_object", JMut))
+    "type_of" -> Some(#(JsVal, "t_type_of", JMut))
+    "is_callable" -> Some(#(JsVal, "t_is_callable", JMut))
+    "require_object_coercible" ->
+      Some(#(JsVal, "t_require_object_coercible", JMutUnit))
+    "throw_type_error" -> Some(#(JsVal, "t_throw_type_error", JMutUnit))
+    "truthy" -> Some(#(JsValFfi, "to_boolean_i32", JPure))
+    "is_nullish" -> Some(#(JsVal, "is_nullish", JPure))
+    "float_lit" -> Some(#(JsVal, "float_from_bits", JPure))
+    "empty_list" -> Some(#(JsVal, "empty_list", JPure))
+    "list_append_one" -> Some(#(JsVal, "list_append_one", JPure))
+    "string_concat" -> Some(#(JsVal, "string_concat", JPure))
+    "to_numeric" -> Some(#(JsVal, "t_to_numeric", JMut))
+    "tdz_check" -> Some(#(JsVal, "t_tdz_check", JMutUnit))
+    // ── rt_js_inspect ──
+    "inspect" -> Some(#(JsInspect, "t_inspect", JMut))
+    // ── rt_js_obj (M4) ──
+    "new_object" -> Some(#(JsObj, "t_new_object_literal", JMut))
+    // Shape-learning literal path — `{a:v,b:w}` allocates SShapedObject
+    // directly so subsequent `.a` hits the shaped IC. JMut: cold path may
+    // mint new ShapeDesc entries on JsStore.shapes.
+    "new_object_shaped" -> Some(#(JsObjFfi, "t_new_object_shaped", JMut))
+    "new_array" -> Some(#(JsObj, "t_new_array", JMut))
+    "new_error" -> Some(#(JsObj, "t_new_error", JMut))
+    "fn_new" -> Some(#(JsCall, "t_new_function", JMut))
+    "make_constructor" -> Some(#(JsCall, "t_make_constructor", JMut))
+    "new_arguments" -> Some(#(JsObj, "t_new_arguments", JMut))
+    "get_prop" -> Some(#(JsObj, "t_get_prop_any", JMut))
+    "get_prop_own_data" -> Some(#(JsObjFfi, "t_get_prop_own_data", JRead))
+    // Direct pdict BIFs — the own-data-property fast path's inlined warm hit.
+    // JPure (no St): `call 'erlang':'get'/1` lowers to a `bif1`, saving the
+    // ~7ns/call `call_ext` dispatch that dominates the obj≤20000µs budget.
+    "pdict_get" -> Some(#(JsErlang, "get", JPure))
+    "pdict_put" -> Some(#(JsErlang, "put", JPure))
+    "erl_band" -> Some(#(JsErlang, "band", JPure))
+    "erl_bsr" -> Some(#(JsErlang, "bsr", JPure))
+    "erl_bsl" -> Some(#(JsErlang, "bsl", JPure))
+    // Runtime-index tuple ops for the inlined shaped-prop-IC warm hit —
+    // `element`/`setelement` are guard BIFs so the loader lowers them to
+    // `bif2`/`gc_bif3` (no `call_ext`).
+    "erl_element" -> Some(#(JsErlang, "element", JPure))
+    "erl_setelement" -> Some(#(JsErlang, "setelement", JPure))
+    "set_prop" -> Some(#(JsObj, "t_set_prop_any", JMut))
+    // JRead: the pdict-overlay hit path never rebuilds `St` (see the
+    // twocore_rt_js_obj_ffi header), so bare `ok`/`miss` and no rebind.
+    "set_prop_own_data" -> Some(#(JsObjFfi, "t_set_prop_own_data", JRead))
+    "set_prop_own_cold" -> Some(#(JsObjFfi, "t_set_prop_own_cold", JMut))
+    // Per-SITE shape inline cache (SPEC i-prop-ic). SiteKey pdict caches
+    // {ShapeId, Off1} (1-based); warm hit = one shape-compare +
+    // element(Off1, Slots). Both JRead — writes land in the pdict overlay.
+    // `miss` on cold / non-shaped / shape-mismatch → emitter falls back.
+    "ic_get" -> Some(#(JsObjFfi, "t_ic_get", JRead))
+    // perf8 raytrace: proto-chain data-get after ic_get own-miss. JRead —
+    // walks Store.data (never mutates); emitter falls to get_prop on `miss`.
+    "ic_proto_get" -> Some(#(JsObjFfi, "t_ic_proto_get", JRead))
+    "ic_set" -> Some(#(JsObjFfi, "t_ic_set", JRead))
+    // JPure warm-only probes — no St, no cold install; the emitter falls
+    // to ic_get/ic_set (JRead) on `miss`. Keeps emitted IR to one bind_if.
+    "ic_warm_get" -> Some(#(JsObjFfi, "t_ic_warm_get", JPure))
+    "ic_warm_set" -> Some(#(JsObjFfi, "t_ic_warm_set", JPure))
+    // simple_this-only warm hit (perf5 richards-gate): C is the
+    // already-threaded `_this_c` overlay, so no get(Id). One call_ext
+    // vs the inline 4-bind_if ladder — trades ~10 BIFs + 1 l_join
+    // `apply` (~34ns) for ~20ns. Non-this reads keep the inline path.
+    "shaped_get" -> Some(#(JsObjFfi, "t_shaped_get", JPure))
+    "shaped_set" -> Some(#(JsObjFfi, "t_shaped_set", JPure))
+    // Indexed-element fast path (SPEC array-index-fast-path). JRead read /
+    // JMut write; both `miss` on any shape mismatch and the emitter falls
+    // back to `to_property_key` + `get_prop`/`set_prop`.
+    "get_elem_fast" -> Some(#(JsObjFfi, "t_get_elem_fast", JRead))
+    "set_elem_fast" -> Some(#(JsObjFfi, "t_set_elem_fast", JMutMiss))
+    // perf7_arr_pdict: `_p` pair — both JRead. Read AND write cold-install
+    // the `{tc_arr,Id}` overlay from Store (write-side install: crypto's
+    // bnpCopyTo/bnpDLShiftTo write fresh arrays never element-read first).
+    // Write returns bare `0 | miss`; sc unchanged (overlay is pdict, not St).
+    "get_elem_fast_p" -> Some(#(JsObjFfi, "t_get_elem_fast_p", JRead))
+    "set_elem_fast_p" -> Some(#(JsObjFfi, "t_set_elem_fast_p", JRead))
+    // perf8_arr_c_hoist: pre-loop `get({tc_arr,Id})` snapshot + `_c` read
+    // via that snapshot. `arr_c_load` is JPure (bare pdict get); `_c` read
+    // is JRead (its miss arm tail-calls `_p` which needs St for cold install).
+    "arr_c_load" -> Some(#(JsObjFfi, "t_arr_c_load", JPure))
+    "get_elem_fast_c" -> Some(#(JsObjFfi, "t_get_elem_fast_c", JRead))
+    "define_prop" -> Some(#(JsObj, "t_create_data_prop", JMut))
+    "has_prop" -> Some(#(JsObj, "t_has_prop", JMut))
+    "delete_prop" -> Some(#(JsObj, "t_delete_prop", JMut))
+    "own_keys" -> Some(#(JsObj, "t_own_keys", JMut))
+    "copy_data_props" -> Some(#(JsObj, "t_copy_data_props", JMut))
+    "get_iterator" -> Some(#(JsObj, "t_get_iterator", JMut))
+    "iter_next" -> Some(#(JsObj, "t_iter_next", JMut))
+    "iter_close" -> Some(#(JsObj, "t_iter_close", JMutUnit))
+    "for_in_keys" -> Some(#(JsObj, "t_for_in_keys", JMut))
+    "spread_into_list" -> Some(#(JsObj, "t_spread_into_list", JMut))
+    "global_get" -> Some(#(JsObj, "t_global_get", JMut))
+    "global_get_fast" -> Some(#(JsObjFfi, "t_global_get_fast", JRead))
+    "global_handle" -> Some(#(JsObjFfi, "t_global_handle", JRead))
+    "global_set" -> Some(#(JsObj, "t_global_set", JMutUnit))
+    "global_typeof" -> Some(#(JsObj, "t_global_typeof", JMut))
+    "global_delete" -> Some(#(JsObj, "t_global_delete", JMut))
+    "module_get" -> Some(#(JsObj, "t_module_get", JMut))
+    "module_set" -> Some(#(JsObj, "t_module_set", JMutUnit))
+    "set_proto" -> Some(#(JsObj, "t_set_proto", JMut))
+    "array_from_list" -> Some(#(JsObj, "t_array_from_list", JMut))
+    "iter_rest" -> Some(#(JsObj, "t_iter_rest", JMut))
+    "regexp_new" -> Some(#(JsObj, "t_regexp_new", JMut))
+    "get_template_object" -> Some(#(JsObj, "t_get_template_object", JMut))
+    "dispose_resources" -> Some(#(JsObj, "t_dispose_resources", JMutUnit))
+    // ── rt_js_ops (M5) — R8: strict_eq/strict_ne are JPure ──
+    "add" -> Some(#(JsOps, "t_add", JMut))
+    "sub" -> Some(#(JsOps, "t_sub", JMut))
+    "mul" -> Some(#(JsOps, "t_mul", JMut))
+    "div" -> Some(#(JsOps, "t_div", JMut))
+    "mod" -> Some(#(JsOps, "t_mod", JMut))
+    "pow" -> Some(#(JsOps, "t_pow", JMut))
+    "neg" -> Some(#(JsOps, "t_neg", JMut))
+    "plus" -> Some(#(JsOps, "t_plus", JMut))
+    "bitnot" -> Some(#(JsOps, "t_bitnot", JMut))
+    "bitand" -> Some(#(JsOps, "t_bitand", JMut))
+    "bitor" -> Some(#(JsOps, "t_bitor", JMut))
+    "bitxor" -> Some(#(JsOps, "t_bitxor", JMut))
+    "shl" -> Some(#(JsOps, "t_shl", JMut))
+    "shr" -> Some(#(JsOps, "t_shr", JMut))
+    "ushr" -> Some(#(JsOps, "t_ushr", JMut))
+    "lt" -> Some(#(JsOps, "t_lt", JMut))
+    "le" -> Some(#(JsOps, "t_le", JMut))
+    "gt" -> Some(#(JsOps, "t_gt", JMut))
+    "ge" -> Some(#(JsOps, "t_ge", JMut))
+    "eq" -> Some(#(JsOps, "t_eq", JMut))
+    "eq_fast" -> Some(#(JsOpsFfi, "t_eq_fast", JPure))
+    "nul_eq" -> Some(#(JsOpsFfi, "nul_eq", JPure))
+    "bitand_fast" -> Some(#(JsOpsFfi, "t_bitand_fast", JPure))
+    "bitor_fast" -> Some(#(JsOpsFfi, "t_bitor_fast", JPure))
+    "bitxor_fast" -> Some(#(JsOpsFfi, "t_bitxor_fast", JPure))
+    "shl_fast" -> Some(#(JsOpsFfi, "t_shl_fast", JPure))
+    "shr_fast" -> Some(#(JsOpsFfi, "t_shr_fast", JPure))
+    "ushr_fast" -> Some(#(JsOpsFfi, "t_ushr_fast", JPure))
+    "bitnot_fast" -> Some(#(JsOpsFfi, "t_bitnot_fast", JPure))
+    "strict_eq" -> Some(#(JsOps, "strict_eq", JPure))
+    "strict_ne" -> Some(#(JsOps, "strict_ne", JPure))
+    "op_in" -> Some(#(JsOps, "t_in", JMut))
+    "instance_of" -> Some(#(JsOps, "t_instance_of", JMut))
+    "instanceof_fast" -> Some(#(JsObjFfi, "t_instanceof_fast", JRead))
+    // ── rt_js_call (M-CALL) ──
+    "call" -> Some(#(JsCall, "t_call_checked", JMut))
+    "call_method_mono" -> Some(#(JsCallFfi, "t_call_method_mono", JMut))
+    "call_method_ic" -> Some(#(JsCallFfi, "t_call_method_ic", JMut))
+    // JPure warm-only method-IC probe (SPEC S ffi-method-ic-hit): pdict-only
+    // shaped-receiver + SiteKey mono/poly hit → `{hit,Code,FnH,SimpleT}`;
+    // `miss` atom otherwise and the emitter falls to `call_method_ic`.
+    "method_ic_warm" -> Some(#(JsCallFfi, "t_method_ic_warm", JPure))
+    "construct" -> Some(#(JsCall, "t_construct", JMut))
+    "new_simple" -> Some(#(JsCallFfi, "t_new_simple", JMut))
+    // perf8 raytrace lever (b): per-SITE ctor-inline IC — skips the
+    // Class.create `this.initialize.apply(this,arguments)` ctor body on
+    // warm hit and dispatches straight to the cached `initialize`.
+    "new_simple_ic" -> Some(#(JsCallFfi, "t_new_simple_ic", JMut))
+    "kfn_code" -> Some(#(JsCall, "t_kfn_code", JRead))
+    "resolve_this" -> Some(#(JsCall, "t_resolve_this", JRead))
+    // ── rt_js_class (M7) — R9: private_in / fn_home_object / is_constructor are JRead ──
+    "new_private_name" -> Some(#(JsClass, "t_new_private_name", JMut))
+    "class_create" -> Some(#(JsClass, "t_class_create", JMut))
+    "define_method" -> Some(#(JsClass, "t_define_method", JMutUnit))
+    "set_fields_init" -> Some(#(JsClass, "t_set_fields_init", JMutUnit))
+    "private_get" -> Some(#(JsClass, "t_private_get", JMut))
+    "private_set" -> Some(#(JsClass, "t_private_set", JMut))
+    "private_define" -> Some(#(JsClass, "t_private_define", JMut))
+    "private_has" -> Some(#(JsClass, "t_private_has", JMut))
+    "private_in" -> Some(#(JsClass, "t_private_in", JRead))
+    "fn_home_object" -> Some(#(JsClass, "t_fn_home_object", JRead))
+    "is_constructor" -> Some(#(JsClass, "t_is_constructor", JRead))
+    "super_get" -> Some(#(JsClass, "t_super_get", JMut))
+    "super_set" -> Some(#(JsClass, "t_super_set", JMut))
+    "super_call" -> Some(#(JsClass, "t_super_call", JMut))
+    "make_method" -> Some(#(JsClass, "t_make_method", JMutUnit))
+    // ── rt_js_async (M8) ──
+    "async_start" -> Some(#(JsAsync, "t_async_start", JMut))
+    "gen_start" -> Some(#(JsAsync, "t_gen_start", JMut))
+    "asyncgen_start" -> Some(#(JsAsync, "t_asyncgen_start", JMut))
+    "async_iter_next" -> Some(#(JsAsync, "t_async_iter_next", JMut))
+    "await" -> Some(#(JsAsync, "t_await", JMutUnit))
+    "yield" -> Some(#(JsAsync, "t_yield", JMut))
+    "yield_star" -> Some(#(JsAsync, "t_yield_star", JMut))
+    "dynamic_import" -> Some(#(JsAsync, "t_dynamic_import", JMut))
+    "drain_microtasks" -> Some(#(JsAsync, "t_drain_microtasks", JMutUnit))
+    // ── rt_js_builtins (M6) ──
+    "init_realm" -> Some(#(JsBuiltins, "init_realm", JMutUnit))
+    // ── rt_js_math_ffi — Math.* direct dispatch (JPure, JsVal→JsVal|miss) ──
+    "math_sqrt" -> Some(#(JsMathFfi, "t_math_sqrt", JPure))
+    "math_floor" -> Some(#(JsMathFfi, "t_math_floor", JPure))
+    "math_abs" -> Some(#(JsMathFfi, "t_math_abs", JPure))
+    "math_pow" -> Some(#(JsMathFfi, "t_math_pow", JPure))
+    "math_min" -> Some(#(JsMathFfi, "t_math_min", JPure))
+    "math_max" -> Some(#(JsMathFfi, "t_math_max", JPure))
+    _ -> None
+  }
+}
+
+/// The Phase-8 LEGACY `js_profile: False` op map (byte-identical to before M9). A LITERAL
 /// `case` in THIS module (D3a): the only input is the static `op` string and the result is one
 /// of a CLOSED set of compile-time-fixed function atoms — the target is NEVER constructed from
 /// program/runtime data, so no `op` value can reach an arbitrary `Mod:Fn`. Each op returns
@@ -4147,11 +4911,7 @@ const js_capability: String = "js"
 /// `divide`/`modulo` because `div` is an Erlang reserved word (the op spelling the frontend
 /// emits is unchanged). `Some(fn_name)` for a known op, `None` (fail-closed → `UnknownJsOp`)
 /// otherwise.
-///
-/// Extending the boundary with a new `rt_js` op is exactly: (1) add one literal arm here, (2)
-/// implement the function in `runtime/rt_js.gleam`, (3) admit it in `ir_lower` (the `"js"`
-/// capability is already admitted wholesale, so no `ir_lower` change is needed per-op).
-fn resolve_js(op: String) -> Option(String) {
+fn resolve_js_legacy(op: String) -> Option(String) {
   case op {
     // arithmetic (sentinel-aware IEEE; see rt_js / twocore_rt_js_ffi)
     "add" -> Some("add")
@@ -5399,13 +6159,62 @@ fn emit_if(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  use #(maybe_def, jcont, state2) <- result.try(materialize(
-    cont,
-    list.length(result),
-    sc,
-    state,
-    ctx,
-  ))
+  // perf5 richards-gate: when one arm is a bottom transfer (Break/Continue/
+  // Return/Trap/Throw/Unreachable), `cont` is reachable from ONE arm only —
+  // materialising it as a letrec join costs one `apply` (~4ns) per If in the
+  // guard chain. arc's `anf.share` emits `If(g, hit, Break(l_miss))` at every
+  // level of a shaped-prop/method-IC hit ladder (4-8 deep, ×~200k `this.x`/run
+  // in richards); passing `cont` straight through drops ~500k applies/run.
+  // Duplication is safe: the diverging arm ignores `cont` (its `emit` never
+  // reaches `apply_cont`), so `cont`'s body is emitted once regardless.
+  let then_div = is_diverging(then_branch)
+  let else_div = is_diverging(else_branch)
+  let arity = list.length(result)
+  let cont_s = strip_identity_binds(cont)
+  // The non-diverging arm inherits `cont` as its own tail cont. If that arm's
+  // spine ends in a construct with a DIFFERENT result-arity (Loop/Block/If),
+  // its own materialize will re-check `cont` against that arity — a KBind cont
+  // then trips ArityMismatch. Only inline when the surviving arm's spine-tail
+  // arity matches (mirrors emit_block's `spine_tail_arity_ok` gate).
+  let arm_ok = fn(div: Bool, arm: Expr) {
+    div || spine_tail_arity_ok(arm, arity)
+  }
+  use #(maybe_def, jcont, state2) <- result.try(case
+    ctx.binding.js_profile && then_div && else_div
+  {
+    // Both diverge → cont is dead; pass anything (never reached).
+    True -> Ok(#(None, KReturn, state))
+    False ->
+      case
+        ctx.binding.js_profile
+        && { then_div || else_div }
+        && cont_arity_ok(cont_s, arity)
+        && arm_ok(then_div, then_branch)
+        && arm_ok(else_div, else_branch)
+      {
+        // Exactly one arm diverges → cont reached ONCE (from the other arm);
+        // its body is emitted once regardless of size, so no letrec.
+        True -> Ok(#(None, cont_s, state))
+        False ->
+          // perf6 let-case: NEITHER arm diverges, `cont` is a KBind that
+          // would materialize as a letrec, and both arms are value-terminal
+          // (no Break/Continue/Return to any outer label) → arms emit under
+          // KValues to a `<st,v..>` case-leaf and `cont` runs ONCE after a
+          // multi-value `let`. Drops the anf.bind_if / stmt.emit_if letrec-
+          // join (arc richards: the ~245k applies/run emit_block's let-case
+          // leaves behind).
+          case
+            perf6_block_let_case
+            && ctx.binding.js_profile
+            && block_can_let_case(cont, arity)
+            && all_breaks_local(then_branch, "", [], [])
+            && all_breaks_local(else_branch, "", [], [])
+          {
+            True -> Ok(#(None, KValues, state))
+            False -> materialize(cont, arity, sc, state, ctx)
+          }
+      }
+  })
   use #(then_c, state3) <- result.try(emit(then_branch, jcont, sc, state2, ctx))
   use #(else_c, state4) <- result.try(emit(else_branch, jcont, sc, state3, ctx))
   let #(wild, state5) = fresh_var(state4)
@@ -5414,7 +6223,109 @@ fn emit_if(
       CClause([PInt(0)], CAtom("true"), else_c),
       CClause([PVar(wild)], CAtom("true"), then_c),
     ])
-  Ok(#(wrap_join(maybe_def, case_expr), state5))
+  // perf6 let-case tail: KValues chosen HERE (block_can_let_case ⇒ cont was a
+  // KBind, not an inherited KValues from an outer let-case) → wrap; else the
+  // arms already flow to jcont directly. `emit_if` never opens a float scope
+  // (multi=False, defs=[]): its arms are arbitrary Builds so a floated cont's
+  // free vars may sit inside the arm — the tuple-destructure path is safe and
+  // richards' hot pattern is anf.share (Block), not bind_if.
+  case jcont == KValues && block_can_let_case(cont, arity) {
+    True -> emit_let_case_wrap(case_expr, arity, [], False, cont, sc, state5, ctx)
+    False -> Ok(#(wrap_join(maybe_def, case_expr), state5))
+  }
+}
+
+/// perf6 let-case tail: bind `body_c` (a KValues-terminal case expression)
+/// and dispose through `cont`. `multi=False` → `body_c`'s leaves are a
+/// `{st',r..}` tuple (or bare under NoState arity=1); destructure via a
+/// one-clause `case`. `multi=True` (perf6 letrec-floating) → `body_c`'s
+/// leaves are a `<st',r..>` values-list; bind DIRECTLY with a multi-value
+/// `let` (zero heap alloc on the hit path) and hoist the collected `defs`
+/// above it — Core `letrec…in E` is single-value, so the hoist is what
+/// makes the values-list legal.
+fn emit_let_case_wrap(
+  body_c: CExpr,
+  arity: Int,
+  defs: List(FunDef),
+  multi: Bool,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(names, state2) = fresh_n_vars(state, arity)
+  let #(tup_names, state3, sc_out) = case sc {
+    NoState -> #(names, state2, sc)
+    Threading(_) -> {
+      let #(st_out, s) = fresh_var(state2)
+      #([st_out, ..names], s, Threading(st_out))
+    }
+  }
+  use #(cont_c, state4) <- result.try(apply_cont(
+    cont,
+    list.map(names, CVar),
+    sc_out,
+    state3,
+    ctx,
+  ))
+  case multi {
+    True -> {
+      // Multi-value `let <st,r..> = body_c in cont_c`. `defs` (the l_miss
+      // conts floated by `materialize_if`) wrap ABOVE — their fun bodies'
+      // free vars are ⊂ scope-at-Block(l_join)-entry (float_safe_body's
+      // structural guarantee), all in scope here. NoState arity=1 leaves are
+      // bare (apply_cont), so `[single]` still binds one name.
+      let inner = CLet(tup_names, body_c, cont_c)
+      case defs {
+        [] -> Ok(#(inner, state4))
+        _ -> Ok(#(CLetrec(defs, inner), state4))
+      }
+    }
+    False ->
+      // Bare value only under NoState arity=1 (matches apply_cont KValues).
+      // Under Threading the leaf ALWAYS built a tuple (even arity=0 →
+      // `{st}`), so always destructure — a `[single]` fast-path here would
+      // bind the 1-tuple as `st`. The intermediate `let <t> = body_c in
+      // case t of {…}` (vs `case body_c of {…}`) is measured FASTER —
+      // nesting the big body case as a discriminee regressed
+      // crypto/raytrace ~25%.
+      case sc, tup_names {
+        NoState, [single] -> Ok(#(CLet([single], body_c, cont_c), state4))
+        _, _ -> {
+          let #(t, state5) = fresh_var(state4)
+          let clause =
+            CClause([PTuple(list.map(tup_names, PVar))], CAtom("true"), cont_c)
+          Ok(#(CLet([t], body_c, CCase(CVar(t), [clause])), state5))
+        }
+      }
+  }
+}
+
+/// True iff `e` is a direct bottom transfer — its lowering never falls
+/// through to `cont`. Walks the Let-spine: arc's `stmt.emit_return(Some(x))`
+/// yields `Let([v], <eval x>, Return([v]))`, so a `stmt.emit_if` THEN-arm
+/// `if(c) return f()` must count as diverging (richards: ~3.3k join applies).
+fn is_diverging(e: Expr) -> Bool {
+  case e {
+    Break(..)
+    | Continue(..)
+    | Return(..)
+    | Trap(..)
+    | ir.Throw(..)
+    | ir.ThrowRef(..)
+    | ir.ReturnCall(..)
+    | ir.ReturnCallIndirect(..)
+    | ir.ReturnCallRef(..)
+    | ir.ReturnCallImport(..) -> True
+    // Let-spine: `body` diverges ⇒ cont never reached (rhs either completes
+    // → body runs, or rhs itself transfers — neither path applies cont).
+    Let(_, _, body) ->
+      case perf8_is_diverging_let {
+        True -> is_diverging(body)
+        False -> False
+      }
+    _ -> False
+  }
 }
 
 /// Lower `Switch` to a `case` on the integer selector: one `<match>` clause per arm and a
@@ -5480,18 +6391,230 @@ fn emit_block(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  use #(maybe_def, exit_cont, state2) <- result.try(materialize(
-    cont,
-    list.length(result),
-    sc,
-    state,
-    ctx,
-  ))
-  let state3 = push_label(state2, LabelEntry(label, exit_cont, None))
-  use #(body_c, state4) <- result.try(emit(body, exit_cont, sc, state3, ctx))
-  let state5 = restore_labels(state4, state2.labels)
-  Ok(#(wrap_join(maybe_def, body_c), state5))
+  let arity = list.length(result)
+  // perf6 richards-gate: LET-CASE lowering. When every non-local exit in
+  // `body` is a `Break` to THIS label (or to a label defined INSIDE body),
+  // the block is lowered as `let <r..> = <body-as-value-expr> in <cont(r)>`
+  // with `Break(label,vs)` → bare `<vs>` — a Core `case` clause value, NOT a
+  // letrec `apply`. Eliminates the l_join letrec-apply per anf.share hit
+  // (arc richards: ~435k applies/run × ~4ns ≈ 1,740µs). The l_miss inner
+  // Block still materializes (its body_tree Breaks to l_join = an outer
+  // label from l_miss's view), but its letrec now RETURNS a value into the
+  // enclosing let-case instead of tail-applying l_join — hit path pays ZERO
+  // applies. `Return`/outer-`Break` inside body would leak into the let-bind
+  // (wrong semantics), so `all_breaks_local` gates on their absence.
+  case
+    perf6_block_let_case
+    && ctx.binding.js_profile
+    && block_can_let_case(cont, arity)
+    && all_breaks_local(body, label, [], kvalues_labels(state.labels))
+  {
+    True -> {
+      // perf6 letrec-floating: open a multi-value scope so `KValues` leaves
+      // emit `<st,v..>` (zero heap alloc) and inner l_miss letrecs float to
+      // `defs` for hoisting above the multi-value `let`. Gated on
+      // `float_safe_body`: the anf.share head-shape guarantees the ONE
+      // materialised cont's free vars are all in scope at the hoist point
+      // (its body is the l_join body's own tail; no CLet sits between the
+      // scope open and the materialize). Not opened when already inside a
+      // multi-value scope — anf.share never nests in its own body, and a
+      // nested open would need transitive floating (free-var unsafe).
+      let outer_float = state.float
+      let open_float =
+        perf6_letrec_float
+        && outer_float == None
+        && float_safe_body(body)
+      let state2 = case open_float {
+        True -> EmitState(..state, float: Some(#(arity, [])))
+        False -> state
+      }
+      let state3 = push_label(state2, LabelEntry(label, KValues, None))
+      use #(body_c, state4) <- result.try(emit(body, KValues, sc, state3, ctx))
+      let state5 = restore_labels(state4, state.labels)
+      let #(defs, state6) = case open_float, state5.float {
+        True, Some(#(_, ds)) ->
+          #(list.reverse(ds), EmitState(..state5, float: outer_float))
+        _, _ -> #([], state5)
+      }
+      emit_let_case_wrap(body_c, arity, defs, open_float, cont, sc, state6, ctx)
+    }
+    False -> {
+      use #(maybe_def, exit_cont, state2) <- result.try(materialize(
+        cont,
+        arity,
+        sc,
+        state,
+        ctx,
+      ))
+      let state3 = push_label(state2, LabelEntry(label, exit_cont, None))
+      use #(body_c, state4) <- result.try(emit(body, exit_cont, sc, state3, ctx))
+      let state5 = restore_labels(state4, state2.labels)
+      Ok(#(wrap_join(maybe_def, body_c), state5))
+    }
+  }
 }
+
+/// perf6 richards-gate: `emit_block` let-case lowering (see `emit_block` doc).
+/// True → `Block` with a `KBind` cont and no outer-label exits lowers to
+/// `let <r> = <case…> in cont` (0 letrec-applies on the hit path). False →
+/// perf5 letrec-join lowering. Flip to False + rerun v8v7_probe to bisect.
+pub const perf6_block_let_case = True
+
+/// perf6 richards-gate: letrec-floating over `perf6_block_let_case`. True →
+/// an anf.share-shaped `Block` let-case emits `<st,v>` values-list leaves
+/// bound by a multi-value `let` (zero heap alloc on hit) with the l_miss cont
+/// letrec hoisted above; False → the `{st,v}` tuple + destructure lowering
+/// (which on richards' ~200k dense per-`.x` joins costs ≈ the letrec-apply it
+/// replaced). Flip to False + rerun v8v7_probe to bisect.
+pub const perf6_letrec_float = True
+
+/// perf7 richards-gate: nested let-case. True → `all_breaks_local` treats a
+/// `Break(l)` to an OUTER label whose stacked `break_cont` is `KValues` as
+/// local, so anf.share's inner `l_miss` Block would let-case instead of
+/// materialising as a letrec. OFF: let-casing l_miss emits `let <d> = body
+/// in cold`, but body's hit-leaves `Break(l_join,_)` are IR jumps that
+/// BYPASS cold — the wrap runs cold on every hit (wrong value flow) and,
+/// under an inherited float scope, mismatches leaf arity → v8v7_bisect Core
+/// `unbound variable`. w2 (inline-cold) / x (CallDirect) are the sound
+/// l_miss levers; the transparent-labels param is wired for those.
+pub const perf7_nested_let_case = False
+
+/// perf8 deltablue-drift gate: `is_diverging` walks the Let-spine so
+/// `Let([v], <eval x>, Return([v]))` (arc's `stmt.emit_return(Some(x))`
+/// shape — every `if(c) return f()`) counts as diverging → emit_if's
+/// one-arm-diverges path inlines cont into the surviving arm instead of
+/// let-case/materialize. Ungated in a7ebc74..f289f0c; measured deltablue
+/// +~2,000µs / richards −~275µs (v8v7_probe perf8 drift bisect) — the
+/// primary ~1,800µs ungated-drift regressor from :203-207. False → perf6's
+/// single-constructor check (Let → False). Flip + rerun v8v7_probe to trade.
+pub const perf8_is_diverging_let = True
+
+/// perf8 richards-gate: relax `all_breaks_local`'s `Return` veto. True → an
+/// arm-nested `ir.Return` counts as a diverging leaf, so `emit_if` let-case
+/// fires for richards' `if(…){…return…}…` shapes (Worker/Handler/Device.run,
+/// ~4,627 applies/run — richards_local.gleam:19-23). OFF: Return under a
+/// KValues let-case wrap emits the fn-return `{Pkg,St}` package where the
+/// wrap destructures `{St,V}` — flip + rerun v8v7_bisect to verify soundness.
+pub const perf8_return_diverges = False
+
+/// True iff `body` is anf.share's `Let([_], Block(l_miss, _, _), cold)` head-
+/// shape — the ONE materialised cont's body is `cold` (this Let's own tail),
+/// so its free vars are ⊂ scope-at-Block(l_join)-entry and hoisting the def
+/// above the multi-value `let` is scope-safe. arc's other Block emitters
+/// (stmt loops/switch/labeled) either fail `all_breaks_local` or wrap a Loop,
+/// so this gate covers the anf.share hot path without a general free-var walk.
+fn float_safe_body(body: Expr) -> Bool {
+  case body {
+    Let(_, Block(_, _, _), _) -> True
+    _ -> False
+  }
+}
+
+/// Let-case is worthwhile only when `cont` would otherwise materialize as a
+/// letrec: a `KBind` of matching arity. Trivial conts (`KReturn`/`KJump`/
+/// `KValues`) already emit no join — the plain path is equivalent and skips
+/// the `all_breaks_local` walk.
+fn block_can_let_case(cont: Cont, arity: Int) -> Bool {
+  case strip_identity_binds(cont) {
+    KBind(names, _, _) -> list.length(names) == arity
+    _ -> False
+  }
+}
+
+/// perf7: labels currently on the stack whose `break_cont` is `KValues` — an
+/// enclosing let-case is already open, so a `Break` to such a label lowers to
+/// a `<st,vs>` values-leaf (a valid case-clause value, not a let-leaking
+/// transfer). Empty when the flag is off → perf6 gate behaviour.
+fn kvalues_labels(labels: List(LabelEntry)) -> List(String) {
+  case perf7_nested_let_case {
+    False -> []
+    True ->
+      list.filter_map(labels, fn(e) {
+        case e.break_cont {
+          KValues -> Ok(e.label)
+          _ -> Error(Nil)
+        }
+      })
+  }
+}
+
+/// True iff every `Break`/`Continue` in `body` targets `this_label`, a label
+/// introduced INSIDE `body` (Block/Loop), or a `transparent` outer label
+/// (perf7: outer let-case's `KValues` label — Break lowers to a values-leaf),
+/// and `body` contains no `Return` / tail-transfer that would leak past a
+/// `let`-bind. Throws (Trap/Throw/…) are fine — they raise, so the enclosing
+/// `let`'s in-clause is not reached.
+fn all_breaks_local(
+  body: Expr,
+  this_label: String,
+  inner: List(String),
+  transparent: List(String),
+) -> Bool {
+  let go = all_breaks_local(_, this_label, inner, transparent)
+  case body {
+    Break(l, _) ->
+      l == this_label
+      || list.contains(inner, l)
+      || list.contains(transparent, l)
+    Continue(l, _) -> list.contains(inner, l)
+    // `Return` yields the fn-return package as a leaf VALUE — under let-case
+    // that would bind into `<r>` instead of exiting the function. Bail unless
+    // perf8_return_diverges (richards_local (c): Return never applies cont).
+    Return(_)
+    | ir.ReturnCall(..)
+    | ir.ReturnCallIndirect(..)
+    | ir.ReturnCallRef(..)
+    | ir.ReturnCallImport(..) -> perf8_return_diverges
+    Let(_, rhs, tail) -> go(rhs) && go(tail)
+    If(_, _, t, f) -> go(t) && go(f)
+    Block(l, _, b) ->
+      all_breaks_local(b, this_label, [l, ..inner], transparent)
+    // A Loop's `Break(this_label,…)` leaf sits INSIDE the loop letrec fun —
+    // the KValues tuple would become the fun's return value, then flow
+    // through `apply loop_fn(…)`. Sound in principle, but arc's while/for
+    // Block(brk,[carried..],Loop(head,_,[],body)) already threads its own
+    // carried-slot join and gains nothing from a second let-case wrapper;
+    // the anf.share/bind_block hot pattern (the ~435k applies/run this
+    // targets) never contains a Loop. Bail — keep the perf5 letrec-join.
+    Loop(..) -> False
+    Switch(_, _, arms, d) ->
+      go(d) && list.all(arms, fn(a: SwitchArm) { go(a.body) })
+    ir.Try(_, b, hs) ->
+      go(b) && list.all(hs, fn(h: ir.CatchHandler) { go(h.handler) })
+    ir.Charge(_, b) -> go(b)
+    // Leaf ops (Values/CallHost/TermOp/Trap/Throw/…): no label reference.
+    _ -> True
+  }
+}
+
+/// Spine-tail construct's result-arity matches `arity` (or the tail is a leaf
+/// that produces `arity` values / diverges). Walks Let-spine only — a nested
+/// If/Block/Loop/Switch at any Let-RHS position is NOT the fall-through tail.
+fn spine_tail_arity_ok(e: Expr, arity: Int) -> Bool {
+  case e {
+    Let(_, _, tail) -> spine_tail_arity_ok(tail, arity)
+    Loop(_, _, r, _) | If(_, r, _, _) | Block(_, r, _) | Switch(_, r, _, _) ->
+      list.length(r) == arity
+    Values(vs) -> list.length(vs) == arity
+    // Diverging tails never reach exit_cont via fall-through.
+    Break(..)
+    | Continue(..)
+    | Return(..)
+    | Trap(..)
+    | ir.Throw(..)
+    | ir.ThrowRef(..) -> True
+    _ -> False
+  }
+}
+
+/// KBind arity matches, or cont is arity-agnostic (KReturn/KJump).
+fn cont_arity_ok(cont: Cont, arity: Int) -> Bool {
+  case cont {
+    KBind(names, _, _) -> list.length(names) == arity
+    _ -> True
+  }
+}
+
 
 /// Lower `Loop` to the verified §5 template: `letrec 'L'/arity = fun(params…) -> <body>`
 /// applied to the loop-param inits. `Continue(label, vs)` becomes a tail `apply 'L'(vs)`
@@ -5515,13 +6638,21 @@ fn emit_loop(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let arity = list.length(params)
-  use #(maybe_def, exit_cont, state2) <- result.try(materialize(
-    cont,
-    list.length(result),
-    sc,
-    state,
-    ctx,
-  ))
+  let r_arity = list.length(result)
+  // arc's `while`/`for` shape is `Block(brk,[T..],Loop(head,_,[], body))` —
+  // Loop result=[] and body ALWAYS `Continue`s or `Break`s(brk); it never
+  // falls through to Loop's own exit_cont. When cont is a raw KBind (from
+  // materialize's small-cont-inline in the enclosing Block) with the outer
+  // arity, materializing it here at Loop's arity=0 mismatches. Gate: only
+  // materialize when arities line up; otherwise the fall-through cont is
+  // dead — supply a KJump to a fresh 0-arity trap so a genuine fall-through
+  // (which would be an IR bug) is loud, not silent.
+  use #(maybe_def, exit_cont, state2) <- result.try(case
+    cont_arity_ok(strip_identity_binds(cont), r_arity)
+  {
+    True -> materialize(cont, r_arity, sc, state, ctx)
+    False -> Ok(#(None, KReturn, state))
+  })
   let #(lname, state3) = fresh_fn(state2)
   case sc {
     NoState -> {
@@ -5634,16 +6765,23 @@ fn emit_charge(
 /// dropped (exactly like `Trap`). Emits `call '<rt_exn>':'throw_exn'(<tag_index>, [args…])`, where
 /// `tag_index` is the tag's module-local `Int` identity (T4, resolved from `Module.tags`) and the
 /// payload is the operand value LIST — rendered, never interpreted (the `(f64,i32)` pair rides
-/// opaquely, «PORFFOR-ABI»). Cell-only (T6): no state travels in the term, so `sc` is irrelevant.
+/// opaquely, «PORFFOR-ABI»). Cell-only (T6) UNLESS `js_profile`: under `Threading(cur)` the live
+/// `St` is PREPENDED to the payload (`[St, ..args]`, R2: St FIRST) so the catch handler rebinds
+/// post-mutation state; the `js_profile: False` path is byte-identical to before (WASM unchanged).
 /// `Error(UnknownTag)` if the module declares no such tag.
 fn emit_throw(
   tag: String,
   args: List(Value),
+  sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use tag_id <- result.try(resolve_tag(ctx, tag))
-  let payload = core_list(list.map(args, emit_value))
+  let cargs = list.map(args, emit_value)
+  let payload = case sc, ctx.binding.js_profile {
+    Threading(cur), True -> core_list([CVar(cur), ..cargs])
+    _, _ -> core_list(cargs)
+  }
   Ok(#(seam_call(exn_module, "throw_exn", [CInt(tag_id), payload]), state))
 }
 
@@ -5666,8 +6804,8 @@ fn emit_throw_ref(
 /// value — §C.1). The `catch <C,R,S>` handler (`try_dispatch`) matches the thrown tag against
 /// `handlers` in order via the `rt_exn` helpers, transfers a matching handler (its result also
 /// disposing through `exit_cont` — so it yields the try's `result`), and re-raises a non-match
-/// (T7). Constant-space + the result arity are preserved. Cell-only (T6): the same `sc` flows to
-/// the handler (no state travels in the throw — Threaded+EH is a categorised-unsupported combo).
+/// (T7). Constant-space + the result arity are preserved. Cell-only (T6) unless `js_profile`:
+/// under `js_profile` the throw carries `St` and the handler re-threads from the caught `St'`.
 fn emit_try(
   result: List(ValType),
   body: Expr,
@@ -5775,40 +6913,83 @@ fn emit_catch_clause(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let ir.CatchHandler(on, payload, exnref, hexpr) = h
-  use #(hbody0, state1) <- result.try(emit(hexpr, exit_cont, sc, state, ctx))
   // Capture the caught exception as an opaque `exnref` handle if the handler binds one (T9).
-  let hbody = case exnref {
-    Some(name) ->
-      CLet(
-        [name],
-        seam_call(exn_module, "capture_exnref", [CVar(rvar)]),
-        hbody0,
-      )
-    None -> hbody0
+  let wrap_exnref = fn(hbody0) {
+    case exnref {
+      Some(name) ->
+        CLet(
+          [name],
+          seam_call(exn_module, "capture_exnref", [CVar(rvar)]),
+          hbody0,
+        )
+      None -> hbody0
+    }
   }
   case on {
     // `catch $t` — match the SAME module-local tag identity throw used (T4); the matched clause
     // binds the payload operands directly (`{ok, [P0,P1,…]}`), so throw/catch arities agree.
-    ir.OnTag(tag) -> {
-      use tag_id <- result.try(resolve_tag(ctx, tag))
-      let match = seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
-      let #(wild, state2) = fresh_var(state1)
-      Ok(#(
-        CCase(match, [
-          CClause(
-            [PTuple([PAtom("ok"), list_pattern(payload)])],
-            CAtom("true"),
-            hbody,
-          ),
-          CClause([PVar(wild)], CAtom("true"), next),
-        ]),
-        state2,
-      ))
-    }
+    // Under `js_profile` + `Threading` the throw prepended `St` (R2): bind `[St', ..payload]` and
+    // emit the handler under `Threading(St')` so post-throw mutations are visible (SPEC§9.11).
+    ir.OnTag(tag) ->
+      case ctx.binding.js_profile, sc {
+        True, Threading(_) -> {
+          let #(st_caught, state_a) = fresh_var(state)
+          use #(hbody0, state_b) <- result.try(emit(
+            hexpr,
+            exit_cont,
+            Threading(st_caught),
+            state_a,
+            ctx,
+          ))
+          let hbody = wrap_exnref(hbody0)
+          use tag_id <- result.try(resolve_tag(ctx, tag))
+          let match =
+            seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
+          let #(wild, state_c) = fresh_var(state_b)
+          Ok(#(
+            CCase(match, [
+              CClause(
+                [PTuple([PAtom("ok"), list_pattern([st_caught, ..payload])])],
+                CAtom("true"),
+                hbody,
+              ),
+              CClause([PVar(wild)], CAtom("true"), next),
+            ]),
+            state_c,
+          ))
+        }
+        _, _ -> {
+          use #(hbody0, state1) <- result.try(emit(
+            hexpr,
+            exit_cont,
+            sc,
+            state,
+            ctx,
+          ))
+          let hbody = wrap_exnref(hbody0)
+          use tag_id <- result.try(resolve_tag(ctx, tag))
+          let match =
+            seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
+          let #(wild, state2) = fresh_var(state1)
+          Ok(#(
+            CCase(match, [
+              CClause(
+                [PTuple([PAtom("ok"), list_pattern(payload)])],
+                CAtom("true"),
+                hbody,
+              ),
+              CClause([PVar(wild)], CAtom("true"), next),
+            ]),
+            state2,
+          ))
+        }
+      }
     // `catch_all` — catch ANY wasm exception but NOT a trap (T7): `is_wasm_exn` is `'false'` for a
     // `{wasm_trap,_}` / fuel raise, which falls to `next` (ultimately the re-raise), so a trap
     // propagates through the region untouched. No payload is bound.
     ir.OnAll -> {
+      use #(hbody0, state1) <- result.try(emit(hexpr, exit_cont, sc, state, ctx))
+      let hbody = wrap_exnref(hbody0)
       let is_exn = seam_call(exn_module, "is_wasm_exn", [CVar(rvar)])
       Ok(#(
         CCase(is_exn, [
@@ -6184,6 +7365,7 @@ fn emit_instantiate_full(
       vars: set.new(),
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
+      float: None,
     )
   let n_imports = count_import_slots(module)
   // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
@@ -6653,6 +7835,7 @@ fn emit_instantiate_cell(
       vars: set.new(),
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
+      float: None,
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   let seed_effect = seam_call(ctx.binding.state_module, "seed", [decl_term])
@@ -6707,6 +7890,7 @@ fn emit_instantiate_threaded(
       vars: set.new(),
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
+      float: None,
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   // (0) The unchanged metering/host seed discards.

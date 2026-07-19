@@ -85,6 +85,10 @@ import twocore/runtime/instance.{type Binding}
 import twocore/runtime/link
 import twocore/runtime/porffor_abi.{type PorfValue}
 import twocore/runtime/profiles
+import twocore/runtime/rt_js_builtins
+import twocore/runtime/rt_js_store
+import twocore/runtime/rt_js_types.{type HostHooks}
+import twocore/runtime/rt_state.{type InstanceState}
 import twocore/runtime/rt_teavm
 
 // ─────────────────────────────── composed error type (D4) ───────────────────────────────
@@ -727,6 +731,24 @@ pub fn chunks_to_beams(
   })
 }
 
+/// IR → in-memory `.beam` binary: composes `ir_to_cmod` → `cmod_to_beam`, discarding the
+/// intermediate lowered module. The one-call "compile an already-built `ir.Module`" seam for
+/// callers that produce IR directly (e.g. the JS emit_2core frontend, SPEC§19.8) rather than
+/// going through the `.wasm` → IR path.
+///
+/// - `m`: the IR module to compile; `m.name` rides on the emitted `CModule` and is the atom
+///   the `.beam` loads under.
+/// - `binding`: the build-time runtime binding (policy mode, optimizer level, chokepoints).
+/// - Return: `Ok(beam_bytes)` or the first failing stage's `Error(IrLowerFailed/EmitFailed/
+///   BuildFailed)`. Total — never panics.
+pub fn compile_ir(
+  m: ir.Module,
+  binding: Binding,
+) -> Result(BitArray, PipelineError) {
+  ir_to_cmod(m, binding)
+  |> result.try(cmod_to_beam)
+}
+
 /// Parse `.ir` text into an `ir.Module` (unit 02's parser). A convenience wrapper used by
 /// the CLI's `.ir`-consuming subcommands; the `ir.parser.ParseError` is NOT a pipeline
 /// stage error (it parses the inter-stage textual form), so it is surfaced as its own type.
@@ -1002,6 +1024,96 @@ fn start_provided_instance(
 /// generated `instantiate/1` byte-for-byte. Total.
 fn module_calls_import(m: ir.Module) -> Bool {
   list.any(m.functions, fn(f) { expr_calls_import(f.body) })
+}
+
+// ─────────────────────────────── JS run-ABI (SPEC §19.8) ───────────────────────────────
+
+/// The M20 differential-test observable for a compiled-JS run: what `console.*` printed
+/// (byte-exact, in emission order) and how the top-level completed. `stdout` is
+/// `rt_js_store.t_console_bytes(st')` — the deterministic in-store buffer, never real stdio.
+/// `result` is `Ok(v)` for a normal `js_main` return (v is the raw `Dynamic` completion value,
+/// typically JS `undefined`), or `Error(reason)` for a load failure, an uncaught JS throw
+/// (rendered via `string.inspect`), or a trap/engine crash. The harness compares `stdout`
+/// byte-for-byte across the interpreter and compiled paths.
+pub type DiffRun {
+  DiffRun(stdout: BitArray, result: Result(Dynamic, String))
+}
+
+/// The three outcomes of `apply_js_main` (wire terms from `twocore_rt_js_exec_ffi`).
+/// `JsReturned`/`JsThrew` carry the recovered `InstanceState` alongside; `JsCrashed`
+/// carries only the rendered reason (no recoverable state — the FFI returns the input st).
+type JsExecOutcome {
+  JsReturned(value: Dynamic)
+  JsThrew(exn: Dynamic)
+  JsCrashed(reason: String)
+}
+
+/// Apply the loaded module's `js_main(St, Frame, [])` under a `try…catch`, wrapping the
+/// outcome as `#(JsExecOutcome, st')`. See `src/twocore_rt_js_exec_ffi.erl`.
+@external(erlang, "twocore_rt_js_exec_ffi", "apply_js_main")
+fn ffi_apply_js_main(
+  module: Atom,
+  st: InstanceState,
+) -> #(JsExecOutcome, InstanceState)
+
+/// **Run a compiled JS module on the BEAM from a fresh threaded state** (SPEC §19.8 — the
+/// M20 harness's compiled-path driver). Builds the minimal empty `InstanceState`
+/// (`fresh_full` with no memories/tables/globals — a JS unit uses none), seeds it with a
+/// fresh `JsStore` (from `hooks`) + a full `Realm` (`init_realm`), then delegates to
+/// `run_js_beam_in`. Total — never panics; a load failure or crash surfaces in
+/// `DiffRun.result` as `Error`.
+///
+/// - `beam`: the compiled `.beam` binary (from `compile_ir` under `profiles.js_direct()`).
+/// - `mod`: the module's atom NAME (must match `ir.Module.name` baked into the `.core`).
+/// - `hooks`: the deterministic embedder capabilities (Date/Math.random/console sink).
+/// - Returns `#(st', DiffRun)` — `st'` is the final threaded state (for further inspection
+///   e.g. `rt_js_store.t_console_read`); `DiffRun` is the harness observable.
+pub fn run_js_beam(
+  beam: BitArray,
+  mod: String,
+  hooks: HostHooks,
+) -> #(InstanceState, DiffRun) {
+  let st =
+    rt_state.fresh_full(
+      rt_state.FullDecl(mems: [], globals: [], tables: [], ref_globals: []),
+    )
+  let st = rt_state.t_with_js_store(st, rt_js_store.t_store_new(hooks))
+  let #(_realm, st) = rt_js_builtins.init_realm(st)
+  run_js_beam_in(st, beam, mod)
+}
+
+/// **Run a compiled JS module on the BEAM in an already-seeded state** (SPEC §19.8). Loads
+/// `beam`, applies `js_main(st, {undefined,undefined,undefined,undefined}, [])` in the
+/// CALLING process under a protected apply, and packages the outcome as a `DiffRun`.
+/// `st` must already carry `js_store: Some(_)` and `js_realm: Some(_)` (the caller ran
+/// `t_store_new`/`init_realm`; `run_js_beam` does this). An uncaught JS throw is caught here
+/// (R2 `{wasm_exn,0,[St',E]}`) — its mutated `st'` is recovered so `stdout` includes lines
+/// printed before the throw. Total — never panics.
+///
+/// - `st`: the pre-seeded threaded instance state.
+/// - `beam`/`mod`: as `run_js_beam`.
+/// - Returns `#(st', DiffRun)`; on a load failure, `st' = st` and `stdout = <<>>`.
+pub fn run_js_beam_in(
+  st: InstanceState,
+  beam: BitArray,
+  mod: String,
+) -> #(InstanceState, DiffRun) {
+  case build_beam.load_module(atom.create(mod), "twocore_cli", beam) {
+    Error(reason) -> #(
+      st,
+      DiffRun(stdout: <<>>, result: Error("load failed: " <> reason)),
+    )
+    Ok(mod_atom) -> {
+      let #(outcome, st) = ffi_apply_js_main(mod_atom, st)
+      let stdout = rt_js_store.t_console_bytes(st)
+      let result = case outcome {
+        JsReturned(v) -> Ok(v)
+        JsThrew(e) -> Error("uncaught: " <> string.inspect(e))
+        JsCrashed(reason) -> Error(reason)
+      }
+      #(st, DiffRun(stdout:, result:))
+    }
+  }
 }
 
 /// `True` iff `expr` (recursively, through the control-flow containers holding sub-`Expr`s)

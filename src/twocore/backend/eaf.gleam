@@ -54,8 +54,8 @@ import gleam/result
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FunDef,
   CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase, CClause, CCons,
-  CFloat, CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar,
-  FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
+  CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import twocore/backend/core_printer
 
@@ -107,6 +107,12 @@ pub type EafError {
   BadTryShape(body_vars: Int, evars: Int)
   /// A module attribute whose value is not a literal term. `key` names it.
   UnsupportedAttribute(key: String)
+  /// A `CFunRef` naming a `letrec` def lowered to the multi-def DISPATCH shape.
+  /// That def is reachable only as `R(tag, [Args…])`, so no plain `'f'/N` fun
+  /// value with the ref's arity exists to hand out. `emit_core` only funrefs
+  /// top-level `jsf_K` functions, so this is unreachable — it is rejected
+  /// rather than mis-lowered to a callable with the wrong ABI.
+  DispatchFunRef(name: String, arity: Int)
 }
 
 /// A short human-readable rendering of an `EafError` for CLI/diagnostic text.
@@ -132,6 +138,11 @@ pub fn describe(error: EafError) -> String {
       <> " exception vars"
     UnsupportedAttribute(key) ->
       "attribute '" <> key <> "' has a non-literal value"
+    DispatchFunRef(name, arity) ->
+      "fun reference to dispatch-lowered '"
+      <> name
+      <> "'/"
+      <> int.to_string(arity)
   }
 }
 
@@ -253,6 +264,12 @@ fn e_fun(ln: Int, clauses: List(Form)) -> Form {
 
 fn e_named_fun(ln: Int, name: String, clauses: List(Form)) -> Form {
   raw(#(atom_of("named_fun"), ln, atom_of(name), clauses))
+}
+
+/// `{'fun', Anno, {function, Name, Arity}}` — a bare reference to a local
+/// top-level function as a VALUE (`fun 'f'/N`), not a call.
+fn e_fun_ref(ln: Int, name: String, arity: Int) -> Form {
+  raw(#(atom_of("fun"), ln, #(atom_of("function"), atom_of(name), arity)))
 }
 
 /// `{'try', Anno, Body, CaseClauses, CatchClauses, After=[]}`.
@@ -380,6 +397,17 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
         Error(_) -> Ok(#(e_call(ln, e_atom(ln, name), argfs), st1))
       }
     }
+    // A funref names an `FName` as a VALUE rather than calling it. Resolution
+    // mirrors `CApply`: a `letrec` def lowered to a named-fun variable IS the
+    // fun value, so hand out the variable; an `FName` absent from `env.funs` is
+    // a top-level module function, so emit `fun 'name'/Arity`. The dispatch
+    // lowering has no such value (see `DispatchFunRef`).
+    CFunRef(FName(name, arity)) ->
+      case dict.get(env.funs, #(name, arity)) {
+        Ok(DirectFun(v)) -> Ok(#(e_var(ln, v), st))
+        Ok(DispatchFun(_, _)) -> Error(DispatchFunRef(name, arity))
+        Error(_) -> Ok(#(e_fun_ref(ln, name, arity), st))
+      }
     CApplyExpr(op, args) -> {
       use #(opf, st1) <- result.try(tr_expr(op, env, st))
       use #(argfs, st2) <- result.try(tr_exprs(args, env, st1))

@@ -222,7 +222,7 @@ pub fn describe(
         [] ->
           case is_pure_value_tier(binding) {
             False -> Error(MutableTierUnsupported)
-            True -> Ok(build_iface(module))
+            True -> Ok(build_iface(module, binding))
           }
       }
   }
@@ -241,8 +241,8 @@ fn is_pure_value_tier(binding: instance.Binding) -> Bool {
 /// Assemble the `Iface` for an ACCEPTED (Threaded, import-free, pure-value-tier) module. Split
 /// from `describe/2` so the fail-closed gate reads top-to-bottom. Assumes every `ExportFn.fn_name`
 /// resolves (guaranteed by validate — the `let assert` documents the impossible state, R13).
-fn build_iface(module: ir.Module) -> Iface {
-  let reaching = emit_core.state_reaching_closure(module.functions)
+fn build_iface(module: ir.Module, binding: instance.Binding) -> Iface {
+  let reaching = emit_core.state_reaching_closure(module.functions, binding)
   // Collect one `#(export_name, function)` per `ExportFn`, in declaration order; skip exported
   // STATE (R13 — not a typed callable this phase).
   let fn_exports =

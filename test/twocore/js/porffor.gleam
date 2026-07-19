@@ -20,13 +20,19 @@ import gleam/list
 import gleam/string
 import twocore/conformance/ffi
 
-/// `True` iff a Porffor toolchain is reachable (`npx` on PATH). When `False`, the live
-/// differential (`js_differential_test`) skips gracefully and the baked `.expected` (Tier-A) still
-/// judges every program. Total.
+/// `True` iff a Porffor toolchain is reachable — `npx` on PATH AND `npx porffor --version`
+/// actually succeeds. `npx` alone is a weak probe: on a machine with npm but no porffor cached
+/// (or an npm registry it cannot auth to), `npx porffor` exits 1 with an `npm error` diagnostic,
+/// which the live differential would misread as "porffor threw uncaught". Probing here means the
+/// live differential (`js_differential_test`) skips gracefully whenever porffor cannot run for
+/// ANY reason, and the baked `.expected` (Tier-A) still judges every program. Total.
 pub fn available() -> Bool {
   case ffi.find_executable("npx") {
-    Ok(_) -> True
     Error(_) -> False
+    Ok(npx) -> {
+      let #(code, out) = ffi.run(npx, ["porffor", "--version"])
+      code == 0 && !string.contains(out, "npm error")
+    }
   }
 }
 
