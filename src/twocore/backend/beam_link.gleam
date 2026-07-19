@@ -18,6 +18,7 @@
 //// deterministic `from_core`, with a built-in fail-closed structural D3a check).
 
 import gleam/erlang/atom.{type Atom}
+import twocore/backend/eaf
 
 /// Why a whole-program link refused to produce a `.beam` (fail-closed). Each
 /// variant is a distinct, terminal reason surfaced at LINK time — never a
@@ -46,9 +47,10 @@ pub type LinkError {
   /// `'M__F'` local-name scheme would not be collision-free. `a`/`b` carry the
   /// offending atom and detail.
   MangleCollision(a: String, b: String)
-  /// `core_scan`/`core_parse`/`core_lint`/`compile:forms` rejected the input or
-  /// the merged output (e.g. broken generated `.core`, or a declared-name
-  /// mismatch). `detail` is a human-readable diagnostic, never a raw term.
+  /// The `to_core` lowering of the generated forms, `core_lint`, or
+  /// `compile:forms` rejected the input or the merged output (e.g. broken
+  /// generated forms, or a declared-name mismatch). `detail` is a
+  /// human-readable diagnostic, never a raw term.
   MalformedCore(detail: String)
   /// An in-closure module was located but its Core could not be acquired (no
   /// `core_v1` `debug_info` chunk and no compilable source). `module`/`reason`
@@ -63,7 +65,7 @@ pub type LinkError {
 /// this boundary; the shapes are validated by the tests (trust boundary).
 @external(erlang, "twocore_linker_ffi", "link_program")
 fn ffi_link_program(
-  generated_core: BitArray,
+  generated_forms: List(eaf.Form),
   module_name: String,
   ambient: List(String),
 ) -> Result(#(Atom, BitArray), #(String, String, String))
@@ -72,7 +74,7 @@ fn ffi_link_program(
 /// merged Core Erlang TEXT before compilation.
 @external(erlang, "twocore_linker_ffi", "link_to_core")
 fn ffi_link_to_core(
-  generated_core: BitArray,
+  generated_forms: List(eaf.Form),
   module_name: String,
   ambient: List(String),
 ) -> Result(#(Atom, String), #(String, String, String))
@@ -97,10 +99,12 @@ fn to_link_error(err: #(String, String, String)) -> LinkError {
 /// Merge the generated module + its transitive twocore/gleam closure into ONE
 /// self-contained `.beam`.
 ///
-/// - `generated_core`: the emitted `.core` TEXT as a byte-aligned `BitArray`
-///   (exactly what `build_beam.compile_core` consumes).
-/// - `module_name`: the generated module's atom name — it MUST equal the `.core`
-///   `module` header (`== ir.Module.name`). It BOTH locates the generated
+/// - `generated_forms`: the generated module's Erlang Abstract Format forms
+///   (from `eaf.module_forms` — exactly what `build_beam.compile_forms`
+///   consumes); the linker recovers the cerl module via the compiler's own
+///   `to_core` pass in-process.
+/// - `module_name`: the generated module's atom name — it MUST equal the
+///   `-module` attribute (`== ir.Module.name`). It BOTH locates the generated
 ///   module and names the merged output. Callers that load multiple linked
 ///   modules concurrently pass a uniquified name (R10/capstone).
 /// - `ambient`: `link_manifest.ambient_allowlist()` — the modules DCE walks up
@@ -112,11 +116,11 @@ fn to_link_error(err: #(String, String, String)) -> LinkError {
 /// reason. Never panics on bad input — a malformed generated `.core`, a missing
 /// dependency, or a D3a violation all surface as a typed `Error`.
 pub fn link_program(
-  generated_core: BitArray,
+  generated_forms: List(eaf.Form),
   module_name: String,
   ambient: List(String),
 ) -> Result(#(Atom, BitArray), LinkError) {
-  case ffi_link_program(generated_core, module_name, ambient) {
+  case ffi_link_program(generated_forms, module_name, ambient) {
     Ok(pair) -> Ok(pair)
     Error(err) -> Error(to_link_error(err))
   }
@@ -135,11 +139,11 @@ pub fn link_program(
 /// the identical reachability/mangle/DCE and the identical fail-closed D3a
 /// self-check.
 pub fn link_to_core(
-  generated_core: BitArray,
+  generated_forms: List(eaf.Form),
   module_name: String,
   ambient: List(String),
 ) -> Result(#(Atom, String), LinkError) {
-  case ffi_link_to_core(generated_core, module_name, ambient) {
+  case ffi_link_to_core(generated_forms, module_name, ambient) {
     Ok(pair) -> Ok(pair)
     Error(err) -> Error(to_link_error(err))
   }
