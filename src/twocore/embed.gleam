@@ -99,7 +99,7 @@ fn no_progress(_percent: Int, _phase: String) -> Nil {
 ///   guests an embedder loads into one node (e.g. `"twocore@wasm@" <> deployment <> "_" <> slug`).
 ///   Passing a colliding name reintroduces the load-overwrite hazard `compile` warns about.
 /// - Returns `Ok(Compiled)` whose `module.name` is `name`, or `Error(text)` (same failure modes as
-///   `compile`; an atom-invalid `name` surfaces as a codegen `Error` from `core_to_beam`). Total.
+///   `compile`; an atom-invalid `name` surfaces as a codegen `Error` from `cmod_to_beam`). Total.
 pub fn compile_named(wasm: BitArray, name: String) -> Result(Compiled, String) {
   compile_with_name(wasm, Some(name), no_progress)
 }

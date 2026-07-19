@@ -37,7 +37,7 @@
 //// `mem_tier`/`table_tier` (`Paged`/`Atomics`/`Nif` · …) — are **build-time fields on the
 //// one `Binding`** that already threads through every stage. The pipeline runs the **same
 //// five stages in the same order** regardless of them:
-////   `source_to_ir → lower_ir → optimize_ir → ir_to_core (emit_core) → core_to_beam`.
+////   `source_to_ir → lower_ir → optimize_ir → ir_to_cmod (emit_core) → cmod_to_beam`.
 //// **No stage branches on a Phase-4 axis.** The axes are consumed at exactly two points, both
 //// downstream of the stage graph:
 ////   - **codegen** — `emit_core` reads `binding.state_strategy` (the one codegen-shape switch:
@@ -60,7 +60,6 @@
 //// threading `St'` across invokes as a value). The `Cell` path is byte-identical to Phase 2/3;
 //// a `Threaded`/`atomics` build runs the SAME driver code end-to-end (G7).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
@@ -201,7 +200,7 @@ fn parse_payload(s: String) -> List(Int) {
 /// `instantiate → invoke_instance` process ABI below (E5). Retained for the fuel-measuring
 /// `ir_lower` tests, which require same-process execution.
 ///
-/// - `beam`: the compiled `.beam` binary (from `core_to_beam`).
+/// - `beam`: the compiled `.beam` binary (from `cmod_to_beam`).
 /// - `mod`: the module's atom NAME (the name baked into the `.core`, i.e. `ir.Module.name`).
 /// - `export`: the exported function name to apply.
 /// - `args`: the call arguments as raw unsigned bit-pattern integers (see the ABI above).
@@ -248,7 +247,7 @@ pub opaque type InstanceProc {
 /// cell) vs the `InstanceState` record (`Threaded`, held as the process's loop variable) — so
 /// this function needs **no** `Binding` parameter and both strategies share one code path.
 ///
-/// - `beam`: the compiled `.beam` binary (from `core_to_beam`).
+/// - `beam`: the compiled `.beam` binary (from `cmod_to_beam`).
 /// - `mod`: the module's atom NAME (must match the name baked into the `.core`).
 /// - Returns `Ok(InstanceProc)` once the state is seeded and the process is ready for
 ///   `invoke_instance`; `Error("load failed: …")` if the binary will not load; or
@@ -339,7 +338,7 @@ pub fn mem_size_instance(proc: InstanceProc) -> Int {
 /// embedder host-function guest is expected to import functions, not state) — an unsatisfied
 /// state import fails closed here (`Error`), never a silent default (spec §4.5.4).
 ///
-/// - `beam`: the compiled module (from `core_to_beam` / `embed.compile`).
+/// - `beam`: the compiled module (from `cmod_to_beam` / `embed.compile`).
 /// - `m`: that module's IR — its `imports` order drives the woven function-import vector.
 /// - `host`: the embedder's dispatcher. Receives `(capability, name, args)` where `args` are the
 ///   call's raw WASM argument bit patterns (D5); returns the raw result bit patterns (`[]` for a
@@ -535,7 +534,7 @@ fn ffi_bench_instance(
 ///
 /// - `wasm`: untrusted `.wasm` bytes.
 /// - Return: `Ok(ir.Module)` or the first failing stage's `Error(PipelineError)`. No policy
-///   pass or codegen is run here (use `ir_to_core` for those). Total — never panics.
+///   pass or codegen is run here (use `ir_to_cmod` for those). Total — never panics.
 pub fn source_to_ir(wasm: BitArray) -> Result(ir.Module, PipelineError) {
   source_to_ir_with(wasm, False)
 }
@@ -598,47 +597,62 @@ pub fn optimize_ir(m: ir.Module, binding: Binding) -> ir.Module {
   ir_opt.optimize(m, binding.opt_level)
 }
 
-/// IR → `#(lowered_optimized_module, core_text)`: run `lower_ir` (Safe policy pass / metering)
-/// then `optimize_ir` (level from `binding.opt_level`) ONCE, then `emit_core` + `core_printer`,
-/// returning BOTH the exact `ir.Module` `emit_core` consumed AND its printed `.core` text.
+/// IR → `#(lowered_optimized_module, cmod)`: run `lower_ir` (Safe policy pass / metering)
+/// then `optimize_ir` (level from `binding.opt_level`) ONCE, then `emit_core`, returning BOTH
+/// the exact `ir.Module` `emit_core` consumed AND the Core-shaped `CModule` it produced.
 ///
 /// This is the **lower-ONCE seam** (Phase-12 · R17) for any consumer that must run a second
 /// analysis over the module the `.beam` is generated from — chiefly the bindings driver, which
-/// hands the returned module to `iface.describe` while the returned `core_text` becomes the `.beam`
-/// (`core_to_beam`). Because both see the IDENTICAL lowered+optimized function bodies, a derived
+/// hands the returned module to `iface.describe` while the returned `CModule` becomes the `.beam`
+/// (`cmod_to_beam`). Because both see the IDENTICAL lowered+optimized function bodies, a derived
 /// property (`touches_state`, emitted arity) can never diverge from the `.beam` ABI — the failure
 /// mode R17 guards against (a mutation-carrying export misclassified pure, silently dropping `St'`).
-/// `ir_to_core/2` is exactly this seam with the module discarded.
+/// `ir_to_cmod/2` is exactly this seam with the module discarded.
 ///
 /// - `m`: the IR module to compile (e.g. from `source_to_ir` or `ir/parser`).
 /// - `binding`: the build-time runtime binding (chokepoint module names + policy mode + the
 ///   optimizer level).
-/// - Return: `Ok(#(lowered_optimized_module, core_text))`, or `Error(IrLowerFailed/EmitFailed)`.
+/// - Return: `Ok(#(lowered_optimized_module, cmod))`, or `Error(IrLowerFailed/EmitFailed)`.
 ///   The module's `.name` (the compiled atom, `twocore@wasm@<base>`) is preserved by `lower_ir`/
 ///   `optimize_ir` — it is the atom the `.beam` loads under and the binding dispatches into. Total.
-pub fn ir_to_lowered_core(
+pub fn ir_to_lowered_cmod(
   m: ir.Module,
   binding: Binding,
-) -> Result(#(ir.Module, String), PipelineError) {
+) -> Result(#(ir.Module, CModule), PipelineError) {
   case lower_ir(m, binding) {
     Error(e) -> Error(e)
     Ok(lowered) -> {
       let optimized = optimize_ir(lowered, binding)
       case emit_core.emit_module(optimized, binding) {
         Error(e) -> Error(EmitFailed(e))
-        Ok(cmod) -> Ok(#(optimized, core_printer.print_module(cmod)))
+        Ok(cmod) -> Ok(#(optimized, cmod))
       }
     }
   }
 }
 
-/// IR → `.core` text: `ir_lower` (Safe policy pass / metering) → `ir_opt` (level from
-/// `binding.opt_level`, F1) → `emit_core`, printed by `core_printer`. The canonical
-/// "IR → backend" path the CLI's `to-core`/`run` use, now with the optimizer in-chain.
+/// IR → the backend `CModule`: `ir_lower` (Safe policy pass / metering) → `ir_opt` (level from
+/// `binding.opt_level`, F1) → `emit_core`. The canonical "IR → backend" seam the CLI's
+/// `run`/`to-beam-wasm` and the test drivers compile through (`cmod_to_beam` /
+/// `build_beam.compile_and_load` consume the result directly — no textual round trip).
 ///
-/// Delegates to `ir_to_lowered_core/2` (the same three stages) and discards the module, so the
-/// `.core` text is byte-identical to the standalone chain — proven by the CLI default-off
-/// byte-identity test.
+/// Delegates to `ir_to_lowered_cmod/2` (the same three stages) and discards the module.
+///
+/// - `m`: the IR module to compile.
+/// - `binding`: the build-time runtime binding.
+/// - Return: `Ok(cmod)`, or `Error(IrLowerFailed/EmitFailed)`. Total — never panics.
+pub fn ir_to_cmod(
+  m: ir.Module,
+  binding: Binding,
+) -> Result(CModule, PipelineError) {
+  ir_to_lowered_cmod(m, binding)
+  |> result.map(fn(pair) { pair.1 })
+}
+
+/// IR → `.core` text: the same three stages as `ir_to_cmod`, pretty-printed by
+/// `core_printer`. This is now a pure INSPECTION surface (the CLI's `to-core` dump and the
+/// text-shape tests) — the compile path consumes the `CModule` directly (`cmod_to_beam`);
+/// the printed text is never re-parsed.
 ///
 /// - `m`: the IR module to compile.
 /// - `binding`: the build-time runtime binding (chokepoint module names + policy mode + the
@@ -648,23 +662,19 @@ pub fn ir_to_core(
   m: ir.Module,
   binding: Binding,
 ) -> Result(String, PipelineError) {
-  ir_to_lowered_core(m, binding)
-  |> result.map(fn(pair) { pair.1 })
+  ir_to_cmod(m, binding)
+  |> result.map(core_printer.print_module)
 }
 
-/// Compile `.core` text to an in-memory `.beam` binary (unit 04), WITHOUT loading it.
+/// Compile a backend `CModule` to an in-memory `.beam` binary (unit 04), WITHOUT loading it:
+/// lower to Erlang Abstract Format (`eaf.module_forms`) and compile in-process via
+/// `compile:forms/2` (`build_beam.compile_module`).
 ///
-/// - `core`: the Core Erlang source text.
-/// - `mod`: the expected module name (documentation/diagnostic only; the real name is the
-///   one baked into the `.core` header — pass `ir.Module.name` for clarity).
-/// - Return: `Ok(beam_bytes)` or `Error(BuildFailed(_))` (scan/parse/compile diagnostics).
-///   Total — never panics on malformed `.core` (it becomes `Error`).
-pub fn core_to_beam(
-  core: String,
-  mod: String,
-) -> Result(BitArray, PipelineError) {
-  let _ = mod
-  case build_beam.compile_core(bit_array.from_string(core)) {
+/// - `cmod`: the emitted Core-shaped module (its `.name` is the atom baked into the `.beam`).
+/// - Return: `Ok(beam_bytes)` or `Error(BuildFailed(_))` (lowering/compile diagnostics).
+///   Total — never panics on a malformed module (it becomes `Error`).
+pub fn cmod_to_beam(cmod: CModule) -> Result(BitArray, PipelineError) {
+  case build_beam.compile_module(cmod) {
     Error(e) -> Error(BuildFailed(e))
     Ok(#(_atom, beam)) -> Ok(beam)
   }
@@ -672,7 +682,7 @@ pub fn core_to_beam(
 
 /// Lower + optimize + emit + **split** an IR module into N balanced Core sub-modules (chunk 0 first).
 ///
-/// Same three stages as `ir_to_lowered_core` up to `emit_core.emit_module`, then `chunk.split_module`
+/// Same three stages as `ir_to_lowered_cmod` up to `emit_core.emit_module`, then `chunk.split_module`
 /// partitions the whole-module `CModule` so the downstream `compile:forms` peak is bounded to
 /// O(largest chunk) instead of O(whole module). `target <= 1` or a module with fewer than
 /// `min_split_defs` defs returns a SINGLE chunk (the whole module), whose printed `.core` is
@@ -710,7 +720,7 @@ pub fn chunks_to_beams(
   chunks: List(CModule),
 ) -> Result(List(#(String, BitArray)), PipelineError) {
   list.try_map(chunks, fn(c) {
-    case core_to_beam(core_printer.print_module(c), c.name) {
+    case cmod_to_beam(c) {
       Error(e) -> Error(e)
       Ok(beam) -> Ok(#(c.name, beam))
     }
@@ -730,7 +740,7 @@ pub fn parse_ir(text: String) -> Result(ir.Module, ir_parser.ParseError) {
 /// End-to-end: `.wasm` bytes → result on the BEAM, through the Phase-2 run-ABI
 /// `load → instantiate → invoke` with one-instance-one-process isolation (E5).
 ///
-/// Composes `source_to_ir` → `ir_to_core(binding)` → `core_to_beam` → `instantiate` (spawn
+/// Composes `source_to_ir` → `ir_to_cmod(binding)` → `cmod_to_beam` → `instantiate` (spawn
 /// the instance's owned process + run `instantiate/0`) → `invoke_instance` → `stop_instance`.
 /// This is the CLI `run` subcommand's engine and the shape the acceptance corpus proves
 /// green. The raw-bit-pattern argument/result ABI (D5) is unchanged.
@@ -762,10 +772,10 @@ pub fn run_source(
   case source_to_ir_with(wasm, binding.narrow_carried) {
     Error(e) -> Error(e)
     Ok(m) ->
-      case ir_to_core(m, binding) {
+      case ir_to_cmod(m, binding) {
         Error(e) -> Error(e)
-        Ok(core) ->
-          case core_to_beam(core, m.name) {
+        Ok(cmod) ->
+          case cmod_to_beam(cmod) {
             Error(e) -> Error(e)
             Ok(beam) ->
               case instantiate(beam, m.name) {
@@ -867,7 +877,7 @@ fn no_mem_reader(_addr: Int, _len: Int) -> Result(BitArray, Nil) {
 
 /// Compile + run a Porffor-emitted `.wasm` on the BEAM under `profiles.porffor()` and collect
 /// its console output + decoded completion value (the JS-on-BEAM run path, P7-08 §C/§E). This
-/// is the headline seam: `source_to_ir` → `ir_to_core(porffor())` → `core_to_beam` →
+/// is the headline seam: `source_to_ir` → `ir_to_cmod(porffor())` → `cmod_to_beam` →
 /// `instantiate` (owned process) → invoke the entry `main` (multi-value `(f64, i32)` return via
 /// `ffi_call_instance_pair`) → drain the console buffer (`ffi_porffor_output`) → decode the pair
 /// (`porffor_abi.porf_decode`). Conformance-neutral: a non-Porffor module never reaches this
@@ -894,10 +904,10 @@ pub fn run_porffor(
         Error(reason) ->
           Ok(PorfforRun(<<>>, porffor_abi.PUndefined, Some("link: " <> reason)))
         Ok(provided) ->
-          case ir_to_core(m, profiles.porffor()) {
+          case ir_to_cmod(m, profiles.porffor()) {
             Error(e) -> Error(e)
-            Ok(core) ->
-              case core_to_beam(core, m.name) {
+            Ok(cmod) ->
+              case cmod_to_beam(cmod) {
                 Error(e) -> Error(e)
                 Ok(beam) ->
                   case start_provided_instance(beam, m.name, provided) {
