@@ -12,13 +12,11 @@
 //// `emit_core_e2e_test.gleam` exactly — an IR module is compiled, loaded, and its exports
 //// applied; term results are compared as `Dynamic` (BEAM term equality).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
@@ -45,8 +43,7 @@ fn to_dynamic(x: a) -> Dynamic
 /// genuine test failure.
 fn load(module: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 

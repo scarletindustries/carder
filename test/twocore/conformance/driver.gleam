@@ -27,7 +27,6 @@
 //// raw value / IEEE-754 bit pattern) for the numeric case, or a reference term / result tuple for
 //// the reference / multi-value case; `invoke` tags each back to a typed `SpecValue` for the oracle.
 
-import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode as dyn_decode
@@ -238,12 +237,12 @@ fn instantiate_typed(
           |> result.map_error(fn(e) { "link: " <> link.import_error_phrase(e) })
       }
   })
-  use core_text <- result.try(
-    pipeline.ir_to_core(irmod, binding)
+  use cmod <- result.try(
+    pipeline.ir_to_cmod(irmod, binding)
     |> result.map_error(pipeline.describe),
   )
   use mod_atom <- result.try(
-    build_beam.compile_and_load(bit_array.from_string(core_text))
+    build_beam.compile_and_load(cmod)
     |> result.map_error(fn(e) { "build: " <> string.inspect(e) }),
   )
   // Dispatch the instantiate ABI by import-presence (R4): an import-free module keeps the

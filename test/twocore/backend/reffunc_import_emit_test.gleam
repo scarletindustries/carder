@@ -13,7 +13,6 @@
 //// under Cell AND Threaded. The e2e harness follows `emit_core_e2e_test`
 //// (`emit_module → core_printer.print_module → build_beam.compile_and_load → catch_apply`).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
@@ -21,7 +20,6 @@ import gleam/option
 import gleam/result
 import gleam/string
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/conformance/driver
 import twocore/ir
@@ -89,11 +87,9 @@ fn emit_and_load(
 ) -> Result(Atom, String) {
   case emit_core.emit_module(module, binding) {
     Error(e) -> Error("emit: " <> string.inspect(e))
-    Ok(cm) -> {
-      let core = core_printer.print_module(cm)
-      build_beam.compile_and_load(bit_array.from_string(core))
+    Ok(cm) ->
+      build_beam.compile_and_load(cm)
       |> result.map_error(fn(e) { "build: " <> string.inspect(e) })
-    }
   }
 }
 

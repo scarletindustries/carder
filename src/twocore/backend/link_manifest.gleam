@@ -83,9 +83,10 @@ pub fn dce_only_remotes() -> List(String) {
 /// NAMES the rule so the choice is single-sourced. Verified acquirable on OTP 29.0.2 for every member
 /// via the primary path.
 pub type Acquisition {
-  /// The GENERATED (wasm-derived) module ONLY: its `.core` source TEXT parsed via the existing
-  /// `core_scan`/`core_parse` path (the `twocore_codegen_ffi` route).
-  GeneratedCoreText
+  /// The GENERATED (wasm-derived) module ONLY: its Erlang Abstract Format forms (from
+  /// `twocore/backend/eaf`) lowered to `#c_module{}` via the compiler's own `to_core` pass
+  /// (`compile:forms/2` stopped at the Core stage), with the auto-added `module_info/0,1` stripped.
+  GeneratedAbstractForms
   /// The UNIFORM primary for every DISCOVERED in-closure module: `beam_lib:chunks(Beam,[debug_info])`
   /// then `Backend:debug_info(core_v1, Mod, Data, [])` straight from the module's RESIDENT `.beam` —
   /// needs no `.erl` on disk (verified on `rt_num`, `gleam@int`, `gleam_stdlib`, `twocore_rt_exn_ffi`).
@@ -99,11 +100,11 @@ pub type Acquisition {
 ///
 /// - `is_generated`: True for the wasm-derived generated module, False for every discovered
 ///   in-closure runtime/gleam/FFI module.
-/// - Returns `GeneratedCoreText` when `is_generated`, otherwise `ResidentBeamCore` (the uniform
+/// - Returns `GeneratedAbstractForms` when `is_generated`, otherwise `ResidentBeamCore` (the uniform
 ///   resident-`.beam` `debug_info` path that covers the `.erl` FFI bucket too).
 pub fn primary_acquisition(is_generated: Bool) -> Acquisition {
   case is_generated {
-    True -> GeneratedCoreText
+    True -> GeneratedAbstractForms
     False -> ResidentBeamCore
   }
 }

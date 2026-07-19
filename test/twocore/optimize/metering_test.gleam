@@ -25,7 +25,6 @@
 //// `runner.trap_matches`, which is for WASM spec phrases), keeping the policy trap out of the
 //// conformance trap-phrase table.
 
-import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/int
 import gleam/list
@@ -158,7 +157,7 @@ fn compile_load(name: String, binding: Binding) -> Atom {
   let assert Ok(m0) = pipeline.source_to_ir(bytes)
   let m =
     ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(mod) = build_beam.compile_and_load(cmod)
   mod
 }

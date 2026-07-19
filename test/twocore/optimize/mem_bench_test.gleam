@@ -14,7 +14,6 @@ import gleam/int
 import gleam/io
 import gleam/list
 import gleam/option
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/middle/ir_lower
@@ -214,7 +213,6 @@ fn build_beam(
 ) -> BitArray {
   let optimized = pass.run_pipeline(m, passes)
   let assert Ok(cmod) = emit_core.emit_module(optimized, binding)
-  let core = core_printer.print_module(cmod)
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   beam
 }

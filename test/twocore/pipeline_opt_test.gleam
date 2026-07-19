@@ -120,8 +120,8 @@ fn count_charge_calls(m: CModule) -> Int {
 /// per-instance seeds (the instance runs `instantiate/0`, which seeds fuel + host policy).
 fn run_add(binding: Binding, a: Int, b: Int) -> pipeline.RunResult {
   let m = add_module()
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
   let assert Ok(proc) = pipeline.instantiate(beam, m.name)
   let result = pipeline.invoke_instance(proc, "add", [a, b])
   pipeline.stop_instance(proc)

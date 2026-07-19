@@ -11,7 +11,6 @@
 //// Canonical references: the Core Erlang language spec + the WebAssembly spec
 //// (i32.clz counts leading zero bits; i32.add is modulo 2^32).
 
-import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
@@ -21,7 +20,10 @@ import twocore/backend/beam_link.{
   UnmergeableConstruct,
 }
 import twocore/backend/build_beam
-import twocore/backend/core_printer
+import twocore/backend/core_erlang.{
+  CApplyExpr, CAtom, CCall, CFun, CModule, CVar, FName, FunDef,
+}
+import twocore/backend/eaf
 import twocore/backend/emit_core
 import twocore/backend/link_manifest
 import twocore/ir
@@ -46,12 +48,35 @@ fn install_synth(name: String, src: String) -> Atom
 
 // ───────────────────────────── plumbing ─────────────────────────────
 
-/// Emit `module` to Core Erlang TEXT (as `build_beam`/the linker consume it).
-/// `let assert` here is the test's success contract — a failure to emit is a
-/// genuine test failure.
-fn gen_core(module: ir.Module) -> BitArray {
+/// Emit `module` to the backend `CModule` (as `build_beam`/the linker consume
+/// it). `let assert` here is the test's success contract — a failure to emit is
+/// a genuine test failure.
+fn gen_cmod(module: ir.Module) -> core_erlang.CModule {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
-  bit_array.from_string(core_printer.print_module(cm))
+  cm
+}
+
+/// Lower a backend `CModule` to the abstract FORMS the linker consumes.
+fn forms_of(cm: core_erlang.CModule) -> List(eaf.Form) {
+  let assert Ok(forms) = eaf.module_forms(cm)
+  forms
+}
+
+/// A tiny synthetic generated module: one exported function `fname/arity`
+/// whose body is `body` over params `params` — the forms-level replacement for
+/// the hand-written `.core` text fixtures the pre-EAF linker consumed.
+fn synth_forms(
+  name: String,
+  fname: String,
+  params: List(String),
+  body: core_erlang.CExpr,
+) -> List(eaf.Form) {
+  let arity = list.length(params)
+  forms_of(
+    CModule(name: name, exports: [FName(fname, arity)], attributes: [], defs: [
+      FunDef(FName(fname, arity), CFun(params, body)),
+    ]),
+  )
 }
 
 /// The frozen OTP-ambient allowlist (the DCE stop-set) the linker consumes.
@@ -138,12 +163,13 @@ fn rotl_fn() -> ir.Function {
 /// hot-replaces it and is called — the two must agree.
 pub fn smoke_differential_numerics_test() {
   let name = "twocore@link@smoke_num"
-  let core = gen_core(num_module(name, [clz_fn(), add_fn()]))
+  let cmod = gen_cmod(num_module(name, [clz_fn(), add_fn()]))
+  let core = forms_of(cmod)
   let clz = atom.create("clz")
   let add = atom.create("add")
 
   // in-process path (the oracle): thin module calling the resident rt_num.
-  let assert Ok(inproc) = build_beam.compile_and_load(core)
+  let assert Ok(inproc) = build_beam.compile_and_load(cmod)
   let r_clz1 = catch_apply(inproc, clz, [1])
   let r_clz0 = catch_apply(inproc, clz, [0])
   let r_add = catch_apply(inproc, add, [2_147_483_647, 1])
@@ -170,7 +196,7 @@ pub fn smoke_differential_numerics_test() {
 /// merged module is loadable purely by that atom.
 pub fn returned_atom_matches_beam_name_test() {
   let name = "twocore@link@atomname"
-  let core = gen_core(num_module(name, [add_fn()]))
+  let core = forms_of(gen_cmod(num_module(name, [add_fn()])))
   let assert Ok(#(mod, beam)) = beam_link.link_program(core, name, ambient())
   // load under the returned atom; the load succeeds only if the atom matches
   // the name baked into the beam.
@@ -192,12 +218,12 @@ pub fn returned_atom_matches_beam_name_test() {
 /// metering closure).
 pub fn safe_metered_fun_capture_target_survives_dce_test() {
   let name = "twocore@link@metered"
-  let assert Ok(core_text) =
-    pipeline.ir_to_core(
+  let assert Ok(cmod) =
+    pipeline.ir_to_cmod(
       num_module(name, [clz_fn(), add_fn()]),
       instance.safe_default(),
     )
-  let core = bit_array.from_string(core_text)
+  let core = forms_of(cmod)
   let assert Ok(#(mod, beam)) = beam_link.link_program(core, name, ambient())
   let assert Ok(_) = build_beam.load_module(mod, "metered.beam", beam)
 
@@ -256,7 +282,7 @@ pub fn instantiate_root_state_survives_dce_test() {
       start: option.None,
       tags: [],
     )
-  let core = gen_core(module)
+  let core = forms_of(gen_cmod(module))
   let assert Ok(#(mod, beam)) = beam_link.link_program(core, name, ambient())
   let assert Ok(_) = build_beam.load_module(mod, "stateful.beam", beam)
 
@@ -281,11 +307,14 @@ pub fn fun_capture_is_first_class_test() {
   let name = "twocore@link@capture"
   // a generated module that reaches the capture-bearing rt_simd function.
   let core =
-    bit_array.from_string(
-      "module '"
-      <> name
-      <> "' ['use'/2]\n    attributes []\n'use'/2 =\n    fun (A, B) ->\n"
-      <> "        call 'twocore@runtime@rt_simd':'f32x4_add'(A, B)\nend\n",
+    synth_forms(
+      name,
+      "use",
+      ["A", "B"],
+      CCall(CAtom("twocore@runtime@rt_simd"), CAtom("f32x4_add"), [
+        CVar("A"),
+        CVar("B"),
+      ]),
     )
 
   // (a) it links + loads (no undef anywhere in the closure).
@@ -310,7 +339,7 @@ pub fn fun_capture_is_first_class_test() {
 /// `rt_num` export (e.g. `f64_sqrt`) must NOT appear as a merged def.
 pub fn dce_drops_unreachable_test() {
   let name = "twocore@link@dce"
-  let core = gen_core(num_module(name, [clz_fn(), rotl_fn()]))
+  let core = forms_of(gen_cmod(num_module(name, [clz_fn(), rotl_fn()])))
   let assert Ok(#(_, text)) = beam_link.link_to_core(core, name, ambient())
   // i32_clz + i32_rotl ARE reached (defs present).
   assert string.contains(text, "'twocore@runtime@rt_num__i32_clz'/1 =")
@@ -326,7 +355,7 @@ pub fn dce_drops_unreachable_test() {
 /// were module-granular those three remotes would leak — they must not.
 pub fn dce_only_remotes_do_not_survive_test() {
   let name = "twocore@link@ambient"
-  let core = gen_core(num_module(name, [clz_fn(), add_fn()]))
+  let core = forms_of(gen_cmod(num_module(name, [clz_fn(), add_fn()])))
   let assert Ok(#(_, text)) = beam_link.link_to_core(core, name, ambient())
   assert !string.contains(text, "call 'code':")
   assert !string.contains(text, "call 'net_kernel':")
@@ -341,7 +370,7 @@ pub fn dce_only_remotes_do_not_survive_test() {
 /// diffable/cacheable.
 pub fn deterministic_output_test() {
   let name = "twocore@link@determinism"
-  let core = gen_core(num_module(name, [clz_fn(), add_fn()]))
+  let core = forms_of(gen_cmod(num_module(name, [clz_fn(), add_fn()])))
   let assert Ok(#(_, beam1)) = beam_link.link_program(core, name, ambient())
   let assert Ok(#(_, beam2)) = beam_link.link_program(core, name, ambient())
   assert beam1 == beam2
@@ -356,11 +385,15 @@ pub fn deterministic_output_test() {
 pub fn d3a_rejects_erlang_apply_test() {
   let name = "twocore@link@apply"
   let core =
-    bit_array.from_string(
-      "module '"
-      <> name
-      <> "' ['f'/2]\n    attributes []\n'f'/2 =\n"
-      <> "    fun (M, A) -> call 'erlang':'apply'(M, 'g', A)\nend\n",
+    synth_forms(
+      name,
+      "f",
+      ["M", "A"],
+      CCall(CAtom("erlang"), CAtom("apply"), [
+        CVar("M"),
+        CAtom("g"),
+        CVar("A"),
+      ]),
     )
   let assert Error(AmbientAuthorityFound(_)) =
     beam_link.link_program(core, name, ambient())
@@ -371,12 +404,7 @@ pub fn d3a_rejects_erlang_apply_test() {
 /// attacker-chosen MFA. The merge succeeds.
 pub fn d3a_allows_first_class_apply_test() {
   let name = "twocore@link@firstclass"
-  let core =
-    bit_array.from_string(
-      "module '"
-      <> name
-      <> "' ['f'/1]\n    attributes []\n'f'/1 =\n    fun (F) -> apply F ('x')\nend\n",
-    )
+  let core = synth_forms(name, "f", ["F"], CApplyExpr(CVar("F"), [CAtom("x")]))
   let assert Ok(_) = beam_link.link_program(core, name, ambient())
 }
 
@@ -388,11 +416,11 @@ pub fn d3a_allows_first_class_apply_test() {
 pub fn fail_closed_missing_module_test() {
   let name = "twocore@link@missing"
   let core =
-    bit_array.from_string(
-      "module '"
-      <> name
-      <> "' ['f'/1]\n    attributes []\n'f'/1 =\n"
-      <> "    fun (X) -> call 'twocore@runtime@does_not_exist':'g'(X)\nend\n",
+    synth_forms(
+      name,
+      "f",
+      ["X"],
+      CCall(CAtom("twocore@runtime@does_not_exist"), CAtom("g"), [CVar("X")]),
     )
   let assert Error(MissingClosureModule("twocore@runtime@does_not_exist")) =
     beam_link.link_program(core, name, ambient())
@@ -406,7 +434,7 @@ pub fn fail_closed_missing_module_test() {
 /// asserts the merged module actually defines the distinctly-mangled names.
 pub fn mangle_disambiguates_same_named_functions_test() {
   let name = "twocore@link@mangle"
-  let core = gen_core(num_module(name, [clz_fn(), rotl_fn()]))
+  let core = forms_of(gen_cmod(num_module(name, [clz_fn(), rotl_fn()])))
   let assert Ok(#(_, text)) = beam_link.link_to_core(core, name, ambient())
   // the runtime `i32_rotl` (a still-seamed op) is mangled with its full module atom — never
   // bare. (`i32.add` is inlined and leaves no seam to observe here.)
@@ -424,10 +452,13 @@ pub fn mangle_collision_on_separator_bearing_module_test() {
     )
   let name = "twocore@link@collide"
   let core =
-    bit_array.from_string(
-      "module '"
-      <> name
-      <> "' ['f'/1]\n    attributes []\n'f'/1 =\n    fun (X) -> call 'foo__bar':'g'(X)\nend\n",
+    synth_forms(
+      name,
+      "f",
+      ["X"],
+      CCall(CAtom("foo__bar"), CAtom("g"), [
+        CVar("X"),
+      ]),
     )
   let assert Error(MangleCollision(_, _)) =
     beam_link.link_program(core, name, ambient())
@@ -448,11 +479,11 @@ pub fn unmergeable_on_load_module_test() {
     )
   let name = "twocore@link@onload"
   let core =
-    bit_array.from_string(
-      "module '"
-      <> name
-      <> "' ['f'/0]\n    attributes []\n'f'/0 =\n"
-      <> "    fun () -> call 'twocore_link_onload_synth':'f'()\nend\n",
+    synth_forms(
+      name,
+      "f",
+      [],
+      CCall(CAtom("twocore_link_onload_synth"), CAtom("f"), []),
     )
   let assert Error(UnmergeableConstruct(_)) =
     beam_link.link_program(core, name, ambient())
@@ -460,12 +491,13 @@ pub fn unmergeable_on_load_module_test() {
 
 // ════════════════════ 10. Trust boundary — malformed input never crashes ════════════════════
 
-/// Trust boundary (fail-closed, D8): a syntactically broken generated `.core`
-/// yields `Error(MalformedCore(_))` — never a panic. Captured normally (no
-/// `let assert`) so a crash would fail the test.
+/// Trust boundary (fail-closed, D8): a semantically broken generated module
+/// (a body referencing an unbound variable — rejected by `erl_lint` inside the
+/// linker's `to_core` acquisition) yields `Error(MalformedCore(_))` — never a
+/// panic. Captured normally (no `let assert`) so a crash would fail the test.
 pub fn malformed_core_yields_typed_error_test() {
-  let core = bit_array.from_string("module @@@ not valid core @@@")
-  let result = beam_link.link_program(core, "whatever", ambient())
+  let core = synth_forms("twocore@link@broken", "f", [], CVar("Unbound"))
+  let result = beam_link.link_program(core, "twocore@link@broken", ambient())
   let assert Error(MalformedCore(_)) = result
 }
 
@@ -473,7 +505,7 @@ pub fn malformed_core_yields_typed_error_test() {
 /// the requested `module_name` is rejected as `MalformedCore` (the returned atom
 /// must be trustworthy for P11-05's `code:which`).
 pub fn declared_name_mismatch_yields_typed_error_test() {
-  let core = gen_core(num_module("twocore@link@actual", [add_fn()]))
+  let core = forms_of(gen_cmod(num_module("twocore@link@actual", [add_fn()])))
   let assert Error(MalformedCore(_)) =
     beam_link.link_program(core, "twocore@link@requested", ambient())
 }

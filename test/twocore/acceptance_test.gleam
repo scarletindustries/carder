@@ -147,13 +147,13 @@ fn instantiate_safe(bytes: BitArray) -> Result(Instance, String) {
     |> result.map_error(pipeline.describe),
   )
   let m = ir.Module(..m0, name: uniquify(m0.name))
-  // `ir_to_core` runs the Safe policy pass (ir_lower) BEFORE emit_core — the proof point.
-  use core <- result.try(
-    pipeline.ir_to_core(m, profiles.safe())
+  // `ir_to_cmod` runs the Safe policy pass (ir_lower) BEFORE emit_core — the proof point.
+  use cmod <- result.try(
+    pipeline.ir_to_cmod(m, profiles.safe())
     |> result.map_error(pipeline.describe),
   )
   use mod_atom <- result.try(
-    build_beam.compile_and_load(bit_array.from_string(core))
+    build_beam.compile_and_load(cmod)
     |> result.map_error(fn(e) { "build: " <> string.inspect(e) }),
   )
   use proc <- result.try(
@@ -359,11 +359,11 @@ fn declared_host_module() -> ir.Module {
 /// Compile a hand-built IR module through the Safe pipeline (ir_lower → emit → build) and
 /// load it, returning the module atom (or the pipeline error as text).
 fn load_ir(m: ir.Module) -> Result(Atom, String) {
-  use core <- result.try(
-    pipeline.ir_to_core(m, profiles.safe())
+  use cmod <- result.try(
+    pipeline.ir_to_cmod(m, profiles.safe())
     |> result.map_error(pipeline.describe),
   )
-  build_beam.compile_and_load(bit_array.from_string(core))
+  build_beam.compile_and_load(cmod)
   |> result.map_error(fn(e) { "build: " <> string.inspect(e) })
 }
 

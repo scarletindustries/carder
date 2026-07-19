@@ -2,12 +2,14 @@
 //// representation).
 ////
 //// Per the high-level spec §5 we model the subset of Core Erlang we emit as
-//// ordinary Gleam custom types and then *print* them to `.core` text (see
-//// `twocore/backend/core_printer`), rather than driving the Erlang `cerl`
-//// record API over FFI (awkward over FFI, loses Gleam's type safety). These
-//// types are the `«CORE-AST»` milestone: unit 08 (`emit_core`) builds them from
-//// the IR (the binding chokepoint, D3b) and the printer turns them into text
-//// that the OTP-29 compiler accepts via `compile:from_core`.
+//// ordinary Gleam custom types, rather than driving the Erlang `cerl` record
+//// API over FFI (awkward over FFI, loses Gleam's type safety). These types are
+//// the `«CORE-AST»` milestone: unit 08 (`emit_core`) builds them from the IR
+//// (the binding chokepoint, D3b). The COMPILE path lowers them to Erlang
+//// Abstract Format terms (`twocore/backend/eaf`) consumed in-process by
+//// `compile:forms/2`; `twocore/backend/core_printer` renders the same AST as
+//// `.core` text purely for INSPECTION (the CLI's `to-core`/`emit` dumps and
+//// text-shape tests) — the printed text is never re-parsed.
 ////
 //// Phase 1 deliberately OMITS Core Erlang annotations (`-| [...]`) entirely — a
 //// zero-annotation module compiles fine on OTP 29 — and omits the

@@ -24,7 +24,6 @@ import gleam/option
 import gleam/result
 import gleam/string
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/conformance/corpus.{
   type Expect, InstantiateTraps, Rejects, Returns, Traps,
@@ -344,8 +343,8 @@ fn compile_load(bytes: BitArray, binding: instance.Binding) -> Atom {
   let assert Ok(m0) = pipeline.source_to_ir(bytes)
   let m =
     ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(mod) = build_beam.compile_and_load(cmod)
   mod
 }
 
@@ -360,8 +359,7 @@ fn read_text(file: String) -> Result(String, String) {
 /// A failure here is a genuine test failure (the backend should compile valid IR).
 fn load_ir(m: ir.Module) -> Atom {
   let assert Ok(cmod) = emit_core.emit_module(m, instance.safe_default())
-  let core = core_printer.print_module(cmod)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cmod)
   mod
 }
 

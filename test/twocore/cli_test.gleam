@@ -77,20 +77,24 @@ pub fn cli_emit_test() {
   assert string.contains(text, "module 'add'")
 }
 
-/// `to-beam` compiles `.core` to a real `.beam` binary on disk (round-tripping the `.core`
-/// produced by `to-core`).
+/// `to-beam` compiles `.ir` to a real `.beam` binary on disk (the abstract-forms
+/// backend — no textual `.core` round trip exists any more).
 pub fn cli_to_beam_writes_beam_test() {
-  let assert Ok(core) = twocore.run(["to-core", golden <> "/add.ir"])
-  let tmp_core = "build/cli_test_add.core"
   let tmp_beam = "build/cli_test_add.beam"
-  let assert Ok(Nil) = simplifile.write(tmp_core, core)
-  let assert Ok(msg) = twocore.run(["to-beam", tmp_core, tmp_beam])
+  let assert Ok(msg) = twocore.run(["to-beam", golden <> "/add.ir", tmp_beam])
   assert string.contains(msg, "wrote")
   // the .beam exists and is non-trivial
   let assert Ok(beam) = simplifile.read_bits(tmp_beam)
   assert beam != <<>>
-  let _ = simplifile.delete(tmp_core)
   let _ = simplifile.delete(tmp_beam)
+}
+
+/// `to-erl <in.ir>` dumps the generated module as Erlang source (`erl_pp` over
+/// the abstract forms `compile:forms/2` consumes).
+pub fn cli_to_erl_test() {
+  let assert Ok(text) = twocore.run(["to-erl", golden <> "/add.ir"])
+  assert string.contains(text, "-module(add).")
+  assert string.contains(text, "instantiate()")
 }
 
 /// `to-beam-wasm [--unsafe] <in.wasm> <out.beam>` compiles a `.wasm` to a `.beam` under EACH

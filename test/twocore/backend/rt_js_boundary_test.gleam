@@ -51,8 +51,7 @@ fn to_dynamic(x: a) -> Dynamic
 /// `let assert` is the success contract — a failure to emit/compile/load is a genuine failure.
 fn load(module: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 

@@ -26,7 +26,6 @@ import gleam/list
 import gleam/option
 import gleam/string
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/backend/emit_erlang_bindings
 import twocore/backend/iface
@@ -172,13 +171,9 @@ fn module_b() -> ir.Module {
 /// Returns the loaded module atom (= `m.name`). A `let assert` here is the test's success contract.
 fn load(m: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(m, profiles.portable())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(string_to_bits(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
-
-@external(erlang, "gleam_stdlib", "identity")
-fn string_to_bits(s: String) -> BitArray
 
 // The raw run-ABI oracle (`test/twocore_threaded_test_ffi.erl`): drive `instantiate/0` and an
 // export DIRECTLY (leading `St`, `{Package, St'}` return), bypassing the binding — the in-process

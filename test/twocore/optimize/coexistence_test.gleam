@@ -22,7 +22,6 @@
 //// Unit 10's `linker_coexist_test` proves the same for a hand-built stateful module; this
 //// capstone confirms it at CORPUS scale and adds the capability-isolation dimension.
 
-import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/int
 import gleam/option
@@ -158,8 +157,8 @@ fn host_module(name: String) -> ir.Module {
 /// BEAM atom. `let assert Ok` is the success contract — a compile/build failure is a genuine test
 /// failure, not an expected path.
 fn compile_load(m: ir.Module, binding: Binding) -> Atom {
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(mod) = build_beam.compile_and_load(cmod)
   mod
 }
 

@@ -1,10 +1,12 @@
-//// The Core Erlang pretty-printer (Unit 03).
+//// The Core Erlang pretty-printer (Unit 03) — now an INSPECTION-ONLY surface.
 ////
-//// Turns a `twocore/backend/core_erlang` AST into `.core` source text that the
-//// OTP-29 compiler accepts via `compile:from_core` (the path
-//// `core_scan` → `core_parse` → `core_lint` → `compile`). It is the last
-//// Gleam-side seam before `twocore/backend/build_beam` hands text to the Erlang
-//// compiler.
+//// Turns a `twocore/backend/core_erlang` AST into `.core` source text for the
+//// CLI's `to-core`/`emit` dumps and the text-shape tests. The COMPILE path no
+//// longer goes through this text: `twocore/backend/eaf` lowers the same AST to
+//// Erlang Abstract Format terms and `build_beam` compiles them in-process with
+//// `compile:forms/2`. The printed text is never re-parsed (the historical
+//// `core_scan` → `core_parse` → `from_core` round trip is gone); the lexical
+//// rules below are kept verbatim so the dump remains faithful `.core`.
 ////
 //// The printer is small and has no algorithmic cleverness — it is a recursive
 //// walk emitting a `gleam/string_tree`. Its hard part is purely *lexical*, and

@@ -8,14 +8,12 @@
 //// two's-complement wrap, shift-count masking, the div/rem zero & signed-overflow traps,
 //// the deny-all capability boundary, and the resolved `own` stdlib.
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
 import gleam/string
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/pipeline
@@ -54,8 +52,7 @@ fn to_dynamic(x: a) -> Dynamic
 /// emit/compile/load is a genuine test failure, not an expected path.
 fn load(module: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 
@@ -844,8 +841,7 @@ fn threaded_binding() -> instance.Binding {
 /// Emit `module` under `Threaded` to Core text, compile it, and load it; return the module atom.
 fn load_threaded(module: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, threaded_binding())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 
@@ -1938,8 +1934,7 @@ pub fn simd_extract_replace_lane_e2e_test() {
 /// would exceed the default budget — an orthogonal concern to the memory64 correctness under test).
 fn load_binding(module: ir.Module, binding: instance.Binding) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, binding)
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 
@@ -2380,9 +2375,7 @@ fn eh_module_full(
 /// an uncaught `{wasm_exn,…}` from a trap — T8). `let assert` is the test's success contract.
 fn to_beam(module: ir.Module) -> BitArray {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
-  let core = core_printer.print_module(cm)
-  let assert Ok(#(_atom, beam)) =
-    build_beam.compile_core(bit_array.from_string(core))
+  let assert Ok(#(_atom, beam)) = build_beam.compile_module(cm)
   beam
 }
 

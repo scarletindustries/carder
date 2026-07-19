@@ -85,10 +85,10 @@ pub fn mangle_injective_rejects_double_underscore_test() {
 // R1 — the Core-acquisition rule.
 // ---------------------------------------------------------------------------
 
-/// R1: the generated module uses `GeneratedCoreText`; every discovered in-closure module uses the
+/// R1: the generated module uses `GeneratedAbstractForms`; every discovered in-closure module uses the
 /// uniform `ResidentBeamCore` primary; the single fallback is `CompileFileToCore`.
 pub fn acquisition_rule_test() {
-  assert m.primary_acquisition(True) == m.GeneratedCoreText
+  assert m.primary_acquisition(True) == m.GeneratedAbstractForms
   assert m.primary_acquisition(False) == m.ResidentBeamCore
   assert m.fallback_acquisition() == m.CompileFileToCore
 }

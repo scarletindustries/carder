@@ -17,7 +17,8 @@
 //// | `opt      <in.ir> [--unsafe]`      | parse `.ir` → optimize_ir(profile) → print `.ir`      |
 //// | `emit     <in.ir> [--unsafe]`      | parse `.ir` → emit_core(profile) → print `.core`      |
 //// | `to-core  <in.ir> [--unsafe]`      | parse `.ir` → ir_lower → optimize → emit_core → `.core` |
-//// | `to-beam  <in.core> [out.beam]` (= `build`) | parse+build `.core` → write `.beam` (no profile) |
+//// | `to-erl   <in.ir> [axes]`          | parse `.ir` → … → emit → abstract forms → print `.erl` |
+//// | `to-beam  <in.ir> [out.beam]` (= `build`) | parse `.ir` → … → compile:forms → write `.beam` (Safe) |
 //// | `run      [axes] <in.wasm> <export> <args…>` | source → … → ir_lower → optimize → load → invoke → print |
 ////
 //// ## Phase-4 axis flags (decision #5 — every posture is a NAMED token; fail-closed default)
@@ -41,7 +42,7 @@
 ////   - `--table-tier paged|ets|atomics` — the funcref-table trust tier.
 ////   - `--cap PAGES` — a bounded linear-memory page cap (required to engage `atomics`/`ceiling`).
 //// `opt` keeps only `--unsafe` (it drives the optimizer, which reads no tier). `to-beam`/`build`
-//// take **no** profile — they compile already-emitted `.core`, which carries no `Binding`.
+//// take **no** profile — they compile the `.ir` under the fail-closed Safe binding.
 ////
 //// ## Value convention (the run/invoke ABI — `pipeline.gleam`)
 ////
@@ -52,7 +53,6 @@
 //// non-zero — a trap is a runtime outcome, surfaced as a CLI failure.
 
 import argv
-import gleam/bit_array
 import gleam/int
 import gleam/io
 import gleam/list
@@ -63,6 +63,7 @@ import simplifile
 import twocore/backend/beam_link
 import twocore/backend/bindings
 import twocore/backend/build_beam
+import twocore/backend/core_erlang
 import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/frontend/wasm/decode
@@ -125,14 +126,23 @@ pub fn run(args: List(String)) -> Result(String, String) {
           _ -> Error(usage())
         }
       })
+    ["to-erl", ..rest] ->
+      with_binding(rest, fn(binding, axes, pos) {
+        use <- reject_link(axes.link, "to-erl")
+        use <- reject_output_flags(axes, "to-erl")
+        case pos {
+          [path] -> cmd_to_erl(path, binding)
+          _ -> Error(usage())
+        }
+      })
     ["to-beam", ..rest] | ["build", ..rest] ->
-      // R13: the `.core`-input verbs carry no `Binding`/profile, so `--link` cannot be gated
-      // (tier-N / import-bearing are undecidable here). Reject the token explicitly rather than
-      // silently no-op it or mistake it for a positional path.
+      // R13: this profile-less verb runs the fail-closed Safe binding, so `--link` cannot be
+      // gated here. Reject the token explicitly rather than silently no-op it or mistake it
+      // for a positional path.
       case list.contains(rest, "--link") {
         True ->
           Error(
-            "--link is only valid on to-beam-wasm; the .core-input to-beam/build verbs carry no Binding to gate (R13)",
+            "--link is only valid on to-beam-wasm; the profile-less to-beam/build verb carries no Binding to gate (R13)",
           )
         False ->
           case rest {
@@ -608,17 +618,50 @@ fn cmd_to_core(path: String, binding: Binding) -> Result(String, String) {
   }
 }
 
-/// `to-beam`/`build <in.core> [out.beam]` — compile `.core` to a `.beam` binary (unit 04)
-/// and write it to `output`. Prints a confirmation line.
+/// `to-beam`/`build <in.ir> [out.beam]` — parse `.ir` → ir_lower → optimize → emit →
+/// abstract forms → `compile:forms/2` → write `.beam` (unit 04). Runs the fail-closed Safe
+/// profile (the verb still takes no axis flags — use `to-beam-wasm [axes]` for a posture).
+/// Prints a confirmation line. (Previously this verb compiled already-printed `.core` text;
+/// the textual re-parse path no longer exists — the backend compiles the AST directly.)
 fn cmd_to_beam(input: String, output: String) -> Result(String, String) {
   use text <- result.try(read_text(input))
-  case build_beam.compile_core(bit_array.from_string(text)) {
-    Error(e) -> Error("build: " <> string.inspect(e))
-    Ok(#(_mod_atom, beam)) ->
-      case simplifile.write_bits(output, beam) {
-        Error(fe) ->
-          Error("write " <> output <> ": " <> simplifile.describe_error(fe))
-        Ok(Nil) -> Ok("wrote " <> output)
+  case pipeline.parse_ir(text) {
+    Error(e) -> Error("parse .ir: " <> string.inspect(e))
+    Ok(m) ->
+      case pipeline.ir_to_cmod(m, profiles.safe()) {
+        Error(e) -> Error(pipeline.describe(e))
+        Ok(cmod) ->
+          case build_beam.compile_module(cmod) {
+            Error(e) -> Error("build: " <> string.inspect(e))
+            Ok(#(_mod_atom, beam)) ->
+              case simplifile.write_bits(output, beam) {
+                Error(fe) ->
+                  Error(
+                    "write " <> output <> ": " <> simplifile.describe_error(fe),
+                  )
+                Ok(Nil) -> Ok("wrote " <> output)
+              }
+          }
+      }
+  }
+}
+
+/// `to-erl <in.ir> [axes]` — parse `.ir` → ir_lower → optimize → emit → abstract forms →
+/// `erl_pp` pretty-print: dump the generated module as Erlang SOURCE text, i.e. exactly the
+/// forms `compile:forms/2` consumes (the EAF-backend inspection surface, the `.erl`-flavoured
+/// sibling of `to-core`).
+fn cmd_to_erl(path: String, binding: Binding) -> Result(String, String) {
+  use text <- result.try(read_text(path))
+  case pipeline.parse_ir(text) {
+    Error(e) -> Error("parse .ir: " <> string.inspect(e))
+    Ok(m) ->
+      case pipeline.ir_to_cmod(m, binding) {
+        Error(e) -> Error(pipeline.describe(e))
+        Ok(cmod) ->
+          case build_beam.module_to_erl(cmod) {
+            Error(e) -> Error("to-erl: " <> string.inspect(e))
+            Ok(erl) -> Ok(erl)
+          }
       }
   }
 }
@@ -762,8 +805,8 @@ fn cmd_to_beam_wasm(
   }
 }
 
-/// The LEGACY `to-beam-wasm` body (P11-04, unchanged) — `source_to_ir → ir_to_core → core_to_beam →
-/// write` (or the `--link` merge). Extracted verbatim so the two-positional path stays
+/// The LEGACY `to-beam-wasm` body (P11-04) — `source_to_ir → ir_to_cmod → cmod_to_beam →
+/// write` (or the `--link` merge). Extracted so the two-positional path stays
 /// byte-identical (proven by `cli_link_flag_test.default_off_byte_identical_test`).
 fn legacy_to_beam_wasm(
   input: String,
@@ -777,10 +820,10 @@ fn legacy_to_beam_wasm(
     Ok(m) ->
       case link {
         False ->
-          case pipeline.ir_to_core(m, binding) {
+          case pipeline.ir_to_cmod(m, binding) {
             Error(e) -> Error(pipeline.describe(e))
-            Ok(core) ->
-              case pipeline.core_to_beam(core, m.name) {
+            Ok(cmod) ->
+              case pipeline.cmod_to_beam(cmod) {
                 Error(e) -> Error(pipeline.describe(e))
                 Ok(beam) -> write_beam(output, beam)
               }
@@ -789,12 +832,10 @@ fn legacy_to_beam_wasm(
           case link_gate(binding, m) {
             Error(ge) -> Error(describe_link_gate_error(ge))
             Ok(Nil) ->
-              case pipeline.ir_to_core(m, binding) {
+              case pipeline.ir_to_cmod(m, binding) {
                 Error(e) -> Error(pipeline.describe(e))
-                Ok(core) ->
-                  case
-                    build_beam.link_beam(bit_array.from_string(core), m.name)
-                  {
+                Ok(cmod) ->
+                  case build_beam.link_beam(cmod) {
                     Error(le) -> Error(describe_beam_link_error(le))
                     Ok(#(_atom, beam)) -> write_beam(output, beam)
                   }
@@ -806,9 +847,9 @@ fn legacy_to_beam_wasm(
 
 /// The FOLDER `to-beam-wasm` path (P12-05): compile `<input>` into `<dir>`, emitting the `.beam` +
 /// one typed companion binding per requested language. The R17 lower-ONCE seam is the crux —
-/// `pipeline.ir_to_lowered_core` lowers+optimizes ONCE and returns BOTH the module and its `.core`;
+/// `pipeline.ir_to_lowered_cmod` lowers+optimizes ONCE and returns BOTH the module and its `CModule`;
 /// the SAME lowered module is handed to `bindings.emit_bindings` (which runs `iface.describe` over
-/// it) while its `.core` becomes the `.beam`. So `describe` and the `.beam` ABI see identical bodies
+/// it) while its `CModule` becomes the `.beam`. So `describe` and the `.beam` ABI see identical bodies
 /// — a mutation-carrying export cannot be misclassified pure (dropping `St'`). Fail-closed: a
 /// rejected module (Cell / import-bearing / mutable-tier) writes NOTHING (describe runs before any
 /// IO); a link-gate/link failure surfaces before emit.
@@ -830,39 +871,39 @@ fn folder_to_beam_wasm(
     pipeline.source_to_ir_with(bytes, binding.narrow_carried)
     |> result.map_error(pipeline.describe),
   )
-  // R17: lower + optimize ONCE; the returned `lowered` module is exactly what the `.core` (hence the
-  // `.beam`) is generated from, and it is what `emit_bindings` runs `describe` over.
-  use #(lowered, core) <- result.try(
-    pipeline.ir_to_lowered_core(m, binding)
+  // R17: lower + optimize ONCE; the returned `lowered` module is exactly what the `CModule` (hence
+  // the `.beam`) is generated from, and it is what `emit_bindings` runs `describe` over.
+  use #(lowered, cmod) <- result.try(
+    pipeline.ir_to_lowered_cmod(m, binding)
     |> result.map_error(pipeline.describe),
   )
-  use beam <- result.try(beam_of_lowered(core, lowered, binding, link))
+  use beam <- result.try(beam_of_lowered(cmod, lowered, binding, link))
   case bindings.emit_bindings(lowered, binding, beam, dir, langs) {
     Error(be) -> Error(bindings.describe_error(be))
     Ok(paths) -> Ok("wrote " <> string.join(paths, ", "))
   }
 }
 
-/// Compile lowered `.core` text into the `.beam` bytes for the FOLDER path, honoring `--link`. With
-/// `link == False` it is a plain `core_to_beam`; with `link == True` it runs the fail-closed
+/// Compile the lowered `CModule` into the `.beam` bytes for the FOLDER path, honoring `--link`.
+/// With `link == False` it is a plain `cmod_to_beam`; with `link == True` it runs the fail-closed
 /// `link_gate` (tier-N / import-bearing) then merges the runtime closure via `build_beam.link_beam`.
 /// Returns the bytes or the rendered CLI diagnostic. `mod`'s `.name`/`.imports` drive the gate + the
 /// baked module atom (it is the SAME lowered module `describe` sees).
 fn beam_of_lowered(
-  core: String,
+  cmod: core_erlang.CModule,
   mod: ir.Module,
   binding: Binding,
   link: Bool,
 ) -> Result(BitArray, String) {
   case link {
     False ->
-      pipeline.core_to_beam(core, mod.name)
+      pipeline.cmod_to_beam(cmod)
       |> result.map_error(pipeline.describe)
     True ->
       case link_gate(binding, mod) {
         Error(ge) -> Error(describe_link_gate_error(ge))
         Ok(Nil) ->
-          case build_beam.link_beam(bit_array.from_string(core), mod.name) {
+          case build_beam.link_beam(cmod) {
             Error(le) -> Error(describe_beam_link_error(le))
             Ok(#(_atom, beam)) -> Ok(beam)
           }
@@ -968,11 +1009,11 @@ fn format_values(values: List(Int)) -> String {
   values |> list.map(int.to_string) |> string.join(" ")
 }
 
-/// Default `.beam` output path for `to-beam`: swap a trailing `.core` for `.beam`, else
+/// Default `.beam` output path for `to-beam`: swap a trailing `.ir` for `.beam`, else
 /// append `.beam`.
 fn default_beam(input: String) -> String {
-  case string.ends_with(input, ".core") {
-    True -> string.drop_end(input, 5) <> ".beam"
+  case string.ends_with(input, ".ir") {
+    True -> string.drop_end(input, 3) <> ".beam"
     False -> input <> ".beam"
   }
 }
@@ -1005,7 +1046,8 @@ fn usage() -> String {
       "  gleam run -- opt      <in.ir> [--unsafe]        optimizer stage → .ir (Safe=Baseline, Unsafe=Aggressive)",
       "  gleam run -- emit     <in.ir> [axes]            emit_core only → .core",
       "  gleam run -- to-core  <in.ir> [axes]            ir_lower + optimize + emit_core → .core",
-      "  gleam run -- to-beam  <in.core> [out.beam]      compile → .beam (alias: build; no profile)",
+      "  gleam run -- to-erl   <in.ir> [axes]            ir_lower + optimize + emit → abstract forms → .erl dump",
+      "  gleam run -- to-beam  <in.ir> [out.beam]        compile → .beam (alias: build; Safe profile)",
       "  gleam run -- to-beam-wasm [axes] [--link] <in.wasm> <out.beam>  .wasm → .beam under a profile (bench)",
       "  gleam run -- to-beam-wasm [axes] --bindings <langs> --out <dir> <in.wasm>  + typed host bindings",
       "  gleam run -- run      [axes] <in.wasm> <export> <args…>  compile + invoke on the BEAM",
@@ -1031,7 +1073,7 @@ fn usage() -> String {
       "                              files into <dir> (pass only <in.wasm>; the .beam name is derived)",
       "  A non-default posture must be NAMED; Safe + --tier nif and an uncapped atomics/ceiling",
       "  build are rejected fail-closed (exit non-zero), never silently downgraded.",
-      "  opt takes only --unsafe; to-beam/build take no profile (they compile .core — no Binding).",
+      "  opt takes only --unsafe; to-beam/build take no profile (they compile under Safe).",
       "Values are raw unsigned bit patterns in decimal (i32 -1 is 4294967295).",
     ],
     "\n",

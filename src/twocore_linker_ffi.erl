@@ -9,15 +9,19 @@
 %%% `cerl`/`cerl_trees`/`core_lint`/`core_pp`/`compile` machinery.
 %%%
 %%% PINNED TO OTP 29. Relies on the compiler-internal `cerl`/`cerl_trees`/
-%%% `core_scan`/`core_parse`/`core_lint`/`core_pp` modules, the `debug_info`
-%%% chunk `core_v1` backend contract, and the undocumented textual `from_core`
-%%% format — all of which may change between OTP releases. Verified on OTP 29.
+%%% `core_lint`/`core_pp` modules, the `debug_info` chunk `core_v1` backend
+%%% contract, and the (undocumented) `from_core` entry for compiling the merged
+%%% cerl — all of which may change between OTP releases. Verified on OTP 29.
+%%% (The GENERATED module now arrives as documented Erlang Abstract Format
+%%% forms and is lowered to cerl via the compiler's own `to_core` pass; the
+%%% textual `core_scan`/`core_parse` route is gone.)
 %%%
 %%% ── The algorithm (spec §3, decisions R1/R4/R5/R6/R9/R10/R11) ─────────────
 %%%
-%%% 1. ACQUIRE the generated module's Core from its `.core` TEXT
-%%%    (`core_scan`/`core_parse`, the `twocore_codegen_ffi` route). Its declared
-%%%    module name must equal `ModuleName`.
+%%% 1. ACQUIRE the generated module's Core from its ABSTRACT FORMS via the
+%%%    compiler's own `to_core` pass (`compile:forms/2` stopped at Core), with
+%%%    the auto-added `module_info/0,1` stripped. Its declared module name must
+%%%    equal `ModuleName`.
 %%% 2. REACHABILITY (R6): a worklist from the ROOTS — the generated module's
 %%%    exports (public exports + the synthesized `instantiate/N`) — following
 %%%    THREE edge kinds (R4): remote `#c_call` to an in-closure module, an
@@ -72,29 +76,30 @@
 
 %% ── Public entry points ───────────────────────────────────────────────────
 
-%% link_program(GeneratedCore, ModuleName, Ambient)
+%% link_program(GeneratedForms, ModuleName, Ambient)
 %%   -> {ok, {Module :: atom(), Beam :: binary()}} | {error, ErrTuple}
 %%
-%% Merge + deterministic-compile to a loadable `.beam`. `GeneratedCore` is the
-%% emitted `.core` TEXT (binary); `ModuleName` is the merged module's atom name
+%% Merge + deterministic-compile to a loadable `.beam`. `GeneratedForms` is the
+%% generated module's Erlang Abstract Format form list (what
+%% `twocore/backend/eaf` emits); `ModuleName` is the merged module's atom name
 %% (binary); `Ambient` is a list of allowlist module-name binaries (the DCE
 %% stop-set). On success the returned Module atom equals the name declared
 %% inside the returned Beam.
-link_program(GeneratedCore, ModuleName, Ambient) ->
-    case build_merged(GeneratedCore, ModuleName, Ambient) of
+link_program(GeneratedForms, ModuleName, Ambient) ->
+    case build_merged(GeneratedForms, ModuleName, Ambient) of
         {ok, {Name, CMod}} -> compile_merged(Name, CMod);
         {error, _} = E -> E
     end.
 
-%% link_to_core(GeneratedCore, ModuleName, Ambient)
+%% link_to_core(GeneratedForms, ModuleName, Ambient)
 %%   -> {ok, {Module :: atom(), CoreText :: binary()}} | {error, ErrTuple}
 %%
 %% The SAME merge as `link_program`, returning the merged Core Erlang TEXT
 %% *before* compilation — the seam P11-06 uses to independently re-run the
 %% structural D3a assertion and inspect DCE. Single-sourced with `link_program`
 %% via `build_merged/3` (both run the fail-closed D3a self-check).
-link_to_core(GeneratedCore, ModuleName, Ambient) ->
-    case build_merged(GeneratedCore, ModuleName, Ambient) of
+link_to_core(GeneratedForms, ModuleName, Ambient) ->
+    case build_merged(GeneratedForms, ModuleName, Ambient) of
         {ok, {Name, CMod}} ->
             Txt = unicode:characters_to_binary(core_pp:format(CMod)),
             {ok, {Name, Txt}};
@@ -106,12 +111,12 @@ link_to_core(GeneratedCore, ModuleName, Ambient) ->
 %% Produce the merged `#c_module{}` (name + cerl), fail-closed. Wrapped in a
 %% catch so any unexpected internal crash surfaces as a typed `malformed_core`
 %% error rather than a raw exception across the FFI boundary (D8, fail-closed).
-build_merged(GeneratedCore, ModuleNameBin, AmbientBins) ->
+build_merged(GeneratedForms, ModuleNameBin, AmbientBins) ->
     try
         MergedName = binary_to_atom(ModuleNameBin, utf8),
         Ambient = sets:from_list([binary_to_atom(B, utf8) || B <- AmbientBins]),
-        %% (1) acquire the generated module from TEXT.
-        GenCMod = acquire_generated(GeneratedCore, MergedName),
+        %% (1) acquire the generated module from its abstract FORMS.
+        GenCMod = acquire_generated(GeneratedForms, MergedName),
         %% (2) reachability + lazy acquisition of the discovered closure.
         St0 = #{merged => MergedName, ambient => Ambient,
                 mods => #{MergedName => index_module(GenCMod)},
@@ -146,29 +151,52 @@ bin(X) -> iolist_to_binary(io_lib:format("~p", [X])).
 
 %% ── (1) Core acquisition ──────────────────────────────────────────────────
 
-%% Scan+parse the generated `.core` TEXT into a `#c_module{}` and check that its
-%% declared module name matches the caller's `ModuleName` (the merged output
-%% name). `malformed_core` on scan/parse failure or a name mismatch.
-acquire_generated(CoreBin, MergedName) ->
-    Str = unicode:characters_to_list(CoreBin),
-    case core_scan:string(Str) of
-        {ok, Toks, _End} ->
-            case core_parse:parse(Toks) of
-                {ok, CMod} ->
-                    Declared = cerl:atom_val(cerl:module_name(CMod)),
-                    case Declared =:= MergedName of
-                        true -> CMod;
-                        false ->
-                            fail(<<"malformed_core">>,
-                                 io_lib:format("generated module declares '~s' "
-                                               "but link requested '~s'",
-                                               [Declared, MergedName]),
-                                 <<>>)
-                    end;
-                {error, EI} -> fail(<<"malformed_core">>, fmt_ei(EI), <<>>)
+%% Lower the generated module's abstract FORMS to a `#c_module{}` via the
+%% compiler's own `to_core` pass in-process (`compile:forms/2` — the same
+%% documented entry the plain build uses, stopped at the Core stage), strip the
+%% auto-added `module_info/0,1` defs/exports (the merge assembles its own pair
+%% for the merged atom — and the pre-EAF generated Core never carried them),
+%% and check that the declared module name matches the caller's `ModuleName`
+%% (the merged output name). `malformed_core` on a compile failure or a name
+%% mismatch.
+acquire_generated(Forms, MergedName) when is_list(Forms) ->
+    case compile:forms(Forms, [to_core, binary, return_errors,
+                               nowarn_unused_vars]) of
+        {ok, _Mod, CMod0} ->
+            CMod = strip_module_info(CMod0),
+            Declared = cerl:atom_val(cerl:module_name(CMod)),
+            case Declared =:= MergedName of
+                true -> CMod;
+                false ->
+                    fail(<<"malformed_core">>,
+                         io_lib:format("generated module declares '~s' "
+                                       "but link requested '~s'",
+                                       [Declared, MergedName]),
+                         <<>>)
             end;
-        {error, EI, _End} -> fail(<<"malformed_core">>, fmt_ei(EI), <<>>)
+        {error, Errs, _W} ->
+            fail(<<"malformed_core">>,
+                 io_lib:format("to_core failed: ~0p", [Errs]), <<>>);
+        Other ->
+            fail(<<"malformed_core">>,
+                 io_lib:format("to_core failed: ~0p", [Other]), <<>>)
     end.
+
+%% Drop the compiler-added `module_info/0,1` definitions + exports from a
+%% freshly `to_core`-compiled generated module, restoring the invariant the
+%% merge pipeline was built on (the generated module defines no module_info;
+%% `assemble` emits the merged pair itself).
+strip_module_info(CMod) ->
+    Defs = [D || {V, _} = D <- cerl:module_defs(CMod),
+                 not is_module_info(cerl:var_name(V))],
+    Exports = [E || E <- cerl:module_exports(CMod),
+                    not is_module_info(cerl:var_name(E))],
+    cerl:update_c_module(CMod, cerl:module_name(CMod), Exports,
+                         cerl:module_attrs(CMod), Defs).
+
+is_module_info({module_info, 0}) -> true;
+is_module_info({module_info, 1}) -> true;
+is_module_info(_) -> false.
 
 %% Acquire a DISCOVERED in-closure module's `#c_module{}` from its RESIDENT
 %% `.beam` via the `debug_info` `core_v1` backend (R1 primary); fall back to
@@ -654,13 +682,6 @@ compile_forms(MergedName, CMod) ->
     end.
 
 %% ── diagnostic rendering ───────────────────────────────────────────────────
-
-fmt_ei({Loc, Mod, Desc}) ->
-    iolist_to_binary([loc(Loc), ": ", Mod:format_error(Desc)]).
-
-loc({L, _C}) -> integer_to_binary(L);
-loc(L) when is_integer(L) -> integer_to_binary(L);
-loc(_) -> <<"module">>.
 
 fmt_lint(Es) ->
     iolist_to_binary(

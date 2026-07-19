@@ -1,26 +1,30 @@
 //// Tests for the `build_beam` driver + the «FFI-SHIM» (Unit 04).
 ////
-//// These assert against the *defined behavior* of Core Erlang and the Erlang
-//// compiler, and against ordinary integer arithmetic — NOT against whatever
-//// bytes the compiler happens to emit (no change-detector tests, D8). `5` is
-//// asserted for `add(2, 3)` because integer addition says so; the `.beam` byte
-//// layout is never inspected.
+//// These assert against the *defined behavior* of the Erlang Abstract Format
+//// and the Erlang compiler, and against ordinary integer arithmetic — NOT
+//// against whatever bytes the compiler happens to emit (no change-detector
+//// tests, D8). `5` is asserted for `add(2, 3)` because integer addition says
+//// so; the `.beam` byte layout is never inspected.
 ////
-//// Canonical references: the Core Erlang language specification (Core Erlang
-//// 1.0.3) and the OTP `compiler` application docs. This unit is what proves
-//// high-level §9.2 (compiled output is real, preemptible BEAM code) and D10
-//// (it loads into and runs in the current VM).
+//// Canonical references: the Erlang Abstract Format reference
+//// (`erts/absform`) and the OTP `compiler` application docs. This unit is what
+//// proves high-level §9.2 (compiled output is real, preemptible BEAM code) and
+//// D10 (it loads into and runs in the current VM).
 ////
-//// The `.core` fixtures are hand-authored for readability and cross-checked
-//// against the canonical OTP-29 shape emitted by `erlc +to_core`. They are
-//// embedded as string constants (committed under `test/`), keeping the test
-//// self-contained with no file-reading dependency.
+//// The fixtures are hand-built backend `CModule` values (the same AST
+//// `emit_core` produces), lowered to abstract forms by `eaf.module_forms`
+//// inside `build_beam` — keeping the tests self-contained with no file-reading
+//// dependency and exercising the exact seam the pipeline compiles through.
 
 import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/string
 import twocore/backend/build_beam.{CompileFailed}
+import twocore/backend/core_erlang.{
+  type CModule, CApply, CAtom, CCall, CCase, CClause, CFun, CInt, CModule, CVar,
+  FName, FunDef, PVar,
+}
 
 // ───────────────────────── test-only externals ─────────────────────────
 //
@@ -38,75 +42,82 @@ fn apply_atom(module: Atom, function: Atom, args: List(Int)) -> Atom
 
 // ───────────────────────────── fixtures ─────────────────────────────
 
-/// A valid hand-written `.core` module: `id/1`, `add/2` (via `erlang:'+'`), and
-/// `classify/1` (a `case` with two guards + a catch-all). Module name is
+/// A valid hand-built module: `id/1`, `add/2` (via `erlang:'+'`), and
+/// `classify/1` (a `case` with two guard clauses + a catch-all). Module name is
 /// `twocore@test@fixture` — `twocore@…`-namespaced so it cannot clobber OTP.
-const fixture_core: String = "module 'twocore@test@fixture' ['add'/2, 'classify'/1, 'id'/1]
-    attributes []
+fn fixture_module() -> CModule {
+  CModule(
+    name: "twocore@test@fixture",
+    exports: [FName("add", 2), FName("classify", 1), FName("id", 1)],
+    attributes: [],
+    defs: [
+      FunDef(FName("id", 1), CFun(["X"], CVar("X"))),
+      FunDef(
+        FName("add", 2),
+        CFun(
+          ["A", "B"],
+          CCall(CAtom("erlang"), CAtom("+"), [CVar("A"), CVar("B")]),
+        ),
+      ),
+      FunDef(
+        FName("classify", 1),
+        CFun(
+          ["N"],
+          CCase(CVar("N"), [
+            CClause(
+              [PVar("X")],
+              CCall(CAtom("erlang"), CAtom("=<"), [CVar("X"), CInt(0)]),
+              CAtom("zero_or_neg"),
+            ),
+            CClause(
+              [PVar("Y")],
+              CCall(CAtom("erlang"), CAtom("<"), [CVar("Y"), CInt(10)]),
+              CAtom("small"),
+            ),
+            CClause([PVar("W")], CAtom("true"), CAtom("big")),
+          ]),
+        ),
+      ),
+    ],
+  )
+}
 
-'id'/1 =
-    fun (X) -> X
+/// One version of a hot-swappable module `twocore@test@hotswap`: `val/0`
+/// returns `value`. Loaded twice with different values in the hot-replace test
+/// to prove the loaded code is genuinely resident (D10), not a static artifact.
+fn hotswap_module(value: Int) -> CModule {
+  CModule(
+    name: "twocore@test@hotswap",
+    exports: [FName("val", 0)],
+    attributes: [],
+    defs: [FunDef(FName("val", 0), CFun([], CInt(value)))],
+  )
+}
 
-'add'/2 =
-    fun (A, B) ->
-        call 'erlang':'+'(A, B)
+/// A structurally broken module: `oops/0`'s body references an UNBOUND
+/// variable. The AST lowers to forms fine, but `erl_lint` inside
+/// `compile:forms` rejects it — exercising the compiler's error path (an
+/// unbound variable is the forms-level analog of the old scanner's `@@@`).
+fn broken_unbound_module() -> CModule {
+  CModule(
+    name: "twocore@test@broken",
+    exports: [FName("oops", 0)],
+    attributes: [],
+    defs: [FunDef(FName("oops", 0), CFun([], CVar("never_bound")))],
+  )
+}
 
-'classify'/1 =
-    fun (N) ->
-        case N of
-            <X> when call 'erlang':'=<'(X, 0) ->
-                'zero_or_neg'
-            <X> when call 'erlang':'<'(X, 10) ->
-                'small'
-            <_X> when 'true' ->
-                'big'
-        end
-end
-"
-
-/// First version of a hot-swappable module `twocore@test@hotswap`: `val/0`
-/// returns `1`. Loaded then replaced by `hotswap_v2_core` in the hot-replace
-/// test to prove the loaded code is genuinely resident (D10), not a static
-/// artifact.
-const hotswap_v1_core: String = "module 'twocore@test@hotswap' ['val'/0]
-    attributes []
-
-'val'/0 =
-    fun () -> 1
-end
-"
-
-/// Second version of `twocore@test@hotswap`: `val/0` returns `2`. Same module
-/// name as v1, so loading it hot-replaces v1.
-const hotswap_v2_core: String = "module 'twocore@test@hotswap' ['val'/0]
-    attributes []
-
-'val'/0 =
-    fun () -> 2
-end
-"
-
-/// Syntactically broken `.core` (stray `@@@` tokens) — exercises the
-/// `core_parse` error path.
-const broken_syntax_core: String = "module 'twocore@test@broken' ['oops'/0]
-    attributes []
-'oops'/0 =
-    fun () -> @@@ not valid @@@
-"
-
-/// Semantically broken `.core`: calls an undefined local function `missing/0`.
-/// Scans and parses fine, but `compile:forms` rejects it — exercises the
-/// `compile` error path (a different error shape than `core_parse`).
-const broken_semantic_core: String = "module 'twocore@test@badsem' ['go'/0]
-    attributes []
-'go'/0 =
-    fun () -> apply 'missing'/0 ()
-end
-"
-
-/// Helper: `.core` source string → byte-aligned `BitArray` for `compile_core`.
-fn core(src: String) -> BitArray {
-  bit_array.from_string(src)
+/// A semantically broken module: `go/0` applies an undefined local function
+/// `missing/0`. Lowers fine, but `compile:forms` rejects it (undefined
+/// function) — a differently-shaped compiler diagnostic than the unbound-var
+/// case.
+fn broken_semantic_module() -> CModule {
+  CModule(
+    name: "twocore@test@badsem",
+    exports: [FName("go", 0)],
+    attributes: [],
+    defs: [FunDef(FName("go", 0), CFun([], CApply(FName("missing", 0), [])))],
+  )
 }
 
 // ───────────────────── 1. happy path, numeric assertion ─────────────────────
@@ -114,11 +125,11 @@ fn core(src: String) -> BitArray {
 /// Compiling, loading, and running the valid fixture must yield the spec-defined
 /// arithmetic / guard results: `add(2,3) == 5`, `id(42) == 42`, and each
 /// `classify` input lands in the documented guard arm. Proves the full
-/// text → `.beam` → loaded → `apply` seam (D10, §9.2).
+/// AST → forms → `.beam` → loaded → `apply` seam (D10, §9.2).
 pub fn compile_load_run_happy_path_test() {
-  let assert Ok(mod) = build_beam.compile_and_load(core(fixture_core))
+  let assert Ok(mod) = build_beam.compile_and_load(fixture_module())
 
-  // The loaded module name comes from the `.core` `module` header.
+  // The loaded module name comes from the `-module` attribute.
   assert atom.to_string(mod) == "twocore@test@fixture"
 
   // add/2 is integer addition; 2 + 3 is 5.
@@ -138,12 +149,13 @@ pub fn compile_load_run_happy_path_test() {
 
 // ───────────────── 2. malformed input → typed Error, no crash ─────────────────
 
-/// Syntactically broken `.core` must produce `Error(CompileFailed(lines))` with
-/// non-empty, human-readable `"<loc>: <message>"` lines — never a panic
-/// (fail-closed, D4). The result is captured normally (no `let assert`), so a
-/// panic would fail the test rather than be silently caught.
-pub fn malformed_syntax_yields_typed_error_test() {
-  let result = build_beam.compile_core(core(broken_syntax_core))
+/// A module whose body references an unbound variable must produce
+/// `Error(CompileFailed(lines))` with non-empty, human-readable
+/// `"<loc>: <message>"` lines — never a panic (fail-closed, D4). The result is
+/// captured normally (no `let assert`), so a panic would fail the test rather
+/// than be silently caught.
+pub fn malformed_unbound_yields_typed_error_test() {
+  let result = build_beam.compile_module(broken_unbound_module())
 
   let assert Error(CompileFailed(lines)) = result
   assert lines != []
@@ -151,13 +163,12 @@ pub fn malformed_syntax_yields_typed_error_test() {
   assert list.all(lines, fn(l) { l != "" && string.contains(l, ": ") })
 }
 
-/// Semantically broken `.core` (a call to an undefined function) scans and
-/// parses but is rejected by `compile:forms`. It must ALSO surface as
+/// A module applying an undefined local function lowers to forms but is
+/// rejected by `compile:forms`. It must ALSO surface as
 /// `Error(CompileFailed(lines))` with non-empty lines — proving the shim
-/// normalizes the (differently-shaped) `compile` errors into the same flat list
-/// as the parse errors. No panic.
+/// normalizes every compiler diagnostic into the same flat list. No panic.
 pub fn malformed_semantic_yields_typed_error_test() {
-  let result = build_beam.compile_core(core(broken_semantic_core))
+  let result = build_beam.compile_module(broken_semantic_module())
 
   let assert Error(CompileFailed(lines)) = result
   assert lines != []
@@ -167,21 +178,21 @@ pub fn malformed_semantic_yields_typed_error_test() {
 // ───────────────────────── 3. FFI shape validation ─────────────────────────
 
 /// Trust-boundary check (Gleam cannot type-check the `.erl` return): on success
-/// `compile_core` must hand back the expected module atom AND a non-empty `beam`
-/// binary.
+/// `compile_module` must hand back the expected module atom AND a non-empty
+/// `beam` binary.
 pub fn ffi_success_shape_test() {
-  let assert Ok(#(mod, beam)) = build_beam.compile_core(core(fixture_core))
+  let assert Ok(#(mod, beam)) = build_beam.compile_module(fixture_module())
   assert atom.to_string(mod) == "twocore@test@fixture"
   // A real `.beam` binary is non-empty.
   assert bit_array.byte_size(beam) > 0
 }
 
-/// Trust-boundary check: on failure `compile_core` must hand back a non-empty
+/// Trust-boundary check: on failure `compile_module` must hand back a non-empty
 /// `List(String)` (every element a non-empty string), regardless of which stage
 /// failed.
 pub fn ffi_failure_shape_test() {
   let assert Error(CompileFailed(lines)) =
-    build_beam.compile_core(core(broken_syntax_core))
+    build_beam.compile_module(broken_unbound_module())
   assert lines != []
   assert list.all(lines, fn(l) { string.length(l) > 0 })
 }
@@ -192,30 +203,30 @@ pub fn ffi_failure_shape_test() {
 /// load must hot-replace the first — demonstrating that the loaded module is
 /// genuinely resident BEAM code, not a static artifact. After loading v1,
 /// `val/0` returns `1`; after loading v2 (same module name), `val/0` returns
-/// `2`. (Core Erlang / OTP code-loading semantics: `code:load_binary` replaces
-/// current code with the new version.)
+/// `2`. (OTP code-loading semantics: `code:load_binary` replaces current code
+/// with the new version.)
 pub fn hot_replace_resident_module_test() {
   let val = atom.create("val")
 
-  let assert Ok(mod1) = build_beam.compile_and_load(core(hotswap_v1_core))
+  let assert Ok(mod1) = build_beam.compile_and_load(hotswap_module(1))
   assert atom.to_string(mod1) == "twocore@test@hotswap"
   assert apply_int(mod1, val, []) == 1
 
-  let assert Ok(mod2) = build_beam.compile_and_load(core(hotswap_v2_core))
+  let assert Ok(mod2) = build_beam.compile_and_load(hotswap_module(2))
   assert atom.to_string(mod2) == "twocore@test@hotswap"
   // The resident module was hot-replaced: the export now returns v2's value.
   assert apply_int(mod2, val, []) == 2
 }
 
-// ───────────────── split-surface: compile_core then load_module ─────────────────
+// ───────────────── split-surface: compile_module then load_module ─────────────────
 
-/// `compile_core` and `load_module` compose: compiling separately, then loading
-/// the returned binary under its own module atom, yields a callable module —
-/// the same outcome as `compile_and_load`, but via the granular two-step API.
-/// `load_module` returns the module atom on success.
+/// `compile_module` and `load_module` compose: compiling separately, then
+/// loading the returned binary under its own module atom, yields a callable
+/// module — the same outcome as `compile_and_load`, but via the granular
+/// two-step API. `load_module` returns the module atom on success.
 pub fn split_compile_then_load_test() {
-  let assert Ok(#(mod, beam)) = build_beam.compile_core(core(fixture_core))
-  let assert Ok(loaded) = build_beam.load_module(mod, "fixture.core", beam)
+  let assert Ok(#(mod, beam)) = build_beam.compile_module(fixture_module())
+  let assert Ok(loaded) = build_beam.load_module(mod, "fixture.forms", beam)
   assert loaded == mod
   assert apply_int(loaded, atom.create("add"), [40, 2]) == 42
 }

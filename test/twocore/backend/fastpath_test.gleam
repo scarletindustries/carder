@@ -17,13 +17,11 @@
 //// path. The harness (`load`/`module`/`fnN`/`catch_apply_dyn`/`to_dynamic`) mirrors
 //// `term_ops_test.gleam` + `rt_js_boundary_test.gleam`.
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
 import twocore/backend/build_beam
-import twocore/backend/core_printer
 import twocore/backend/emit_core
 import twocore/ir
 import twocore/runtime/instance
@@ -50,8 +48,7 @@ fn to_dynamic(x: a) -> Dynamic
 /// test VM; return the loaded module atom. `let assert` is the success contract.
 fn load(module: ir.Module) -> Atom {
   let assert Ok(cm) = emit_core.emit_module(module, instance.safe_default())
-  let core = core_printer.print_module(cm)
-  let assert Ok(mod) = build_beam.compile_and_load(bit_array.from_string(core))
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
   mod
 }
 

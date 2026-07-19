@@ -128,8 +128,8 @@ pub fn default_off_byte_identical_test() {
   let assert Ok(m) = pipeline.source_to_ir(bytes)
   let assert Ok(binding) =
     twocore.resolve_binding(profiles.safe(), False, False, None, None, None)
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(oracle_beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(oracle_beam) = pipeline.cmod_to_beam(cmod)
 
   assert cli_beam == oracle_beam
   let _ = simplifile.delete(out)
@@ -288,7 +288,7 @@ pub fn r17_lower_once_seam_test() {
   let assert Ok(m) = pipeline.source_to_ir(bytes)
 
   // The seam: the module `describe` sees IS the one the `.core` (hence `.beam`) is generated from.
-  let assert Ok(#(lowered, _core)) = pipeline.ir_to_lowered_core(m, binding)
+  let assert Ok(#(lowered, _cmod)) = pipeline.ir_to_lowered_cmod(m, binding)
   let assert Ok(desc) = iface.describe(lowered, binding)
 
   // Memory-mutating exports → Threaded, every export state-reaching.
@@ -329,8 +329,8 @@ pub fn folder_emission_and_beam_non_perturbation_test() {
   let binding = threaded_binding()
   let assert Ok(bytes) = simplifile.read_bits(wasm)
   let assert Ok(m) = pipeline.source_to_ir(bytes)
-  let assert Ok(#(lowered, core)) = pipeline.ir_to_lowered_core(m, binding)
-  let assert Ok(oracle_beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(#(lowered, cmod)) = pipeline.ir_to_lowered_cmod(m, binding)
+  let assert Ok(oracle_beam) = pipeline.cmod_to_beam(cmod)
   assert folder_beam == oracle_beam
 
   // Each companion file's content EQUALS the emitter's output for the same descriptor.
@@ -359,8 +359,8 @@ pub fn emit_bindings_deterministic_test() {
   let binding = threaded_binding()
   let assert Ok(bytes) = simplifile.read_bits(wasm)
   let assert Ok(m) = pipeline.source_to_ir(bytes)
-  let assert Ok(#(lowered, core)) = pipeline.ir_to_lowered_core(m, binding)
-  let assert Ok(beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(#(lowered, cmod)) = pipeline.ir_to_lowered_cmod(m, binding)
+  let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
 
   let d1 = "build/p12_det_1"
   let d2 = "build/p12_det_2"

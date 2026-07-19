@@ -33,7 +33,6 @@
 //// bounds/traps <https://webassembly.github.io/spec/core/exec/instructions.html>. Every value
 //// is bit-pattern-compared (D5/D7); every trap via `runner.trap_matches` / raw-reason identity.
 
-import gleam/bit_array
 import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
@@ -50,6 +49,9 @@ import twocore/backend/beam_link.{
   UnmergeableConstruct,
 }
 import twocore/backend/build_beam
+import twocore/backend/core_erlang
+import twocore/backend/core_printer
+import twocore/backend/eaf
 import twocore/backend/link_manifest
 import twocore/conformance/driver
 import twocore/conformance/ffi
@@ -111,6 +113,13 @@ fn to_dynamic(x: a) -> Dynamic
 /// The frozen OTP-ambient allowlist (the DCE stop-set) every merge in this suite consumes (R7).
 fn ambient() -> List(String) {
   link_manifest.ambient_allowlist()
+}
+
+/// Lower a backend `CModule` to the abstract FORMS the linker consumes
+/// (`let assert` — a lowering failure is a genuine test failure).
+fn forms_of(cmod: core_erlang.CModule) -> List(eaf.Form) {
+  let assert Ok(forms) = eaf.module_forms(cmod)
+  forms
 }
 
 /// Render a `LinkError` as a one-line diagnostic covering ALL SEVEN variants (so a merge failure
@@ -205,17 +214,13 @@ fn linked_instantiate(
           |> result.map_error(fn(e) { "link: " <> link.import_error_phrase(e) })
       }
   })
-  use core_text <- result.try(
-    pipeline.ir_to_core(irmod, binding)
+  use cmod <- result.try(
+    pipeline.ir_to_cmod(irmod, binding)
     |> result.map_error(pipeline.describe),
   )
   // THE ONE DIFFERENCE from the oracle: merge the runtime closure IN, rather than call it out.
   use pair <- result.try(
-    beam_link.link_program(
-      bit_array.from_string(core_text),
-      irmod.name,
-      ambient(),
-    )
+    beam_link.link_program(forms_of(cmod), irmod.name, ambient())
     |> result.map_error(fn(e) { "link_program: " <> describe_link_error(e) }),
   )
   let #(mod_atom, beam) = pair
@@ -499,9 +504,9 @@ pub fn l1_instantiate_root_seeds_state_test() {
 pub fn l1_import_bearing_instantiate1_merges_test() {
   let m = import_bearing_module("twocore@link@importfix")
   let binding = combos.binding_for(combos.cell_paged)
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
   let assert Ok(#(mod, beam)) =
-    beam_link.link_program(bit_array.from_string(core), m.name, ambient())
+    beam_link.link_program(forms_of(cmod), m.name, ambient())
   let assert Ok(_) = build_beam.load_module(mod, "importfix.beam", beam)
   let assert Ok(imports) = link.link_imports(m, [])
   // seed the merged instantiate/1 with the provided import vector, then read the global.
@@ -541,10 +546,10 @@ fn import_bearing_module(name: String) -> ir.Module {
 pub fn determinism_link_twice_byte_identical_test() {
   let assert Ok(bytes) = combos.read_wasm("mem")
   let assert Ok(m) = pipeline.source_to_ir(bytes)
-  let assert Ok(core) = pipeline.ir_to_core(m, profiles.unsafe())
-  let bits = bit_array.from_string(core)
-  let assert Ok(#(_, beam1)) = beam_link.link_program(bits, m.name, ambient())
-  let assert Ok(#(_, beam2)) = beam_link.link_program(bits, m.name, ambient())
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, profiles.unsafe())
+  let forms = forms_of(cmod)
+  let assert Ok(#(_, beam1)) = beam_link.link_program(forms, m.name, ambient())
+  let assert Ok(#(_, beam2)) = beam_link.link_program(forms, m.name, ambient())
   assert beam1 == beam2
 }
 
@@ -572,14 +577,12 @@ pub fn d3a_structural_over_merged_corpus_test() {
 fn d3a_failures(name: String) -> List(String) {
   let assert Ok(bytes) = combos.read_wasm(name)
   let assert Ok(m) = pipeline.source_to_ir(bytes)
-  case pipeline.ir_to_core(m, profiles.unsafe()) {
+  case pipeline.ir_to_cmod(m, profiles.unsafe()) {
     // Import-bearing / out-of-scope programs never compile to a linkable core; skip (not a bare-node
     // artifact). The differential (L1) already proves they REJECT identically.
     Error(_) -> []
-    Ok(core) ->
-      case
-        beam_link.link_to_core(bit_array.from_string(core), m.name, ambient())
-      {
+    Ok(cmod) ->
+      case beam_link.link_to_core(forms_of(cmod), m.name, ambient()) {
         Error(e) -> [
           name <> ": link_to_core failed: " <> describe_link_error(e),
         ]
@@ -661,9 +664,10 @@ pub fn merged_exports_exactly_original_plus_instantiate_plus_module_info_test() 
 fn export_failures(name: String) -> List(String) {
   let assert Ok(bytes) = combos.read_wasm(name)
   let assert Ok(m) = pipeline.source_to_ir(bytes)
-  let assert Ok(core) = pipeline.ir_to_core(m, profiles.unsafe())
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, profiles.unsafe())
+  let core = core_printer.print_module(cmod)
   let assert Ok(#(_, merged)) =
-    beam_link.link_to_core(bit_array.from_string(core), m.name, ambient())
+    beam_link.link_to_core(forms_of(cmod), m.name, ambient())
   let expected =
     set.union(
       set.from_list(header_exports(core)),
@@ -886,9 +890,9 @@ pub fn l2_constant_space_sum_to_100000_bare_node_test() {
   // (b) measured constant space on the merged artifact (its own runtime), in-process.
   let assert Ok(m) = pipeline.source_to_ir(bytes)
   let um = ir.Module(..m, name: m.name <> "_cspace")
-  let assert Ok(core2) = pipeline.ir_to_core(um, binding)
+  let assert Ok(cmod2) = pipeline.ir_to_cmod(um, binding)
   let assert Ok(#(mod2, beam2)) =
-    beam_link.link_program(bit_array.from_string(core2), um.name, ambient())
+    beam_link.link_program(forms_of(cmod2), um.name, ambient())
   let assert Ok(_) = build_beam.load_module(mod2, "cspace.beam", beam2)
 
   let assert Ok(small) = ffi.start_instance(mod2)
@@ -954,10 +958,10 @@ fn linked_beam_pair(
     Error(e) -> Error(pipeline.describe(e))
     Ok(m0) -> {
       let m = ir.Module(..m0, name: uniquify(m0.name))
-      case pipeline.ir_to_core(m, binding) {
+      case pipeline.ir_to_cmod(m, binding) {
         Error(e) -> Error(pipeline.describe(e))
-        Ok(core) ->
-          beam_link.link_program(bit_array.from_string(core), m.name, ambient())
+        Ok(cmod) ->
+          beam_link.link_program(forms_of(cmod), m.name, ambient())
           |> result.map_error(describe_link_error)
       }
     }

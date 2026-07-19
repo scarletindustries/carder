@@ -79,8 +79,8 @@ pub fn default_off_byte_identical_test() {
       option.None,
       option.None,
     )
-  let assert Ok(core) = pipeline.ir_to_core(m, binding)
-  let assert Ok(oracle_beam) = pipeline.core_to_beam(core, m.name)
+  let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
+  let assert Ok(oracle_beam) = pipeline.cmod_to_beam(cmod)
 
   assert cli_beam == oracle_beam
   let _ = simplifile.delete(out)

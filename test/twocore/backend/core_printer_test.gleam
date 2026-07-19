@@ -22,7 +22,6 @@
 //// `compiler` app (`core_scan`/`core_parse`/`core_lint`, `core_pp.erl`,
 //// `io_lib:write_string/2`).
 
-import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
@@ -350,10 +349,7 @@ pub fn integration_add_compiles_loads_runs_test() {
         ),
       ),
     ])
-  let assert Ok(mod) =
-    build_beam.compile_and_load(
-      bit_array.from_string(core_printer.print_module(m)),
-    )
+  let assert Ok(mod) = build_beam.compile_and_load(m)
   assert atom.to_string(mod) == "twocore@test@printer_add"
   let add = atom.create("add")
   assert apply_int(mod, add, [2, 3]) == 5
@@ -390,10 +386,7 @@ pub fn integration_factorial_recursion_test() {
     CModule("twocore@test@printer_fac", [FName("fac", 1)], [], [
       FunDef(FName("fac", 1), CFun(["n"], body)),
     ])
-  let assert Ok(mod) =
-    build_beam.compile_and_load(
-      bit_array.from_string(core_printer.print_module(m)),
-    )
+  let assert Ok(mod) = build_beam.compile_and_load(m)
   let fac = atom.create("fac")
   assert apply_int(mod, fac, [0]) == 1
   assert apply_int(mod, fac, [5]) == 120
@@ -423,10 +416,7 @@ pub fn integration_classify_guards_test() {
     CModule("twocore@test@printer_classify", [FName("classify", 1)], [], [
       FunDef(FName("classify", 1), CFun(["n"], body)),
     ])
-  let assert Ok(mod) =
-    build_beam.compile_and_load(
-      bit_array.from_string(core_printer.print_module(m)),
-    )
+  let assert Ok(mod) = build_beam.compile_and_load(m)
   let c = atom.create("classify")
   assert apply_atom(mod, c, [-3]) == atom.create("zero_or_neg")
   assert apply_atom(mod, c, [0]) == atom.create("zero_or_neg")
