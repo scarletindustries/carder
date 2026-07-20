@@ -39,8 +39,8 @@ import gleam/string_tree.{type StringTree}
 import twocore/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CApplyExpr, CAtom, CBinary, CCall, CCase, CCons, CFloat,
-  CFun, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, PAtom,
-  PCons, PInt, PNil, PTuple, PVar,
+  CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar,
+  PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 
 /// One indentation step. Whitespace is insignificant to the Core Erlang scanner,
@@ -187,6 +187,7 @@ fn print_expr(e: CExpr, ind: String) -> StringTree {
         st("}#"),
       ])
     CFun(vars, body) -> print_fun(vars, body, ind)
+    CFunRef(name) -> print_fname(name)
     CLet(vars, arg, body) -> print_let(vars, arg, body, ind)
     CLetrec(defs, body) -> print_letrec(defs, body, ind)
     CCase(arg, clauses) -> print_case(arg, clauses, ind)

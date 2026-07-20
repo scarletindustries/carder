@@ -56,7 +56,9 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/set.{type Set}
+import twocore/runtime/rt_js_types.{type JsStore, type Realm}
 
 /// `erlang:put/2` — store `value` under `key` in the current process dictionary; returns
 /// the previous value (or the atom `undefined` if unset), which callers here discard.
@@ -131,6 +133,15 @@ type StateKey {
 ///   ambient `apply` of a data-named `module:atom` (D3a). Seeded by `seed_func_imports` (cell) /
 ///   `set_func_imports` (threaded) at `instantiate`; empty (`[]`) for a module with no
 ///   imported-function CALLS (so the field is inert + byte-neutral for the whole Phase-1..5 corpus).
+/// - `js_store`: the threaded **JS heap** (SPEC §2.1) — present only for a JS-target build, seeded
+///   by `rt_js_store.t_store_new` at instantiate and rebound on every JS op. `None` for a pure-WASM
+///   instance (the whole prior corpus), so the field is inert + byte-neutral there. Typed as
+///   `Option(JsStore(InstanceState))` (D17): the store is generic over its own outer state so JS
+///   ops can thread the WHOLE `InstanceState` (mem + globals + JS heap) through one value.
+/// - `js_realm`: the realm's intrinsic-handle record (SPEC §2.5). NOT on `JsStore` (G18 — a store
+///   exists before any realm); held HERE so threaded `t_*` ops taking only `st` can reach
+///   `%Object.prototype%` etc. Seeded by M19 driver from `init_realm`'s return; `None` for
+///   pure-WASM.
 pub type InstanceState {
   InstanceState(
     mems: List(Dynamic),
@@ -140,6 +151,8 @@ pub type InstanceState {
     dropped_elem: Set(Int),
     ref_globals: Dict(String, Dynamic),
     func_imports: List(Dynamic),
+    js_store: Option(JsStore(InstanceState)),
+    js_realm: Option(Realm),
   )
 }
 
@@ -681,6 +694,39 @@ pub fn t_func_import_at(st: InstanceState, slot: Int) -> Dynamic {
   )
 }
 
+// ── JS heap (threaded; SPEC §2.1) ─────────────────────────────────────────────
+
+/// Project the threaded JS heap out of the record (SPEC §2.1). READ-ONLY. Returns `None` for a
+/// pure-WASM instance (no JS store seeded); `Some(js)` after `t_with_js_store`. Total; never raises.
+pub fn t_js_store(st: InstanceState) -> Option(JsStore(InstanceState)) {
+  st.js_store
+}
+
+/// Rebind the JS heap on the threaded record, RETURNING the updated record (SPEC §2.1). Wraps `js`
+/// in `Some`; only `js_store` changes, other fields shared by reference. Total; never raises.
+pub fn t_with_js_store(
+  st: InstanceState,
+  js: JsStore(InstanceState),
+) -> InstanceState {
+  InstanceState(..st, js_store: Some(js))
+}
+
+/// Read the realm intrinsics record. Fail-closed panic on `None` — a realm-needing op reaches here
+/// only under `js_profile: True` after M19's driver has run `init_realm` and `t_with_realm`, so
+/// `None` is an internal invariant violation (same posture as `rt_js_store.require_js`).
+pub fn t_realm(st: InstanceState) -> Realm {
+  case st.js_realm {
+    Some(r) -> r
+    None -> panic as "js op on InstanceState with no Realm — init_realm not run"
+  }
+}
+
+/// Rebind the realm intrinsics on the threaded record. Called ONCE by M19's driver with
+/// `init_realm`'s return; the realm is immutable thereafter (handle ids are pinned).
+pub fn t_with_realm(st: InstanceState, r: Realm) -> InstanceState {
+  InstanceState(..st, js_realm: Some(r))
+}
+
 // ── internal helpers ──────────────────────────────────────────────────────────
 
 /// Materialise the single-memory / single-table / import-free `StateDecl` (the byte-identical
@@ -721,6 +767,12 @@ fn build_full(decl: FullDecl) -> InstanceState {
     // only when the module actually calls an imported function — so a no-imported-call module keeps
     // an empty vector and the whole Phase-1..5 corpus is byte-neutral through this field.
     func_imports: [],
+    // The JS heap starts ABSENT (SPEC §2.1); a JS-target `instantiate` seeds it via
+    // `t_with_js_store` after `rt_js_store.t_store_new`, so a pure-WASM instance stays `None`.
+    js_store: None,
+    // The realm intrinsics record starts ABSENT; M19's driver seeds it via `t_with_realm` from
+    // `init_realm`'s return (G18 — realm is NOT on JsStore).
+    js_realm: None,
   )
 }
 

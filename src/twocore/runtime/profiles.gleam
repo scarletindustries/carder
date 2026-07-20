@@ -185,6 +185,24 @@ pub fn js() -> Binding {
   porffor()
 }
 
+/// The **arc→2core direct-IR JS profile**: `Threaded` state, universal JS-function threading,
+/// split `rt_js_*` modules. Replaces `js()` as the JS-on-BEAM posture — `js_profile: True`
+/// short-circuits `state_reaching_closure` to ALL functions and gates the `emit_core` rewrites
+/// that thread `InstanceState` through every `CallHost("js",…)`/closure/throw/catch (SPEC§7.M9).
+/// `MeterOff` because JS metering is the arc-side realm's job, not `ir_lower`'s `Charge` nodes.
+/// Tier-P on every axis (identical to `portable()` bar `js_profile`/`meter`). Total.
+pub fn js_direct() -> Binding {
+  // arc emit_2core no longer leaks anf.run-local slot-var names past the Let-RHS boundary
+  // (stmt.let_ splices the Let-spine; anf.bind_if/bind_block thread rebound slots through
+  // the wrapper's result tuple), so the IR is well-scoped and Baseline's propagate/dead-let
+  // passes are sound over it (SPEC§9.12).
+  Binding(
+    ..compose(safe(), Threaded, Paged, TablePaged),
+    js_profile: True,
+    meter: MeterOff,
+  )
+}
+
 /// The named **Unsafe** profile (F4) — the platform's second named mode, the aggressive
 /// posture in one value: the aggressive optimizer, no CPU metering, the open BIF gate,
 /// passthrough stdlib, and the open host, while keeping the **identical**

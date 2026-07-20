@@ -44,25 +44,8 @@ id(X) -> X.
 %% Module atom is taken from the `-module` attribute. On failure every
 %% diagnostic is returned as a flat list of human-readable "<loc>: <message>"
 %% binaries.
-%%
-%% Options: `binary` returns the `.beam` in-memory (never touches disk);
-%% `return_errors`/`return_warnings` select the tuple (not printed) report
-%% shapes; `nowarn_unused_vars` silences the one warning class alpha-renamed
-%% codegen output legitimately triggers en masse (fresh pattern binders used
-%% as wildcards), keeping the warning list from growing O(module) on large
-%% guests.
 compile_forms(Forms) when is_list(Forms) ->
-    try compile:forms(Forms, [binary, return_errors, return_warnings,
-                              nowarn_unused_vars]) of
-        {ok, Mod, Beam, _W} -> {ok, {Mod, Beam}};
-        {ok, Mod, Beam}     -> {ok, {Mod, Beam}};
-        {error, Errs, _W}   -> {error, fmt_errs(Errs)};
-        error               -> {error, [<<"module: compile:forms failed">>]}
-    catch
-        Class:Reason ->
-            Msg = io_lib:format("compiler crashed: ~0p:~0p", [Class, Reason]),
-            {error, [unicode:characters_to_binary(Msg)]}
-    end.
+    compile_forms_guarded(Forms, []).
 
 %% forms_to_erl(Forms) -> Binary
 %%
@@ -72,6 +55,85 @@ compile_forms(Forms) when is_list(Forms) ->
 %% the dump.
 forms_to_erl(Forms) when is_list(Forms) ->
     unicode:characters_to_binary([[erl_pp:form(F), $\n] || F <- Forms]).
+
+%% perf5 CFunRef workaround: emit_core now emits bare `'jsf_K'/N` fun-ref
+%% VALUES for zero-capture closures (perf5_cfunref_zero_capture). On some
+%% OTP-29 builds many such refs inside one large js_main crash beam_ssa_opt's
+%% ssa_opt_type_start (fun-type-lattice badmatch — an OTP-internal error, not
+%% a diagnostic). Retry once with `no_type_opt` (whole type-opt phase off; the
+%% finest-grained safe skip per ../arc/test/emit_2core_cfunref_spike.gleam). OTP
+%% 29's fold_comp (compile.erl:1333) already wraps every pass in try/catch and
+%% returns pass crashes as a CLEAN {error,[{F,[{none,compile,{crash,…}}]}],W}
+%% — so the retry must key off that descriptor, not (only) a raised exception.
+%% A clean {error,…} WITHOUT a crash descriptor is a real diagnostic and
+%% surfaces unchanged, so well-formed modules keep the full optimizer.
+%% Options: `binary` returns the `.beam` in-memory (never touches disk);
+%% `return_errors`/`return_warnings` select the tuple (not printed) report
+%% shapes; `nowarn_unused_vars` silences the one warning class alpha-renamed
+%% codegen output legitimately triggers en masse (fresh pattern binders used
+%% as wildcards), keeping the warning list from growing O(module) on large
+%% guests.
+compile_forms_guarded(Forms, Extra) ->
+    Opts = [binary, return_errors, return_warnings, nowarn_unused_vars | Extra],
+    try compile:forms(Forms, Opts) of
+        {ok, Mod, Beam, _W} -> {ok, {Mod, Beam}};
+        {ok, Mod, Beam}     -> {ok, {Mod, Beam}};
+        {error, Errs, _W} when Extra =:= [] ->
+            case has_crash_desc(Errs) of
+                true ->
+                    io:format(standard_error,
+                              "[codegen] no_type_opt retry (crash-desc) mod=~p~n",
+                              [forms_module(Forms)]),
+                    case compile_forms_guarded(Forms, [no_type_opt]) of
+                        {ok, _} = Ok  -> Ok;
+                        {error, Msgs} -> {error, fmt_errs(Errs) ++ Msgs}
+                    end;
+                false -> {error, fmt_errs(Errs)}
+            end;
+        {error, Errs, _W}   -> {error, fmt_errs(Errs)};
+        error               -> {error, [<<"module: compile:forms failed">>]}
+    catch
+        Class:Reason when Extra =:= [] ->
+            io:format(standard_error,
+                      "[codegen] no_type_opt retry (catch ~p:~0p) mod=~p~n",
+                      [Class, Reason, forms_module(Forms)]),
+            case compile_forms_guarded(Forms, [no_type_opt]) of
+                {ok, _} = Ok -> Ok;
+                {error, Msgs} ->
+                    {error, [crash_line(Class, Reason) | Msgs]}
+            end;
+        Class:Reason ->
+            {error, [crash_line(Class, Reason)]}
+    end.
+
+%% The module name from a form list's `-module` attribute, for the retry log
+%% line only. `unknown` when absent (a malformed list the compiler will reject
+%% anyway) — never crashes the diagnostic path.
+forms_module(Forms) ->
+    case [M || {attribute, _, module, M} <- Forms] of
+        [Mod | _] -> Mod;
+        []        -> unknown
+    end.
+
+%% True iff the compiler's per-file error list carries an internal-pass-crash
+%% descriptor (compile.erl fold_comp emits {none,compile,{crash,Pass,R,Stk}}).
+has_crash_desc(Errs) ->
+    lists:any(fun({_F, EIs}) ->
+                  lists:any(fun({_, compile, {crash, _, _, _}}) -> true;
+                               (_) -> false
+                            end, EIs)
+              end, Errs).
+
+%% One-line rendering of an OTP-compiler crash so the Gleam side sees a
+%% List(String) diagnostic (never a raw exit) even when the retry also fails.
+crash_line(Class, Reason) ->
+    R = iolist_to_binary(io_lib:format("~0p", [Reason])),
+    Head = case byte_size(R) > 200 of
+               true  -> <<(binary:part(R, 0, 200))/binary, "...">>;
+               false -> R
+           end,
+    <<"module: OTP compiler crashed (", (atom_to_binary(Class, utf8))/binary,
+      "): ", Head/binary>>.
 
 %% Flatten the compiler's per-file nested error list into one flat list of
 %% rendered binary lines.

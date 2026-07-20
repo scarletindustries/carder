@@ -1453,6 +1453,8 @@ pub type ConvOp {
 /// - `TupleSize`: the arity of the single tuple arg (`erlang:tuple_size/1`). Result `TI32`.
 ///   Exactly 1 arg.
 /// - `MakeCons`: build a cons cell `[H|T]` from exactly 2 args (head, tail). Result `TTerm`.
+/// - `MakeNil`: the empty-list literal `[]` from **0 args**. Result `TTerm`. The `cons_list`
+///   fold seed — a `Value` cannot represent `[]` (no `ConstNil`), so this is the pure literal.
 /// - `ListHead`: the head of the single cons arg (`erlang:hd/1`). Result `TTerm`. Exactly 1 arg.
 /// - `ListTail`: the tail of the single cons arg (`erlang:tl/1`). Result `TTerm`. Exactly 1 arg.
 /// - `IsEmptyList`: `1` if the single list arg is `[]`, else `0` — an **i32 truth value** (so it
@@ -1461,6 +1463,7 @@ pub type TermOp {
   MakeTuple
   TupleGet(index: Int)
   MakeCons
+  MakeNil
   TupleSize
   ListHead
   ListTail

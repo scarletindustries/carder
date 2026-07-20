@@ -251,6 +251,23 @@ pub type Binding {
     table_module: String,
     state_module: String,
     js_runtime_module: String,
+    // ── Phase-9 M9 split rt_js modules (SPEC§7.M9 §9.1 / R3). Each is the mangled BEAM
+    // atom `emit_core`'s `js_module_atom` links a `JsRtModule` variant to under
+    // `js_profile: True`. Inert under `js_profile: False` (the WASM/Porffor default).
+    js_store_module: String,
+    js_val_module: String,
+    js_obj_module: String,
+    js_ops_module: String,
+    js_call_module: String,
+    js_class_module: String,
+    js_async_module: String,
+    js_gc_module: String,
+    js_builtins_module: String,
+    js_inspect_module: String,
+    /// The Phase-9 M9 gate (R3): `True` makes `emit_core` thread `InstanceState` through
+    /// EVERY `CallHost("js",…)`/`MakeClosure`/`CallClosure`/`Throw`/catch so compiled JS
+    /// functions have shape `fun(St,…) -> {V,St'}`. `False` = byte-identical WASM/Porffor.
+    js_profile: Bool,
     safe_max_pages: Int,
     /// The documented, spec-aligned RUNTIME page cap for a 64-bit (`Idx64`) memory (memory64,
     /// I4/S9). We do NOT reserve 2^64 bytes: the `paged` backend grows on demand, so this is a
@@ -364,6 +381,19 @@ pub fn safe_default() -> Binding {
     // `CallHost("js", op, args)` routes here via a build-fixed literal `case` in `emit_core`
     // (D3a — never `apply` from data). Inert unless the module emits a `"js"` CallHost (K7).
     js_runtime_module: "twocore@runtime@rt_js",
+    // ── Phase-9 M9 split rt_js seeds (SPEC§9.1). Each is the default `twocore@runtime@rt_js_*`
+    // atom; inert under `js_profile: False` (the fail-closed default, next).
+    js_store_module: "twocore@runtime@rt_js_store",
+    js_val_module: "twocore@runtime@rt_js_val",
+    js_obj_module: "twocore@runtime@rt_js_obj",
+    js_ops_module: "twocore@runtime@rt_js_ops",
+    js_call_module: "twocore@runtime@rt_js_call",
+    js_class_module: "twocore@runtime@rt_js_class",
+    js_async_module: "twocore@runtime@rt_js_async",
+    js_gc_module: "twocore@runtime@rt_js_gc",
+    js_builtins_module: "twocore@runtime@rt_js_builtins",
+    js_inspect_module: "twocore@runtime@rt_js_inspect",
+    js_profile: False,
     // The finite Safe max-pages cap baked into `rt_mem:fresh` (E3). `65536` = the i32 hard
     // cap (2^16 pages = 4 GiB), so the module's DECLARED max governs for conformance; unit
     // 11 lowers it to a real Safe resource bound.

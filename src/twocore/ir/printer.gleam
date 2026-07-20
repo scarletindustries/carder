@@ -1273,6 +1273,7 @@ fn termop_to_string(op: TermOp) -> String {
   case op {
     MakeTuple -> "make_tuple"
     MakeCons -> "make_cons"
+    ir.MakeNil -> "make_nil"
     TupleGet(index) -> "tuple_get." <> int.to_string(index)
     ir.TupleSize -> "tuple_size"
     ir.ListHead -> "list_head"

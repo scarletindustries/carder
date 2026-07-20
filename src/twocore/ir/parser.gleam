@@ -2557,6 +2557,7 @@ fn string_to_termop(w: String) -> Result(TermOp, Nil) {
   case w {
     "make_tuple" -> Ok(MakeTuple)
     "make_cons" -> Ok(MakeCons)
+    "make_nil" -> Ok(ir.MakeNil)
     "tuple_size" -> Ok(ir.TupleSize)
     "list_head" -> Ok(ir.ListHead)
     "list_tail" -> Ok(ir.ListTail)
