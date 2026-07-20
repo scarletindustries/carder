@@ -135,7 +135,9 @@ fn constructor(
     True ->
       rt_js_val.t_throw_range_error(
         st,
-        "Start offset " <> int_str(offset) <> " is outside the bounds of the buffer",
+        "Start offset "
+          <> int_str(offset)
+          <> " is outside the bounds of the buffer",
       )
     False -> Nil
   }
@@ -201,7 +203,11 @@ fn get_view_value(
     require_data_view(st, this, "get" <> elem_name(elem))
   let #(idx_v, le_v) = helpers.two_args_or_undefined(args)
   let #(idx, st) =
-    rt_js_val.t_to_index(st, idx_v, "Offset is outside the bounds of the DataView")
+    rt_js_val.t_to_index(
+      st,
+      idx_v,
+      "Offset is outside the bounds of the DataView",
+    )
   let little = rt_js_val.to_boolean(le_v)
   let bytes = ensure_not_detached(st, buffer, "get" <> elem_name(elem))
   let elem_size = rt_js_types.typed_array_elem_size(elem)
@@ -226,7 +232,11 @@ fn set_view_value(
     require_data_view(st, this, "set" <> elem_name(elem))
   let #(idx_v, val_v, le_v) = helpers.three_args_or_undefined(args)
   let #(idx, st) =
-    rt_js_val.t_to_index(st, idx_v, "Offset is outside the bounds of the DataView")
+    rt_js_val.t_to_index(
+      st,
+      idx_v,
+      "Offset is outside the bounds of the DataView",
+    )
   // BigInt64/BigUint64 use ToBigInt; others use ToNumber (§25.3.1.2 step 4).
   let #(raw, st) = coerce_elem_value(st, val_v, elem)
   let little = rt_js_val.to_boolean(le_v)
@@ -300,7 +310,11 @@ fn require_array_buffer(st: InstanceState, v: JsVal) -> #(Handle, Int) {
   }
 }
 
-fn ensure_not_detached(st: InstanceState, buffer: Handle, op: String) -> BitArray {
+fn ensure_not_detached(
+  st: InstanceState,
+  buffer: Handle,
+  op: String,
+) -> BitArray {
   case rt_js_store.t_cell_get(st, buffer) {
     SObject(kind: ArrayBufferObj(bytes:, detached: False), ..) -> bytes
     _ ->

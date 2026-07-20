@@ -1180,8 +1180,17 @@ pub fn typed_array_name(kind: TypedArrayKind) -> String {
 
 /// All 11 typed-array kinds in global-installation order.
 pub const all_typed_array_kinds = [
-  Int8, Uint8, Uint8Clamped, Int16, Uint16, Int32, Uint32, Float32, Float64,
-  BigInt64, BigUint64,
+  Int8,
+  Uint8,
+  Uint8Clamped,
+  Int16,
+  Uint16,
+  Int32,
+  Uint32,
+  Float32,
+  Float64,
+  BigInt64,
+  BigUint64,
 ]
 
 /// §24.1 Map built-in dispatch tokens (arc `MapNativeFn`). `MapConstructor`

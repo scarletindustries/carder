@@ -43,7 +43,8 @@ pub fn init(
       "revocable",
       2,
     )
-  let #(revocable_prop, st) = common.builtin_property(st, mk_object(revocable_h))
+  let #(revocable_prop, st) =
+    common.builtin_property(st, mk_object(revocable_h))
   let #(len_p, st) = common.fn_length_property(st, 2)
   let #(name_p, st) = common.fn_name_property(st, "Proxy")
   // The constructor itself. `constructible: True`; NO `prototype` own prop.
@@ -178,4 +179,3 @@ fn require_object(st: InstanceState, v: JsVal, what: String) -> Handle {
       )
   }
 }
-

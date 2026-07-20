@@ -115,7 +115,11 @@ fn bigint_as_int_n(
 ) -> #(JsVal, InstanceState) {
   let #(bits_v, bigint_v) = helpers.two_args_or_undefined(args)
   let #(bits, st) =
-    rt_js_val.t_to_index(st, bits_v, "Invalid value: not (convertible to) a safe integer")
+    rt_js_val.t_to_index(
+      st,
+      bits_v,
+      "Invalid value: not (convertible to) a safe integer",
+    )
   let #(n, st) = rt_js_val.t_to_bigint(st, bigint_v)
   case bits {
     0 -> #(mk_bigint(0), st)
@@ -138,7 +142,11 @@ fn bigint_as_uint_n(
 ) -> #(JsVal, InstanceState) {
   let #(bits_v, bigint_v) = helpers.two_args_or_undefined(args)
   let #(bits, st) =
-    rt_js_val.t_to_index(st, bits_v, "Invalid value: not (convertible to) a safe integer")
+    rt_js_val.t_to_index(
+      st,
+      bits_v,
+      "Invalid value: not (convertible to) a safe integer",
+    )
   let #(n, st) = rt_js_val.t_to_bigint(st, bigint_v)
   case bits {
     0 -> #(mk_bigint(0), st)

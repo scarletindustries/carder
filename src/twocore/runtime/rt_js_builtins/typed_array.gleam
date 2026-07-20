@@ -24,17 +24,16 @@ import twocore/runtime/rt_js_types.{
   type TypedArrayNative, type TypedArrays, ArrayBufferObj, ArrayIterEntries,
   ArrayIterKeys, ArrayIterValues, ArrayIterator, BigInt64, BigUint64, Index,
   JInt, KHandle, KUndef, Named, NoElements, ReturnThis, SObject, StringKey,
-  TypedArrayConstructor,
-  TypedArrayFrom, TypedArrayGetBuffer, TypedArrayGetByteLength,
-  TypedArrayGetByteOffset, TypedArrayGetLength, TypedArrayGetToStringTag,
-  TypedArrayIntrinsicConstructor, TypedArrayN, TypedArrayObj, TypedArrayOf,
-  TypedArrayPrototypeAt, TypedArrayPrototypeCopyWithin,
-  TypedArrayPrototypeEntries, TypedArrayPrototypeEvery, TypedArrayPrototypeFill,
-  TypedArrayPrototypeFilter, TypedArrayPrototypeFind,
-  TypedArrayPrototypeFindIndex, TypedArrayPrototypeFindLast,
-  TypedArrayPrototypeFindLastIndex, TypedArrayPrototypeForEach,
-  TypedArrayPrototypeIncludes, TypedArrayPrototypeIndexOf,
-  TypedArrayPrototypeJoin, TypedArrayPrototypeKeys,
+  TypedArrayConstructor, TypedArrayFrom, TypedArrayGetBuffer,
+  TypedArrayGetByteLength, TypedArrayGetByteOffset, TypedArrayGetLength,
+  TypedArrayGetToStringTag, TypedArrayIntrinsicConstructor, TypedArrayN,
+  TypedArrayObj, TypedArrayOf, TypedArrayPrototypeAt,
+  TypedArrayPrototypeCopyWithin, TypedArrayPrototypeEntries,
+  TypedArrayPrototypeEvery, TypedArrayPrototypeFill, TypedArrayPrototypeFilter,
+  TypedArrayPrototypeFind, TypedArrayPrototypeFindIndex,
+  TypedArrayPrototypeFindLast, TypedArrayPrototypeFindLastIndex,
+  TypedArrayPrototypeForEach, TypedArrayPrototypeIncludes,
+  TypedArrayPrototypeIndexOf, TypedArrayPrototypeJoin, TypedArrayPrototypeKeys,
   TypedArrayPrototypeLastIndexOf, TypedArrayPrototypeMap,
   TypedArrayPrototypeReduce, TypedArrayPrototypeReduceRight,
   TypedArrayPrototypeReverse, TypedArrayPrototypeSet, TypedArrayPrototypeSlice,
@@ -118,8 +117,7 @@ pub fn init(
       #("toSorted", TypedArrayN(TypedArrayPrototypeToSorted), 1),
       #("with", TypedArrayN(TypedArrayPrototypeWith), 2),
     ])
-  let proto_props =
-    list.flatten([getters, [#("values", values_prop)], methods])
+  let proto_props = list.flatten([getters, [#("values", values_prop)], methods])
   // §23.2.2 statics — from/of, inherited by all 11.
   let #(statics, st) =
     common.alloc_methods(st, fn_proto, [
@@ -172,8 +170,7 @@ pub fn init(
       tag_prop,
     )
   // §23.2.2.4 get %TypedArray%[@@species].
-  let st =
-    common.add_species_accessor(st, fn_proto, ta.constructor, ReturnThis)
+  let st = common.add_species_accessor(st, fn_proto, ta.constructor, ReturnThis)
   // 11 concrete kinds: proto → %TypedArray.prototype%; ctor → %TypedArray%.
   let #(by_kind, st) =
     list.fold(all_typed_array_kinds, #(dict.new(), st), fn(acc, kind) {
@@ -364,11 +361,7 @@ fn constructor(
                   #({ buf_len - offset } / elem_size, st)
                 }
                 _ ->
-                  rt_js_val.t_to_index(
-                    st,
-                    len_v,
-                    "Invalid typed array length",
-                  )
+                  rt_js_val.t_to_index(st, len_v, "Invalid typed array length")
               }
               case offset + len * elem_size > buf_len {
                 True ->
@@ -453,7 +446,10 @@ fn get_length(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
 }
 
 /// §23.2.3.38: undefined for a non-TypedArray receiver — never throws.
-fn get_to_string_tag(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
+fn get_to_string_tag(
+  st: InstanceState,
+  this: JsVal,
+) -> #(JsVal, InstanceState) {
   case classify(this) {
     KHandle(h) ->
       case rt_js_store.t_cell_get(st, h) {
@@ -519,13 +515,7 @@ fn int_str(n: Int) -> String
 /// Validated view: brand-checked, buffer not detached. arc `TaWitness`
 /// simplified (2core buffers are fixed-length; no length-tracking).
 type TaView {
-  TaView(
-    ta: Handle,
-    buffer: Handle,
-    kind: TypedArrayKind,
-    off: Int,
-    len: Int,
-  )
+  TaView(ta: Handle, buffer: Handle, kind: TypedArrayKind, off: Int, len: Int)
 }
 
 /// §23.2.4.4 ValidateTypedArray: brand-check + IsDetachedBuffer.
@@ -549,7 +539,11 @@ fn buffer_bytes(st: InstanceState, buffer: Handle) -> Option(BitArray) {
   }
 }
 
-fn write_buffer(st: InstanceState, buffer: Handle, bytes: BitArray) -> InstanceState {
+fn write_buffer(
+  st: InstanceState,
+  buffer: Handle,
+  bytes: BitArray,
+) -> InstanceState {
   rt_js_store.t_cell_update(st, buffer, fn(slot) {
     case slot {
       SObject(kind: ArrayBufferObj(detached:, ..), ..) ->
@@ -607,13 +601,17 @@ fn ta_write_raw(
         None -> st
         Some(bytes) -> {
           let size = typed_array_elem_size(view.kind)
-          write_buffer(st, view.buffer, data_view.write_elem(
-            bytes,
-            view.off + k * size,
-            view.kind,
-            raw,
-            True,
-          ))
+          write_buffer(
+            st,
+            view.buffer,
+            data_view.write_elem(
+              bytes,
+              view.off + k * size,
+              view.kind,
+              raw,
+              True,
+            ),
+          )
         }
       }
   }
@@ -725,7 +723,15 @@ fn iterate_calls(
       case decide(res, el, k) {
         Some(v) -> #(Some(v), st)
         None ->
-          iterate_calls(st, view, k + direction_step(dir), dir, cb, this_arg, decide)
+          iterate_calls(
+            st,
+            view,
+            k + direction_step(dir),
+            dir,
+            cb,
+            this_arg,
+            decide,
+          )
       }
     }
   }
@@ -763,7 +769,11 @@ fn proto_fill(
 ) -> #(JsVal, InstanceState) {
   let view = validate_ta(st, this)
   let #(raw, st) =
-    data_view.coerce_elem_value(st, helpers.first_arg_or_undefined(args), view.kind)
+    data_view.coerce_elem_value(
+      st,
+      helpers.first_arg_or_undefined(args),
+      view.kind,
+    )
   let #(s, st) = to_int_or_inf(st, helpers.arg_at(args, 1))
   let #(e, st) = case classify(helpers.arg_at(args, 2)) {
     KUndef -> #(IPosInf, st)
@@ -1154,7 +1164,10 @@ fn reduce_loop(
       let el = ta_get(st, view, k)
       let #(res, st) =
         call_cb(st, cb, mk_undefined(), [
-          acc, el, mk_number(JInt(k)), mk_object(view.ta),
+          acc,
+          el,
+          mk_number(JInt(k)),
+          mk_object(view.ta),
         ])
       reduce_loop(st, view, k + direction_step(dir), dir, cb, res)
     }
@@ -1192,11 +1205,11 @@ fn proto_copy_within(
           let assert Ok(region) =
             bit_array.slice(data, view.off + from * size, count * size)
           let st =
-            write_buffer(st, view.buffer, splice(
-              data,
-              view.off + to * size,
-              region,
-            ))
+            write_buffer(
+              st,
+              view.buffer,
+              splice(data, view.off + to * size, region),
+            )
           #(this, st)
         }
       }
@@ -1245,7 +1258,10 @@ fn reversed_bytes_loop(
 }
 
 /// §23.2.3.32 toReversed ( ).
-fn proto_to_reversed(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
+fn proto_to_reversed(
+  st: InstanceState,
+  this: JsVal,
+) -> #(JsVal, InstanceState) {
   let view = validate_ta(st, this)
   let #(fresh, st) = ta_same_type_create(st, view.kind, view.len)
   case buffer_bytes(st, view.buffer) {
@@ -1352,7 +1368,11 @@ fn proto_slice(
                 None -> #(mk_object(target.ta), st)
                 Some(tdata) -> #(
                   mk_object(target.ta),
-                  write_buffer(st, target.buffer, splice(tdata, target.off, region)),
+                  write_buffer(
+                    st,
+                    target.buffer,
+                    splice(tdata, target.off, region),
+                  ),
                 )
               }
             }
@@ -1389,8 +1409,10 @@ fn proto_set(
   case classify(src) {
     KHandle(src_h) ->
       case rt_js_store.t_cell_get(st, src_h) {
-        SObject(kind: TypedArrayObj(buffer: sb, offset: so, len: sl, kind: sk), ..) ->
-          set_from_typed_array(st, view, offset, sb, sk, so, sl)
+        SObject(
+          kind: TypedArrayObj(buffer: sb, offset: so, len: sl, kind: sk),
+          ..,
+        ) -> set_from_typed_array(st, view, offset, sb, sk, so, sl)
         _ -> set_from_array_like(st, view, offset, src)
       }
     KUndef | rt_js_types.KNull ->
@@ -1440,11 +1462,11 @@ fn set_from_typed_array(
                 bit_array.slice(src_data, src_off, src_len * size)
               #(
                 mk_undefined(),
-                write_buffer(st, view.buffer, splice(
-                  data,
-                  view.off + offset * size,
-                  region,
-                )),
+                write_buffer(
+                  st,
+                  view.buffer,
+                  splice(data, view.off + offset * size, region),
+                ),
               )
             }
           }
@@ -1457,8 +1479,7 @@ fn set_from_typed_array(
               off: src_off,
               len: src_len,
             )
-          let st =
-            set_convert_loop(st, view, offset, src_view, 0, src_len)
+          let st = set_convert_loop(st, view, offset, src_view, 0, src_len)
           #(mk_undefined(), st)
         }
       }
@@ -1478,7 +1499,14 @@ fn set_convert_loop(
     True -> st
     False -> {
       let v = ta_get(st, src, k)
-      set_convert_loop(ta_write(st, dst, offset + k, v), dst, offset, src, k + 1, src_len)
+      set_convert_loop(
+        ta_write(st, dst, offset + k, v),
+        dst,
+        offset,
+        src,
+        k + 1,
+        src_len,
+      )
     }
   }
 }
@@ -1511,7 +1539,14 @@ fn set_array_like_loop(
     True -> st
     False -> {
       let #(v, st) = rt_js_obj.t_get_prop(st, src, StringKey(Index(k)))
-      set_array_like_loop(ta_write(st, view, offset + k, v), view, offset, src, k + 1, src_len)
+      set_array_like_loop(
+        ta_write(st, view, offset + k, v),
+        view,
+        offset,
+        src,
+        k + 1,
+        src_len,
+      )
     }
   }
 }
@@ -1685,7 +1720,12 @@ fn locale_loop(
   }
 }
 
-fn join_sep(parts: List(String), sep: String, first: Bool, acc: String) -> String {
+fn join_sep(
+  parts: List(String),
+  sep: String,
+  first: Bool,
+  acc: String,
+) -> String {
   case parts {
     [] -> acc
     [p, ..rest] ->
@@ -1713,8 +1753,7 @@ fn ta_from(
       let #(ic, st) = rt_js_val.t_is_callable(st, map_fn)
       case ic {
         True -> #(True, st)
-        False ->
-          rt_js_val.t_throw_type_error(st, "mapfn is not a function")
+        False -> rt_js_val.t_throw_type_error(st, "mapfn is not a function")
       }
     }
   }
@@ -1727,7 +1766,16 @@ fn ta_from(
   let target = validate_ta(st, mk_object(target_h))
   let _ = this_kind
   let st =
-    from_loop(st, target, mk_object(src_h), 0, src_len, has_map, map_fn, this_arg)
+    from_loop(
+      st,
+      target,
+      mk_object(src_h),
+      0,
+      src_len,
+      has_map,
+      map_fn,
+      this_arg,
+    )
   #(mk_object(target_h), st)
 }
 
@@ -1749,7 +1797,16 @@ fn from_loop(
         True -> call_cb(st, map_fn, this_arg, [v, mk_number(JInt(k))])
         False -> #(v, st)
       }
-      from_loop(ta_write(st, target, k, v), target, src, k + 1, src_len, has_map, map_fn, this_arg)
+      from_loop(
+        ta_write(st, target, k, v),
+        target,
+        src,
+        k + 1,
+        src_len,
+        has_map,
+        map_fn,
+        this_arg,
+      )
     }
   }
 }
@@ -1786,7 +1843,9 @@ fn require_ta_constructor(
         _ ->
           rt_js_val.t_throw_type_error(
             st,
-            "%TypedArray%." <> op <> " requires a TypedArray constructor as this",
+            "%TypedArray%."
+              <> op
+              <> " requires a TypedArray constructor as this",
           )
       }
     _ ->
@@ -1835,9 +1894,11 @@ fn ta_species_create(
     KUndef -> ta_same_type_create(st, kind, len)
     KHandle(_) -> {
       let #(species, st) =
-        rt_js_obj.t_get_prop(st, ctor_v, rt_js_types.SymbolKey(
-          rt_js_types.symbol_species,
-        ))
+        rt_js_obj.t_get_prop(
+          st,
+          ctor_v,
+          rt_js_types.SymbolKey(rt_js_types.symbol_species),
+        )
       case classify(species) {
         KUndef | rt_js_types.KNull -> ta_same_type_create(st, kind, len)
         KHandle(_) -> {
@@ -1883,9 +1944,11 @@ fn species_proto(
   case classify(ctor_v) {
     KHandle(_) -> {
       let #(species, st) =
-        rt_js_obj.t_get_prop(st, ctor_v, rt_js_types.SymbolKey(
-          rt_js_types.symbol_species,
-        ))
+        rt_js_obj.t_get_prop(
+          st,
+          ctor_v,
+          rt_js_types.SymbolKey(rt_js_types.symbol_species),
+        )
       case classify(species) {
         KHandle(_) -> proto_from_new_target(st, species, default)
         _ -> #(default, st)
@@ -1896,7 +1959,6 @@ fn species_proto(
 }
 
 fn default_proto_for(st: InstanceState, kind: TypedArrayKind) -> Handle {
-  let assert Ok(bt) =
-    dict.get(rt_state.t_realm(st).typed_arrays.by_kind, kind)
+  let assert Ok(bt) = dict.get(rt_state.t_realm(st).typed_arrays.by_kind, kind)
   bt.prototype
 }

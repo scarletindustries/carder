@@ -20,8 +20,8 @@ import twocore/runtime/rt_js_types.{
   JFloat, JInt, JNan, JNegInf, JPosInf, KBig, KBool, KBound, KFunction, KHandle,
   KNative, KNull, KNum, KStr, KSym, KTdz, KUndef, Named, ProxyObj, RangeErr,
   ReferenceErr, SObject, StringKey, SymbolKey, SyntaxErr, TypeErr,
-  array_index_of_float, canonical_key, classify, index_key, mk_number,
-  mk_object, mk_string, symbol_to_primitive,
+  array_index_of_float, canonical_key, classify, index_key, mk_number, mk_object,
+  mk_string, symbol_to_primitive,
 }
 import twocore/runtime/rt_state.{type InstanceState}
 
@@ -65,7 +65,11 @@ pub fn t_throw_syntax_error(st: InstanceState, msg: String) -> a {
 /// SPEC§8 `tdz_check` — §9.1.1.1.5 step 5. If `v` is the TDZ sentinel, throw
 /// `ReferenceError: <name> is not defined`; else return `st` unchanged. arc's
 /// M12 emits this before every checked lexical write (`write_slot_checked`).
-pub fn t_tdz_check(st: InstanceState, v: JsVal, name: BitArray) -> InstanceState {
+pub fn t_tdz_check(
+  st: InstanceState,
+  v: JsVal,
+  name: BitArray,
+) -> InstanceState {
   case classify(v) {
     KTdz -> {
       let n = bit_array.to_string(name) |> result.unwrap("<name>")
@@ -275,8 +279,7 @@ pub fn t_to_primitive(
                 HintNumber -> "number"
                 HintDefault -> "default"
               }
-              let #(result, st) =
-                ops.call(st, exotic, v, [mk_string(hint_str)])
+              let #(result, st) = ops.call(st, exotic, v, [mk_string(hint_str)])
               // §7.1.1 step 1.b.iv: an object result is a TypeError.
               case is_object(result) {
                 False -> #(result, st)
@@ -287,8 +290,7 @@ pub fn t_to_primitive(
                   )
               }
             }
-            False ->
-              t_throw_type_error(st, "@@toPrimitive is not callable")
+            False -> t_throw_type_error(st, "@@toPrimitive is not callable")
           }
         }
       }
@@ -322,8 +324,7 @@ fn try_primitive_methods(
 ) -> #(JsVal, InstanceState) {
   let receiver = mk_object(h)
   case method_names {
-    [] ->
-      t_throw_type_error(st, "Cannot convert object to primitive value")
+    [] -> t_throw_type_error(st, "Cannot convert object to primitive value")
     [name, ..rest] -> {
       let ops = require_ops(st)
       let #(method, st) = ops.get_prop(st, receiver, StringKey(Named(name)))
@@ -707,7 +708,11 @@ fn parse_plain_digits(s: String) -> Result(JsNum, Nil) {
   }
 }
 
-fn accumulate_digits(bytes: BitArray, acc: Int, count: Int) -> Result(Int, Nil) {
+fn accumulate_digits(
+  bytes: BitArray,
+  acc: Int,
+  count: Int,
+) -> Result(Int, Nil) {
   case bytes {
     <<>> if count >= 1 && count <= 15 -> Ok(acc)
     <<d, rest:bytes>> if d >= 0x30 && d <= 0x39 ->
@@ -1030,8 +1035,7 @@ pub fn t_to_number(st: InstanceState, v: JsVal) -> #(JsNum, InstanceState) {
     KUndef -> #(JNan, st)
     KBig(_) -> t_throw_type_error(st, "Cannot convert BigInt to number")
     KSym(_) -> t_throw_type_error(st, "Cannot convert Symbol to number")
-    KHandle(_) | KTdz ->
-      panic as "ToNumber: ToPrimitive returned non-primitive"
+    KHandle(_) | KTdz -> panic as "ToNumber: ToPrimitive returned non-primitive"
   }
 }
 
@@ -1075,8 +1079,7 @@ pub fn t_to_bigint(st: InstanceState, v: JsVal) -> #(Int, InstanceState) {
     KSym(_) -> t_throw_type_error(st, "Cannot convert a Symbol to a BigInt")
     KNull -> t_throw_type_error(st, "Cannot convert null to a BigInt")
     KUndef -> t_throw_type_error(st, "Cannot convert undefined to a BigInt")
-    KHandle(_) | KTdz ->
-      panic as "ToBigInt: ToPrimitive returned non-primitive"
+    KHandle(_) | KTdz -> panic as "ToBigInt: ToPrimitive returned non-primitive"
   }
 }
 

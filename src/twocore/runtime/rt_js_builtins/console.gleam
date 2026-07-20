@@ -72,7 +72,10 @@ pub fn print(st: InstanceState, args: List(JsVal)) -> #(JsVal, InstanceState) {
 
 /// Format `args` to the string a console method would print, without the I/O.
 /// Public so tests can assert formatting independent of the print hook.
-pub fn format(st: InstanceState, args: List(JsVal)) -> #(String, InstanceState) {
+pub fn format(
+  st: InstanceState,
+  args: List(JsVal),
+) -> #(String, InstanceState) {
   case args {
     // §2.1 step 4: only run Formatter if first is a string AND there are more
     // args. `console.log("100%")` must print `100%`, not consume the `%`.
@@ -128,8 +131,7 @@ fn spec(
     "s", [head, ..rest] ->
       case classify(head) {
         // %s on a Symbol is Call(%String%) — descriptive string, never throw.
-        KSym(id) ->
-          Some(#(rt_js_types.symbol_descriptive_string(id), rest, st))
+        KSym(id) -> Some(#(rt_js_types.symbol_descriptive_string(id), rest, st))
         _ -> {
           let #(s, st) = rt_js_val.t_to_string(st, head)
           Some(#(s, rest, st))
@@ -143,8 +145,7 @@ fn spec(
         _ -> {
           let #(n, st) = case sp {
             // %i is %parseInt% — ToString-only coercion.
-            "i" ->
-              global_fns.parse_int_value(st, head, mk_number(JInt(10)))
+            "i" -> global_fns.parse_int_value(st, head, mk_number(JInt(10)))
             // %d is Number() — ToNumber; user valueOf runs.
             _ -> rt_js_val.t_to_number(st, head)
           }

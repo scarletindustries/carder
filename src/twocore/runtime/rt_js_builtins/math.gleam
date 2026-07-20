@@ -324,8 +324,7 @@ fn math_exp(args: List(JsVal), st: InstanceState) -> #(JsVal, InstanceState) {
 fn math_random(st: InstanceState) -> #(JsVal, InstanceState) {
   case st.js_store {
     option.Some(js) -> #(mk_number(JFloat(js.host_hooks.random())), st)
-    option.None ->
-      panic as "Math.random on InstanceState with no JsStore"
+    option.None -> panic as "Math.random on InstanceState with no JsStore"
   }
 }
 
@@ -476,7 +475,10 @@ fn log1p_finite(n: Float) -> JsNum {
 }
 
 /// Math.fround(x) — round to the nearest 32-bit float and widen back.
-fn math_fround(args: List(JsVal), st: InstanceState) -> #(JsVal, InstanceState) {
+fn math_fround(
+  args: List(JsVal),
+  st: InstanceState,
+) -> #(JsVal, InstanceState) {
   use x <- math_unary(args, st)
   case x {
     JInt(_) | JFloat(_) -> ffi_fround(finite_to_float(x))

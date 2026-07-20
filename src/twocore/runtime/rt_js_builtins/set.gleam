@@ -20,8 +20,8 @@ import twocore/runtime/rt_js_types.{
   type BuiltinPair, type Handle, type JsVal, type MapKey, type ObjKind,
   type SetIterKind, type SetNative, JFloat, JInt, JNan, KHandle, KNull, KNum,
   KUndef, Named, NoElements, SObject, SetAdd, SetClear, SetConstructor,
-  SetDelete, SetDifference, SetEntries, SetForEach, SetGetSize,
-  SetHas, SetIntersection, SetIsDisjointFrom, SetIsSubsetOf, SetIsSupersetOf,
+  SetDelete, SetDifference, SetEntries, SetForEach, SetGetSize, SetHas,
+  SetIntersection, SetIsDisjointFrom, SetIsSubsetOf, SetIsSupersetOf,
   SetIterEntries, SetIterValues, SetIterator, SetN, SetObj,
   SetSymmetricDifference, SetUnion, SetValues, StringKey, classify,
   js_to_map_key, mk_bool, mk_number, mk_object, mk_undefined, symbol_iterator,
@@ -367,12 +367,7 @@ fn set_difference(
   let result = read_set_store(st, ref)
   case ordered_entries.size(result) <= rec.size {
     True ->
-      difference_this_loop(
-        st,
-        rec,
-        ordered_entries.live_values(result),
-        result,
-      )
+      difference_this_loop(st, rec, ordered_entries.live_values(result), result)
     False -> {
       let #(keys, st) = get_keys_iterator(st, rec)
       difference_other_loop(st, keys, result)

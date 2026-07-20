@@ -24,6 +24,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/set
+import twocore/runtime/rt_js_builtins/js_string
 import twocore/runtime/rt_js_store
 import twocore/runtime/rt_js_tree_array as tree_array
 import twocore/runtime/rt_js_types.{
@@ -34,7 +35,6 @@ import twocore/runtime/rt_js_types.{
   Ordinary, Private, ProxyObj, SAsyncGen, SBox, SGenerator, SObject, SPromise,
   SShapedObject, ShapeDesc, Sparse, StringKey, StringObj, SymbolKey, TypeErr,
 }
-import twocore/runtime/rt_js_builtins/js_string
 import twocore/runtime/rt_js_val
 import twocore/runtime/rt_state.{type InstanceState}
 
@@ -1689,7 +1689,11 @@ fn is_list(a: a) -> Bool
 /// walk; the emitter's `IsAtom` guard falls back to `t_get_prop_any` on
 /// miss. Typed as `JsVal` (loosely — `miss` is an atom) like `t_kfn_code`.
 @external(erlang, "twocore_rt_js_obj_ffi", "t_get_prop_own_data")
-pub fn t_get_prop_own_data(st: InstanceState, recv: JsVal, key: BitArray) -> JsVal
+pub fn t_get_prop_own_data(
+  st: InstanceState,
+  recv: JsVal,
+  key: BitArray,
+) -> JsVal
 
 /// SPEC§8 `set_prop_own_data` — JRead fast-path probe: overwrite an
 /// EXISTING own writable DataProperty via the pdict overlay. Returns bare
@@ -1705,7 +1709,11 @@ pub fn t_set_prop_own_data(
 
 /// SPEC§8 `get_prop` — [[Get]] with a wire-form key (arc emits both bare
 /// `PropertyKey` for static `.x` and `ObjectKey` for computed `[e]`).
-pub fn t_get_prop_any(st: InstanceState, recv: JsVal, key: k) -> #(JsVal, InstanceState) {
+pub fn t_get_prop_any(
+  st: InstanceState,
+  recv: JsVal,
+  key: k,
+) -> #(JsVal, InstanceState) {
   t_get_prop(st, recv, as_object_key(key))
 }
 
@@ -1751,23 +1759,34 @@ pub fn t_create_data_prop(
 /// ordinary [[Get]] returning `undefined`; arc's M12 handles the strict-mode
 /// unresolved-reference throw at the emit layer, so this returns `undefined`
 /// for a missing binding rather than throwing.
-pub fn t_global_get(st: InstanceState, name: BitArray) -> #(JsVal, InstanceState) {
+pub fn t_global_get(
+  st: InstanceState,
+  name: BitArray,
+) -> #(JsVal, InstanceState) {
   let g = rt_state.t_realm(st).global_object
   t_get_prop(st, rt_js_types.mk_object(g), StringKey(binary_key(name)))
 }
 
 /// SPEC§8 `global_set` — `PutValue` on the global object (§9.1.1.4.5). arc's
 /// emit handles the strict-mode throw-on-failure; this drops the `Bool` result.
-pub fn t_global_set(st: InstanceState, name: BitArray, v: JsVal) -> InstanceState {
+pub fn t_global_set(
+  st: InstanceState,
+  name: BitArray,
+  v: JsVal,
+) -> InstanceState {
   let g = rt_state.t_realm(st).global_object
-  let #(_, st) = t_set_prop(st, rt_js_types.mk_object(g), StringKey(binary_key(name)), v)
+  let #(_, st) =
+    t_set_prop(st, rt_js_types.mk_object(g), StringKey(binary_key(name)), v)
   st
 }
 
 /// SPEC§8 `global_typeof` — ES2024 §13.5.3 `typeof <ident>` where `<ident>` is
 /// an unresolvable global Reference yields `"undefined"` without throwing. If
 /// the binding exists on the global object, read it and delegate to `t_type_of`.
-pub fn t_global_typeof(st: InstanceState, name: BitArray) -> #(String, InstanceState) {
+pub fn t_global_typeof(
+  st: InstanceState,
+  name: BitArray,
+) -> #(String, InstanceState) {
   let g = rt_state.t_realm(st).global_object
   let key = StringKey(binary_key(name))
   let #(has, st) = t_has_prop(st, rt_js_types.mk_object(g), key)

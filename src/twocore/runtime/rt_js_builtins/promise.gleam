@@ -80,8 +80,7 @@ pub fn init(
       static_methods,
     )
   let st = common.add_to_string_tag(st, bt.prototype, "Promise")
-  let st =
-    common.add_species_accessor(st, fn_proto, bt.constructor, ReturnThis)
+  let st = common.add_species_accessor(st, fn_proto, bt.constructor, ReturnThis)
   #(bt, st)
 }
 
@@ -121,7 +120,13 @@ pub fn dispatch(
     // ── minted-closure natives ───────────────────────────────────────────────
     PromiseCapabilityExecutor(resolve_box:, reject_box:) ->
       capability_executor(st, resolve_box, reject_box, args)
-    PromiseAllResolveElement(index:, remaining:, values:, already_called:, resolve:) ->
+    PromiseAllResolveElement(
+      index:,
+      remaining:,
+      values:,
+      already_called:,
+      resolve:,
+    ) ->
       all_element(st, args, index, remaining, values, already_called, resolve)
     PromiseAllSettledElement(
       fulfilled:,
@@ -141,7 +146,13 @@ pub fn dispatch(
         already_called,
         resolve,
       )
-    PromiseAnyRejectElement(index:, remaining:, errors:, already_called:, reject:) ->
+    PromiseAnyRejectElement(
+      index:,
+      remaining:,
+      errors:,
+      already_called:,
+      reject:,
+    ) ->
       any_reject_element(
         st,
         args,
@@ -290,7 +301,8 @@ pub fn perform_promise_then_with_cap(
         ),
       )
     }
-    _ -> panic as "perform_promise_then_with_cap: Handle is not an SPromise cell"
+    _ ->
+      panic as "perform_promise_then_with_cap: Handle is not an SPromise cell"
   }
 }
 
@@ -330,8 +342,7 @@ fn finally(
   // Steps 1-2: this must be an Object.
   case classify(this) {
     KHandle(_) -> Nil
-    _ ->
-      throw_type_error(st, "Promise.prototype.finally called on non-object")
+    _ -> throw_type_error(st, "Promise.prototype.finally called on non-object")
   }
   // Step 3: C = ? SpeciesConstructor(promise, %Promise%).
   let #(c, st) = species_constructor(st, this)
@@ -361,7 +372,10 @@ fn finally(
     }
   }
   // Step 7: Return ? Invoke(promise, "then", « thenFinally, catchFinally »).
-  t_call_method(st, this, StringKey(Named("then")), [then_finally, catch_finally])
+  t_call_method(st, this, StringKey(Named("then")), [
+    then_finally,
+    catch_finally,
+  ])
 }
 
 /// §27.2.5.3.1/.2 Then/Catch Finally Function — `onFinally()`, then chain
@@ -557,9 +571,7 @@ fn perform_combinator(
           let st = increment_counter(st, remaining_h)
           #(resolve_fn, cap.reject, st)
         },
-        fn(st) {
-          final_resolve_values(st, remaining_h, values_h, cap.resolve)
-        },
+        fn(st) { final_resolve_values(st, remaining_h, values_h, cap.resolve) },
       )
     }
     CombAllSettled -> {
@@ -602,9 +614,7 @@ fn perform_combinator(
           let st = increment_counter(st, remaining_h)
           #(resolve_fn, reject_fn, st)
         },
-        fn(st) {
-          final_resolve_values(st, remaining_h, values_h, cap.resolve)
-        },
+        fn(st) { final_resolve_values(st, remaining_h, values_h, cap.resolve) },
       )
     }
     CombAny -> {
@@ -875,10 +885,7 @@ fn capability_executor(
 }
 
 /// §27.2.4.1.2 GetPromiseResolve(C): Get(C, "resolve"), require callable.
-fn get_promise_resolve(
-  st: InstanceState,
-  c: JsVal,
-) -> #(JsVal, InstanceState) {
+fn get_promise_resolve(st: InstanceState, c: JsVal) -> #(JsVal, InstanceState) {
   let #(resolve_fn, st) =
     rt_js_obj.t_get_prop(st, c, StringKey(Named("resolve")))
   case is_callable(st, resolve_fn) {
@@ -889,10 +896,7 @@ fn get_promise_resolve(
 
 /// §7.3.22 SpeciesConstructor(O, %Promise%). Reads `O.constructor[@@species]`;
 /// falls back to %Promise% on undefined/null at any step.
-fn species_constructor(
-  st: InstanceState,
-  o: JsVal,
-) -> #(JsVal, InstanceState) {
+fn species_constructor(st: InstanceState, o: JsVal) -> #(JsVal, InstanceState) {
   let default = mk_object(rt_state.t_realm(st).promise.constructor)
   let #(c, st) = rt_js_obj.t_get_prop(st, o, StringKey(Named("constructor")))
   case classify(c) {

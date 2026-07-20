@@ -7,8 +7,7 @@ import twocore/runtime/rt_js_store
 import twocore/runtime/rt_js_types.{
   type BooleanNative, type BuiltinPair, type Handle, type JsVal,
   BooleanConstructor, BooleanN, BooleanObj, BooleanPrototypeToString,
-  BooleanPrototypeValueOf, KBool, KHandle, SObject, classify, mk_bool,
-  mk_string,
+  BooleanPrototypeValueOf, KBool, KHandle, SObject, classify, mk_bool, mk_string,
 }
 import twocore/runtime/rt_js_val
 import twocore/runtime/rt_state.{type InstanceState}
@@ -74,7 +73,10 @@ fn boolean_value_of(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
 
 /// §20.3.3.2 Boolean.prototype.toString ( ) — ? thisBooleanValue(this),
 /// then "true"/"false".
-fn boolean_to_string(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
+fn boolean_to_string(
+  st: InstanceState,
+  this: JsVal,
+) -> #(JsVal, InstanceState) {
   case this_boolean_value(st, this, "toString") {
     True -> #(mk_string("true"), st)
     False -> #(mk_string("false"), st)

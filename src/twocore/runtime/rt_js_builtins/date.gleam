@@ -19,20 +19,20 @@ import twocore/runtime/rt_js_obj
 import twocore/runtime/rt_js_store
 import twocore/runtime/rt_js_types.{
   type BuiltinPair, type DateNative, type Handle, type JsNum, type JsVal,
-  DateConstructor, DateN, DateNow, DateObj, DateParse,
-  DatePrototypeGetDate, DatePrototypeGetDay, DatePrototypeGetFullYear,
-  DatePrototypeGetHours, DatePrototypeGetMilliseconds, DatePrototypeGetMinutes,
-  DatePrototypeGetMonth, DatePrototypeGetSeconds, DatePrototypeGetTime,
-  DatePrototypeGetTimezoneOffset, DatePrototypeGetUTCDate,
-  DatePrototypeGetUTCDay, DatePrototypeGetUTCFullYear, DatePrototypeGetUTCHours,
-  DatePrototypeGetUTCMilliseconds, DatePrototypeGetUTCMinutes,
-  DatePrototypeGetUTCMonth, DatePrototypeGetUTCSeconds, DatePrototypeGetYear,
-  DatePrototypeSetDate, DatePrototypeSetFullYear, DatePrototypeSetHours,
-  DatePrototypeSetMilliseconds, DatePrototypeSetMinutes, DatePrototypeSetMonth,
-  DatePrototypeSetSeconds, DatePrototypeSetTime, DatePrototypeSetUTCDate,
-  DatePrototypeSetUTCFullYear, DatePrototypeSetUTCHours,
-  DatePrototypeSetUTCMilliseconds, DatePrototypeSetUTCMinutes,
-  DatePrototypeSetUTCMonth, DatePrototypeSetUTCSeconds, DatePrototypeSetYear,
+  DateConstructor, DateN, DateNow, DateObj, DateParse, DatePrototypeGetDate,
+  DatePrototypeGetDay, DatePrototypeGetFullYear, DatePrototypeGetHours,
+  DatePrototypeGetMilliseconds, DatePrototypeGetMinutes, DatePrototypeGetMonth,
+  DatePrototypeGetSeconds, DatePrototypeGetTime, DatePrototypeGetTimezoneOffset,
+  DatePrototypeGetUTCDate, DatePrototypeGetUTCDay, DatePrototypeGetUTCFullYear,
+  DatePrototypeGetUTCHours, DatePrototypeGetUTCMilliseconds,
+  DatePrototypeGetUTCMinutes, DatePrototypeGetUTCMonth,
+  DatePrototypeGetUTCSeconds, DatePrototypeGetYear, DatePrototypeSetDate,
+  DatePrototypeSetFullYear, DatePrototypeSetHours, DatePrototypeSetMilliseconds,
+  DatePrototypeSetMinutes, DatePrototypeSetMonth, DatePrototypeSetSeconds,
+  DatePrototypeSetTime, DatePrototypeSetUTCDate, DatePrototypeSetUTCFullYear,
+  DatePrototypeSetUTCHours, DatePrototypeSetUTCMilliseconds,
+  DatePrototypeSetUTCMinutes, DatePrototypeSetUTCMonth,
+  DatePrototypeSetUTCSeconds, DatePrototypeSetYear,
   DatePrototypeSymbolToPrimitive, DatePrototypeToDateString,
   DatePrototypeToISOString, DatePrototypeToJSON, DatePrototypeToLocaleDateString,
   DatePrototypeToLocaleString, DatePrototypeToLocaleTimeString,
@@ -313,8 +313,7 @@ fn set_time(
   name: String,
 ) -> #(JsVal, InstanceState) {
   let h = require_date_handle(st, this, name)
-  let #(n, st) =
-    rt_js_val.t_to_number(st, helpers.first_arg_or_undefined(args))
+  let #(n, st) = rt_js_val.t_to_number(st, helpers.first_arg_or_undefined(args))
   let clipped = time_clip(n)
   let st = write_date(st, h, clipped)
   #(mk_number(clipped), st)
@@ -404,20 +403,28 @@ fn compute_set_field(
         SetYear -> {
           let z = JInt(0)
           let epoch = DateComponents(JInt(1970), z, JInt(1), z, z, z, z)
-          Some(make_date_from_components(overwrite_fields(
-            epoch,
-            first,
-            new_nums,
-          )))
+          Some(
+            make_date_from_components(overwrite_fields(epoch, first, new_nums)),
+          )
         }
         _ -> None
       }
   }
 }
 
-fn fields_to_components(b: #(Int, Int, Int, Int, Int, Int, Int, Int)) -> DateComponents {
+fn fields_to_components(
+  b: #(Int, Int, Int, Int, Int, Int, Int, Int),
+) -> DateComponents {
   let #(y, mo, d, _wd, h, mi, s, ms) = b
-  DateComponents(JInt(y), JInt(mo), JInt(d), JInt(h), JInt(mi), JInt(s), JInt(ms))
+  DateComponents(
+    JInt(y),
+    JInt(mo),
+    JInt(d),
+    JInt(h),
+    JInt(mi),
+    JInt(s),
+    JInt(ms),
+  )
 }
 
 /// Replace `len(new_nums)` consecutive components starting at `first`.
@@ -454,8 +461,7 @@ fn date_set_year(
 ) -> #(JsVal, InstanceState) {
   let h = require_date_handle(st, this, name)
   let tv = require_date(st, this, name)
-  let #(n, st) =
-    rt_js_val.t_to_number(st, helpers.first_arg_or_undefined(args))
+  let #(n, st) = rt_js_val.t_to_number(st, helpers.first_arg_or_undefined(args))
   case num_to_int(n) {
     None -> {
       let st = write_date(st, h, JNan)
@@ -513,7 +519,11 @@ fn to_json(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
     | rt_js_types.KNum(rt_js_types.JNegInf) -> #(rt_js_types.mk_null(), st)
     _ -> {
       let #(iso_fn, st) =
-        rt_js_obj.t_get_prop(st, mk_object(o_h), StringKey(Named("toISOString")))
+        rt_js_obj.t_get_prop(
+          st,
+          mk_object(o_h),
+          StringKey(Named("toISOString")),
+        )
       let assert Some(js) = st.js_store
       js.ops.call(st, iso_fn, mk_object(o_h), [])
     }
@@ -556,7 +566,10 @@ fn ordinary_to_primitive(
 ) -> #(JsVal, InstanceState) {
   case names {
     [] ->
-      rt_js_val.t_throw_type_error(st, "Cannot convert object to primitive value")
+      rt_js_val.t_throw_type_error(
+        st,
+        "Cannot convert object to primitive value",
+      )
     [name, ..rest] -> {
       let #(method, st) = ops.get_prop(st, o, StringKey(Named(name)))
       let #(is_call, st) = rt_js_val.t_is_callable(st, method)
@@ -770,10 +783,13 @@ fn civil_from_days(z: Int) -> #(Int, Int, Int) {
   let era = floor_div(z, 146_097)
   let doe = z - era * 146_097
   let yoe =
-    floor_div(doe - floor_div(doe, 1460) + floor_div(doe, 36_524) - floor_div(
-        doe,
-        146_096,
-      ), 365)
+    floor_div(
+      doe
+        - floor_div(doe, 1460)
+        + floor_div(doe, 36_524)
+        - floor_div(doe, 146_096),
+      365,
+    )
   let y = yoe + era * 400
   let doy = doe - { 365 * yoe + floor_div(yoe, 4) - floor_div(yoe, 100) }
   let mp = floor_div(5 * doy + 2, 153)
@@ -810,37 +826,37 @@ fn days_from_civil(y: Int, m: Int, d: Int) -> Int {
 fn format_iso(ms: Int) -> String {
   let #(y, mo, d, _, h, mi, s, milli) = breakdown(ms)
   pad(y, 4)
-    <> "-"
-    <> pad(mo + 1, 2)
-    <> "-"
-    <> pad(d, 2)
-    <> "T"
-    <> pad(h, 2)
-    <> ":"
-    <> pad(mi, 2)
-    <> ":"
-    <> pad(s, 2)
-    <> "."
-    <> pad(milli, 3)
-    <> "Z"
+  <> "-"
+  <> pad(mo + 1, 2)
+  <> "-"
+  <> pad(d, 2)
+  <> "T"
+  <> pad(h, 2)
+  <> ":"
+  <> pad(mi, 2)
+  <> ":"
+  <> pad(s, 2)
+  <> "."
+  <> pad(milli, 3)
+  <> "Z"
 }
 
 fn to_utc_string(ms: Int) -> String {
   let #(y, mo, d, wd, h, mi, s, _) = breakdown(ms)
   weekday_name(wd)
-    <> ", "
-    <> pad(d, 2)
-    <> " "
-    <> month_name(mo)
-    <> " "
-    <> pad(y, 4)
-    <> " "
-    <> pad(h, 2)
-    <> ":"
-    <> pad(mi, 2)
-    <> ":"
-    <> pad(s, 2)
-    <> " GMT"
+  <> ", "
+  <> pad(d, 2)
+  <> " "
+  <> month_name(mo)
+  <> " "
+  <> pad(y, 4)
+  <> " "
+  <> pad(h, 2)
+  <> ":"
+  <> pad(mi, 2)
+  <> ":"
+  <> pad(s, 2)
+  <> " GMT"
 }
 
 /// §21.4.3.2: parse the §21.4.1.32 Date Time String Format subset arc supports
@@ -870,10 +886,13 @@ fn parse_iso(s: String) -> JsNum {
       s0,
       rest:bytes,
     >> ->
-      case digs4(y3, y2, y1, y0), digs2(m1, m0), digs2(d1, d0), digs2(h1, h0), digs2(
-        mi1,
-        mi0,
-      ), digs2(s1, s0)
+      case
+        digs4(y3, y2, y1, y0),
+        digs2(m1, m0),
+        digs2(d1, d0),
+        digs2(h1, h0),
+        digs2(mi1, mi0),
+        digs2(s1, s0)
       {
         Ok(y), Ok(mo), Ok(d), Ok(h), Ok(mi), Ok(sec) -> {
           let milli = parse_frac(rest)

@@ -270,7 +270,8 @@ fn alloc_regexp(
   // §22.2.4.1 step 8 → RegExpAlloc → OrdinaryCreateFromConstructor.
   let #(proto, st) =
     proto_from_new_target(st, new_target, realm.regexp.prototype)
-  let #(li_prop, st) = common.data_property(st, rt_js_types.mk_number(rt_js_types.JInt(0)))
+  let #(li_prop, st) =
+    common.data_property(st, rt_js_types.mk_number(rt_js_types.JInt(0)))
   rt_js_store.t_cell_new(
     st,
     SObject(
@@ -298,9 +299,11 @@ fn proto_from_new_target(
   fallback: Handle,
 ) -> #(Handle, InstanceState) {
   let #(proto, st) =
-    rt_js_obj.t_get_prop(st, new_target, rt_js_types.StringKey(rt_js_types.Named(
-      "prototype",
-    )))
+    rt_js_obj.t_get_prop(
+      st,
+      new_target,
+      rt_js_types.StringKey(rt_js_types.Named("prototype")),
+    )
   case classify(proto) {
     KHandle(h) -> #(h, st)
     _ -> #(fallback, st)
@@ -445,11 +448,19 @@ fn advance_past_continuations(s: String, i: Int, len: Int) -> Int {
 }
 
 /// ? Get(O, P) via the observable protocol.
-fn try_get(st: InstanceState, o: JsVal, key: ObjectKey) -> #(JsVal, InstanceState) {
+fn try_get(
+  st: InstanceState,
+  o: JsVal,
+  key: ObjectKey,
+) -> #(JsVal, InstanceState) {
   rt_js_obj.t_get_prop(st, o, key)
 }
 
-fn get_named(st: InstanceState, o: JsVal, name: String) -> #(JsVal, InstanceState) {
+fn get_named(
+  st: InstanceState,
+  o: JsVal,
+  name: String,
+) -> #(JsVal, InstanceState) {
   try_get(st, o, StringKey(Named(name)))
 }
 
@@ -460,7 +471,8 @@ fn set_throw(
   name: String,
   v: JsVal,
 ) -> InstanceState {
-  let #(ok, st) = rt_js_obj.t_set_prop(st, mk_object(h), StringKey(Named(name)), v)
+  let #(ok, st) =
+    rt_js_obj.t_set_prop(st, mk_object(h), StringKey(Named(name)), v)
   case ok {
     True -> st
     False ->
@@ -650,7 +662,10 @@ fn make_indices(
       let values =
         list.map(names, fn(pair) {
           let #(name, idx) = pair
-          #(name, helpers.list_at(pair_values, idx) |> option.unwrap(mk_undefined()))
+          #(
+            name,
+            helpers.list_at(pair_values, idx) |> option.unwrap(mk_undefined()),
+          )
         })
       alloc_null_proto_object(st, dedupe_group_values(values))
     }
@@ -880,10 +895,12 @@ fn advance_if_empty(
     "" -> {
       let #(li_v, st) = get_named(st, mk_object(h), "lastIndex")
       let #(this_index, st) = rt_js_val.t_to_length(st, li_v)
-      set_throw(st, h, "lastIndex", mk_number(JInt(next_char_boundary(
-        s,
-        this_index,
-      ))))
+      set_throw(
+        st,
+        h,
+        "lastIndex",
+        mk_number(JInt(next_char_boundary(s, this_index))),
+      )
     }
     _ -> st
   }
@@ -1043,7 +1060,15 @@ fn process_replace_results(
           )
         }
         False ->
-          process_replace_results(st, rest, s, length_s, replacer, next_pos, acc)
+          process_replace_results(
+            st,
+            rest,
+            s,
+            length_s,
+            replacer,
+            next_pos,
+            acc,
+          )
       }
     }
   }
@@ -1117,10 +1142,10 @@ fn compute_replacement(
         )
       case classify(named_captures) {
         KUndef ->
-          finish_replacement(st, substitution.resolve_plain_parts(
-            without_named,
-            ctx,
-          ))
+          finish_replacement(
+            st,
+            substitution.resolve_plain_parts(without_named, ctx),
+          )
         KNull ->
           rt_js_val.t_throw_type_error(st, "Cannot convert null to object")
         _ -> resolve_segments(st, with_named, ctx, named_captures, [])
@@ -1236,26 +1261,43 @@ fn split_loop(
   count: Int,
 ) -> #(JsVal, InstanceState) {
   case q >= size {
-    True -> ok_array(st, list.reverse([mk_string(byte_drop_start(s, p)), ..acc]))
+    True ->
+      ok_array(st, list.reverse([mk_string(byte_drop_start(s, p)), ..acc]))
     False -> {
       let st = set_throw(st, sp_h, "lastIndex", mk_number(JInt(q)))
       let #(z, st) = regexp_exec_abstract(st, splitter, s)
       case classify(z) {
         KNull ->
-          split_loop(st, splitter, sp_h, s, size, lim, p, next_char_boundary(
+          split_loop(
+            st,
+            splitter,
+            sp_h,
             s,
-            q,
-          ), acc, count)
+            size,
+            lim,
+            p,
+            next_char_boundary(s, q),
+            acc,
+            count,
+          )
         _ -> {
           let #(li_v, st) = get_named(st, splitter, "lastIndex")
           let #(e0, st) = rt_js_val.t_to_length(st, li_v)
           let e = int.min(e0, size)
           case e == p {
             True ->
-              split_loop(st, splitter, sp_h, s, size, lim, p, next_char_boundary(
+              split_loop(
+                st,
+                splitter,
+                sp_h,
                 s,
-                q,
-              ), acc, count)
+                size,
+                lim,
+                p,
+                next_char_boundary(s, q),
+                acc,
+                count,
+              )
             False -> {
               let acc = [mk_string(byte_slice(s, p, q - p)), ..acc]
               let count = count + 1
@@ -1270,7 +1312,18 @@ fn split_loop(
                   case hit {
                     True -> ok_array(st, list.reverse(acc))
                     False ->
-                      split_loop(st, splitter, sp_h, s, size, lim, e, e, acc, count)
+                      split_loop(
+                        st,
+                        splitter,
+                        sp_h,
+                        s,
+                        size,
+                        lim,
+                        e,
+                        e,
+                        acc,
+                        count,
+                      )
                   }
                 }
               }
@@ -1475,13 +1528,17 @@ fn mark_iter_done(st: InstanceState, h: Handle) -> InstanceState {
           Ok(rt_js_types.DataProperty(seq:, ..)) ->
             SObject(
               ..slot,
-              props: dict.insert(props, Named(rsi_done), rt_js_types.DataProperty(
-                value: mk_bool(True),
-                writable: True,
-                enumerable: True,
-                configurable: True,
-                seq:,
-              )),
+              props: dict.insert(
+                props,
+                Named(rsi_done),
+                rt_js_types.DataProperty(
+                  value: mk_bool(True),
+                  writable: True,
+                  enumerable: True,
+                  configurable: True,
+                  seq:,
+                ),
+              ),
             )
           _ -> slot
         }
@@ -1518,14 +1575,19 @@ fn species_constructor(
     KUndef -> #(mk_object(default_ctor), st)
     KHandle(_) -> {
       let #(s, st) =
-        rt_js_obj.t_get_prop(st, c, rt_js_types.SymbolKey(
-          rt_js_types.symbol_species,
-        ))
+        rt_js_obj.t_get_prop(
+          st,
+          c,
+          rt_js_types.SymbolKey(rt_js_types.symbol_species),
+        )
       case classify(s) {
         KUndef | KNull -> #(mk_object(default_ctor), st)
         KHandle(_) -> #(s, st)
         _ ->
-          rt_js_val.t_throw_type_error(st, "constructor[Symbol.species] is not a constructor")
+          rt_js_val.t_throw_type_error(
+            st,
+            "constructor[Symbol.species] is not a constructor",
+          )
       }
     }
     _ -> rt_js_val.t_throw_type_error(st, "object.constructor is not an Object")
@@ -1535,8 +1597,14 @@ fn species_constructor(
 // ── flag metadata ───────────────────────────────────────────────────────────
 
 const all_flags = [
-  RFHasIndices, RFGlobal, RFIgnoreCase, RFMultiline, RFDotAll, RFUnicode,
-  RFUnicodeSets, RFSticky,
+  RFHasIndices,
+  RFGlobal,
+  RFIgnoreCase,
+  RFMultiline,
+  RFDotAll,
+  RFUnicode,
+  RFUnicodeSets,
+  RFSticky,
 ]
 
 fn flag_property(f: RegExpFlag) -> String {

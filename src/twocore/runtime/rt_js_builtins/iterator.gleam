@@ -28,12 +28,12 @@ import twocore/runtime/rt_js_types.{
   type IteratorRecord, type JsVal, type MapIterKind, type NativeToken,
   type ObjKind, type ObjectKey, type SetIterKind, type ZipMember, type ZipMode,
   ArgumentsObj, ArrayBufferObj, ArrayIterEntries, ArrayIterKeys, ArrayIterValues,
-  ArrayIterator, ArrayObj, AsyncFromSyncClose, AsyncFromSyncIterator, AsyncFromSyncNext,
-  AsyncFromSyncReturn, AsyncFromSyncThrow, AsyncFromSyncUnwrap, ClassicHelper,
-  ConcatHelper, ConcatItem, GenCompleted, GenExecuting, GenSuspendedStart,
-  GenSuspendedYield, HelperDrop, HelperFilter, HelperFlatMap, HelperMap,
-  HelperTake, IteratorConstructor, IteratorHelperObj, IteratorN, JFloat, JInt,
-  JNan, JNegInf, JPosInf, KHandle, KNull, KStr, KUndef,
+  ArrayIterator, ArrayObj, AsyncFromSyncClose, AsyncFromSyncIterator,
+  AsyncFromSyncNext, AsyncFromSyncReturn, AsyncFromSyncThrow,
+  AsyncFromSyncUnwrap, ClassicHelper, ConcatHelper, ConcatItem, GenCompleted,
+  GenExecuting, GenSuspendedStart, GenSuspendedYield, HelperDrop, HelperFilter,
+  HelperFlatMap, HelperMap, HelperTake, IteratorConstructor, IteratorHelperObj,
+  IteratorN, JFloat, JInt, JNan, JNegInf, JPosInf, KHandle, KNull, KStr, KUndef,
   MapIterEntries, MapIterKeys, MapIterValues, MapIterator, MapObj, Named,
   NoElements, Ordinary, RangeErr, ReturnThis, SObject, SetIterEntries,
   SetIterValues, SetIterator, SetObj, StringIterator, StringKey, SymbolKey,
@@ -200,9 +200,15 @@ pub fn init(
       IteratorN(rt_js_types.IteratorProtoSetToStringTag),
       "[Symbol.toStringTag]",
     )
-  let st = common.add_named_property(st, iterator_proto, "constructor", ctor_acc)
   let st =
-    common.add_symbol_property(st, iterator_proto, symbol_to_string_tag, tag_acc)
+    common.add_named_property(st, iterator_proto, "constructor", ctor_acc)
+  let st =
+    common.add_symbol_property(
+      st,
+      iterator_proto,
+      symbol_to_string_tag,
+      tag_acc,
+    )
   // %IteratorHelperPrototype% — §27.1.4.1. proto → %IteratorPrototype%;
   // next/return + @@toStringTag = "Iterator Helper".
   let #(helper_methods, st) =
@@ -381,7 +387,12 @@ fn array_iterator_next(
     False -> {
       let #(len, st) = array_source_length(st, target)
       case index >= len {
-        True -> iter_done(set_iter_kind(st, iter_h, ArrayIterator(target:, index: -1, kind:)))
+        True ->
+          iter_done(set_iter_kind(
+            st,
+            iter_h,
+            ArrayIterator(target:, index: -1, kind:),
+          ))
         False -> {
           let #(out, st) = case kind {
             ArrayIterKeys -> #(mk_number(JInt(index)), st)
@@ -401,7 +412,11 @@ fn array_iterator_next(
           }
           // [[Get]] may have run user code: re-read the slot when bumping.
           let st =
-            set_iter_kind(st, iter_h, ArrayIterator(target:, index: index + 1, kind:))
+            set_iter_kind(
+              st,
+              iter_h,
+              ArrayIterator(target:, index: index + 1, kind:),
+            )
           iter_yield(st, out)
         }
       }
@@ -467,7 +482,10 @@ const iteration_budget_msg = "Array-like length exceeds the maximum supported it
 
 // ── §24.1.5.2.1 %MapIteratorPrototype%.next() (arc call.gleam:1933) ─────────
 
-fn map_iterator_next(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
+fn map_iterator_next(
+  st: InstanceState,
+  this: JsVal,
+) -> #(JsVal, InstanceState) {
   use st, iter_h, target, index, kind <- require_map_iter(st, this)
   case index < 0 {
     True -> iter_done(st)
@@ -479,7 +497,11 @@ fn map_iterator_next(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) 
       }
       case step {
         None ->
-          iter_done(set_iter_kind(st, iter_h, MapIterator(target:, index: -1, kind:)))
+          iter_done(set_iter_kind(
+            st,
+            iter_h,
+            MapIterator(target:, index: -1, kind:),
+          ))
         Some(#(next_cursor, mk, v)) -> {
           let #(out, st) = case kind {
             MapIterKeys -> #(map_key_to_js(mk), st)
@@ -487,7 +509,11 @@ fn map_iterator_next(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) 
             MapIterEntries -> alloc_pair(st, map_key_to_js(mk), v)
           }
           let st =
-            set_iter_kind(st, iter_h, MapIterator(target:, index: next_cursor, kind:))
+            set_iter_kind(
+              st,
+              iter_h,
+              MapIterator(target:, index: next_cursor, kind:),
+            )
           iter_yield(st, out)
         }
       }
@@ -514,7 +540,10 @@ fn require_map_iter(
 
 // ── §24.2.5.2.1 %SetIteratorPrototype%.next() (arc call.gleam:1880) ─────────
 
-fn set_iterator_next(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
+fn set_iterator_next(
+  st: InstanceState,
+  this: JsVal,
+) -> #(JsVal, InstanceState) {
   use st, iter_h, target, index, kind <- require_set_iter(st, this)
   case index < 0 {
     True -> iter_done(st)
@@ -526,14 +555,22 @@ fn set_iterator_next(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) 
       }
       case step {
         None ->
-          iter_done(set_iter_kind(st, iter_h, SetIterator(target:, index: -1, kind:)))
+          iter_done(set_iter_kind(
+            st,
+            iter_h,
+            SetIterator(target:, index: -1, kind:),
+          ))
         Some(#(next_cursor, _mk, v)) -> {
           let #(out, st) = case kind {
             SetIterValues -> #(v, st)
             SetIterEntries -> alloc_pair(st, v, v)
           }
           let st =
-            set_iter_kind(st, iter_h, SetIterator(target:, index: next_cursor, kind:))
+            set_iter_kind(
+              st,
+              iter_h,
+              SetIterator(target:, index: next_cursor, kind:),
+            )
           iter_yield(st, out)
         }
       }
@@ -576,10 +613,18 @@ fn string_iterator_next(
             False ->
               case js_string.char_at(source, index) {
                 None ->
-                  iter_done(set_iter_kind(st, h, StringIterator(source:, index: -1)))
+                  iter_done(set_iter_kind(
+                    st,
+                    h,
+                    StringIterator(source:, index: -1),
+                  ))
                 Some(ch) -> {
                   let st =
-                    set_iter_kind(st, h, StringIterator(source:, index: index + 1))
+                    set_iter_kind(
+                      st,
+                      h,
+                      StringIterator(source:, index: index + 1),
+                    )
                   iter_yield(st, mk_string(ch))
                 }
               }
@@ -602,7 +647,11 @@ fn iter_yield(st: InstanceState, value: JsVal) -> #(JsVal, InstanceState) {
   #(mk_object(h), st)
 }
 
-fn alloc_pair(st: InstanceState, a: JsVal, b: JsVal) -> #(JsVal, InstanceState) {
+fn alloc_pair(
+  st: InstanceState,
+  a: JsVal,
+  b: JsVal,
+) -> #(JsVal, InstanceState) {
   let #(h, st) = realm_ops.alloc_array(st, [a, b])
   #(mk_object(h), st)
 }
@@ -957,8 +1006,7 @@ fn coerce_limit(
 ) -> #(Int, InstanceState) {
   let arg = first_arg_or_undefined(args)
   // ToNumber via t_to_number (runs ToPrimitive for objects; may throw).
-  let #(nout, st) =
-    protected_any(st, fn(st) { rt_js_val.t_to_number(st, arg) })
+  let #(nout, st) = protected_any(st, fn(st) { rt_js_val.t_to_number(st, arg) })
   case nout {
     ThrowCompletion(thrown) -> iter_protocol.close_throw(st, this, thrown)
     NormalCompletion(n) ->
@@ -1664,7 +1712,11 @@ fn mark_done(st: InstanceState, ref: Handle) -> InstanceState {
   set_gen_state(st, ref, GenCompleted)
 }
 
-fn write_counter(st: InstanceState, ref: Handle, counter: Int) -> InstanceState {
+fn write_counter(
+  st: InstanceState,
+  ref: Handle,
+  counter: Int,
+) -> InstanceState {
   use kind, _counter <- update_helper(st, ref)
   #(kind, counter)
 }
@@ -1687,10 +1739,7 @@ fn map_helper_body(
   rt_js_store.t_cell_update(st, ref, fn(slot) {
     case slot {
       SObject(kind: IteratorHelperObj(body:, ..) as helper, ..) ->
-        SObject(
-          ..slot,
-          kind: IteratorHelperObj(..helper, body: update(body)),
-        )
+        SObject(..slot, kind: IteratorHelperObj(..helper, body: update(body)))
       other -> other
     }
   })
@@ -1835,20 +1884,21 @@ fn zip_collect(
       iter_protocol.iterator_step_value(st, input_rec)
     })
   case step {
-    ThrowCompletion(thrown) ->
-      close_all_throw(st, collected_iters(acc), thrown)
+    ThrowCompletion(thrown) -> close_all_throw(st, collected_iters(acc), thrown)
     NormalCompletion(None) -> #(list.reverse(acc), st)
     NormalCompletion(Some(v)) -> {
-      use rec, st <- or_close_all(st, fn() {
-        [input_rec.iterator, ..collected_iters(acc)]
-      }, fn(st) {
-        iter_protocol.get_iterator_flattenable(
-          st,
-          v,
-          RejectPrimitives,
-          "Iterator.zip input",
-        )
-      })
+      use rec, st <- or_close_all(
+        st,
+        fn() { [input_rec.iterator, ..collected_iters(acc)] },
+        fn(st) {
+          iter_protocol.get_iterator_flattenable(
+            st,
+            v,
+            RejectPrimitives,
+            "Iterator.zip input",
+          )
+        },
+      )
       zip_collect(st, input_rec, [rec, ..acc])
     }
   }
@@ -2235,7 +2285,11 @@ fn or_close_all(
 
 /// IteratorCloseAll with a pending throw: close every iterator in REVERSE
 /// list order (errors from .return swallowed), then rethrow the original.
-fn close_all_throw(st: InstanceState, iters: List(JsVal), original: JsVal) -> a {
+fn close_all_throw(
+  st: InstanceState,
+  iters: List(JsVal),
+  original: JsVal,
+) -> a {
   let st =
     list.fold(list.reverse(iters), st, fn(st, it) {
       let #(_superseded, st) = iter_protocol.call_return(st, it)
@@ -2329,8 +2383,7 @@ fn concat_validate(
               }
           }
         }
-        _ ->
-          throw_type_error(st, "Iterator.concat argument is not an object")
+        _ -> throw_type_error(st, "Iterator.concat argument is not an object")
       }
   }
 }

@@ -18,8 +18,8 @@ import twocore/runtime/rt_js_obj
 import twocore/runtime/rt_js_store
 import twocore/runtime/rt_js_types.{
   type BuiltinPair, type Handle, type JsVal, type StringNative, type SymbolId,
-  JFloat, JInt, JNan, KHandle, KNull, KStr, KUndef, Named, NoElements,
-  RegExpObj, SObject, StringConstructor, StringFromCharCode, StringFromCodePoint,
+  JFloat, JInt, JNan, KHandle, KNull, KStr, KUndef, Named, NoElements, RegExpObj,
+  SObject, StringConstructor, StringFromCharCode, StringFromCodePoint,
   StringIterator, StringKey, StringN, StringObj, StringPrototypeAnchor,
   StringPrototypeAt, StringPrototypeBig, StringPrototypeBlink,
   StringPrototypeBold, StringPrototypeCharAt, StringPrototypeCharCodeAt,
@@ -462,8 +462,7 @@ fn string_substring(
   let len = js_string.length(s)
   let #(raw_start, st) =
     rt_js_val.t_to_integer_or_infinity(st, helpers.first_arg_or_undefined(args))
-  let #(raw_end, st) =
-    second_arg_index_or_len(st, args, len, fn(n, _, _) { n })
+  let #(raw_end, st) = second_arg_index_or_len(st, args, len, fn(n, _, _) { n })
   let start = int.clamp(raw_start, 0, len)
   let end = int.clamp(raw_end, 0, len)
   let #(start, end) = case start > end {
@@ -695,8 +694,7 @@ fn get_method(
           let #(callable, st) = rt_js_val.t_is_callable(st, func)
           case callable {
             True -> #(Some(func), st)
-            False ->
-              rt_js_val.t_throw_type_error(st, not_a_function(symbol))
+            False -> rt_js_val.t_throw_type_error(st, not_a_function(symbol))
           }
         }
       }
@@ -779,8 +777,7 @@ fn string_replace(
   let st = require_object_coercible(st, this, "replace")
   let search_val = helpers.first_arg_or_undefined(args)
   let replace_val = helpers.arg_at(args, 1)
-  let #(method_opt, st) =
-    get_method(st, search_val, rt_js_types.symbol_replace)
+  let #(method_opt, st) = get_method(st, search_val, rt_js_types.symbol_replace)
   case method_opt {
     Some(method) ->
       rt_js_call.t_call_checked(st, method, search_val, [this, replace_val])
@@ -803,8 +800,7 @@ fn string_replace_all(
   let replace_val = helpers.arg_at(args, 1)
   let #(is_re, st) = is_regexp(st, search_val)
   let st = require_global_when_regexp(st, search_val, is_re, "replaceAll")
-  let #(method_opt, st) =
-    get_method(st, search_val, rt_js_types.symbol_replace)
+  let #(method_opt, st) = get_method(st, search_val, rt_js_types.symbol_replace)
   case method_opt {
     Some(method) ->
       rt_js_call.t_call_checked(st, method, search_val, [this, replace_val])
@@ -839,8 +835,7 @@ fn string_match_all(
           regexp_arg,
           mk_string("g"),
         ])
-      let #(method_opt, st) =
-        get_method(st, rx, rt_js_types.symbol_match_all)
+      let #(method_opt, st) = get_method(st, rx, rt_js_types.symbol_match_all)
       case method_opt {
         Some(method) ->
           rt_js_call.t_call_checked(st, method, rx, [mk_string(s)])
@@ -1129,14 +1124,10 @@ fn string_raw_loop(
       case subs {
         [sub_val, ..rest] -> {
           let #(sub, st) = rt_js_val.t_to_string(st, sub_val)
-          string_raw_loop(
-            st,
-            raw_val,
-            rest,
-            literal_count,
-            index + 1,
-            [sub, ..acc_rev],
-          )
+          string_raw_loop(st, raw_val, rest, literal_count, index + 1, [
+            sub,
+            ..acc_rev
+          ])
         }
         [] ->
           string_raw_loop(st, raw_val, [], literal_count, index + 1, acc_rev)
@@ -1214,26 +1205,23 @@ fn from_code_point_loop(
         JFloat(f) ->
           case rt_js_val.integral_int(f) {
             Some(i) if i >= 0 && i <= 0x10FFFF ->
-              from_code_point_loop(
-                st,
-                rest,
-                [codepoint_or_replacement(i), ..acc],
-              )
+              from_code_point_loop(st, rest, [
+                codepoint_or_replacement(i),
+                ..acc
+              ])
             _ ->
               rt_js_val.t_throw_range_error(
                 st,
                 "Invalid code point " <> rt_js_val.js_format_float(f),
               )
           }
-        JNan ->
-          rt_js_val.t_throw_range_error(st, "Invalid code point NaN")
+        JNan -> rt_js_val.t_throw_range_error(st, "Invalid code point NaN")
         JInt(i) ->
           rt_js_val.t_throw_range_error(
             st,
             "Invalid code point " <> int.to_string(i),
           )
-        _ ->
-          rt_js_val.t_throw_range_error(st, "Invalid code point Infinity")
+        _ -> rt_js_val.t_throw_range_error(st, "Invalid code point Infinity")
       }
     }
   }
@@ -1354,8 +1342,7 @@ fn with_this_string(
 ) -> #(String, InstanceState) {
   case classify(this) {
     KStr(s) -> #(s, st)
-    KNull ->
-      rt_js_val.t_throw_type_error(st, "Cannot read properties of null")
+    KNull -> rt_js_val.t_throw_type_error(st, "Cannot read properties of null")
     KUndef ->
       rt_js_val.t_throw_type_error(st, "Cannot read properties of undefined")
     _ -> rt_js_val.t_to_string(st, this)
@@ -1373,11 +1360,7 @@ fn string_transform(
 }
 
 /// §22.1.3 thisStringValue(value): String primitive or [[StringData]] slot.
-fn this_string_value(
-  st: InstanceState,
-  this: JsVal,
-  method: String,
-) -> String {
+fn this_string_value(st: InstanceState, this: JsVal, method: String) -> String {
   case classify(this) {
     KStr(s) -> s
     KHandle(h) ->

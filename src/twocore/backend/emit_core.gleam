@@ -2574,67 +2574,67 @@ fn materialize_if(
       case list.length(names) == arity {
         False -> Error(ArityMismatch(arity, list.length(names)))
         True ->
-      // Only inline when the caller GUARANTEES `cont` is reached from ONE
-      // exit (`force_inline`, i.e. emit_if with one arm diverging).
-      // A weight-gated inline (`is_trivial_cont(next) &&
-      // cont_inline_weight ≤ N`) is UNSOUND for multi-exit callers
-      // (Block/Switch/2-arm-If): `apply_cont` re-emits `body`'s IR
-      // VERBATIM at every exit, so its `names` and `body`'s ANF binder
-      // names are bound multiple times in nested scopes — Core Erlang
-      // tolerates the shadow, but the `inline` compile pass we now enable
-      // (twocore_codegen_ffi) trips `cerl_inline` `undefined_var` on it.
-      case
-        force_inline
-        || {
-          ctx.binding.js_profile
-          && is_trivial_cont(next)
-          && cont_inline_weight(body, cont_inline_threshold) >= 0
-        }
-      {
-        True -> Ok(#(None, kb, state))
-        False ->
-          case sc {
-            NoState -> {
-              let #(jname, state2) = fresh_fn(state)
-              let fname = FName(jname, arity)
-              let outer_float = state2.float
-              use #(jbody, state3) <- result.try(emit(
-                body,
-                next,
-                NoState,
-                EmitState(..state2, float: None),
-                ctx,
-              ))
-              float_or_wrap(
-                FunDef(fname, CFun(names, jbody)),
-                fname,
-                EmitState(..state3, float: outer_float),
-              )
+          // Only inline when the caller GUARANTEES `cont` is reached from ONE
+          // exit (`force_inline`, i.e. emit_if with one arm diverging).
+          // A weight-gated inline (`is_trivial_cont(next) &&
+          // cont_inline_weight ≤ N`) is UNSOUND for multi-exit callers
+          // (Block/Switch/2-arm-If): `apply_cont` re-emits `body`'s IR
+          // VERBATIM at every exit, so its `names` and `body`'s ANF binder
+          // names are bound multiple times in nested scopes — Core Erlang
+          // tolerates the shadow, but the `inline` compile pass we now enable
+          // (twocore_codegen_ffi) trips `cerl_inline` `undefined_var` on it.
+          case
+            force_inline
+            || {
+              ctx.binding.js_profile
+              && is_trivial_cont(next)
+              && cont_inline_weight(body, cont_inline_threshold) >= 0
             }
-            Threading(_) -> {
-              let #(jname, state2) = fresh_fn(state)
-              let #(st_join, state3) = fresh_var(state2)
-              let fname = FName(jname, arity + 1)
-              // Fun body is single-value: emit under float=None so its
-              // KValues leaves yield a `{st,r..}` tuple. Any float sink
-              // opened INSIDE `body` (nested emit_block let-case) is
-              // independent — restored to None when that scope closes.
-              let outer_float = state3.float
-              use #(jbody, state4) <- result.try(emit(
-                body,
-                next,
-                Threading(st_join),
-                EmitState(..state3, float: None),
-                ctx,
-              ))
-              float_or_wrap(
-                FunDef(fname, CFun([st_join, ..names], jbody)),
-                fname,
-                EmitState(..state4, float: outer_float),
-              )
-            }
+          {
+            True -> Ok(#(None, kb, state))
+            False ->
+              case sc {
+                NoState -> {
+                  let #(jname, state2) = fresh_fn(state)
+                  let fname = FName(jname, arity)
+                  let outer_float = state2.float
+                  use #(jbody, state3) <- result.try(emit(
+                    body,
+                    next,
+                    NoState,
+                    EmitState(..state2, float: None),
+                    ctx,
+                  ))
+                  float_or_wrap(
+                    FunDef(fname, CFun(names, jbody)),
+                    fname,
+                    EmitState(..state3, float: outer_float),
+                  )
+                }
+                Threading(_) -> {
+                  let #(jname, state2) = fresh_fn(state)
+                  let #(st_join, state3) = fresh_var(state2)
+                  let fname = FName(jname, arity + 1)
+                  // Fun body is single-value: emit under float=None so its
+                  // KValues leaves yield a `{st,r..}` tuple. Any float sink
+                  // opened INSIDE `body` (nested emit_block let-case) is
+                  // independent — restored to None when that scope closes.
+                  let outer_float = state3.float
+                  use #(jbody, state4) <- result.try(emit(
+                    body,
+                    next,
+                    Threading(st_join),
+                    EmitState(..state3, float: None),
+                    ctx,
+                  ))
+                  float_or_wrap(
+                    FunDef(fname, CFun([st_join, ..names], jbody)),
+                    fname,
+                    EmitState(..state4, float: outer_float),
+                  )
+                }
+              }
           }
-      }
       }
   }
 }
@@ -4700,8 +4700,7 @@ fn resolve_js(op: String) -> Option(#(JsRtModule, String, JsOpKind)) {
     // JPure §7.1.19 fast probe (l-jread-reclass): primitive int/str/sym →
     // wire key with no St; `miss` on Handle/rare and the emitter falls to
     // JMut `to_property_key`. Saves the {V,St'} alloc + rebind on hit.
-    "to_property_key_fast" ->
-      Some(#(JsValFfi, "t_to_property_key_fast", JPure))
+    "to_property_key_fast" -> Some(#(JsValFfi, "t_to_property_key_fast", JPure))
     "to_object" -> Some(#(JsVal, "t_to_object", JMut))
     "type_of" -> Some(#(JsVal, "t_type_of", JMut))
     "is_callable" -> Some(#(JsVal, "t_is_callable", JMut))
@@ -6179,42 +6178,42 @@ fn emit_if(
   let arm_ok = fn(div: Bool, arm: Expr) {
     div || spine_tail_arity_ok(arm, arity)
   }
-  use #(maybe_def, jcont, state2) <- result.try(case
-    ctx.binding.js_profile && then_div && else_div
-  {
-    // Both diverge → cont is dead; pass anything (never reached).
-    True -> Ok(#(None, KReturn, state))
-    False ->
-      case
-        ctx.binding.js_profile
-        && { then_div || else_div }
-        && cont_arity_ok(cont_s, arity)
-        && arm_ok(then_div, then_branch)
-        && arm_ok(else_div, else_branch)
-      {
-        // Exactly one arm diverges → cont reached ONCE (from the other arm);
-        // its body is emitted once regardless of size, so no letrec.
-        True -> Ok(#(None, cont_s, state))
-        False ->
-          // perf6 let-case: NEITHER arm diverges, `cont` is a KBind that
-          // would materialize as a letrec, and both arms are value-terminal
-          // (no Break/Continue/Return to any outer label) → arms emit under
-          // KValues to a `<st,v..>` case-leaf and `cont` runs ONCE after a
-          // multi-value `let`. Drops the anf.bind_if / stmt.emit_if letrec-
-          // join (arc richards: the ~245k applies/run emit_block's let-case
-          // leaves behind).
-          case
-            perf6_block_let_case
-            && ctx.binding.js_profile
-            && block_can_let_case(cont, arity)
-            && all_breaks_local(then_branch, "", [], [])
-            && all_breaks_local(else_branch, "", [], [])
-          {
-            True -> Ok(#(None, KValues, state))
-            False -> materialize(cont, arity, sc, state, ctx)
-          }
-      }
-  })
+  use #(maybe_def, jcont, state2) <- result.try(
+    case ctx.binding.js_profile && then_div && else_div {
+      // Both diverge → cont is dead; pass anything (never reached).
+      True -> Ok(#(None, KReturn, state))
+      False ->
+        case
+          ctx.binding.js_profile
+          && { then_div || else_div }
+          && cont_arity_ok(cont_s, arity)
+          && arm_ok(then_div, then_branch)
+          && arm_ok(else_div, else_branch)
+        {
+          // Exactly one arm diverges → cont reached ONCE (from the other arm);
+          // its body is emitted once regardless of size, so no letrec.
+          True -> Ok(#(None, cont_s, state))
+          False ->
+            // perf6 let-case: NEITHER arm diverges, `cont` is a KBind that
+            // would materialize as a letrec, and both arms are value-terminal
+            // (no Break/Continue/Return to any outer label) → arms emit under
+            // KValues to a `<st,v..>` case-leaf and `cont` runs ONCE after a
+            // multi-value `let`. Drops the anf.bind_if / stmt.emit_if letrec-
+            // join (arc richards: the ~245k applies/run emit_block's let-case
+            // leaves behind).
+            case
+              perf6_block_let_case
+              && ctx.binding.js_profile
+              && block_can_let_case(cont, arity)
+              && all_breaks_local(then_branch, "", [], [])
+              && all_breaks_local(else_branch, "", [], [])
+            {
+              True -> Ok(#(None, KValues, state))
+              False -> materialize(cont, arity, sc, state, ctx)
+            }
+        }
+    },
+  )
   use #(then_c, state3) <- result.try(emit(then_branch, jcont, sc, state2, ctx))
   use #(else_c, state4) <- result.try(emit(else_branch, jcont, sc, state3, ctx))
   let #(wild, state5) = fresh_var(state4)
@@ -6230,7 +6229,8 @@ fn emit_if(
   // free vars may sit inside the arm — the tuple-destructure path is safe and
   // richards' hot pattern is anf.share (Block), not bind_if.
   case jcont == KValues && block_can_let_case(cont, arity) {
-    True -> emit_let_case_wrap(case_expr, arity, [], False, cont, sc, state5, ctx)
+    True ->
+      emit_let_case_wrap(case_expr, arity, [], False, cont, sc, state5, ctx)
     False -> Ok(#(wrap_join(maybe_def, case_expr), state5))
   }
 }
@@ -6421,9 +6421,7 @@ fn emit_block(
       // nested open would need transitive floating (free-var unsafe).
       let outer_float = state.float
       let open_float =
-        perf6_letrec_float
-        && outer_float == None
-        && float_safe_body(body)
+        perf6_letrec_float && outer_float == None && float_safe_body(body)
       let state2 = case open_float {
         True -> EmitState(..state, float: Some(#(arity, [])))
         False -> state
@@ -6432,8 +6430,10 @@ fn emit_block(
       use #(body_c, state4) <- result.try(emit(body, KValues, sc, state3, ctx))
       let state5 = restore_labels(state4, state.labels)
       let #(defs, state6) = case open_float, state5.float {
-        True, Some(#(_, ds)) ->
-          #(list.reverse(ds), EmitState(..state5, float: outer_float))
+        True, Some(#(_, ds)) -> #(
+          list.reverse(ds),
+          EmitState(..state5, float: outer_float),
+        )
         _, _ -> #([], state5)
       }
       emit_let_case_wrap(body_c, arity, defs, open_float, cont, sc, state6, ctx)
@@ -6567,8 +6567,7 @@ fn all_breaks_local(
     | ir.ReturnCallImport(..) -> perf8_return_diverges
     Let(_, rhs, tail) -> go(rhs) && go(tail)
     If(_, _, t, f) -> go(t) && go(f)
-    Block(l, _, b) ->
-      all_breaks_local(b, this_label, [l, ..inner], transparent)
+    Block(l, _, b) -> all_breaks_local(b, this_label, [l, ..inner], transparent)
     // A Loop's `Break(this_label,…)` leaf sits INSIDE the loop letrec fun —
     // the KValues tuple would become the fun's return value, then flow
     // through `apply loop_fn(…)`. Sound in principle, but arc's while/for
@@ -6615,7 +6614,6 @@ fn cont_arity_ok(cont: Cont, arity: Int) -> Bool {
   }
 }
 
-
 /// Lower `Loop` to the verified §5 template: `letrec 'L'/arity = fun(params…) -> <body>`
 /// applied to the loop-param inits. `Continue(label, vs)` becomes a tail `apply 'L'(vs)`
 /// (the back-edge → constant space); fall-through and `Break(label, …)` exit through the
@@ -6647,12 +6645,12 @@ fn emit_loop(
   // materialize when arities line up; otherwise the fall-through cont is
   // dead — supply a KJump to a fresh 0-arity trap so a genuine fall-through
   // (which would be an IR bug) is loud, not silent.
-  use #(maybe_def, exit_cont, state2) <- result.try(case
-    cont_arity_ok(strip_identity_binds(cont), r_arity)
-  {
-    True -> materialize(cont, r_arity, sc, state, ctx)
-    False -> Ok(#(None, KReturn, state))
-  })
+  use #(maybe_def, exit_cont, state2) <- result.try(
+    case cont_arity_ok(strip_identity_binds(cont), r_arity) {
+      True -> materialize(cont, r_arity, sc, state, ctx)
+      False -> Ok(#(None, KReturn, state))
+    },
+  )
   let #(lname, state3) = fresh_fn(state2)
   case sc {
     NoState -> {

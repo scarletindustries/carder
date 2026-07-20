@@ -25,10 +25,10 @@ import twocore/runtime/rt_js_types.{
   type BuiltinPair, type Handle, type JsVal, type MapIterKind, type MapKey,
   type MapNative, type ObjKind, JInt, KHandle, KNull, KUndef, MapClear,
   MapConstructor, MapDelete, MapEntries, MapForEach, MapGet, MapGetSize, MapHas,
-  MapIterEntries, MapIterKeys, MapIterValues, MapIterator, MapKeys, MapN,
-  MapObj, MapSet, MapValues, Named, NoElements, SObject, StringKey, classify,
-  js_to_map_key, map_key_to_js, mk_bool, mk_number, mk_object,
-  mk_undefined, symbol_iterator,
+  MapIterEntries, MapIterKeys, MapIterValues, MapIterator, MapKeys, MapN, MapObj,
+  MapSet, MapValues, Named, NoElements, SObject, StringKey, classify,
+  js_to_map_key, map_key_to_js, mk_bool, mk_number, mk_object, mk_undefined,
+  symbol_iterator,
 }
 import twocore/runtime/rt_js_val
 import twocore/runtime/rt_state.{type InstanceState}
@@ -141,8 +141,7 @@ fn map_constructor(
     _ -> {
       let iterable = first_arg_or_undefined(args)
       // Steps 5-6: adder = ? Get(map, "set"); must be callable.
-      let #(adder, st) =
-        rt_js_obj.t_get_prop(st, map, StringKey(Named("set")))
+      let #(adder, st) = rt_js_obj.t_get_prop(st, map, StringKey(Named("set")))
       case rt_js_call.is_callable(st, adder) {
         False ->
           rt_js_val.t_throw_type_error(

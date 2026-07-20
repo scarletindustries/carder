@@ -88,10 +88,7 @@ pub fn dispatch(
 ) -> #(JsVal, InstanceState) {
   case native {
     ArrayBufferConstructor(..) ->
-      rt_js_val.t_throw_type_error(
-        st,
-        "Constructor ArrayBuffer requires 'new'",
-      )
+      rt_js_val.t_throw_type_error(st, "Constructor ArrayBuffer requires 'new'")
     ArrayBufferIsView -> is_view(st, args)
     ArrayBufferGetByteLength -> get_byte_length(st, this)
     ArrayBufferGetDetached -> get_detached(st, this)
@@ -320,18 +317,12 @@ fn require_ab_st(st: InstanceState, v: JsVal) -> InstanceState {
 fn throw_receiver(st: InstanceState, op: String) -> a {
   rt_js_val.t_throw_type_error(
     st,
-    "Method ArrayBuffer.prototype."
-      <> op
-      <> " called on incompatible receiver",
+    "Method ArrayBuffer.prototype." <> op <> " called on incompatible receiver",
   )
 }
 
 /// Normalize a slice-style relative index to [0, len] (§25.1.6.9 steps 4-8).
-fn clamp_index(
-  st: InstanceState,
-  v: JsVal,
-  len: Int,
-) -> #(Int, InstanceState) {
+fn clamp_index(st: InstanceState, v: JsVal, len: Int) -> #(Int, InstanceState) {
   let #(rel, st) = rt_js_val.t_to_integer_or_infinity(st, v)
   let abs = case rel < 0 {
     True -> int.max(len + rel, 0)
@@ -352,4 +343,3 @@ fn proto_from_new_target(
     _ -> #(fallback, st)
   }
 }
-

@@ -264,7 +264,10 @@ fn to_string(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
 }
 
 /// §20.4.3.2 get Symbol.prototype.description — [[Description]] or undefined.
-fn description_getter(st: InstanceState, this: JsVal) -> #(JsVal, InstanceState) {
+fn description_getter(
+  st: InstanceState,
+  this: JsVal,
+) -> #(JsVal, InstanceState) {
   let id = this_symbol_value(st, this, "description")
   case symbol_description(id) {
     Some(s) -> #(mk_string(s), st)

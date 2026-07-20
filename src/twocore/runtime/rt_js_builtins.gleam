@@ -140,34 +140,39 @@ pub fn init_realm(st: InstanceState) -> #(Realm, InstanceState) {
     )
   // 16. globalThis — allocated last so it can reference every constructor.
   let #(global_object, st) =
-    alloc_global_object(st, object_proto, gfns, GlobalRefs(
-      object:,
-      function:,
-      array:,
-      string:,
-      number:,
-      boolean:,
-      symbol:,
-      bigint:,
-      errors:,
-      map:,
-      set:,
-      weak_map:,
-      weak_set:,
-      date:,
-      regexp:,
-      promise:,
-      iterator: iters.iterator,
-      proxy:,
-      array_buffer:,
-      data_view:,
-      typed_arrays:,
-      math:,
-      json:,
-      reflect:,
-      console:,
-      atomics:,
-    ))
+    alloc_global_object(
+      st,
+      object_proto,
+      gfns,
+      GlobalRefs(
+        object:,
+        function:,
+        array:,
+        string:,
+        number:,
+        boolean:,
+        symbol:,
+        bigint:,
+        errors:,
+        map:,
+        set:,
+        weak_map:,
+        weak_set:,
+        date:,
+        regexp:,
+        promise:,
+        iterator: iters.iterator,
+        proxy:,
+        array_buffer:,
+        data_view:,
+        typed_arrays:,
+        math:,
+        json:,
+        reflect:,
+        console:,
+        atomics:,
+      ),
+    )
   // Assemble the Realm record — every field populated, no Options.
   let realm =
     Realm(
@@ -504,7 +509,8 @@ pub fn dispatch_native_construct(
     RegExpN(n) -> b_regexp.dispatch_construct(st, n, args, new_target)
     ProxyN(n) -> b_proxy.dispatch_construct(st, n, args, new_target)
     PromiseN(_) -> b_promise.dispatch_construct(st, args, new_target)
-    ArrayBufferN(n) -> b_array_buffer.dispatch_construct(st, n, args, new_target)
+    ArrayBufferN(n) ->
+      b_array_buffer.dispatch_construct(st, n, args, new_target)
     DataViewN(n) -> b_data_view.dispatch_construct(st, n, args, new_target)
     TypedArrayN(n) -> b_typed_array.dispatch_construct(st, n, args, new_target)
     // §22.1.1 Array — proto derived from new.target, then ArrayCreate.
@@ -512,7 +518,8 @@ pub fn dispatch_native_construct(
     // via its call path then fix up [[Prototype]] before returning.
     ArrayN(n) -> {
       let r = rt_state.t_realm(st)
-      let #(proto, st) = proto_from_new_target(st, new_target, r.array.prototype)
+      let #(proto, st) =
+        proto_from_new_target(st, new_target, r.array.prototype)
       let #(v, st) = b_array.dispatch(st, n, mk_undefined(), args)
       let #(h, st) = require_handle(st, v)
       let #(_ok, st) = rt_js_obj.t_set_proto(st, h, Some(proto))
@@ -533,7 +540,8 @@ pub fn dispatch_native_construct(
     // §21.1.1.1 Number — n = args ? ToNumeric (BigInt→𝔽) : +0; wrap.
     NumberN(NumberConstructor) -> {
       let r = rt_state.t_realm(st)
-      let #(v, st) = b_number.dispatch(st, NumberConstructor, mk_undefined(), args)
+      let #(v, st) =
+        b_number.dispatch(st, NumberConstructor, mk_undefined(), args)
       let n = case classify(v) {
         rt_js_types.KNum(n) -> n
         _ -> JInt(0)

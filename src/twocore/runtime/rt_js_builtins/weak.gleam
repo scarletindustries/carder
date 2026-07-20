@@ -412,7 +412,11 @@ fn read_wm(st: InstanceState, ref: WMRef) -> Dict(Int, JsVal) {
   entries
 }
 
-fn lookup_wm(st: InstanceState, ref: WMRef, key: JsVal) -> option.Option(JsVal) {
+fn lookup_wm(
+  st: InstanceState,
+  ref: WMRef,
+  key: JsVal,
+) -> option.Option(JsVal) {
   case classify(key) {
     KHandle(h) -> dict.get(read_wm(st, ref), h.id) |> option.from_result
     _ -> None

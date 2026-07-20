@@ -473,7 +473,9 @@ fn set_stack_ignoring_prototype(
       )
     False -> {
       // Step 3: desc = ? this.[[GetOwnProperty]]("stack").
-      let has_own = case rt_js_obj.as_sobject(st, rt_js_store.t_cell_get(st, h)) {
+      let has_own = case
+        rt_js_obj.as_sobject(st, rt_js_store.t_cell_get(st, h))
+      {
         SObject(props:, ..) -> dict.has_key(props, Named("stack"))
         _ -> False
       }

@@ -56,7 +56,9 @@ pub fn t_store_new(hooks: HostHooks) -> JsStore(InstanceState) {
     microtasks: jq_new(),
     unhandled_rejections: [],
     console_buf: [],
-    shapes: dict.from_list([#(0, rt_js_types.ShapeDesc(0, dict.new(), dict.new()))]),
+    shapes: dict.from_list([
+      #(0, rt_js_types.ShapeDesc(0, dict.new(), dict.new())),
+    ]),
     next_shape: 1,
   )
 }

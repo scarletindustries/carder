@@ -66,7 +66,13 @@ pub fn init(
   // Number.isNaN / Number.isFinite are deliberately NOT the globals: they
   // skip ToNumber coercion (§21.1.2.2/.4).
   let #(is_nan_ref, st) =
-    common.alloc_rooted_native_fn(st, fn_proto, GlobalN(GlobalIsNaN), "isNaN", 1)
+    common.alloc_rooted_native_fn(
+      st,
+      fn_proto,
+      GlobalN(GlobalIsNaN),
+      "isNaN",
+      1,
+    )
   let #(is_finite_ref, st) =
     common.alloc_rooted_native_fn(
       st,
@@ -407,10 +413,7 @@ fn number_to_exponential(
   let arg = helpers.first_arg_or_undefined(args)
   case classify(arg) {
     // Step 6.c: undefined → shortest round-trip digits.
-    KUndef -> #(
-      mk_string(format_non_finite(n, format_to_exponential_auto)),
-      st,
-    )
+    KUndef -> #(mk_string(format_non_finite(n, format_to_exponential_auto)), st)
     _ -> {
       let #(f, st) = rt_js_val.t_to_integer_or_infinity(st, arg)
       // Step 4 BEFORE step 5's range check: non-finite `this` returns

@@ -28,8 +28,7 @@ import twocore/runtime/rt_js_types.{
   JsonParse, JsonRawJson, JsonStringify, KBig, KBool, KHandle, KNull, KNum, KStr,
   KSym, KUndef, Named, NumberObj, Ordinary, SObject, SShapedObject, StringKey,
   StringObj, classify, index_key, mk_bool, mk_null, mk_number, mk_object,
-  mk_string,
-  mk_undefined,
+  mk_string, mk_undefined,
 }
 import twocore/runtime/rt_js_val
 import twocore/runtime/rt_state.{type InstanceState}
@@ -88,8 +87,7 @@ fn json_parse(args: List(JsVal), st: InstanceState) -> #(JsVal, InstanceState) {
   // Step 2: Parse as ECMA-404 JSON text.
   let bytes = bit_array.from_string(json_str)
   case parse_value(bytes) {
-    Error(e) ->
-      rt_js_val.t_throw_syntax_error(st, json_error_message(e))
+    Error(e) -> rt_js_val.t_throw_syntax_error(st, json_error_message(e))
     Ok(#(val, rest)) ->
       case skip_whitespace(rest) {
         <<>> -> {
@@ -109,7 +107,10 @@ fn json_parse(args: List(JsVal), st: InstanceState) -> #(JsVal, InstanceState) {
           }
         }
         _ ->
-          rt_js_val.t_throw_syntax_error(st, json_error_message(TrailingContent))
+          rt_js_val.t_throw_syntax_error(
+            st,
+            json_error_message(TrailingContent),
+          )
       }
   }
 }
@@ -276,8 +277,7 @@ fn json_error_message(e: JsonParseError) -> String {
     RawJsonEmpty -> "JSON.rawJSON text must not be empty"
     RawJsonSurroundingWhitespace ->
       "JSON.rawJSON text must not start or end with whitespace"
-    RawJsonNotPrimitive ->
-      "JSON.rawJSON text must not be an object or an array"
+    RawJsonNotPrimitive -> "JSON.rawJSON text must not be an object or an array"
   }
 }
 
@@ -291,7 +291,9 @@ fn skip_whitespace(bytes: BitArray) -> BitArray {
   }
 }
 
-fn parse_value(bytes: BitArray) -> Result(#(JsonValue, BitArray), JsonParseError) {
+fn parse_value(
+  bytes: BitArray,
+) -> Result(#(JsonValue, BitArray), JsonParseError) {
   let bytes = skip_whitespace(bytes)
   case bytes {
     <<>> -> Error(UnexpectedEnd)
@@ -331,7 +333,9 @@ fn scan_string(bytes: BitArray, n: Int) -> StringScan {
   }
 }
 
-fn parse_string(bytes: BitArray) -> Result(#(String, BitArray), JsonParseError) {
+fn parse_string(
+  bytes: BitArray,
+) -> Result(#(String, BitArray), JsonParseError) {
   case scan_string(bytes, 0) {
     FoundQuote(n, after) -> {
       use s <- result.map(take_string(bytes, n))
@@ -445,8 +449,7 @@ fn parse_low_surrogate(bytes: BitArray) -> Option(#(Int, BitArray)) {
   case bytes {
     <<0x5c, 0x75, rest:bytes>> ->
       case parse_unicode_escape(rest) {
-        Ok(#(low, rest)) if low >= 0xdc00 && low <= 0xdfff ->
-          Some(#(low, rest))
+        Ok(#(low, rest)) if low >= 0xdc00 && low <= 0xdfff -> Some(#(low, rest))
         _ -> None
       }
     _ -> None
@@ -544,7 +547,8 @@ fn count_number_bytes(bytes: BitArray, n: Int) -> Int {
       || b == 0x2e
       || b == 0x65
       || b == 0x45
-      || b >= 0x30 && b <= 0x39
+      || b >= 0x30
+      && b <= 0x39
     -> count_number_bytes(rest, n + 1)
     _ -> n
   }
@@ -653,8 +657,7 @@ fn materialize(st: InstanceState, val: JsonValue) -> #(JsVal, InstanceState) {
           let #(v, st) = materialize(st, jv)
           #([#(k, v), ..ps], st)
         })
-      let #(h, st) =
-        common.alloc_pojo(st, obj_proto, list.reverse(pairs))
+      let #(h, st) = common.alloc_pojo(st, obj_proto, list.reverse(pairs))
       #(mk_object(h), st)
     }
   }
@@ -944,8 +947,7 @@ fn serialize_property(
       let #(to_json, st) =
         rt_js_obj.t_get_prop(st, val, StringKey(Named("toJSON")))
       case rt_js_call.is_callable(st, to_json) {
-        True ->
-          rt_js_call.t_call_checked(st, to_json, val, [mk_string(key)])
+        True -> rt_js_call.t_call_checked(st, to_json, val, [mk_string(key)])
         False -> #(val, st)
       }
     }
@@ -1037,10 +1039,7 @@ fn serialize_object(
       }
       let #(partial, st) =
         serialize_members(st, ctx, stack, step_indent, h, keys, [])
-      #(
-        finalize_brackets(partial, ctx.gap, step_indent, indent, "{", "}"),
-        st,
-      )
+      #(finalize_brackets(partial, ctx.gap, step_indent, indent, "{", "}"), st)
     }
   }
 }
@@ -1057,8 +1056,7 @@ fn serialize_members(
   case keys {
     [] -> #(list.reverse(acc), st)
     [k, ..rest] -> {
-      let #(str_p, st) =
-        serialize_property(st, ctx, stack, step_indent, k, h)
+      let #(str_p, st) = serialize_property(st, ctx, stack, step_indent, k, h)
       case str_p {
         Some(s) -> {
           let sep = case ctx.gap {
@@ -1091,10 +1089,7 @@ fn serialize_array(
       let #(len, st) = length_of_array_like(st, h)
       let #(partial, st) =
         serialize_elements(st, ctx, stack, step_indent, h, 0, len, [])
-      #(
-        finalize_brackets(partial, ctx.gap, step_indent, indent, "[", "]"),
-        st,
-      )
+      #(finalize_brackets(partial, ctx.gap, step_indent, indent, "[", "]"), st)
     }
   }
 }
@@ -1228,10 +1223,7 @@ fn is_array_handle(st: InstanceState, h: Handle) -> Bool {
   }
 }
 
-fn length_of_array_like(
-  st: InstanceState,
-  h: Handle,
-) -> #(Int, InstanceState) {
+fn length_of_array_like(st: InstanceState, h: Handle) -> #(Int, InstanceState) {
   let #(len_v, st) =
     rt_js_obj.t_get_prop(st, mk_object(h), StringKey(Named("length")))
   rt_js_val.t_to_length(st, len_v)

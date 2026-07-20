@@ -110,10 +110,7 @@ fn pause(st: InstanceState, args: List(JsVal)) -> #(JsVal, InstanceState) {
           )
       }
     _ ->
-      rt_js_val.t_throw_type_error(
-        st,
-        "Atomics.pause: not an integral number",
-      )
+      rt_js_val.t_throw_type_error(st, "Atomics.pause: not an integral number")
   }
 }
 
