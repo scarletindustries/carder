@@ -71,6 +71,8 @@
 //// only `ir`); `fuel_budget`'s Safe default is read from `runtime/rt_meter` (also acyclic —
 //// `rt_meter` imports neither `instance` nor `ir_opt`), the single source of the budget.
 
+import gleam/dict.{type Dict}
+import gleam/option.{type Option, None}
 import twocore/opt_level.{type OptLevel, Baseline}
 import twocore/runtime/rt_meter
 
@@ -179,6 +181,41 @@ pub type TableTier {
   TableAtomics
 }
 
+/// How a direct-host op interacts with the threaded instance state `St`. This is the calling
+/// convention `emit_core` uses for a `CallHost` routed through `Binding.direct_host`:
+///
+/// - `Pure`: `M:F(args)`; no `St`; one value; the state channel is unchanged.
+/// - `Read`: `M:F(St, args)`; returns a bare value; the state channel is unchanged.
+/// - `Mut`: `M:F(St, args)`; returns `{V, St'}`; rebinds the state channel to `St'`.
+/// - `MutMiss`: `M:F(St, args)`; returns bare `St' | miss` (an atom on miss); rebinds to the
+///   result unless it is an atom, in which case `St` is kept.
+/// - `MutUnit`: `M:F(St, args)`; returns bare `St'`; rebinds, yields no value.
+///
+/// Every kind other than `Pure` needs a threaded state channel, so a `direct_host` binding
+/// only makes sense with `state_strategy: Threaded`.
+pub type OpKind {
+  Pure
+  Read
+  Mut
+  MutMiss
+  MutUnit
+}
+
+/// One direct-host op target: the fully resolved Erlang `module` atom (e.g.
+/// `"twocore@runtime@rt_js_obj"` or `"erlang"`), the `function` atom, and its `kind`.
+/// Both atoms are emitted as build-time literals in a `call M:F(...)`; they come from the
+/// caller's `Binding` value, never from program data (D3a).
+pub type HostOp {
+  HostOp(module: String, function: String, kind: OpKind)
+}
+
+/// A caller-supplied direct host: every `CallHost(capability, op, args)` whose capability
+/// equals `capability` is emitted as a direct call to `ops[op]` under that op's `OpKind`
+/// convention. An `op` absent from `ops` is a compile error (fail-closed), never a fallback.
+pub type DirectHost {
+  DirectHost(capability: String, ops: Dict(String, HostOp))
+}
+
 /// Which compiled runtime module implements each runtime layer.
 ///
 /// Each field holds a Gleam→Erlang-mangled module name (e.g.
@@ -251,23 +288,12 @@ pub type Binding {
     table_module: String,
     state_module: String,
     js_runtime_module: String,
-    // ── Phase-9 M9 split rt_js modules (SPEC§7.M9 §9.1 / R3). Each is the mangled BEAM
-    // atom `emit_core`'s `js_module_atom` links a `JsRtModule` variant to under
-    // `js_profile: True`. Inert under `js_profile: False` (the WASM/Porffor default).
-    js_store_module: String,
-    js_val_module: String,
-    js_obj_module: String,
-    js_ops_module: String,
-    js_call_module: String,
-    js_class_module: String,
-    js_async_module: String,
-    js_gc_module: String,
-    js_builtins_module: String,
-    js_inspect_module: String,
-    /// The Phase-9 M9 gate (R3): `True` makes `emit_core` thread `InstanceState` through
-    /// EVERY `CallHost("js",…)`/`MakeClosure`/`CallClosure`/`Throw`/catch so compiled JS
-    /// functions have shape `fun(St,…) -> {V,St'}`. `False` = byte-identical WASM/Porffor.
-    js_profile: Bool,
+    /// The caller-supplied direct host (see `DirectHost`). `Some(_)` makes `emit_core` thread
+    /// the instance state through EVERY function, `MakeClosure`/`CallClosure`, `Throw`/catch,
+    /// and every `CallHost` on `capability` (compiled functions have shape
+    /// `fun(St, ...) -> {V, St'}`), and routes those `CallHost`s through `ops`. `None` (the
+    /// default in every profile here) is byte-identical WASM/Porffor output.
+    direct_host: Option(DirectHost),
     safe_max_pages: Int,
     /// The documented, spec-aligned RUNTIME page cap for a 64-bit (`Idx64`) memory (memory64,
     /// I4/S9). We do NOT reserve 2^64 bytes: the `paged` backend grows on demand, so this is a
@@ -381,19 +407,8 @@ pub fn safe_default() -> Binding {
     // `CallHost("js", op, args)` routes here via a build-fixed literal `case` in `emit_core`
     // (D3a — never `apply` from data). Inert unless the module emits a `"js"` CallHost (K7).
     js_runtime_module: "twocore@runtime@rt_js",
-    // ── Phase-9 M9 split rt_js seeds (SPEC§9.1). Each is the default `twocore@runtime@rt_js_*`
-    // atom; inert under `js_profile: False` (the fail-closed default, next).
-    js_store_module: "twocore@runtime@rt_js_store",
-    js_val_module: "twocore@runtime@rt_js_val",
-    js_obj_module: "twocore@runtime@rt_js_obj",
-    js_ops_module: "twocore@runtime@rt_js_ops",
-    js_call_module: "twocore@runtime@rt_js_call",
-    js_class_module: "twocore@runtime@rt_js_class",
-    js_async_module: "twocore@runtime@rt_js_async",
-    js_gc_module: "twocore@runtime@rt_js_gc",
-    js_builtins_module: "twocore@runtime@rt_js_builtins",
-    js_inspect_module: "twocore@runtime@rt_js_inspect",
-    js_profile: False,
+    // No direct host: the fail-closed, byte-identical WASM/Porffor default.
+    direct_host: None,
     // The finite Safe max-pages cap baked into `rt_mem:fresh` (E3). `65536` = the i32 hard
     // cap (2^16 pages = 4 GiB), so the module's DECLARED max governs for conformance; unit
     // 11 lowers it to a real Safe resource bound.

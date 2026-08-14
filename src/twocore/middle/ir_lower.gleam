@@ -17,7 +17,7 @@
 ////      - a call into the reserved JS-runtime capability (`"js"`, Phase-8 unit 05 / K6) is
 ////        **admitted** here (exactly as a resolved `"std"` call is) and **left unchanged** —
 ////        its concrete `op → rt_js:<fn>` dispatch, and the fail-closed rejection of an unknown
-////        op, are the build-fixed literal `case` in `emit_core` (`resolve_js`/`UnknownJsOp`,
+////        op, are the build-fixed literal `case` in `emit_core` (`resolve_js_legacy`/`UnknownJsOp`,
 ////        D3a). This pass admits the *capability* (provenance); `emit_core` validates the *op*.
 ////      - a call to anything else — an un-allowlisted capability that is neither the
 ////        stdlib capability, the JS-runtime capability, nor a declared import — is **rejected
@@ -64,6 +64,7 @@
 //// designed to be consulted here.
 
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/set.{type Set}
 import twocore/ir.{type Expr, type Function, type Module, type Value}
 import twocore/runtime/instance.{type Binding, MeterFuel, MeterOff}
@@ -81,7 +82,7 @@ pub const stdlib_capability: String = "std"
 /// The reserved capability string that names the JS runtime boundary (Phase-8 unit 05, K6).
 /// A `CallHost` whose capability equals this is ADMITTED here (exactly as a resolved `"std"`
 /// call is admitted) — its concrete `op → rt_js:<fn>` dispatch is the build-fixed literal `case`
-/// in `emit_core` (`resolve_js`), where an unknown op FAILS CLOSED (`UnknownJsOp`, D3a — never
+/// in `emit_core` (`resolve_js_legacy`), where an unknown op FAILS CLOSED (`UnknownJsOp`, D3a — never
 /// `apply` from data). This pass admits the CAPABILITY (provenance); `emit_core` validates the
 /// OP (dispatch). Every OTHER non-stdlib, non-imported capability still fails closed here
 /// (`ForbiddenHost`). Pinned with `emit_core.js_capability` /
@@ -384,7 +385,11 @@ fn classify_call_host(
   binding: Binding,
   imports: Set(#(String, String)),
 ) -> Result(Nil, LowerError) {
-  case capability == stdlib_capability, capability == js_capability {
+  let direct = case binding.direct_host {
+    Some(dh) -> dh.capability == capability
+    None -> False
+  }
+  case capability == stdlib_capability, capability == js_capability || direct {
     // reserved stdlib capability → resolve posture-aware, then gate on `binding.bif_gate`
     True, _ ->
       case resolve_stdlib_fn(name, list.length(args), binding) {
@@ -395,11 +400,12 @@ fn classify_call_host(
             Error(_) -> Error(BifNotAllowed(name))
           }
       }
-    // reserved JS runtime capability (K6) → ADMITTED (like a resolved `"std"` call). The concrete
-    // `op → rt_js:<fn>` dispatch — and the fail-closed rejection of an unknown op — is the
-    // build-fixed literal `case` in `emit_core` (`resolve_js`/`UnknownJsOp`, D3a). Admitting the
-    // capability here means a `"js"` call is NOT `ForbiddenHost`; it is NOT rewritten (the node is
-    // left for `emit_core` to route, exactly like a stdlib/host call).
+    // reserved JS runtime capability (K6) or the binding's `direct_host` capability → ADMITTED
+    // (like a resolved `"std"` call). The concrete `op → M:F` dispatch — and the fail-closed
+    // rejection of an unknown op — is in `emit_core` (`resolve_js_legacy`/`UnknownJsOp`, or the
+    // `direct_host.ops` table/`UnknownDirectOp`, D3a). Admitting the capability here means such a
+    // call is NOT `ForbiddenHost`; it is NOT rewritten (the node is left for `emit_core` to
+    // route, exactly like a stdlib/host call).
     _, True -> Ok(Nil)
     // any other capability → a declared host import is allowed (run-time deny); else reject
     False, False ->

@@ -109,8 +109,9 @@ import twocore/ir.{
   UninitializedElement, Unreachable, Values, Var, W32, W64,
 }
 import twocore/runtime/instance.{
-  type Binding, type HostPolicy, type MemTier, Atomics, HostDenyAll, HostOpen,
-  HostWhitelist, MeterFuel, MeterOff, Nif, Paged, Threaded,
+  type Binding, type DirectHost, type HostPolicy, type MemTier, Atomics,
+  HostDenyAll, HostOp, HostOpen, HostWhitelist, MeterFuel, MeterOff, Mut,
+  MutMiss, MutUnit, Nif, Paged, Pure, Read, Threaded,
 }
 import twocore/runtime/profiles
 
@@ -193,18 +194,21 @@ pub type EmitError {
   /// (never a panic).
   UnknownTag(name: String)
   /// A `CallHost("js", op, args)` (Phase-8 unit 05, K6) whose `op` is NOT one of the
-  /// build-fixed `rt_js` ops (`resolve_js`). FAIL-CLOSED (K6/D3a): the JS runtime boundary is a
+  /// build-fixed `rt_js` ops (`resolve_js_legacy`). FAIL-CLOSED (K6/D3a): the JS runtime boundary is a
   /// literal `case` bound at build time to the `js_runtime_module` atom — an unrecognised `op`
   /// resolves to NO function, so no `call`/`apply` is emitted and the module is rejected here
   /// rather than a data-derived op reaching an arbitrary MFA. Never a panic. The real `rt_js`
   /// (the frontend's) will grow this op set; a new op is registered by adding one literal arm to
-  /// `resolve_js` (and the `ir_lower` "js" admit + the `rt_js` impl).
+  /// `resolve_js_legacy` (and the `ir_lower` "js" admit + the `rt_js` impl).
   UnknownJsOp(op: String)
-  /// A `js_profile: True` `CallHost("js", op, …)` whose `JsOpKind` needs `Threading(cur)` (JRead/
-  /// JMut/JMutUnit) but reached a `NoState` context (SPEC§7.M9 §9.5 / R12). FAIL-CLOSED — the
-  /// profile guarantees every function is state-reaching, so this is a backend defence, never a
-  /// panic.
-  JsProfileRequiresThreaded(op: String)
+  /// A `CallHost(cap, op, …)` on the `Binding.direct_host` capability whose `op` is not in
+  /// `direct_host.ops`. FAIL-CLOSED: no call is emitted (the table is the caller's build-time
+  /// `Binding` value, so an unknown op cannot reach an arbitrary MFA). Never a panic.
+  UnknownDirectOp(capability: String, op: String)
+  /// A direct-host `CallHost` whose `OpKind` needs `Threading(cur)` (Read/Mut/MutMiss/MutUnit)
+  /// but reached a `NoState` context. FAIL-CLOSED — `direct_host` makes every function
+  /// state-reaching, so this is a backend defence, never a panic.
+  DirectOpRequiresThreaded(op: String)
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -850,8 +854,8 @@ pub fn state_reaching_closure(
   functions: List(Function),
   binding: Binding,
 ) -> Set(String) {
-  case binding.js_profile {
-    // Under `js_profile` EVERY function threads `St` (SPEC§9.6) — closures/throws/CallHost("js")
+  case is_direct(binding) {
+    // Under `direct_host` EVERY function threads `St` (SPEC§9.6) — closures/throws/CallHost("js")
     // all thread, so the fixpoint is trivially the full set. Short-circuit avoids seeding
     // `expr_touches_state` with JS nodes (which would perturb the `False` path — SPEC§9.7).
     True -> set.from_list(list.map(functions, fn(f) { f.name }))
@@ -1549,7 +1553,7 @@ fn emit_num_term(
 /// panic. `arity = 0` yields a nullary `fun () -> apply 'fn_name'/m(captures…)`; `captures = []`
 /// yields a plain `fun` forwarding all args.
 ///
-/// Under `js_profile: True` with a state-reaching target, the closure is lifted to `fun/(arity+1)`
+/// Under `direct_host` with a state-reaching target, the closure is lifted to `fun/(arity+1)`
 /// taking `St` first and forwarding to the target's threaded `m+arity+1` form (M9§6). Otherwise
 /// the body is the UN-threaded direct call (no WASM module produces this node — K7).
 fn emit_make_closure(
@@ -1570,7 +1574,7 @@ fn emit_make_closure(
         True -> {
           let target_threaded =
             is_threaded(ctx)
-            && ctx.binding.js_profile
+            && is_direct(ctx.binding)
             && set.contains(ctx.fn_state_reaching, fn_name)
           case target_threaded {
             False -> {
@@ -1635,9 +1639,9 @@ fn emit_make_closure(
 /// data-named `apply(Mod, Fn, Args)`, never the list-spreading `erlang:apply/2`). EFFECTFUL
 /// barrier (it transfers to arbitrary code, like `CallIndirect`), yielding ONE value.
 ///
-/// Under `js_profile: False` this is state-NEUTRAL (a native BEAM fun does not carry our
+/// Without `direct_host` this is state-NEUTRAL (a native BEAM fun does not carry our
 /// `InstanceState`; `cur` flows through unchanged and `apply_cont_call` with `r = 1` disposes the
-/// single result). Under `js_profile: True` + `Threading(cur)` the target is a `fun(St,…)->{V,St'}`
+/// single result). Under `direct_host` + `Threading(cur)` the target is a `fun(St,…)->{V,St'}`
 /// closure built by `emit_make_closure`, so `St` is PREPENDED to the args and the `{V,St'}` result
 /// is unpacked exactly like a threaded direct call (§emit_call_direct): tail `KReturn` passes the
 /// pair straight through; non-tail goes via `emit_threaded_call_unpack`. Arity mismatch is a BEAM
@@ -1651,7 +1655,7 @@ fn emit_call_closure(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let cargs = list.map(args, emit_value)
-  case ctx.binding.js_profile, sc {
+  case is_direct(ctx.binding), sc {
     False, _ | True, NoState -> {
       let applied = CApplyExpr(emit_value(callee), cargs)
       apply_cont_call(cont, applied, 1, sc, state, ctx)
@@ -2125,10 +2129,10 @@ fn emit_value_state_pair(
   ))
 }
 
-/// Rebind the threaded `InstanceState` from a `JMutUnit` call that returns bare `St'` (SPEC§7.M9
+/// Rebind the threaded `InstanceState` from a `MutUnit` call that returns bare `St'` (SPEC§7.M9
 /// §9.5): fresh `St2 = <call>`, then continue with ZERO values under `Threading(St2)`. Distinct
 /// from `emit_threaded_record_effect` — no `Result` unwrap (the JS runtime never `{error,_}`s).
-/// arc's `anf.host_unit` wraps every JMutUnit CallHost in `Let([r], _, body)` (r discarded), so
+/// arc's `anf.host_unit` wraps every MutUnit CallHost in `Let([r], _, body)` (r discarded), so
 /// a `KBind([_], …)` cont is fed one dummy `undefined` to satisfy the arity check.
 fn emit_state_rebind(
   call: CExpr,
@@ -2151,11 +2155,11 @@ fn emit_state_rebind(
   Ok(#(CLet([st2], call, rest), state3))
 }
 
-/// Rebind the threaded `InstanceState` from a `JMutMiss` call that returns
+/// Rebind the threaded `InstanceState` from a `MutMiss` call that returns
 /// bare `St' | miss`: bind `R = <call>`, then `St2 = if is_atom(R) -> cur;
 /// else -> R`, and continue with `[R]` under `Threading(St2)`. The caller's
 /// own `IsAtom(R)` test distinguishes hit (tuple) from miss (atom); on miss
-/// sc is unchanged so the slow-path JMut sees the pre-call St. No `#(V,St')`
+/// sc is unchanged so the slow-path Mut sees the pre-call St. No `#(V,St')`
 /// tuple is allocated on the hit path.
 fn emit_state_rebind_or_miss(
   call: CExpr,
@@ -2586,7 +2590,7 @@ fn materialize_if(
           case
             force_inline
             || {
-              ctx.binding.js_profile
+              is_direct(ctx.binding)
               && is_trivial_cont(next)
               && cont_inline_weight(body, cont_inline_threshold) >= 0
             }
@@ -4442,25 +4446,30 @@ fn emit_threaded_call_unpack(
   ))
 }
 
-/// Lower a `CallHost` (the capability boundary, D9). THREE fates, all D3a-clean (the target
+/// Lower a `CallHost` (the capability boundary, D9). FOUR fates, all D3a-clean (the target
 /// module + function are always build-controlled literal atoms, never derived from `capability`/
 /// `name`/`args` data — no `apply(Mod,Fn,Args)`):
 ///
-/// - the reserved JS-runtime capability `"js"` (Phase-8 unit 05, K6) → a DIRECT
+/// - the caller's `Binding.direct_host` capability → a DIRECT `call '<M>':'<F>'(…)` to the
+///   `HostOp` that `direct_host.ops` maps `name` to, under that op's `OpKind` state-threading
+///   convention (`emit_call_direct_host`). An `op` outside the table is FAIL-CLOSED as
+///   `UnknownDirectOp`.
+/// - else the reserved JS-runtime capability `"js"` (Phase-8 unit 05, K6) → a DIRECT
 ///   `call '<js_runtime_module>':'<fn>'(args…)`, where `<fn>` is resolved from `name` by the
-///   build-fixed literal `case` `resolve_js`. An `op` outside that set is FAIL-CLOSED here as
-///   `UnknownJsOp` — no call is emitted, so a data-driven op cannot reach an arbitrary MFA.
+///   build-fixed literal `case` `resolve_js_legacy`. An `op` outside that set is FAIL-CLOSED
+///   here as `UnknownJsOp` — no call is emitted, so a data-driven op cannot reach an arbitrary
+///   MFA.
 /// - a resolved `own`-stdlib triple (`resolve_stdlib`) → a DIRECT
 ///   `call '<stdlib_module>':'<fn>'(args…)` (a vetted call does not pass through the host);
 /// - otherwise (a genuine host import) → the deny-all
 ///   `call '<host_module>':'call_host'(Cap, Name, [args…])`, which under the Safe profile
 ///   fails closed.
 ///
-/// SEAM (for unit 11's `ir_lower`, the allowlist enforcer): `resolve_stdlib`/`resolve_js` here
-/// mirror the pinned stdlib / JS-runtime op mappings. `ir_lower` is the canonical place the
-/// capability provenance is enforced (the stdlib `rt_bif` allowlist and the `"js"` admit); this
-/// backend routing must stay aligned with it. `Cap`/`Name` for the host fate are emitted as
-/// BINARY STRINGS — the exact type `rt_host.call_host` consumes, so its
+/// SEAM (for unit 11's `ir_lower`, the allowlist enforcer): `resolve_stdlib`/`resolve_js_legacy`
+/// here mirror the pinned stdlib / JS-runtime op mappings. `ir_lower` is the canonical place the
+/// capability provenance is enforced (the stdlib `rt_bif` allowlist and the `"js"`/direct-host
+/// admit); this backend routing must stay aligned with it. `Cap`/`Name` for the host fate are
+/// emitted as BINARY STRINGS — the exact type `rt_host.call_host` consumes, so its
 /// `resolve_handler`/`HostWhitelist` string matching actually fires under a permissive
 /// (`HostOpen`/`HostWhitelist`) posture (F4), and the deny-all `{capability_denied, Cap,
 /// Name}` echoes them as binaries (consistent with a direct Gleam-side call). Emitting them
@@ -4476,12 +4485,13 @@ fn emit_call_host(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let cargs = list.map(args, emit_value)
-  case capability == js_capability {
-    // The reserved JS runtime boundary (K6): a build-fixed literal dispatch to `rt_js`.
-    True ->
-      case ctx.binding.js_profile {
-        // ── js_profile: False → Phase-8 legacy path (BYTE-IDENTICAL to before M9) ──
-        False ->
+  case direct_host_for(ctx.binding, capability) {
+    Some(dh) -> emit_call_direct_host(dh, name, cargs, cont, sc, state, ctx)
+    None ->
+      case capability == js_capability {
+        // The reserved JS runtime boundary (K6): Phase-8 legacy path, a build-fixed literal
+        // dispatch to `rt_js` (BYTE-IDENTICAL to before M9).
+        True ->
           case resolve_js_legacy(name) {
             Some(fn_name) ->
               // A vetted `rt_js` op yields exactly ONE value (K6/Phase-1). State-neutral: the JS
@@ -4502,402 +4512,101 @@ fn emit_call_host(
             // literal `case`, not a data-driven target, so no `call`/`apply` is emitted.
             None -> Error(UnknownJsOp(name))
           }
-        // ── js_profile: True → SPEC§7.M9 §9.5 4-way JsOpKind dispatch to split rt_js_* ──
-        True ->
-          case resolve_js(name) {
-            None -> Error(UnknownJsOp(name))
-            Some(#(rtmod, fn_name, kind)) -> {
-              let mod_atom = js_module_atom(ctx.binding, rtmod)
-              case kind, sc {
-                // JPure: no St; single value; sc unchanged.
-                JPure, _ ->
-                  apply_cont_call(
-                    cont,
-                    CCall(CAtom(mod_atom), CAtom(fn_name), cargs),
-                    1,
-                    sc,
-                    state,
-                    ctx,
-                  )
-                // JRead: St prepended; bare-V return; sc UNCHANGED (R9 — no rebind).
-                JRead, Threading(cur) ->
-                  apply_cont_call(
-                    cont,
-                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
-                    1,
-                    sc,
-                    state,
-                    ctx,
-                  )
-                // JMut: St prepended; `#(V, St')` return (R1); rebinds sc.
-                JMut, Threading(cur) ->
-                  emit_value_state_pair(
-                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
-                    cont,
-                    state,
-                    ctx,
-                  )
-                // JMutMiss: St prepended; bare `St' | miss` return; rebinds sc
-                // to result unless atom (then sc stays cur).
-                JMutMiss, Threading(cur) ->
-                  emit_state_rebind_or_miss(
-                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
-                    cur,
-                    cont,
-                    state,
-                    ctx,
-                  )
-                // JMutUnit: St prepended; bare-St' return; rebinds sc, zero values.
-                JMutUnit, Threading(cur) ->
-                  emit_state_rebind(
-                    CCall(CAtom(mod_atom), CAtom(fn_name), [CVar(cur), ..cargs]),
-                    cont,
-                    state,
-                    ctx,
-                  )
-                // js_profile:True but sc=NoState is unreachable (§9.6 short-circuits so every
-                // function threads); fail closed with a typed error rather than panic (R12).
-                _, NoState -> Error(JsProfileRequiresThreaded(name))
-              }
+        False ->
+          case resolve_stdlib(capability, name) {
+            Some(fn_name) ->
+              // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`). State-neutral:
+              // the host boundary never touches the record, so `cur` flows through unchanged (§G).
+              apply_cont_call(
+                cont,
+                CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs),
+                1,
+                sc,
+                state,
+                ctx,
+              )
+            None -> {
+              // The host yields a single value or raises (`{capability_denied,…}`).
+              // `capability`/`name` are emitted as BINARY STRINGS so `rt_host`'s handler/whitelist
+              // matching (which pattern-matches Gleam `String`s) fires under a permissive posture,
+              // not just deny-all.
+              let call =
+                CCall(CAtom(ctx.binding.host_module), CAtom("call_host"), [
+                  core_binary_string(capability),
+                  core_binary_string(name),
+                  core_list(cargs),
+                ])
+              apply_cont_call(cont, call, 1, sc, state, ctx)
             }
           }
       }
-    False ->
-      case resolve_stdlib(capability, name) {
-        Some(fn_name) ->
-          // A vetted `own`-stdlib call yields a single value (Phase-1: `gcd/2`). State-neutral:
-          // the host boundary never touches the record, so `cur` flows through unchanged (§G).
-          apply_cont_call(
+  }
+}
+
+/// Whether the binding carries a `direct_host`. This is the single gate for the universal
+/// state-threading conventions (every function threads `St`; threaded closures; `[St, ..args]`
+/// throw payloads and `{ok, [St' | payload]}` catch rebinds; the let-case/inline perf shapes
+/// that assume them). None of those are specific to what the direct host implements.
+fn is_direct(binding: Binding) -> Bool {
+  option.is_some(binding.direct_host)
+}
+
+/// The binding's `DirectHost` when `capability` is the one it claims, else `None`.
+fn direct_host_for(binding: Binding, capability: String) -> Option(DirectHost) {
+  case binding.direct_host {
+    Some(dh) if dh.capability == capability -> Some(dh)
+    _ -> None
+  }
+}
+
+/// Lower a direct-host `CallHost`: look `name` up in `dh.ops` and emit `call 'M':'F'(…)` under
+/// the op's `OpKind` convention — `Pure`: `M:F(args)`, one value, `sc` unchanged; `Read`:
+/// `M:F(St, args)`, bare value, `sc` unchanged; `Mut`: `{V, St'}`, rebinds; `MutMiss`:
+/// bare `St' | miss`, rebinds unless atom; `MutUnit`: bare `St'`, rebinds, zero values.
+/// `Error(UnknownDirectOp)` for an op not in the table; `Error(DirectOpRequiresThreaded)` if a
+/// state-taking kind meets `NoState` (unreachable: `direct_host` threads every function).
+fn emit_call_direct_host(
+  dh: DirectHost,
+  name: String,
+  cargs: List(CExpr),
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case dict.get(dh.ops, name) {
+    Error(Nil) -> Error(UnknownDirectOp(dh.capability, name))
+    Ok(HostOp(module:, function:, kind:)) -> {
+      let call = fn(a) { CCall(CAtom(module), CAtom(function), a) }
+      case kind, sc {
+        Pure, _ -> apply_cont_call(cont, call(cargs), 1, sc, state, ctx)
+        Read, Threading(cur) ->
+          apply_cont_call(cont, call([CVar(cur), ..cargs]), 1, sc, state, ctx)
+        Mut, Threading(cur) ->
+          emit_value_state_pair(call([CVar(cur), ..cargs]), cont, state, ctx)
+        MutMiss, Threading(cur) ->
+          emit_state_rebind_or_miss(
+            call([CVar(cur), ..cargs]),
+            cur,
             cont,
-            CCall(CAtom(ctx.binding.stdlib_module), CAtom(fn_name), cargs),
-            1,
-            sc,
             state,
             ctx,
           )
-        None -> {
-          // The host yields a single value or raises (`{capability_denied,…}`).
-          // `capability`/`name` are emitted as BINARY STRINGS so `rt_host`'s handler/whitelist
-          // matching (which pattern-matches Gleam `String`s) fires under a permissive posture,
-          // not just deny-all.
-          let call =
-            CCall(CAtom(ctx.binding.host_module), CAtom("call_host"), [
-              core_binary_string(capability),
-              core_binary_string(name),
-              core_list(cargs),
-            ])
-          apply_cont_call(cont, call, 1, sc, state, ctx)
-        }
+        MutUnit, Threading(cur) ->
+          emit_state_rebind(call([CVar(cur), ..cargs]), cont, state, ctx)
+        _, NoState -> Error(DirectOpRequiresThreaded(name))
       }
+    }
   }
 }
 
 /// The reserved capability string that names the JS runtime boundary (Phase-8 unit 05, K6).
 /// A `CallHost` whose capability equals this routes to the build-fixed `js_runtime_module`
-/// (`rt_js`) via `resolve_js`; it is NEVER treated as a stdlib call or a host import. Pinned
+/// (`rt_js`) via `resolve_js_legacy`; it is NEVER treated as a stdlib call or a host import. Pinned
 /// with `ir_lower.js_capability` (the admit gate) and `specs/phase-8/05-js-runtime-boundary.md`.
 const js_capability: String = "js"
 
-/// The Phase-9 M9 split-module axis (SPEC§7.M9 §9.3): each variant names one `Binding.js_*_module`
-/// field, so `resolve_js` returns a variant and `js_module_atom` links it to the concrete BEAM
-/// atom at emission time (D3a — the target atom is build-fixed via `Binding`, never data-derived).
-type JsRtModule {
-  JsStore
-  JsVal
-  /// `twocore_rt_js_val_ffi` — the wire-form guard shim. Routes `truthy`
-  /// there directly so ToBoolean is one guard-dispatch, no {k_*,…} boxing.
-  JsValFfi
-  JsObj
-  /// The own-data-property FFI shim itself — routes hot-path probes there
-  /// directly (skipping the Gleam `@external` wrapper's extra dispatch).
-  JsObjFfi
-  /// The `erlang` module — for BIFs the emitted code calls DIRECTLY (loader
-  /// lowers `call 'erlang':'get'/1` to a `bif1` instruction, so no `call_ext`
-  /// dispatch). Build-fixed atom (D3a).
-  JsErlang
-  JsOps
-  /// `twocore_rt_js_ops_ffi` — hot-path `==` probe (JPure, no ToPrimitive).
-  JsOpsFfi
-  JsCall
-  /// The call-path FFI shim itself — routes hot-path method-call / construct
-  /// probes there directly (skipping the Gleam `@external` wrapper's dispatch).
-  JsCallFfi
-  JsClass
-  JsAsync
-  JsGc
-  JsBuiltins
-  JsInspect
-  /// `twocore_rt_js_math_ffi` — Math.* direct-dispatch fast paths (JPure,
-  /// JsVal→JsVal|miss). Skips the Math-object property lookup on raytrace's
-  /// hot sqrt/floor/abs/pow/min/max calls.
-  JsMathFfi
-}
-
-/// The Phase-9 M9 op-kind classification (SPEC§7.M9 §9.3 / R1/R9): how a `CallHost("js", op, …)`
-/// interacts with the threaded `InstanceState` under `js_profile: True`. Drives the 4-way dispatch
-/// in `emit_call_host`'s `"js"` arm.
-type JsOpKind {
-  /// Pure — takes NO `St`, returns bare `V`. `sc` flows through unchanged.
-  JPure
-  /// Read-only — takes `St`, returns bare `V`. `sc` UNCHANGED (R9 — no rebind).
-  JRead
-  /// Mutating — takes `St`, returns `#(V, St')` (R1 — value first). Rebinds via
-  /// `emit_value_state_pair`.
-  JMut
-  /// Mutating with miss — takes `St`, returns bare `St' | miss`. On atom `miss`
-  /// sc stays `cur`; otherwise rebinds to the result. Caller sees the bare
-  /// result (tuple on hit / atom on miss) so `IsAtom` distinguishes them.
-  /// Saves the `#(V, St')` alloc a `JMut` would cost per hit.
-  JMutMiss
-  /// Mutating, unit-valued — takes `St`, returns bare `St'`. Rebinds via `emit_state_rebind`.
-  JMutUnit
-}
-
-/// Map a `JsRtModule` variant to its concrete `Binding.js_*_module` atom (SPEC§7.M9 §9.3 / D3a).
-/// The ONLY place a `JsRtModule` becomes a `call` target atom — a literal `case`, so the linked
-/// module is always one of the build-fixed `Binding` fields (never a data-derived atom).
-fn js_module_atom(binding: Binding, m: JsRtModule) -> String {
-  case m {
-    JsStore -> binding.js_store_module
-    JsVal -> binding.js_val_module
-    JsValFfi -> "twocore_rt_js_val_ffi"
-    JsObj -> binding.js_obj_module
-    JsObjFfi -> "twocore_rt_js_obj_ffi"
-    JsErlang -> "erlang"
-    JsOps -> binding.js_ops_module
-    JsOpsFfi -> "twocore_rt_js_ops_ffi"
-    JsCall -> binding.js_call_module
-    JsCallFfi -> "twocore_rt_js_call_ffi"
-    JsClass -> binding.js_class_module
-    JsAsync -> binding.js_async_module
-    JsGc -> binding.js_gc_module
-    JsBuiltins -> binding.js_builtins_module
-    JsInspect -> binding.js_inspect_module
-    JsMathFfi -> "twocore_rt_js_math_ffi"
-  }
-}
-
-/// The Phase-9 M9 build-fixed JS-runtime op → `#(module, fn, kind)` map (SPEC§8 / R8/R9/R12).
-/// A LITERAL `case` (D3a): the target module + fn are compile-time atoms via `js_module_atom` —
-/// no `op` value can reach an arbitrary `Mod:Fn`. `None` → `UnknownJsOp` (fail-closed, never
-/// panic). Active only under `js_profile: True`; the `False` path uses `resolve_js_legacy`.
-fn resolve_js(op: String) -> Option(#(JsRtModule, String, JsOpKind)) {
-  case op {
-    // ── rt_js_store (M1) ──
-    "cell_new" -> Some(#(JsStore, "t_cell_new", JMut))
-    "cell_get" -> Some(#(JsStore, "t_cell_get", JRead))
-    "cell_set" -> Some(#(JsStore, "t_cell_set", JMutUnit))
-    "pin_root" -> Some(#(JsStore, "t_pin_root", JMutUnit))
-    "tuple_set" -> Some(#(JsStore, "t_tuple_set", JMutUnit))
-    "console_log" -> Some(#(JsStore, "t_console_write", JMutUnit))
-    // ── rt_js_gc (M2) ──
-    "collect" -> Some(#(JsGc, "t_collect", JMutUnit))
-    // ── rt_js_val (M3) ──
-    "to_primitive" -> Some(#(JsVal, "t_to_primitive", JMut))
-    "to_number" -> Some(#(JsVal, "t_to_number", JMut))
-    "to_string" -> Some(#(JsVal, "t_to_string", JMut))
-    "to_property_key" -> Some(#(JsVal, "t_to_property_key", JMut))
-    // JPure §7.1.19 fast probe (l-jread-reclass): primitive int/str/sym →
-    // wire key with no St; `miss` on Handle/rare and the emitter falls to
-    // JMut `to_property_key`. Saves the {V,St'} alloc + rebind on hit.
-    "to_property_key_fast" -> Some(#(JsValFfi, "t_to_property_key_fast", JPure))
-    "to_object" -> Some(#(JsVal, "t_to_object", JMut))
-    "type_of" -> Some(#(JsVal, "t_type_of", JMut))
-    "is_callable" -> Some(#(JsVal, "t_is_callable", JMut))
-    "require_object_coercible" ->
-      Some(#(JsVal, "t_require_object_coercible", JMutUnit))
-    "throw_type_error" -> Some(#(JsVal, "t_throw_type_error", JMutUnit))
-    "truthy" -> Some(#(JsValFfi, "to_boolean_i32", JPure))
-    "is_nullish" -> Some(#(JsVal, "is_nullish", JPure))
-    "float_lit" -> Some(#(JsVal, "float_from_bits", JPure))
-    "empty_list" -> Some(#(JsVal, "empty_list", JPure))
-    "list_append_one" -> Some(#(JsVal, "list_append_one", JPure))
-    "string_concat" -> Some(#(JsVal, "string_concat", JPure))
-    "to_numeric" -> Some(#(JsVal, "t_to_numeric", JMut))
-    "tdz_check" -> Some(#(JsVal, "t_tdz_check", JMutUnit))
-    // ── rt_js_inspect ──
-    "inspect" -> Some(#(JsInspect, "t_inspect", JMut))
-    // ── rt_js_obj (M4) ──
-    "new_object" -> Some(#(JsObj, "t_new_object_literal", JMut))
-    // Shape-learning literal path — `{a:v,b:w}` allocates SShapedObject
-    // directly so subsequent `.a` hits the shaped IC. JMut: cold path may
-    // mint new ShapeDesc entries on JsStore.shapes.
-    "new_object_shaped" -> Some(#(JsObjFfi, "t_new_object_shaped", JMut))
-    "new_array" -> Some(#(JsObj, "t_new_array", JMut))
-    "new_error" -> Some(#(JsObj, "t_new_error", JMut))
-    "fn_new" -> Some(#(JsCall, "t_new_function", JMut))
-    "make_constructor" -> Some(#(JsCall, "t_make_constructor", JMut))
-    "new_arguments" -> Some(#(JsObj, "t_new_arguments", JMut))
-    "get_prop" -> Some(#(JsObj, "t_get_prop_any", JMut))
-    "get_prop_own_data" -> Some(#(JsObjFfi, "t_get_prop_own_data", JRead))
-    // Direct pdict BIFs — the own-data-property fast path's inlined warm hit.
-    // JPure (no St): `call 'erlang':'get'/1` lowers to a `bif1`, saving the
-    // ~7ns/call `call_ext` dispatch that dominates the obj≤20000µs budget.
-    "pdict_get" -> Some(#(JsErlang, "get", JPure))
-    "pdict_put" -> Some(#(JsErlang, "put", JPure))
-    "erl_band" -> Some(#(JsErlang, "band", JPure))
-    "erl_bsr" -> Some(#(JsErlang, "bsr", JPure))
-    "erl_bsl" -> Some(#(JsErlang, "bsl", JPure))
-    // Runtime-index tuple ops for the inlined shaped-prop-IC warm hit —
-    // `element`/`setelement` are guard BIFs so the loader lowers them to
-    // `bif2`/`gc_bif3` (no `call_ext`).
-    "erl_element" -> Some(#(JsErlang, "element", JPure))
-    "erl_setelement" -> Some(#(JsErlang, "setelement", JPure))
-    "set_prop" -> Some(#(JsObj, "t_set_prop_any", JMut))
-    // JRead: the pdict-overlay hit path never rebuilds `St` (see the
-    // twocore_rt_js_obj_ffi header), so bare `ok`/`miss` and no rebind.
-    "set_prop_own_data" -> Some(#(JsObjFfi, "t_set_prop_own_data", JRead))
-    "set_prop_own_cold" -> Some(#(JsObjFfi, "t_set_prop_own_cold", JMut))
-    // Per-SITE shape inline cache (SPEC i-prop-ic). SiteKey pdict caches
-    // {ShapeId, Off1} (1-based); warm hit = one shape-compare +
-    // element(Off1, Slots). Both JRead — writes land in the pdict overlay.
-    // `miss` on cold / non-shaped / shape-mismatch → emitter falls back.
-    "ic_get" -> Some(#(JsObjFfi, "t_ic_get", JRead))
-    // perf8 raytrace: proto-chain data-get after ic_get own-miss. JRead —
-    // walks Store.data (never mutates); emitter falls to get_prop on `miss`.
-    "ic_proto_get" -> Some(#(JsObjFfi, "t_ic_proto_get", JRead))
-    "ic_set" -> Some(#(JsObjFfi, "t_ic_set", JRead))
-    // JPure warm-only probes — no St, no cold install; the emitter falls
-    // to ic_get/ic_set (JRead) on `miss`. Keeps emitted IR to one bind_if.
-    "ic_warm_get" -> Some(#(JsObjFfi, "t_ic_warm_get", JPure))
-    "ic_warm_set" -> Some(#(JsObjFfi, "t_ic_warm_set", JPure))
-    // simple_this-only warm hit (perf5 richards-gate): C is the
-    // already-threaded `_this_c` overlay, so no get(Id). One call_ext
-    // vs the inline 4-bind_if ladder — trades ~10 BIFs + 1 l_join
-    // `apply` (~34ns) for ~20ns. Non-this reads keep the inline path.
-    "shaped_get" -> Some(#(JsObjFfi, "t_shaped_get", JPure))
-    "shaped_set" -> Some(#(JsObjFfi, "t_shaped_set", JPure))
-    // Indexed-element fast path (SPEC array-index-fast-path). JRead read /
-    // JMut write; both `miss` on any shape mismatch and the emitter falls
-    // back to `to_property_key` + `get_prop`/`set_prop`.
-    "get_elem_fast" -> Some(#(JsObjFfi, "t_get_elem_fast", JRead))
-    "set_elem_fast" -> Some(#(JsObjFfi, "t_set_elem_fast", JMutMiss))
-    // perf7_arr_pdict: `_p` pair — both JRead. Read AND write cold-install
-    // the `{tc_arr,Id}` overlay from Store (write-side install: crypto's
-    // bnpCopyTo/bnpDLShiftTo write fresh arrays never element-read first).
-    // Write returns bare `0 | miss`; sc unchanged (overlay is pdict, not St).
-    "get_elem_fast_p" -> Some(#(JsObjFfi, "t_get_elem_fast_p", JRead))
-    "set_elem_fast_p" -> Some(#(JsObjFfi, "t_set_elem_fast_p", JRead))
-    // perf8_arr_c_hoist: pre-loop `get({tc_arr,Id})` snapshot + `_c` read
-    // via that snapshot. `arr_c_load` is JPure (bare pdict get); `_c` read
-    // is JRead (its miss arm tail-calls `_p` which needs St for cold install).
-    "arr_c_load" -> Some(#(JsObjFfi, "t_arr_c_load", JPure))
-    "get_elem_fast_c" -> Some(#(JsObjFfi, "t_get_elem_fast_c", JRead))
-    "define_prop" -> Some(#(JsObj, "t_create_data_prop", JMut))
-    "has_prop" -> Some(#(JsObj, "t_has_prop", JMut))
-    "delete_prop" -> Some(#(JsObj, "t_delete_prop", JMut))
-    "own_keys" -> Some(#(JsObj, "t_own_keys", JMut))
-    "copy_data_props" -> Some(#(JsObj, "t_copy_data_props", JMut))
-    "get_iterator" -> Some(#(JsObj, "t_get_iterator", JMut))
-    "iter_next" -> Some(#(JsObj, "t_iter_next", JMut))
-    "iter_close" -> Some(#(JsObj, "t_iter_close", JMutUnit))
-    "for_in_keys" -> Some(#(JsObj, "t_for_in_keys", JMut))
-    "spread_into_list" -> Some(#(JsObj, "t_spread_into_list", JMut))
-    "global_get" -> Some(#(JsObj, "t_global_get", JMut))
-    "global_get_fast" -> Some(#(JsObjFfi, "t_global_get_fast", JRead))
-    "global_handle" -> Some(#(JsObjFfi, "t_global_handle", JRead))
-    "global_set" -> Some(#(JsObj, "t_global_set", JMutUnit))
-    "global_typeof" -> Some(#(JsObj, "t_global_typeof", JMut))
-    "global_delete" -> Some(#(JsObj, "t_global_delete", JMut))
-    "module_get" -> Some(#(JsObj, "t_module_get", JMut))
-    "module_set" -> Some(#(JsObj, "t_module_set", JMutUnit))
-    "set_proto" -> Some(#(JsObj, "t_set_proto", JMut))
-    "array_from_list" -> Some(#(JsObj, "t_array_from_list", JMut))
-    "iter_rest" -> Some(#(JsObj, "t_iter_rest", JMut))
-    "regexp_new" -> Some(#(JsObj, "t_regexp_new", JMut))
-    "get_template_object" -> Some(#(JsObj, "t_get_template_object", JMut))
-    "dispose_resources" -> Some(#(JsObj, "t_dispose_resources", JMutUnit))
-    // ── rt_js_ops (M5) — R8: strict_eq/strict_ne are JPure ──
-    "add" -> Some(#(JsOps, "t_add", JMut))
-    "sub" -> Some(#(JsOps, "t_sub", JMut))
-    "mul" -> Some(#(JsOps, "t_mul", JMut))
-    "div" -> Some(#(JsOps, "t_div", JMut))
-    "mod" -> Some(#(JsOps, "t_mod", JMut))
-    "pow" -> Some(#(JsOps, "t_pow", JMut))
-    "neg" -> Some(#(JsOps, "t_neg", JMut))
-    "plus" -> Some(#(JsOps, "t_plus", JMut))
-    "bitnot" -> Some(#(JsOps, "t_bitnot", JMut))
-    "bitand" -> Some(#(JsOps, "t_bitand", JMut))
-    "bitor" -> Some(#(JsOps, "t_bitor", JMut))
-    "bitxor" -> Some(#(JsOps, "t_bitxor", JMut))
-    "shl" -> Some(#(JsOps, "t_shl", JMut))
-    "shr" -> Some(#(JsOps, "t_shr", JMut))
-    "ushr" -> Some(#(JsOps, "t_ushr", JMut))
-    "lt" -> Some(#(JsOps, "t_lt", JMut))
-    "le" -> Some(#(JsOps, "t_le", JMut))
-    "gt" -> Some(#(JsOps, "t_gt", JMut))
-    "ge" -> Some(#(JsOps, "t_ge", JMut))
-    "eq" -> Some(#(JsOps, "t_eq", JMut))
-    "eq_fast" -> Some(#(JsOpsFfi, "t_eq_fast", JPure))
-    "nul_eq" -> Some(#(JsOpsFfi, "nul_eq", JPure))
-    "bitand_fast" -> Some(#(JsOpsFfi, "t_bitand_fast", JPure))
-    "bitor_fast" -> Some(#(JsOpsFfi, "t_bitor_fast", JPure))
-    "bitxor_fast" -> Some(#(JsOpsFfi, "t_bitxor_fast", JPure))
-    "shl_fast" -> Some(#(JsOpsFfi, "t_shl_fast", JPure))
-    "shr_fast" -> Some(#(JsOpsFfi, "t_shr_fast", JPure))
-    "ushr_fast" -> Some(#(JsOpsFfi, "t_ushr_fast", JPure))
-    "bitnot_fast" -> Some(#(JsOpsFfi, "t_bitnot_fast", JPure))
-    "strict_eq" -> Some(#(JsOps, "strict_eq", JPure))
-    "strict_ne" -> Some(#(JsOps, "strict_ne", JPure))
-    "op_in" -> Some(#(JsOps, "t_in", JMut))
-    "instance_of" -> Some(#(JsOps, "t_instance_of", JMut))
-    "instanceof_fast" -> Some(#(JsObjFfi, "t_instanceof_fast", JRead))
-    // ── rt_js_call (M-CALL) ──
-    "call" -> Some(#(JsCall, "t_call_checked", JMut))
-    "call_method_mono" -> Some(#(JsCallFfi, "t_call_method_mono", JMut))
-    "call_method_ic" -> Some(#(JsCallFfi, "t_call_method_ic", JMut))
-    // JPure warm-only method-IC probe (SPEC S ffi-method-ic-hit): pdict-only
-    // shaped-receiver + SiteKey mono/poly hit → `{hit,Code,FnH,SimpleT}`;
-    // `miss` atom otherwise and the emitter falls to `call_method_ic`.
-    "method_ic_warm" -> Some(#(JsCallFfi, "t_method_ic_warm", JPure))
-    "construct" -> Some(#(JsCall, "t_construct", JMut))
-    "new_simple" -> Some(#(JsCallFfi, "t_new_simple", JMut))
-    // perf8 raytrace lever (b): per-SITE ctor-inline IC — skips the
-    // Class.create `this.initialize.apply(this,arguments)` ctor body on
-    // warm hit and dispatches straight to the cached `initialize`.
-    "new_simple_ic" -> Some(#(JsCallFfi, "t_new_simple_ic", JMut))
-    "kfn_code" -> Some(#(JsCall, "t_kfn_code", JRead))
-    "resolve_this" -> Some(#(JsCall, "t_resolve_this", JRead))
-    // ── rt_js_class (M7) — R9: private_in / fn_home_object / is_constructor are JRead ──
-    "new_private_name" -> Some(#(JsClass, "t_new_private_name", JMut))
-    "class_create" -> Some(#(JsClass, "t_class_create", JMut))
-    "define_method" -> Some(#(JsClass, "t_define_method", JMutUnit))
-    "set_fields_init" -> Some(#(JsClass, "t_set_fields_init", JMutUnit))
-    "private_get" -> Some(#(JsClass, "t_private_get", JMut))
-    "private_set" -> Some(#(JsClass, "t_private_set", JMut))
-    "private_define" -> Some(#(JsClass, "t_private_define", JMut))
-    "private_has" -> Some(#(JsClass, "t_private_has", JMut))
-    "private_in" -> Some(#(JsClass, "t_private_in", JRead))
-    "fn_home_object" -> Some(#(JsClass, "t_fn_home_object", JRead))
-    "is_constructor" -> Some(#(JsClass, "t_is_constructor", JRead))
-    "super_get" -> Some(#(JsClass, "t_super_get", JMut))
-    "super_set" -> Some(#(JsClass, "t_super_set", JMut))
-    "super_call" -> Some(#(JsClass, "t_super_call", JMut))
-    "make_method" -> Some(#(JsClass, "t_make_method", JMutUnit))
-    // ── rt_js_async (M8) ──
-    "async_start" -> Some(#(JsAsync, "t_async_start", JMut))
-    "gen_start" -> Some(#(JsAsync, "t_gen_start", JMut))
-    "asyncgen_start" -> Some(#(JsAsync, "t_asyncgen_start", JMut))
-    "async_iter_next" -> Some(#(JsAsync, "t_async_iter_next", JMut))
-    "await" -> Some(#(JsAsync, "t_await", JMutUnit))
-    "yield" -> Some(#(JsAsync, "t_yield", JMut))
-    "yield_star" -> Some(#(JsAsync, "t_yield_star", JMut))
-    "dynamic_import" -> Some(#(JsAsync, "t_dynamic_import", JMut))
-    "drain_microtasks" -> Some(#(JsAsync, "t_drain_microtasks", JMutUnit))
-    // ── rt_js_builtins (M6) ──
-    "init_realm" -> Some(#(JsBuiltins, "init_realm", JMutUnit))
-    // ── rt_js_math_ffi — Math.* direct dispatch (JPure, JsVal→JsVal|miss) ──
-    "math_sqrt" -> Some(#(JsMathFfi, "t_math_sqrt", JPure))
-    "math_floor" -> Some(#(JsMathFfi, "t_math_floor", JPure))
-    "math_abs" -> Some(#(JsMathFfi, "t_math_abs", JPure))
-    "math_pow" -> Some(#(JsMathFfi, "t_math_pow", JPure))
-    "math_min" -> Some(#(JsMathFfi, "t_math_min", JPure))
-    "math_max" -> Some(#(JsMathFfi, "t_math_max", JPure))
-    _ -> None
-  }
-}
-
-/// The Phase-8 LEGACY `js_profile: False` op map (byte-identical to before M9). A LITERAL
+/// The Phase-8 LEGACY (no `direct_host`) op map (byte-identical to before M9). A LITERAL
 /// `case` in THIS module (D3a): the only input is the static `op` string and the result is one
 /// of a CLOSED set of compile-time-fixed function atoms — the target is NEVER constructed from
 /// program/runtime data, so no `op` value can reach an arbitrary `Mod:Fn`. Each op returns
@@ -6179,12 +5888,12 @@ fn emit_if(
     div || spine_tail_arity_ok(arm, arity)
   }
   use #(maybe_def, jcont, state2) <- result.try(
-    case ctx.binding.js_profile && then_div && else_div {
+    case is_direct(ctx.binding) && then_div && else_div {
       // Both diverge → cont is dead; pass anything (never reached).
       True -> Ok(#(None, KReturn, state))
       False ->
         case
-          ctx.binding.js_profile
+          is_direct(ctx.binding)
           && { then_div || else_div }
           && cont_arity_ok(cont_s, arity)
           && arm_ok(then_div, then_branch)
@@ -6203,7 +5912,7 @@ fn emit_if(
             // leaves behind).
             case
               perf6_block_let_case
-              && ctx.binding.js_profile
+              && is_direct(ctx.binding)
               && block_can_let_case(cont, arity)
               && all_breaks_local(then_branch, "", [], [])
               && all_breaks_local(else_branch, "", [], [])
@@ -6405,7 +6114,7 @@ fn emit_block(
   // (wrong semantics), so `all_breaks_local` gates on their absence.
   case
     perf6_block_let_case
-    && ctx.binding.js_profile
+    && is_direct(ctx.binding)
     && block_can_let_case(cont, arity)
     && all_breaks_local(body, label, [], kvalues_labels(state.labels))
   {
@@ -6763,9 +6472,9 @@ fn emit_charge(
 /// dropped (exactly like `Trap`). Emits `call '<rt_exn>':'throw_exn'(<tag_index>, [args…])`, where
 /// `tag_index` is the tag's module-local `Int` identity (T4, resolved from `Module.tags`) and the
 /// payload is the operand value LIST — rendered, never interpreted (the `(f64,i32)` pair rides
-/// opaquely, «PORFFOR-ABI»). Cell-only (T6) UNLESS `js_profile`: under `Threading(cur)` the live
+/// opaquely, «PORFFOR-ABI»). Cell-only (T6) UNLESS `direct_host`: under `Threading(cur)` the live
 /// `St` is PREPENDED to the payload (`[St, ..args]`, R2: St FIRST) so the catch handler rebinds
-/// post-mutation state; the `js_profile: False` path is byte-identical to before (WASM unchanged).
+/// post-mutation state; the no-`direct_host` path is byte-identical to before (WASM unchanged).
 /// `Error(UnknownTag)` if the module declares no such tag.
 fn emit_throw(
   tag: String,
@@ -6776,7 +6485,7 @@ fn emit_throw(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use tag_id <- result.try(resolve_tag(ctx, tag))
   let cargs = list.map(args, emit_value)
-  let payload = case sc, ctx.binding.js_profile {
+  let payload = case sc, is_direct(ctx.binding) {
     Threading(cur), True -> core_list([CVar(cur), ..cargs])
     _, _ -> core_list(cargs)
   }
@@ -6802,8 +6511,8 @@ fn emit_throw_ref(
 /// value — §C.1). The `catch <C,R,S>` handler (`try_dispatch`) matches the thrown tag against
 /// `handlers` in order via the `rt_exn` helpers, transfers a matching handler (its result also
 /// disposing through `exit_cont` — so it yields the try's `result`), and re-raises a non-match
-/// (T7). Constant-space + the result arity are preserved. Cell-only (T6) unless `js_profile`:
-/// under `js_profile` the throw carries `St` and the handler re-threads from the caught `St'`.
+/// (T7). Constant-space + the result arity are preserved. Cell-only (T6) unless `direct_host`:
+/// under `direct_host` the throw carries `St` and the handler re-threads from the caught `St'`.
 fn emit_try(
   result: List(ValType),
   body: Expr,
@@ -6926,10 +6635,10 @@ fn emit_catch_clause(
   case on {
     // `catch $t` — match the SAME module-local tag identity throw used (T4); the matched clause
     // binds the payload operands directly (`{ok, [P0,P1,…]}`), so throw/catch arities agree.
-    // Under `js_profile` + `Threading` the throw prepended `St` (R2): bind `[St', ..payload]` and
+    // Under `direct_host` + `Threading` the throw prepended `St` (R2): bind `[St', ..payload]` and
     // emit the handler under `Threading(St')` so post-throw mutations are visible (SPEC§9.11).
     ir.OnTag(tag) ->
-      case ctx.binding.js_profile, sc {
+      case is_direct(ctx.binding), sc {
         True, Threading(_) -> {
           let #(st_caught, state_a) = fresh_var(state)
           use #(hbody0, state_b) <- result.try(emit(
