@@ -47,14 +47,16 @@
 //// tier; an atomics build needs a bounded reservation cap); `link` is the **sole** validated
 //// `Binding → Instance` seam.
 
+import gleam/dict.{type Dict}
 import gleam/int
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/result
 import twocore/opt_level.{Aggressive}
 import twocore/runtime/instance.{
-  type Binding, type MemTier, type Mode, type StateStrategy, type TableTier,
-  Atomics, BifOpen, Binding, Cell, HostOpen, HostWhitelist, MeterOff, Nif, Paged,
-  Safe, StdlibPassthrough, TableAtomics, TableEts, TablePaged, Threaded, Unsafe,
+  type Binding, type HostOp, type MemTier, type Mode, type StateStrategy,
+  type TableTier, Atomics, BifOpen, Binding, Cell, DirectHost, HostOp, HostOpen,
+  HostWhitelist, MeterOff, Mut, MutMiss, MutUnit, Nif, Paged, Pure, Read, Safe,
+  StdlibPassthrough, TableAtomics, TableEts, TablePaged, Threaded, Unsafe,
   safe_default,
 }
 import twocore/runtime/rt_mem_atomics
@@ -185,22 +187,209 @@ pub fn js() -> Binding {
   porffor()
 }
 
-/// The **arc→2core direct-IR JS profile**: `Threaded` state, universal JS-function threading,
-/// split `rt_js_*` modules. Replaces `js()` as the JS-on-BEAM posture — `js_profile: True`
-/// short-circuits `state_reaching_closure` to ALL functions and gates the `emit_core` rewrites
-/// that thread `InstanceState` through every `CallHost("js",…)`/closure/throw/catch (SPEC§7.M9).
-/// `MeterOff` because JS metering is the arc-side realm's job, not `ir_lower`'s `Charge` nodes.
-/// Tier-P on every axis (identical to `portable()` bar `js_profile`/`meter`). Total.
+/// The **arc->2core direct-IR JS profile**: `Threaded` state plus a `direct_host` for the
+/// `"js"` capability whose op table is `legacy_js_ops()` (the split `rt_js_*` modules that
+/// still live in this repo). `Some(direct_host)` is what makes `emit_core` thread the instance
+/// state through every function/closure/throw/catch and dispatch each `CallHost("js", ...)`
+/// by its `OpKind`. `MeterOff` because JS metering is the arc-side realm's job, not
+/// `ir_lower`'s `Charge` nodes. Tier-P on every axis (identical to `portable()` bar
+/// `direct_host`/`meter`). Total.
+///
+/// Temporary: arc will supply its own `DirectHost` and this profile (with `legacy_js_ops`)
+/// goes away.
 pub fn js_direct() -> Binding {
-  // arc emit_2core no longer leaks anf.run-local slot-var names past the Let-RHS boundary
-  // (stmt.let_ splices the Let-spine; anf.bind_if/bind_block thread rebound slots through
-  // the wrapper's result tuple), so the IR is well-scoped and Baseline's propagate/dead-let
-  // passes are sound over it (SPEC§9.12).
   Binding(
     ..compose(safe(), Threaded, Paged, TablePaged),
-    js_profile: True,
+    direct_host: Some(DirectHost(capability: "js", ops: legacy_js_ops())),
     meter: MeterOff,
   )
+}
+
+/// The `"js"` direct-host op table for `js_direct()`: op name -> `HostOp(module, function,
+/// kind)` targeting the in-repo `twocore@runtime@rt_js_*` modules and their
+/// `twocore_rt_js_*_ffi` shims (plus a few `erlang` guard BIFs). Every module/function is a
+/// literal here, so the emitted call targets stay build-fixed (D3a). Total.
+///
+/// Temporary: this is the table arc's emitter is written against today; it leaves with
+/// `js_direct()` once arc passes its own.
+pub fn legacy_js_ops() -> Dict(String, HostOp) {
+  let store = "twocore@runtime@rt_js_store"
+  let val = "twocore@runtime@rt_js_val"
+  let val_ffi = "twocore_rt_js_val_ffi"
+  let obj = "twocore@runtime@rt_js_obj"
+  let obj_ffi = "twocore_rt_js_obj_ffi"
+  let erl = "erlang"
+  let ops = "twocore@runtime@rt_js_ops"
+  let ops_ffi = "twocore_rt_js_ops_ffi"
+  let call = "twocore@runtime@rt_js_call"
+  let call_ffi = "twocore_rt_js_call_ffi"
+  let class = "twocore@runtime@rt_js_class"
+  let async = "twocore@runtime@rt_js_async"
+  let gc = "twocore@runtime@rt_js_gc"
+  let builtins = "twocore@runtime@rt_js_builtins"
+  let inspect = "twocore@runtime@rt_js_inspect"
+  let math_ffi = "twocore_rt_js_math_ffi"
+  dict.from_list([
+    #("cell_new", HostOp(store, "t_cell_new", Mut)),
+    #("cell_get", HostOp(store, "t_cell_get", Read)),
+    #("cell_set", HostOp(store, "t_cell_set", MutUnit)),
+    #("pin_root", HostOp(store, "t_pin_root", MutUnit)),
+    #("tuple_set", HostOp(store, "t_tuple_set", MutUnit)),
+    #("console_log", HostOp(store, "t_console_write", MutUnit)),
+    #("collect", HostOp(gc, "t_collect", MutUnit)),
+    #("to_primitive", HostOp(val, "t_to_primitive", Mut)),
+    #("to_number", HostOp(val, "t_to_number", Mut)),
+    #("to_string", HostOp(val, "t_to_string", Mut)),
+    #("to_property_key", HostOp(val, "t_to_property_key", Mut)),
+    #("to_property_key_fast", HostOp(val_ffi, "t_to_property_key_fast", Pure)),
+    #("to_object", HostOp(val, "t_to_object", Mut)),
+    #("type_of", HostOp(val, "t_type_of", Mut)),
+    #("is_callable", HostOp(val, "t_is_callable", Mut)),
+    #(
+      "require_object_coercible",
+      HostOp(val, "t_require_object_coercible", MutUnit),
+    ),
+    #("throw_type_error", HostOp(val, "t_throw_type_error", MutUnit)),
+    #("truthy", HostOp(val_ffi, "to_boolean_i32", Pure)),
+    #("is_nullish", HostOp(val, "is_nullish", Pure)),
+    #("float_lit", HostOp(val, "float_from_bits", Pure)),
+    #("empty_list", HostOp(val, "empty_list", Pure)),
+    #("list_append_one", HostOp(val, "list_append_one", Pure)),
+    #("string_concat", HostOp(val, "string_concat", Pure)),
+    #("to_numeric", HostOp(val, "t_to_numeric", Mut)),
+    #("tdz_check", HostOp(val, "t_tdz_check", MutUnit)),
+    #("inspect", HostOp(inspect, "t_inspect", Mut)),
+    #("new_object", HostOp(obj, "t_new_object_literal", Mut)),
+    #("new_object_shaped", HostOp(obj_ffi, "t_new_object_shaped", Mut)),
+    #("new_array", HostOp(obj, "t_new_array", Mut)),
+    #("new_error", HostOp(obj, "t_new_error", Mut)),
+    #("fn_new", HostOp(call, "t_new_function", Mut)),
+    #("make_constructor", HostOp(call, "t_make_constructor", Mut)),
+    #("new_arguments", HostOp(obj, "t_new_arguments", Mut)),
+    #("get_prop", HostOp(obj, "t_get_prop_any", Mut)),
+    #("get_prop_own_data", HostOp(obj_ffi, "t_get_prop_own_data", Read)),
+    #("pdict_get", HostOp(erl, "get", Pure)),
+    #("pdict_put", HostOp(erl, "put", Pure)),
+    #("erl_band", HostOp(erl, "band", Pure)),
+    #("erl_bsr", HostOp(erl, "bsr", Pure)),
+    #("erl_bsl", HostOp(erl, "bsl", Pure)),
+    #("erl_element", HostOp(erl, "element", Pure)),
+    #("erl_setelement", HostOp(erl, "setelement", Pure)),
+    #("set_prop", HostOp(obj, "t_set_prop_any", Mut)),
+    #("set_prop_own_data", HostOp(obj_ffi, "t_set_prop_own_data", Read)),
+    #("set_prop_own_cold", HostOp(obj_ffi, "t_set_prop_own_cold", Mut)),
+    #("ic_get", HostOp(obj_ffi, "t_ic_get", Read)),
+    #("ic_proto_get", HostOp(obj_ffi, "t_ic_proto_get", Read)),
+    #("ic_set", HostOp(obj_ffi, "t_ic_set", Read)),
+    #("ic_warm_get", HostOp(obj_ffi, "t_ic_warm_get", Pure)),
+    #("ic_warm_set", HostOp(obj_ffi, "t_ic_warm_set", Pure)),
+    #("shaped_get", HostOp(obj_ffi, "t_shaped_get", Pure)),
+    #("shaped_set", HostOp(obj_ffi, "t_shaped_set", Pure)),
+    #("get_elem_fast", HostOp(obj_ffi, "t_get_elem_fast", Read)),
+    #("set_elem_fast", HostOp(obj_ffi, "t_set_elem_fast", MutMiss)),
+    #("get_elem_fast_p", HostOp(obj_ffi, "t_get_elem_fast_p", Read)),
+    #("set_elem_fast_p", HostOp(obj_ffi, "t_set_elem_fast_p", Read)),
+    #("arr_c_load", HostOp(obj_ffi, "t_arr_c_load", Pure)),
+    #("get_elem_fast_c", HostOp(obj_ffi, "t_get_elem_fast_c", Read)),
+    #("define_prop", HostOp(obj, "t_create_data_prop", Mut)),
+    #("has_prop", HostOp(obj, "t_has_prop", Mut)),
+    #("delete_prop", HostOp(obj, "t_delete_prop", Mut)),
+    #("own_keys", HostOp(obj, "t_own_keys", Mut)),
+    #("copy_data_props", HostOp(obj, "t_copy_data_props", Mut)),
+    #("get_iterator", HostOp(obj, "t_get_iterator", Mut)),
+    #("iter_next", HostOp(obj, "t_iter_next", Mut)),
+    #("iter_close", HostOp(obj, "t_iter_close", MutUnit)),
+    #("for_in_keys", HostOp(obj, "t_for_in_keys", Mut)),
+    #("spread_into_list", HostOp(obj, "t_spread_into_list", Mut)),
+    #("global_get", HostOp(obj, "t_global_get", Mut)),
+    #("global_get_fast", HostOp(obj_ffi, "t_global_get_fast", Read)),
+    #("global_handle", HostOp(obj_ffi, "t_global_handle", Read)),
+    #("global_set", HostOp(obj, "t_global_set", MutUnit)),
+    #("global_typeof", HostOp(obj, "t_global_typeof", Mut)),
+    #("global_delete", HostOp(obj, "t_global_delete", Mut)),
+    #("module_get", HostOp(obj, "t_module_get", Mut)),
+    #("module_set", HostOp(obj, "t_module_set", MutUnit)),
+    #("set_proto", HostOp(obj, "t_set_proto", Mut)),
+    #("array_from_list", HostOp(obj, "t_array_from_list", Mut)),
+    #("iter_rest", HostOp(obj, "t_iter_rest", Mut)),
+    #("regexp_new", HostOp(obj, "t_regexp_new", Mut)),
+    #("get_template_object", HostOp(obj, "t_get_template_object", Mut)),
+    #("dispose_resources", HostOp(obj, "t_dispose_resources", MutUnit)),
+    #("add", HostOp(ops, "t_add", Mut)),
+    #("sub", HostOp(ops, "t_sub", Mut)),
+    #("mul", HostOp(ops, "t_mul", Mut)),
+    #("div", HostOp(ops, "t_div", Mut)),
+    #("mod", HostOp(ops, "t_mod", Mut)),
+    #("pow", HostOp(ops, "t_pow", Mut)),
+    #("neg", HostOp(ops, "t_neg", Mut)),
+    #("plus", HostOp(ops, "t_plus", Mut)),
+    #("bitnot", HostOp(ops, "t_bitnot", Mut)),
+    #("bitand", HostOp(ops, "t_bitand", Mut)),
+    #("bitor", HostOp(ops, "t_bitor", Mut)),
+    #("bitxor", HostOp(ops, "t_bitxor", Mut)),
+    #("shl", HostOp(ops, "t_shl", Mut)),
+    #("shr", HostOp(ops, "t_shr", Mut)),
+    #("ushr", HostOp(ops, "t_ushr", Mut)),
+    #("lt", HostOp(ops, "t_lt", Mut)),
+    #("le", HostOp(ops, "t_le", Mut)),
+    #("gt", HostOp(ops, "t_gt", Mut)),
+    #("ge", HostOp(ops, "t_ge", Mut)),
+    #("eq", HostOp(ops, "t_eq", Mut)),
+    #("eq_fast", HostOp(ops_ffi, "t_eq_fast", Pure)),
+    #("nul_eq", HostOp(ops_ffi, "nul_eq", Pure)),
+    #("bitand_fast", HostOp(ops_ffi, "t_bitand_fast", Pure)),
+    #("bitor_fast", HostOp(ops_ffi, "t_bitor_fast", Pure)),
+    #("bitxor_fast", HostOp(ops_ffi, "t_bitxor_fast", Pure)),
+    #("shl_fast", HostOp(ops_ffi, "t_shl_fast", Pure)),
+    #("shr_fast", HostOp(ops_ffi, "t_shr_fast", Pure)),
+    #("ushr_fast", HostOp(ops_ffi, "t_ushr_fast", Pure)),
+    #("bitnot_fast", HostOp(ops_ffi, "t_bitnot_fast", Pure)),
+    #("strict_eq", HostOp(ops, "strict_eq", Pure)),
+    #("strict_ne", HostOp(ops, "strict_ne", Pure)),
+    #("op_in", HostOp(ops, "t_in", Mut)),
+    #("instance_of", HostOp(ops, "t_instance_of", Mut)),
+    #("instanceof_fast", HostOp(obj_ffi, "t_instanceof_fast", Read)),
+    #("call", HostOp(call, "t_call_checked", Mut)),
+    #("call_method_mono", HostOp(call_ffi, "t_call_method_mono", Mut)),
+    #("call_method_ic", HostOp(call_ffi, "t_call_method_ic", Mut)),
+    #("method_ic_warm", HostOp(call_ffi, "t_method_ic_warm", Pure)),
+    #("construct", HostOp(call, "t_construct", Mut)),
+    #("new_simple", HostOp(call_ffi, "t_new_simple", Mut)),
+    #("new_simple_ic", HostOp(call_ffi, "t_new_simple_ic", Mut)),
+    #("kfn_code", HostOp(call, "t_kfn_code", Read)),
+    #("resolve_this", HostOp(call, "t_resolve_this", Read)),
+    #("new_private_name", HostOp(class, "t_new_private_name", Mut)),
+    #("class_create", HostOp(class, "t_class_create", Mut)),
+    #("define_method", HostOp(class, "t_define_method", MutUnit)),
+    #("set_fields_init", HostOp(class, "t_set_fields_init", MutUnit)),
+    #("private_get", HostOp(class, "t_private_get", Mut)),
+    #("private_set", HostOp(class, "t_private_set", Mut)),
+    #("private_define", HostOp(class, "t_private_define", Mut)),
+    #("private_has", HostOp(class, "t_private_has", Mut)),
+    #("private_in", HostOp(class, "t_private_in", Read)),
+    #("fn_home_object", HostOp(class, "t_fn_home_object", Read)),
+    #("is_constructor", HostOp(class, "t_is_constructor", Read)),
+    #("super_get", HostOp(class, "t_super_get", Mut)),
+    #("super_set", HostOp(class, "t_super_set", Mut)),
+    #("super_call", HostOp(class, "t_super_call", Mut)),
+    #("make_method", HostOp(class, "t_make_method", MutUnit)),
+    #("async_start", HostOp(async, "t_async_start", Mut)),
+    #("gen_start", HostOp(async, "t_gen_start", Mut)),
+    #("asyncgen_start", HostOp(async, "t_asyncgen_start", Mut)),
+    #("async_iter_next", HostOp(async, "t_async_iter_next", Mut)),
+    #("await", HostOp(async, "t_await", MutUnit)),
+    #("yield", HostOp(async, "t_yield", Mut)),
+    #("yield_star", HostOp(async, "t_yield_star", Mut)),
+    #("dynamic_import", HostOp(async, "t_dynamic_import", Mut)),
+    #("drain_microtasks", HostOp(async, "t_drain_microtasks", MutUnit)),
+    #("init_realm", HostOp(builtins, "init_realm", MutUnit)),
+    #("math_sqrt", HostOp(math_ffi, "t_math_sqrt", Pure)),
+    #("math_floor", HostOp(math_ffi, "t_math_floor", Pure)),
+    #("math_abs", HostOp(math_ffi, "t_math_abs", Pure)),
+    #("math_pow", HostOp(math_ffi, "t_math_pow", Pure)),
+    #("math_min", HostOp(math_ffi, "t_math_min", Pure)),
+    #("math_max", HostOp(math_ffi, "t_math_max", Pure)),
+  ])
 }
 
 /// The named **Unsafe** profile (F4) — the platform's second named mode, the aggressive
