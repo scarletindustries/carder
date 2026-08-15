@@ -12,7 +12,8 @@ import twocore/backend/emit_core
 import twocore/ir
 import twocore/middle/ir_lower
 import twocore/runtime/instance.{
-  type Binding, Binding, DirectHost, HostOp, Mut, MutMiss, MutUnit, Pure, Read,
+  type Binding, Binding, DirectHost, HostOp, MeterOff, Mut, MutMiss, MutUnit,
+  Pure, Read, Threaded,
 }
 import twocore/runtime/profiles
 
@@ -114,17 +115,23 @@ pub fn ir_lower_admits_direct_capability_test() {
   assert e == ir_lower.ForbiddenHost("cap", "whatever")
 }
 
-/// `js_direct()` is a direct host on `"js"` whose table covers the legacy op set, so an
-/// arc-style `CallHost("js", ...)` resolves through `direct_host`, not `js_runtime_module`.
-pub fn js_direct_routes_through_direct_host_test() {
-  let assert Some(dh) = profiles.js_direct().direct_host
-  assert dh.capability == "js"
-  assert dict.get(dh.ops, "get_prop")
-    == Ok(HostOp("twocore@runtime@rt_js_obj", "t_get_prop_any", Mut))
+/// `profiles.direct(host)` carries the caller's `DirectHost` verbatim on a `Threaded`,
+/// `MeterOff` binding; a direct host on `"js"` takes precedence over the legacy
+/// `js_runtime_module` path for that capability.
+pub fn direct_profile_routes_through_direct_host_test() {
+  let host =
+    DirectHost(
+      capability: "js",
+      ops: dict.from_list([#("to_number", HostOp("dh_js_mod", "to_num", Mut))]),
+    )
+  let b = profiles.direct(host)
+  assert b.direct_host == Some(host)
+  assert b.state_strategy == Threaded
+  assert b.meter == MeterOff
   let m =
     module("jsd", [fn1("f", ir.CallHost("js", "to_number", [ir.Var("p0")]))])
-  let assert Ok(cm) = emit_core.emit_module(m, profiles.js_direct())
+  let assert Ok(cm) = emit_core.emit_module(m, b)
   let core = core_printer.print_module(cm)
-  assert string.contains(core, "'twocore@runtime@rt_js_val':'t_to_number'")
+  assert string.contains(core, "'dh_js_mod':'to_num'")
   assert !string.contains(core, "'twocore@runtime@rt_js':")
 }

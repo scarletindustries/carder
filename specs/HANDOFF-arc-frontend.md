@@ -7,6 +7,14 @@
 > to the existing pipeline (`decode`-free direct-IR entry → `ir_lower` → `emit_core` → `build_beam` →
 > BEAM). 2core team owns the IR + backend (the Phase-8 value layer, now shipped — see `specs/01-status.md` §3); **you own the emitter + `rt_js`**.
 
+> **Status (rt-unify P3).** The emitter and the JS runtime both live in the arc repo now: the runtime is
+> `arc/src/arc/rt/**` (+ `arc/src/arc_rt_*_ffi.erl`), the emitter and its op table are `arc/aot/`
+> (`arc_aot/emit/`, `arc_aot/host_ops.gleam`), and the run driver is `arc_aot/run.gleam`. Nothing JS-specific
+> remains in 2core beyond the Phase-8 `rt_js` stub and its legacy `"js"` dispatch. arc reaches 2core through
+> `pipeline.compile_ir(module, profiles.direct(DirectHost("js", ops)))`: the frontend passes its own op table
+> (`Binding.direct_host`), so **adding an op is an entry in arc's `host_ops.table()`, not a change here**. The
+> `emit2core` specs that used to sit under `specs/emit2core/` are in `arc/specs/emit2core/`.
+
 ---
 
 ## 1. The pipeline & the division of labour
@@ -25,8 +33,9 @@ JS source ──arc.parser──▶ AST ──arc.scope.finalize──▶ scope-
 - **Reuse from arc, verbatim:** the parser (AST) and `scope.finalize` (slot allocation + which locals
   are captured / boxed). `scope.lookup` gives you a per-identifier `Resolution` — use it directly.
 - **You write:** `emit_2core` (AST → IR, this doc) and **`rt_js`** (all JS *semantics* — the IR carries
-  none). Register every `rt_js` op in the Phase-8 unit-05 fixed dispatch (D3a: no dynamic apply — adding
-  an op = adding a `case` arm on the 2core side; coordinate a small allow-list PR).
+  none). Register every op in the frontend's `DirectHost.ops` table handed to `profiles.direct(...)`
+  (D3a: no dynamic apply — each entry is a build-time `HostOp(module, function, kind)` literal; adding
+  an op = adding a table entry in arc, no 2core change).
 - **2core guarantees:** the IR nodes below lower to idiomatic, preemptive, GC'd Core Erlang; the WASM
   surface is untouched; the numeric fast paths are bit-exact (D5).
 
@@ -131,9 +140,10 @@ in the fixed dispatch.
 
 ## 4. The `rt_js` ABI (the runtime YOU provide)
 
-`rt_js.gleam` (BEAM module) implements JS semantics, reached only via `CallHost("js", op, args)`. The
-2core Phase-8 stub ships a few ops; you grow it. Register each in the unit-05 dispatch. Suggested core
-surface (name → args → result), all on boxed `TTerm`s:
+`rt_js` (arc's `src/arc/rt/**`) implements JS semantics, reached only via `CallHost("js", op, args)`.
+Register each op in your `DirectHost.ops` table (the 2core Phase-8 `rt_js` stub is only the legacy
+fallback when no `direct_host` is bound). Suggested core surface (name → args → result), all on boxed
+`TTerm`s:
 
 - **cells (mutable captures + object storage):** `cell_new(init)→cell` · `cell_get(cell)→v` ·
   `cell_set(cell, v)→undefined`.
