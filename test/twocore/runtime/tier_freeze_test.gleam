@@ -20,7 +20,6 @@
 import gleam/dict
 import gleam/dynamic
 import gleam/list
-import gleam/option.{None}
 import gleam/set
 import twocore/runtime/instance.{
   type Binding, Atomics, Binding, Cell, Nif, Paged, TablePaged, Threaded,
@@ -102,8 +101,6 @@ pub fn threaded_box_round_trips_test() {
       dropped_elem: set.new(),
       ref_globals: dict.new(),
       func_imports: [],
-      js_store: None,
-      js_realm: None,
     )
   // The index-0 aliases project the default memory/table (byte-identical to Phase-4).
   assert rt_state.mem(st) == mem

@@ -202,7 +202,7 @@ pub type OpKind {
 }
 
 /// One direct-host op target: the fully resolved Erlang `module` atom (e.g.
-/// `"twocore@runtime@rt_js_obj"` or `"erlang"`), the `function` atom, and its `kind`.
+/// `"arc@rt@obj"` or `"erlang"`), the `function` atom, and its `kind`.
 /// Both atoms are emitted as build-time literals in a `call M:F(...)`; they come from the
 /// caller's `Binding` value, never from program data (D3a).
 pub type HostOp {
