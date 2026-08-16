@@ -274,6 +274,21 @@ type Cont {
   KJump(target: FName)
   KValues
   KBind(names: List(String), body: Expr, next: Cont)
+  /// The continuation of a `Try` body. The body is a nullary fun applied
+  /// under the Core `try`, so it must not transfer control past the try —
+  /// the continuation would run under the protected extent and a later raise
+  /// would land in this try's handler. Every exit instead RETURNS an exit
+  /// record from the body fun and the try's `of` clause dispatches it outside:
+  ///   `{'$2c_fall', V1..Vn}`      fall-through with the try's result values
+  ///   `{'$2c_ret', Pkg}`           `Return` — the `function_return` package
+  ///   `{'$2c_brk', 'l', V1..Vk}`   `Break` to a label outside the try
+  ///   `{'$2c_cont', 'l', V1..Vk}`  `Continue` to a loop outside the try
+  /// Under `Threading(cur)` the record is paired with the live state,
+  /// `{Rec, St}`. `KTryFall` yields the fall-through record; `KTryReturn` the
+  /// return record (a tail call inside a try body lowers as a plain call under
+  /// it).
+  KTryFall
+  KTryReturn
 }
 
 /// The state-threading channel carried alongside `cont` under `state_strategy: Threaded`
@@ -318,7 +333,32 @@ type EmitState {
     fns: Set(String),
     labels: List(LabelEntry),
     float: Option(#(Int, List(FunDef))),
+    /// `Some(n)` while emitting a `Try` body: `n` labels were in scope at the
+    /// try, so a `Break`/`Continue` to one of them (or a `Return`) leaves the
+    /// body through an exit record (see `KTryFall`).
+    try_outer: Option(Int),
   )
+}
+
+/// Whether `label` (an entry of `state.labels`) sits outside the innermost
+/// enclosing `Try` body.
+fn label_outside_try(state: EmitState, label: String) -> Bool {
+  case state.try_outer {
+    None -> False
+    Some(outer) -> {
+      let inner = list.length(state.labels) - outer
+      !list.any(list.take(state.labels, inner), fn(e) { e.label == label })
+    }
+  }
+}
+
+/// `{tag, vs…}` — under `Threading(cur)` paired with the live state.
+fn exit_record(tag: String, vs: List(CExpr), sc: StateChan) -> CExpr {
+  let rec = CTuple([CAtom(tag), ..vs])
+  case sc {
+    NoState -> rec
+    Threading(cur) -> CTuple([rec, CVar(cur)])
+  }
 }
 
 /// A fresh Core-variable raw name guaranteed distinct from every name already reserved
@@ -689,6 +729,7 @@ fn emit_function(
       fns: reserved_fns,
       labels: [],
       float: None,
+      try_outer: None,
     )
   case is_threaded(ctx) && set.contains(ctx.fn_state_reaching, f.name) {
     True -> {
@@ -1197,14 +1238,28 @@ fn emit(
     // keystone deliberately does NOT claim the constant-stack property. Q13-05 replaces these with
     // the forced-`KReturn` tail emit + the `rt_table.call_indirect_lookup` seam + the funcref-ABI
     // change (overview §2 ⚠ ABI reconciliation note). ──
+    // Inside a `Try` body a tail call must come back through the exit record
+    // (`KTryReturn`), so it lowers as the plain call there.
     ir.ReturnCall(fn_name, args) ->
-      emit_return_call(fn_name, args, sc, state, ctx)
+      case state.try_outer {
+        Some(_) -> emit_call_direct(fn_name, args, KTryReturn, sc, state, ctx)
+        None -> emit_return_call(fn_name, args, sc, state, ctx)
+      }
     ir.ReturnCallIndirect(table, index, ty, args) ->
-      emit_return_call_indirect(table, index, ty, args, sc, state, ctx)
+      case state.try_outer {
+        Some(_) ->
+          emit(CallIndirect(table, index, ty, args), KTryReturn, sc, state, ctx)
+        None ->
+          emit_return_call_indirect(table, index, ty, args, sc, state, ctx)
+      }
     ir.ReturnCallRef(funcref, args) ->
       emit_return_call_ref(funcref, args, sc, state, ctx)
     ir.ReturnCallImport(slot, ty, args) ->
-      emit_return_call_import(slot, ty, args, sc, state, ctx)
+      case state.try_outer {
+        Some(_) ->
+          emit(ir.CallImport(slot, ty, args), KTryReturn, sc, state, ctx)
+        None -> emit_return_call_import(slot, ty, args, sc, state, ctx)
+      }
     // ── Phase-7 EH nodes (§J/T1/T5/T7): BEAM-native exceptions through the `rt_exn` chokepoint.
     // `Throw`/`ThrowRef` are BOTTOM transfers (like `Trap`/`Return`) — they drop `cont`; `Try`
     // installs a Core Erlang `try…catch` (the `CTry` node) around its body. EH ships CELL-ONLY
@@ -1679,9 +1734,13 @@ fn emit_return(
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let pkg = function_return(list.map(vs, emit_value))
-  case sc {
-    NoState -> Ok(#(pkg, state))
-    Threading(cur) -> Ok(#(CTuple([pkg, CVar(cur)]), state))
+  case state.try_outer {
+    Some(_) -> Ok(#(exit_record("$2c_ret", [pkg], sc), state))
+    None ->
+      case sc {
+        NoState -> Ok(#(pkg, state))
+        Threading(cur) -> Ok(#(CTuple([pkg, CVar(cur)]), state))
+      }
   }
 }
 
@@ -2259,11 +2318,19 @@ fn apply_cont(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case cont {
     KReturn ->
-      case sc {
-        NoState -> Ok(#(function_return(vals), state))
-        Threading(cur) ->
-          Ok(#(CTuple([function_return(vals), CVar(cur)]), state))
+      case state.try_outer {
+        Some(_) ->
+          Ok(#(exit_record("$2c_ret", [function_return(vals)], sc), state))
+        None ->
+          case sc {
+            NoState -> Ok(#(function_return(vals), state))
+            Threading(cur) ->
+              Ok(#(CTuple([function_return(vals), CVar(cur)]), state))
+          }
       }
+    KTryFall -> Ok(#(exit_record("$2c_fall", vals, sc), state))
+    KTryReturn ->
+      Ok(#(exit_record("$2c_ret", [function_return(vals)], sc), state))
     KValues ->
       // perf6 emit_block/emit_if let-case. Under `state.float=None` (single-
       // value context — a `letrec` fun body, or emit_if let-case): yield ONE
@@ -2570,6 +2637,8 @@ fn materialize_if(
     KReturn -> Ok(#(None, KReturn, state))
     KJump(t) -> Ok(#(None, KJump(t), state))
     KValues -> Ok(#(None, KValues, state))
+    KTryFall -> Ok(#(None, KTryFall, state))
+    KTryReturn -> Ok(#(None, KTryReturn, state))
     KBind(names, body, next) as kb ->
       // js-profile only: inline a small linear-spine cont whose own next is
       // already trivial. Both arms of the caller If/Block re-emit `body`,
@@ -5923,8 +5992,21 @@ fn emit_if(
         }
     },
   )
+  // Under the let-case tail the arms' `KValues` leaves must be tuples
+  // (`multi=False` below), so an inherited multi-value scope is closed for
+  // the arms and restored after.
+  let let_case = jcont == KValues && block_can_let_case(cont, arity)
+  let outer_float = state2.float
+  let state2 = case let_case {
+    True -> EmitState(..state2, float: None)
+    False -> state2
+  }
   use #(then_c, state3) <- result.try(emit(then_branch, jcont, sc, state2, ctx))
   use #(else_c, state4) <- result.try(emit(else_branch, jcont, sc, state3, ctx))
+  let state4 = case let_case {
+    True -> EmitState(..state4, float: outer_float)
+    False -> state4
+  }
   let #(wild, state5) = fresh_var(state4)
   let case_expr =
     CCase(emit_value(cond), [
@@ -5937,7 +6019,7 @@ fn emit_if(
   // (multi=False, defs=[]): its arms are arbitrary Builds so a floated cont's
   // free vars may sit inside the arm — the tuple-destructure path is safe and
   // richards' hot pattern is anf.share (Block), not bind_if.
-  case jcont == KValues && block_can_let_case(cont, arity) {
+  case let_case {
     True ->
       emit_let_case_wrap(case_expr, arity, [], False, cont, sc, state5, ctx)
     False -> Ok(#(wrap_join(maybe_def, case_expr), state5))
@@ -6131,9 +6213,11 @@ fn emit_block(
       let outer_float = state.float
       let open_float =
         perf6_letrec_float && outer_float == None && float_safe_body(body)
+      // Not opening a scope: leaves must be tuples for the `multi=False`
+      // wrap, so an inherited multi-value scope is closed for the body.
       let state2 = case open_float {
         True -> EmitState(..state, float: Some(#(arity, [])))
-        False -> state
+        False -> EmitState(..state, float: None)
       }
       let state3 = push_label(state2, LabelEntry(label, KValues, None))
       use #(body_c, state4) <- result.try(emit(body, KValues, sc, state3, ctx))
@@ -6143,7 +6227,7 @@ fn emit_block(
           list.reverse(ds),
           EmitState(..state5, float: outer_float),
         )
-        _, _ -> #([], state5)
+        _, _ -> #([], EmitState(..state5, float: outer_float))
       }
       emit_let_case_wrap(body_c, arity, defs, open_float, cont, sc, state6, ctx)
     }
@@ -6413,7 +6497,11 @@ fn emit_break(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use entry <- result.try(find_label(state, label))
-  apply_cont(entry.break_cont, list.map(vs, emit_value), sc, state, ctx)
+  let vals = list.map(vs, emit_value)
+  case label_outside_try(state, label) {
+    True -> Ok(#(exit_record("$2c_brk", [CAtom(label), ..vals], sc), state))
+    False -> apply_cont(entry.break_cont, vals, sc, state, ctx)
+  }
 }
 
 /// Lower `Continue(label, vs)`: tail-apply the loop head `apply 'L'(vs)` — under
@@ -6427,14 +6515,16 @@ fn emit_continue(
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use entry <- result.try(find_label(state, label))
-  case entry.continue_target {
-    Some(lfname) ->
+  let vals = list.map(vs, emit_value)
+  case entry.continue_target, label_outside_try(state, label) {
+    Some(_), True ->
+      Ok(#(exit_record("$2c_cont", [CAtom(label), ..vals], sc), state))
+    Some(lfname), False ->
       case sc {
-        NoState -> Ok(#(CApply(lfname, list.map(vs, emit_value)), state))
-        Threading(cur) ->
-          Ok(#(CApply(lfname, [CVar(cur), ..list.map(vs, emit_value)]), state))
+        NoState -> Ok(#(CApply(lfname, vals), state))
+        Threading(cur) -> Ok(#(CApply(lfname, [CVar(cur), ..vals]), state))
       }
-    None -> Error(UnboundLabel(label))
+    None, _ -> Error(UnboundLabel(label))
   }
 }
 
@@ -6529,7 +6619,15 @@ fn emit_try(
     state,
     ctx,
   ))
-  use #(body_c, s2) <- result.try(emit(body, exit_cont, sc, s1, ctx))
+  // The body is a nullary fun (a single-value context) that must not run the
+  // continuation under the try: it is emitted under `KTryFall` with the
+  // labels in scope at the try recorded, so every exit comes back as an exit
+  // record (see `KTryFall`) that the `of` clause dispatches below.
+  let outer_float = s1.float
+  let body_state =
+    EmitState(..s1, float: None, try_outer: Some(list.length(s1.labels)))
+  use #(body_c, s2) <- result.try(emit(body, KTryFall, sc, body_state, ctx))
+  let s2 = EmitState(..s2, float: outer_float, try_outer: s1.try_outer)
   // Hoist the protected body into a local NULLARY function so the try's `Arg` is a SINGLE
   // `apply 'trybody'/0()` (a closure over the try-site scope). This is required for correctness,
   // not cosmetics: a trapping op inside the body emits a `case`-and-raise, and a `case` whose
@@ -6556,15 +6654,139 @@ fn emit_try(
     s6,
     ctx,
   ))
+  use #(dispatch_c, s8) <- result.try(exit_dispatch(
+    vv,
+    list.length(result),
+    body,
+    exit_cont,
+    sc,
+    s7,
+    ctx,
+  ))
   let ctry =
     CTry(
       arg: CApply(body_fn, []),
       body_vars: [vv],
-      body: CVar(vv),
+      body: dispatch_c,
       evars: [cvar, rvar, svar],
       handler: handler_c,
     )
-  Ok(#(wrap_join(join, CLetrec([body_def], ctry)), s7))
+  Ok(#(wrap_join(join, CLetrec([body_def], ctry)), s8))
+}
+
+/// The `of <R> ->` clause of a lowered `Try`: dispatch the body's exit record
+/// (see `KTryFall`) outside the protected extent. Fall-through feeds the
+/// try's own continuation; a return, break or continue is re-emitted here, so
+/// one that must also leave an enclosing try becomes that try's record.
+fn exit_dispatch(
+  rvar: String,
+  arity: Int,
+  body: Expr,
+  exit_cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let #(rec, state) = fresh_var(state)
+  let #(st, state) = fresh_var(state)
+  let #(inner_sc, wrap) = case sc {
+    NoState -> #(NoState, fn(e: CExpr) { CLet([rec], CVar(rvar), e) })
+    Threading(_) -> #(Threading(st), fn(e: CExpr) {
+      CCase(CVar(rvar), [
+        CClause([PTuple([PVar(rec), PVar(st)])], CAtom("true"), e),
+      ])
+    })
+  }
+  let #(fall_vars, state) = fresh_vars(state, arity)
+  use #(fall_c, state) <- result.try(apply_cont(
+    exit_cont,
+    list.map(fall_vars, CVar),
+    inner_sc,
+    state,
+    ctx,
+  ))
+  let #(pkg, state) = fresh_var(state)
+  use #(ret_c, state) <- result.try(case state.try_outer {
+    Some(_) -> Ok(#(exit_record("$2c_ret", [CVar(pkg)], inner_sc), state))
+    None ->
+      case inner_sc {
+        NoState -> Ok(#(CVar(pkg), state))
+        Threading(cur) -> Ok(#(CTuple([CVar(pkg), CVar(cur)]), state))
+      }
+  })
+  use #(transfer_clauses, state) <- result.try(
+    list.try_fold(outer_transfers(body, [], []), #([], state), fn(acc, t) {
+      let #(clauses, state) = acc
+      let #(tag, label, n) = t
+      let #(vs, state) = fresh_vars(state, n)
+      let ir_vs = list.map(vs, Var)
+      use #(body_c, state) <- result.try(case tag {
+        "$2c_brk" -> emit_break(label, ir_vs, inner_sc, state, ctx)
+        _ -> emit_continue(label, ir_vs, inner_sc, state)
+      })
+      let pat = PTuple([PAtom(tag), PAtom(label), ..list.map(vs, PVar)])
+      Ok(#([CClause([pat], CAtom("true"), body_c), ..clauses], state))
+    }),
+  )
+  let clauses = [
+    CClause(
+      [PTuple([PAtom("$2c_fall"), ..list.map(fall_vars, PVar)])],
+      CAtom("true"),
+      fall_c,
+    ),
+    CClause([PTuple([PAtom("$2c_ret"), PVar(pkg)])], CAtom("true"), ret_c),
+    ..list.reverse(transfer_clauses)
+  ]
+  Ok(#(wrap(CCase(CVar(rec), clauses)), state))
+}
+
+fn fresh_vars(state: EmitState, n: Int) -> #(List(String), EmitState) {
+  let #(names, state) =
+    list.fold(list.repeat(Nil, n), #([], state), fn(acc, _) {
+      let #(names, state) = acc
+      let #(v, state) = fresh_var(state)
+      #([v, ..names], state)
+    })
+  #(list.reverse(names), state)
+}
+
+/// Every `#(tag, label, arity)` a `Break`/`Continue` inside `body` may leave
+/// the try with: targets not bound by a `Block`/`Loop` inside `body`, in
+/// first-seen order, deduplicated. `defined` accumulates the labels bound so
+/// far on the path.
+fn outer_transfers(
+  body: Expr,
+  defined: List(String),
+  acc: List(#(String, String, Int)),
+) -> List(#(String, String, Int)) {
+  let add = fn(acc, tag, label, n) {
+    case list.contains(defined, label) || list.contains(acc, #(tag, label, n)) {
+      True -> acc
+      False -> list.append(acc, [#(tag, label, n)])
+    }
+  }
+  case body {
+    Let(_, rhs, b) ->
+      outer_transfers(b, defined, outer_transfers(rhs, defined, acc))
+    If(_, _, t, e) ->
+      outer_transfers(e, defined, outer_transfers(t, defined, acc))
+    Switch(_, _, arms, default) ->
+      list.fold(arms, acc, fn(a, arm) {
+        let SwitchArm(_, b) = arm
+        outer_transfers(b, defined, a)
+      })
+      |> outer_transfers(default, defined, _)
+    Block(label, _, b) -> outer_transfers(b, [label, ..defined], acc)
+    Loop(label, _, _, b) -> outer_transfers(b, [label, ..defined], acc)
+    Charge(_, b) -> outer_transfers(b, defined, acc)
+    ir.Try(_, b, handlers) ->
+      list.fold(handlers, outer_transfers(b, defined, acc), fn(a, h) {
+        outer_transfers(h.handler, defined, a)
+      })
+    Break(label, vs) -> add(acc, "$2c_brk", label, list.length(vs))
+    Continue(label, vs) -> add(acc, "$2c_cont", label, list.length(vs))
+    _ -> acc
+  }
 }
 
 /// Build the `catch <C,R,S>` handler body for a `Try`'s clauses (§C.3, `Produces` #2): a chain of
@@ -7073,6 +7295,7 @@ fn emit_instantiate_full(
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
       float: None,
+      try_outer: None,
     )
   let n_imports = count_import_slots(module)
   // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
@@ -7543,6 +7766,7 @@ fn emit_instantiate_cell(
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
       float: None,
+      try_outer: None,
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   let seed_effect = seam_call(ctx.binding.state_module, "seed", [decl_term])
@@ -7598,6 +7822,7 @@ fn emit_instantiate_threaded(
       fns: set.from_list(dict.keys(ctx.fn_arity)),
       labels: [],
       float: None,
+      try_outer: None,
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   // (0) The unchanged metering/host seed discards.

@@ -92,10 +92,8 @@ pub type EafError {
   NonFunDef(name: String)
   /// A `primop` other than `'build_stacktrace'` (the only one emitted).
   UnsupportedPrimop(name: String)
-  /// A multi-binder `let` whose RHS is not a same-arity literal value list —
-  /// `emit_core.value_list` is the single producer, so this is unreachable.
-  /// `binders`/`values` are the mismatched arities (`values` is `-1` for a
-  /// non-value-list RHS).
+  /// A multi-binder `let` whose RHS is a literal value list of a different
+  /// arity. `binders`/`values` are the mismatched arities.
   BadValueBinding(binders: Int, values: Int)
   /// A bare value list (`CValues`) in single-value expression position.
   BareValueList(arity: Int)
@@ -602,12 +600,42 @@ fn tr_body(
         }
       }
     }
-    CLet(vars, _, _) -> Error(BadValueBinding(list.length(vars), -1))
+    CLet(vars, arg, body) -> {
+      // A multi-binder let over a computed RHS (a `case`/`let` chain whose
+      // leaves are value lists). Erlang has no multi-value expressions, so
+      // every leaf becomes a tuple and the binders match against it:
+      // `let <X,Y> = E in B` → `{X@n, Y@m} = E′, B′…`.
+      use #(argf, st1) <- result.try(tr_expr(tuple_leaves(arg), env, st))
+      let #(pat, env2, st2) = tr_pat(PTuple(list.map(vars, PVar)), env, st1)
+      use #(rest, st3) <- result.try(tr_body(body, env2, st2))
+      Ok(#([e_match(ln, pat, argf), ..rest], st3))
+    }
     CLetrec(defs, inner) -> tr_letrec(defs, inner, env, st)
     _ -> {
       use #(f, st1) <- result.try(tr_expr(expr, env, st))
       Ok(#([f], st1))
     }
+  }
+}
+
+/// Rewrite every value-list leaf of `expr` (in tail position through `let`,
+/// `letrec`, `case` clauses and `try` arms) into a tuple, so a multi-value
+/// expression can be bound by a single tuple match.
+fn tuple_leaves(expr: CExpr) -> CExpr {
+  case expr {
+    CValues(values) -> CTuple(values)
+    CLet(vars, arg, body) -> CLet(vars, arg, tuple_leaves(body))
+    CLetrec(defs, body) -> CLetrec(defs, tuple_leaves(body))
+    CCase(arg, clauses) ->
+      CCase(
+        arg,
+        list.map(clauses, fn(cl) {
+          CClause(cl.pats, cl.guard, tuple_leaves(cl.body))
+        }),
+      )
+    CTry(arg, body_vars, body, evars, handler) ->
+      CTry(arg, body_vars, tuple_leaves(body), evars, tuple_leaves(handler))
+    _ -> expr
   }
 }
 
