@@ -2512,10 +2512,21 @@ pub fn try_lowers_to_ctry_with_tag_dispatch_test() {
         ir.Return([ir.Var("p")]),
       ),
     ])
-  let assert CTry(_arg, [v], CVar(vb), [c, r, s], handler) =
-    ctry_of(eh_module(body, [tag0()]))
-  // transparent success binder: `of <v> -> v`.
+  let assert CTry(_arg, [v], CLet([rec], CVar(vb), CCase(CVar(rec2), arms)), [
+    c,
+    r,
+    s,
+  ], handler) = ctry_of(eh_module(body, [tag0()]))
+  // success binder: `of <v> -> case v of {'$2c_fall', x} -> x; {'$2c_ret', p} -> p`
+  // — the body's exit record is dispatched OUTSIDE the protected extent.
   assert v == vb
+  assert rec == rec2
+  let assert [
+    CClause([PTuple([PAtom("$2c_fall"), PVar(x)])], CAtom("true"), CVar(x2)),
+    CClause([PTuple([PAtom("$2c_ret"), PVar(p)])], CAtom("true"), CVar(p2)),
+  ] = arms
+  assert x == x2
+  assert p == p2
   // handler dispatch on the SAME tag identity (T4) via match_tag (T7).
   let assert CCase(
     CCall(CAtom(m0), CAtom("match_tag"), [CVar(r0), CInt(0)]),
