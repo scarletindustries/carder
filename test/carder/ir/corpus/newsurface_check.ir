@@ -1,0 +1,28 @@
+module @carder@wasm@bulk_check {
+  numerics true
+  memory (min 1)
+  memory (min 1)
+  export "bulk_check" = @f0
+  export "overlap_check" = @f1
+  export "multimem_check" = @f2
+  data passive = 0x61626364
+  func @f0 () -> (i32) {
+    let () = mem.fill i32.const 0 i32.const 88 i32.const 4
+    let () = mem.init i32.const 1 i32.const 1 i32.const 2 seg=0
+    let (%v1) = mem.load i32 1 i32.const 1 offset=0
+    values (%v1)
+  }
+  func @f1 () -> (i32) {
+    let () = mem.store 4 i32.const 0 i32.const 67305985 offset=0
+    let () = mem.copy i32.const 2 i32.const 0 i32.const 4
+    let (%v1) = mem.load i32 1 i32.const 3 offset=0
+    values (%v1)
+  }
+  func @f2 () -> (i32) {
+    let () = mem.store 4 i32.const 0 i32.const 287454020 offset=0 mem=1
+    let () = mem.copy i32.const 0 i32.const 0 i32.const 4 src_mem=1
+    let (%v1) = mem.load i32 4 i32.const 0 offset=0
+    values (%v1)
+  }
+}
+

@@ -1,0 +1,26 @@
+module @carder@wasm@set_global {
+  numerics true
+  memory (min 1)
+  global @g0 : i32 mut = values (i32.const 0)
+  export "set_global" = @f0
+  export "get_global" = @f1
+  export "store" = @f2
+  export "load" = @f3
+  func @f0 (%p0:i32) -> () {
+    let () = global.set @g0 %p0
+    values ()
+  }
+  func @f1 () -> (i32) {
+    let (%v1) = global.get @g0
+    values (%v1)
+  }
+  func @f2 (%p0:i32, %p1:i32) -> () {
+    let () = mem.store 4 %p0 %p1 offset=0
+    values ()
+  }
+  func @f3 (%p0:i32) -> (i32) {
+    let (%v1) = mem.load i32 4 %p0 offset=0
+    values (%v1)
+  }
+}
+

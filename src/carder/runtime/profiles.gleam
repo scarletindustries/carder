@@ -50,9 +50,9 @@
 import carder/opt_level.{Aggressive}
 import carder/runtime/instance.{
   type Binding, type DirectHost, type MemTier, type Mode, type StateStrategy,
-  type TableTier, Atomics, BifOpen, Binding, Cell, HostOpen, HostWhitelist,
-  MeterOff, Nif, Paged, Safe, StdlibPassthrough, TableAtomics, TableEts,
-  TablePaged, Threaded, Unsafe, safe_default,
+  type TableTier, Atomics, BifOpen, Binding, Cell, HostOpen, MeterOff, Nif,
+  Paged, Safe, StdlibPassthrough, TableAtomics, TableEts, TablePaged, Threaded,
+  Unsafe, safe_default,
 }
 import carder/runtime/rt_mem_atomics
 import gleam/int
@@ -119,70 +119,6 @@ pub fn safe_capped(max_pages: Int) -> Binding {
 /// fails.
 pub fn safe_metered(budget: Int) -> Binding {
   Binding(..safe(), fuel_budget: budget)
-}
-
-/// The build-fixed allow-set for the official `spectest` host functions (§G, R14) — exactly the
-/// seven `#("spectest", print*)` pairs, nothing more. A LITERAL list in this module (D3a — no
-/// data-driven allow-set); every other capability stays denied. Used to build the import-capable
-/// Safe binding (`safe_spectest()`) the conformance harness links `spectest`-importing modules
-/// under. The seven names match `rt_host`'s `spectest` handler arms exactly.
-///
-/// Returns the seven `#(capability, name)` pairs. Total — never fails.
-pub fn spectest_allow() -> List(#(String, String)) {
-  [
-    #("spectest", "print"),
-    #("spectest", "print_i32"),
-    #("spectest", "print_i64"),
-    #("spectest", "print_f32"),
-    #("spectest", "print_f64"),
-    #("spectest", "print_i32_f32"),
-    #("spectest", "print_f64_f64"),
-  ]
-}
-
-/// The **Safe** binding that admits the `spectest` host functions (§G, R14) — a `HostWhitelist`,
-/// NEVER `HostOpen`. Identical to `safe()` except `host_policy: HostWhitelist(spectest_allow())`;
-/// every non-`spectest` capability stays denied (the fail-closed whitelist conjunction, Phase-3),
-/// and an unlisted `spectest` pair (nothing here) is denied too. The conformance harness links
-/// `spectest`-importing modules under this posture.
-///
-/// It is a **Safe** posture (`mode: Safe`) — NOT an Unsafe opt-out, so the fail-closed enumeration
-/// is unperturbed (`unsafe()`/`ceiling()` remain the only `mode: Unsafe` constructors). It changes
-/// only `host_policy`, so it composes with `link/1` exactly as `safe()`. Total — never fails.
-pub fn safe_spectest() -> Binding {
-  Binding(..safe(), host_policy: HostWhitelist(spectest_allow()))
-}
-
-/// The build-fixed allow-set for Porffor's runtime intrinsics (P7-08 §A/§G) — exactly the four
-/// `#("", letter)` pairs Porffor imports from module `""` (`a`=print, `b`=printChar, `c`=time,
-/// `d`=timeOrigin), nothing more. A LITERAL list in this module (D3a — no data-driven
-/// allow-set); every other capability stays denied. Mirrors `spectest_allow/0`; the four names
-/// match `rt_host`'s Porffor handler arms exactly.
-///
-/// Returns the four `#(capability, name)` pairs. Total — never fails.
-pub fn porffor_allow() -> List(#(String, String)) {
-  [#("", "a"), #("", "b"), #("", "c"), #("", "d")]
-}
-
-/// The **Safe** binding that admits Porffor's `""` runtime intrinsics (P7-08 §G) — the
-/// JS-on-BEAM posture. A `HostWhitelist`, NEVER `HostOpen`. Identical to `safe()` except
-/// `host_policy: HostWhitelist(porffor_allow())`; every non-Porffor capability stays denied
-/// (the fail-closed whitelist conjunction), and an unprovided `""` intrinsic (`""."e"`, the PGO
-/// `profileLocalSet`, …) is denied too (§B.4). The four intrinsics are explicit, auditable host
-/// functions with BOUNDED authority (append to a process-local output buffer / read a
-/// deterministic clock — no file/socket/node authority), so this stays a genuinely **Safe**
-/// posture (`mode: Safe`), NOT an Unsafe opt-out — the fail-closed enumeration is unperturbed
-/// (`unsafe()`/`ceiling()` remain the only `mode: Unsafe` constructors). Changes only
-/// `host_policy`, so it composes with `link/1` exactly as `safe()`/`safe_spectest()`. Total.
-pub fn porffor() -> Binding {
-  Binding(..safe(), host_policy: HostWhitelist(porffor_allow()))
-}
-
-/// The JS-on-BEAM posture name — an alias for `porffor()` (the headline "run JS via Porffor"
-/// build). Provided so callers name the *intent* (`profiles.js()`) not the *toolchain*;
-/// identical binding. Total.
-pub fn js() -> Binding {
-  porffor()
 }
 
 /// The **direct-IR frontend profile**: `Threaded` state plus the caller's `direct_host`

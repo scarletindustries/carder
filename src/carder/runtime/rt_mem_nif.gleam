@@ -38,8 +38,8 @@
 //// `.so` is loaded (→ `enif_get_resource` is sound), else a paged `Mem` (→ delegating to `rt_mem`'s
 //// coercing entry points is sound).
 ////
-//// **The one exception is an IMPORTED memory.** A module may `(import "spectest" "memory" …)`, and
-//// `link.spectest_export` builds the provided memory with the PAGED tier UNCONDITIONALLY
+//// **The one exception is an IMPORTED memory.** A module may import a memory from a host namespace,
+//// and the embedder-supplied `link.Provider` builds that `ProvidedMemory` with the PAGED tier
 //// (`rt_mem.fresh`), tier-agnostically — so under a loaded `.so` the `mem` slot can hold a paged `Mem`
 //// even though `nif_available()` is `true`. Handing that foreign handle to a native `@external`
 //// (`enif_get_resource`) FAILS with `badarg` — NOT the WebAssembly `Error(MemoryOutOfBounds)` an

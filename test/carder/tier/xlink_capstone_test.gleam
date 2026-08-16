@@ -9,9 +9,20 @@
 //// `reffunc_import_emit_test.gleam` proves emit/dispatch/arity-lockstep/guards on HAND-BUILT modules,
 //// and `emit_core_security_test.imported_funcref_adapter_has_no_ambient_authority_test` proves the
 //// D3a adapter is ambient-free; this capstone RE-RUNS those green (via the suite + an explicit cite)
-//// and adds the missing witness: the SAME properties driven through the REAL decoded `xlink.wasm`
-//// (our decoder → validate → lower → emit → BEAM), linked against a `(register)`ed provider, on
+//// and adds the missing witness: the SAME properties driven through the REAL checked-in `corpus/xlink.ir`
+//// (parse → lower → opt → emit → BEAM), linked against a `(register)`ed provider, on
 //// `TablePaged`/`TableEts`/`TableAtomics` × Cell/Threaded.
+////
+//// ## The frontend split: the fixtures are `.ir` TEXT
+////
+//// carder's WebAssembly frontend moved to `scribbler`; carder is the BACKEND, and a `runner.Driver`'s
+//// `BitArray` is now UTF-8 `.ir` SOURCE TEXT (see `carder/harness/driver`). The importer `$b` is the
+//// checked-in `corpus/xlink.ir` (generated from the pre-split `xlink.wasm` by `to-ir`, and MEASURED
+//// to produce the byte-identical `.beam`, so this drives the exact same artifact). The two auxiliary
+//// modules that used to be embedded as raw `.wasm` byte literals — the provider `$a` and the
+//// `ref.func`-of-import-ONLY module `$c` — are embedded as `.ir` TEXT literals below, spelling the
+//// SAME functions, exports, table, element segment and imports the wasm literals encoded. Nothing
+//// below the parse changed, so every assertion in this file is the assertion it always was.
 ////
 //// Spec: WebAssembly element segments (§2.5.6 / §4.5.4) — the funcidx space is unified (imports
 //// FIRST), so `ref.func x` for an IMPORTED x yields that import's function reference, which an active
@@ -26,45 +37,80 @@
 
 import carder/backend/emit_core
 import carder/backend/emit_core_security_test
-import carder/conformance/driver
-import carder/conformance/fixture.{I32Val}
-import carder/conformance/runner.{
+import carder/harness/driver
+import carder/harness/fixture.{I32Val}
+import carder/harness/runner.{
   type Instance, DriverError, ImportEnv, Returned, Trapped,
   provider_from_instance, trap_matches,
 }
 import carder/opt_level.{type OptLevel, Aggressive, Baseline, OptNone}
-import carder/pipeline
 import carder/runtime/instance.{type Binding, Binding, MeterOff}
 import carder/tier/combos.{type Combo, type Outcome}
+import gleam/bit_array
 import gleam/int
 import gleam/io
 import gleam/list
 
 // ─────────────────────────────── the provider + fixtures under test ───────────────────────────────
 
-/// The provider module `$a`'s `.wasm` bytes (`wat2wasm` of `corpus/xlink.wat`'s module `$a`, embedded
-/// as a byte literal so the fixture stays the overview's three files — `corpus/xlink.{wat,wasm,expected}`
-/// — with `xlink.wasm` being the IMPORTER module `$b` alone). Exports `ef0(x)=x+10` (funcidx 0) and
-/// `ef1(x)=x*2` (funcidx 1); cross-checked with wasmtime 46.0.1 at authoring time.
+/// The provider module `$a` as `.ir` SOURCE TEXT — the module `corpus/xlink.ir`'s importer `$b`
+/// links against, kept in-file so the checked-in fixture stays the overview's pair
+/// (`corpus/xlink.{ir,expected}`, with `xlink.ir` being the IMPORTER `$b` alone).
+///
+/// Exports `ef0(x) = x + 10` (funcidx 0) and `ef1(x) = x * 2` (funcidx 1) — the SAME two functions,
+/// in the SAME order, that the pre-split `.wasm` byte literal encoded (it was `wat2wasm` of
+/// `corpus/xlink.wat`'s module `$a`); values cross-checked with wasmtime 46.0.1 at authoring time.
+/// The funcidx ORDER is load-bearing: `xlink.ir`'s element segment stores `ref.func_import 0` (=
+/// `ef0`) at slot 0 and `ref.func_import 1` (= `ef1`) at slot 2.
+const module_a_ir: String = "module @carder@wasm@xlink_a {
+  numerics true
+  memory none
+  export \"ef0\" = @f0
+  export \"ef1\" = @f1
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = num i.add.32 (%p0, i32.const 10)
+    values (%v1)
+  }
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = num i.mul.32 (%p0, i32.const 2)
+    values (%v1)
+  }
+}
+"
+
+/// The provider module `$a`'s bytes as a `Driver` consumes them: the UTF-8 encoding of
+/// `module_a_ir`. (`bit_array.from_string` is total — a Gleam `String` is always valid UTF-8.)
 fn module_a_bytes() -> BitArray {
-  <<
-    0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 127, 1, 127, 3, 3, 2, 0, 0, 7,
-    13, 2, 3, 101, 102, 48, 0, 0, 3, 101, 102, 49, 0, 1, 10, 17, 2, 7, 0, 32, 0,
-    65, 10, 106, 11, 7, 0, 32, 0, 65, 2, 108, 11,
-  >>
+  bit_array.from_string(module_a_ir)
 }
 
-/// A `ref.func`-of-import-ONLY module `$c`'s `.wasm` bytes: it imports `a.ef0` (funcidx 0), places it
-/// into a `funcref` table via an active `elem` `ref.func` segment, and dispatches via `call_indirect`
-/// — but NEVER `call`s the import in any body (no `CallImport`). So it is import-bearing PURELY through
-/// the element-segment scan, the sharpest arity-lockstep edge (R3). `via_ci(x)` = `ef0(x)` = x+10.
+/// A `ref.func`-of-import-ONLY module `$c` as `.ir` SOURCE TEXT: it imports `a.ef0` (funcidx 0),
+/// places it into a `funcref` table via an active `elem` `ref.func_import` segment, and dispatches
+/// via `call_indirect` — but NEVER `call_import`s it in any body. So it is import-bearing PURELY
+/// through the element-segment scan, the sharpest arity-lockstep edge (R3): `emit_core`'s
+/// `needs_func_imports` must see it via the segment alone, or the generated `instantiate/1` arity
+/// and the driver's supplied `Imports` length desync. `via_ci(x)` = `ef0(x)` = x + 10.
+///
+/// This spells exactly the module the pre-split `.wasm` byte literal encoded (one type
+/// `(i32) -> (i32)`, one function import `a.ef0`, one defined function, a `funcref` table of min 1,
+/// an active `elem` at offset 0 holding `ref.func 0`, and the single export `via_ci`).
+const reffuncimport_only_ir: String = "module @carder@wasm@xlink_c {
+  numerics true
+  memory none
+  table @t0 min 1
+  import \"a\" \"ef0\" : (i32) -> (i32)
+  export \"via_ci\" = @f1
+  elem funcref @t0 (values (i32.const 0)) [ref.func_import 0 : (i32) -> (i32)]
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [i32.const 0] : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+}
+"
+
+/// Module `$c`'s bytes as a `Driver` consumes them: the UTF-8 encoding of `reffuncimport_only_ir`.
 fn reffuncimport_only_bytes() -> BitArray {
-  <<
-    0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 127, 1, 127, 2, 9, 1, 1, 97, 3,
-    101, 102, 48, 0, 0, 3, 2, 1, 0, 4, 4, 1, 112, 0, 1, 7, 10, 1, 6, 118, 105,
-    97, 95, 99, 105, 0, 1, 9, 7, 1, 0, 65, 0, 11, 1, 0, 10, 11, 1, 9, 0, 32, 0,
-    65, 0, 17, 0, 0, 11,
-  >>
+  bit_array.from_string(reffuncimport_only_ir)
 }
 
 // ─────────────────────────────── linked-drive helpers ───────────────────────────────
@@ -122,7 +168,7 @@ fn traps_with(
 // ─────────────── PROOF 1: an imported funcref via call_indirect == a direct call of the import ───────────────
 
 /// PROOF 1 (the load-bearing semantic identity, spec §4.4.8). For EVERY cross-module combo, drive the
-/// real decoded `xlink.wasm` linked against provider `a`, and assert at several `x` that
+/// real checked-in `corpus/xlink.ir` linked against provider `a`, and assert at several `x` that
 /// `via_ci(0, x) == direct(x)` (slot 0 is the IMPORTED `ef0`, reached indirectly vs directly),
 /// `via_ci(2, x) == ef1(x) == 2*x` (slot 2 is the imported `ef1`), and `via_ci(1, x) == x-1` (slot 1
 /// is the DEFINED function in the same mixed segment — the imported items don't poison it). A wrong
@@ -257,17 +303,18 @@ pub fn imported_funcref_fail_closed_guards_test() {
 // ─────────────── PROOF 5: instantiate/0 ⇄ instantiate/1 arity lockstep on the real decoder ───────────────
 
 /// PROOF 5 (arity in lockstep, R3) — the capstone-level end-to-end witness. A module that ONLY
-/// `ref.func`s an import into an active `elem` segment and NEVER `CallImport`s it (decoded from real
-/// `.wasm` through our decoder → lower) is recognised as import-bearing by the SINGLE public predicate
-/// `emit_core.needs_func_imports` (the element-segment scan) that `driver.module_calls_import`
-/// DELEGATES to — so the generated `instantiate/1` arity and the driver's supplied `Imports` length are
-/// the SAME function of the SAME module and CANNOT desync. It then instantiates as `instantiate/1`,
-/// links against a provider, and dispatches: `via_ci(x) == ef0(x) == x+10`. Re-runs R14-02's
-/// `import_bearing_detection_is_in_lockstep_test` green (which pins the hand-built shapes) and CITES it;
-/// this adds the real-decoder end-to-end drive.
+/// `ref.func`s an import into an active `elem` segment and NEVER `CallImport`s it (parsed from real
+/// `.ir` source text through the shipped `parse_ir`) is recognised as import-bearing by the SINGLE
+/// public predicate `emit_core.needs_func_imports` (the element-segment scan) that
+/// `driver.module_calls_import` DELEGATES to — so the generated `instantiate/1` arity and the driver's
+/// supplied `Imports` length are the SAME function of the SAME module and CANNOT desync. It then
+/// instantiates as `instantiate/1`, links against a provider, and dispatches:
+/// `via_ci(x) == ef0(x) == x+10`. Re-runs R14-02's `import_bearing_detection_is_in_lockstep_test`
+/// green (which pins the hand-built shapes) and CITES it; this adds the end-to-end drive over a
+/// module that reaches the predicate through the SEGMENT scan alone.
 pub fn ref_func_import_only_arity_lockstep_test() {
   let bytes = reffuncimport_only_bytes()
-  let assert Ok(irmod) = pipeline.source_to_ir(bytes)
+  let assert Ok(irmod) = driver.parse(bytes)
 
   // ONE shared predicate: emit and the driver agree by construction (delegation, not a diffed mirror).
   assert emit_core.needs_func_imports(irmod) == True
@@ -331,9 +378,10 @@ pub fn running_total_report_test() {
 
 // ─────────────────────────────── fixture IO ───────────────────────────────
 
-/// The importer `xlink.wasm` (module `$b` alone) bytes — read through the shared corpus IO. `let
-/// assert` fails the test if the fixture is missing (a broken checkout, not a silent pass).
+/// The importer `corpus/xlink.ir` (module `$b` alone) as bytes — read through the shared corpus IO
+/// (`.ir` SOURCE TEXT, which is what a `Driver` parses). `let assert` fails the test if the fixture
+/// is missing (a broken checkout, not a silent pass).
 fn importer_bytes() -> BitArray {
-  let assert Ok(bytes) = combos.read_wasm("xlink")
+  let assert Ok(bytes) = combos.read_ir("xlink")
   bytes
 }

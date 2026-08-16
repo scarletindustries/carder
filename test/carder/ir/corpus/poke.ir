@@ -1,0 +1,15 @@
+module @carder@wasm@run {
+  numerics true
+  memory (min 1)
+  import "dance" "poke" : (i32, i32) -> ()
+  export "mem" = memory 0
+  export "run" = @f1
+  func @f1 () -> (i32) {
+    let () = mem.store 1 i32.const 0 i32.const 65 offset=0
+    let () = mem.store 1 i32.const 1 i32.const 66 offset=0
+    let () = mem.store 1 i32.const 2 i32.const 67 offset=0
+    let () = call_import 0 : (i32, i32) -> () (i32.const 0, i32.const 3)
+    values (i32.const 3)
+  }
+}
+

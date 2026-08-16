@@ -20,17 +20,28 @@
 //// <https://webassembly.github.io/spec/core/exec/numerics.html>, bounds/traps
 //// <https://webassembly.github.io/spec/core/exec/instructions.html> — cited per program inside
 //// each `.expected`.
+////
+//// ## Corpus input: `.ir` TEXT, not a `.wasm` binary
+////
+//// carder is now the BACKEND only — the WebAssembly frontend moved to the `scribbler` repo — so
+//// each program enters the `Driver` as UTF-8 `.ir` SOURCE TEXT from `test/carder/ir/corpus/`
+//// (parsed by `pipeline.parse_ir`) instead of as a `.wasm` binary. Every `.ir` was produced from
+//// the very same `.wasm` by the pre-split `to-ir`, and `wasm -> .beam` was measured
+//// byte-identical to `wasm -> .ir text -> .beam`, so these differentials compare the exact same
+//// compiled artifacts they always did. The `.expected` files are the ORIGINAL, byte-for-byte
+//// unchanged ones: they were always frontend-independent (export name + raw bit-pattern
+//// args/results + spec trap phrase), so the spec-correctness half of every proof is untouched.
 
-import carder/conformance/corpus.{
+import carder/harness/corpus.{
   type Expect, InstantiateTraps, Rejects, Returns, Traps,
 }
-import carder/conformance/driver
-import carder/conformance/ffi
-import carder/conformance/fixture.{
+import carder/harness/driver
+import carder/harness/ffi
+import carder/harness/fixture.{
   type SpecValue, F32Bits, F32Nan, F64Bits, F64Nan, I32Val, I64Val,
 }
-import carder/conformance/oracle
-import carder/conformance/runner.{type Driver, DriverError, Returned, Trapped}
+import carder/harness/oracle
+import carder/harness/runner.{type Driver, DriverError, Returned, Trapped}
 import carder/opt_level.{Aggressive, Baseline, OptNone}
 import carder/pipeline
 import carder/runtime/instance.{type Binding, Binding}
@@ -40,12 +51,12 @@ import gleam/list
 import gleam/result
 import gleam/string
 
-const corpus_dir = "test/carder/conformance/corpus"
+const corpus_dir = "test/carder/ir/corpus"
 
 /// Every Phase-1+Phase-2 acceptance-corpus program that carries a spec-sourced `.expected`
-/// (the authored `corpus/*.wat`). `growcap`/`iso`/`memloop` are excluded — they have no
-/// `.expected` and are driven by dedicated Phase-2 tests (Safe cap / isolation / constant
-/// space), not by a value oracle.
+/// (originally authored as `corpus/*.wat`, now checked in as `ir/corpus/*.ir`).
+/// `growcap`/`iso`/`memloop` are excluded — they have no `.expected` and are driven by dedicated
+/// Phase-2 tests (Safe cap / isolation / constant space), not by a value oracle.
 const corpus_programs: List(String) = [
   "add", "intops", "sum_to", "fib", "fac", "floatops", "hostimport", "mem",
   "callind", "gvar", "memgrow", "trunc", "trapstart", "oobdata",
@@ -145,7 +156,7 @@ pub fn safe_unsafe_differential_test() {
 /// `rt_meter` occurrences ANYWHERE. Together with proof 2 (the two `.core`s compute the same
 /// answers) this is F5's "differ exactly by the instrumentation".
 pub fn unsafe_zero_overhead_charge_test() {
-  let assert Ok(m) = pipeline.source_to_ir(read_bytes("sum_to"))
+  let assert Ok(m) = pipeline.parse_ir(read_ir_text("sum_to"))
   let assert Ok(safe_core) = pipeline.ir_to_core(m, profiles.safe())
   let assert Ok(unsafe_core) = pipeline.ir_to_core(m, profiles.unsafe())
 
@@ -169,7 +180,7 @@ pub fn unsafe_zero_overhead_charge_test() {
 ///   `.expected`). Total — never panics; a compile-stage rejection of a value program is itself a
 ///   recorded `Outcome` + failure, so a level that fails to build shows up in BOTH checks.
 fn evaluate(d: Driver, name: String) -> #(List(Outcome), List(String)) {
-  let assert Ok(bytes) = read_wasm(name)
+  let assert Ok(bytes) = read_ir(name)
   let assert Ok(text) = read_expected(name)
   let assert Ok(expects) = corpus.parse(text)
 
@@ -334,13 +345,21 @@ fn pipeline_at(binding: Binding) -> Driver {
 
 // ─────────────────────────────── fixture IO / text ───────────────────────────────
 
-fn read_wasm(name: String) -> Result(BitArray, String) {
-  ffi.read_file(corpus_dir <> "/" <> name <> ".wasm")
+/// The raw bytes of `ir/corpus/<name>.ir` — UTF-8 `.ir` SOURCE TEXT, which is what a `Driver`
+/// consumes (see the module doc). `Error(reason)` if the file is missing/unreadable.
+fn read_ir(name: String) -> Result(BitArray, String) {
+  ffi.read_file(corpus_dir <> "/" <> name <> ".ir")
 }
 
-fn read_bytes(name: String) -> BitArray {
-  let assert Ok(b) = read_wasm(name)
-  b
+/// `ir/corpus/<name>.ir` decoded to a `String`, for the one test that parses a module directly
+/// rather than through the `Driver`. `let assert Ok` is the contract — a missing or non-UTF-8
+/// corpus file is a broken checkout, not an expected path.
+fn read_ir_text(name: String) -> String {
+  let assert Ok(text) = {
+    use bytes <- result.try(read_ir(name))
+    bit_array.to_string(bytes) |> result.replace_error("non-UTF8 .ir source")
+  }
+  text
 }
 
 fn read_expected(name: String) -> Result(String, String) {

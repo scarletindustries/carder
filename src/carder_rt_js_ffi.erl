@@ -1,5 +1,5 @@
 %%% carder_rt_js_ffi — the JS-semantics engine behind `rt_js` (the `"js"`
-%%% capability boundary, Phase-8 unit 05 / HANDOFF-arc-frontend.md §4).
+%%% capability boundary, Phase-8 unit 05 / FRONTEND-API.md §4).
 %%%
 %%% Hand-written Erlang, so it carries the `carder_` namespace prefix
 %%% (overview §5) and can NEVER collide with an OTP module — exactly like

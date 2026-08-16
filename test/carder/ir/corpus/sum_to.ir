@@ -1,0 +1,24 @@
+module @carder@wasm@sum_to {
+  numerics true
+  memory none
+  export "sum_to" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v0) = values (i32.const 0)
+    let (%v1) = values (i32.const 0)
+    let (%v12, %v13) = block $lbl3 : (i32, i32) {
+      let (%v10, %v11) = loop $lbl6 (%v4:i32 = i32.const 1, %v5:i32 = i32.const 0) : (i32, i32) {
+        let (%v7) = num i.gt_s.32 (%v4, %p0)
+        if %v7 : (i32, i32) {
+          break $lbl3 (%v4, %v5)
+        } else {
+          let (%v8) = num i.add.32 (%v5, %v4)
+          let (%v9) = num i.add.32 (%v4, i32.const 1)
+          continue $lbl6 (%v9, %v8)
+        }
+      }
+      values (%v10, %v11)
+    }
+    values (%v13)
+  }
+}
+

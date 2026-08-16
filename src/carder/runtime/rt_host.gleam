@@ -48,11 +48,9 @@
 //// wired by `emit_core`'s `instantiate/0` (unit 09), which emits
 //// `rt_host:seed_policy(binding.host_policy)` alongside `rt_meter.seed_fuel`.
 
-import carder/ir.{type FuncType, FuncType, TF32, TF64, TI32, TI64}
 import carder/runtime/instance.{
   type HostPolicy, HostDenyAll, HostOpen, HostWhitelist,
 }
-import carder/runtime/porffor_abi
 import gleam/bit_array
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -85,8 +83,8 @@ fn erlang_get(key: k) -> Dynamic
 @external(erlang, "gleam_stdlib", "identity")
 fn coerce_policy(raw: Dynamic) -> HostPolicy
 
-/// Identity coercion of the stored Porffor output cell (`Dynamic`) back to a `BitArray`. Sound
-/// because `rt_host` is the SOLE producer of the term under `CarderRtPorfforOutput` (the same
+/// Identity coercion of the stored host output cell (`Dynamic`) back to a `BitArray`. Sound
+/// because `rt_host` is the SOLE producer of the term under `CarderRtHostOutput` (the same
 /// cell-coercion precedent as `coerce_policy`). Only reached for a seeded value; the unseeded
 /// `undefined` atom is guarded FIRST by `is_unseeded` (see `read_output_cell`).
 @external(erlang, "gleam_stdlib", "identity")
@@ -106,12 +104,12 @@ type Tag {
   CapabilityDenied
 }
 
-/// The process-dictionary key holding THIS instance's Porffor console output buffer (§E). As a
-/// 0-field Gleam constructor it compiles to the unique atom `carder_rt_porffor_output`,
+/// The process-dictionary key holding THIS instance's host output buffer (§E). As a
+/// 0-field Gleam constructor it compiles to the unique atom `carder_rt_host_output`,
 /// disjoint from the host-policy key, `rt_meter`'s fuel, and `rt_state`'s cell — so the buffer
 /// is per-instance (process-local) and GC'd with the instance's owned process (E1).
-type PorfOutKey {
-  CarderRtPorfforOutput
+type HostOutKey {
+  CarderRtHostOutput
 }
 
 /// A vetted host handler: raw WASM argument bit patterns (D5 — i32/i64/f32/f64 all `Int`) →
@@ -186,146 +184,13 @@ fn resolve_handler(
     // The Phase-3 host environment is deliberately minimal (F7/F8 add no host surface). This
     // single representative handler is deterministic + side-effect-free (tier-P), so it
     // neither perturbs the F2 optimizer differential nor introduces non-determinism, and it
-    // exercises the admit path end-to-end. The broad environment (spectest, the Porffor host
-    // shim) plugs into this same registry in Phase 5/6 — one new arm each, no dispatch change.
+    // exercises the admit path end-to-end. carder itself implements NO named host module: a
+    // frontend's host surface (the spec suite's `spectest`, a Porffor guest's `""` intrinsics,
+    // a TeaVM guest's `teavmJso`) is supplied as a `link.Provider.Namespace` in the frontend's
+    // own repo, whose handlers are closures the trusted embedder hands in — the same
+    // capability shape as `ProvidedFunc`, so nothing here has to know a producer's name.
     "env", "identity" -> Ok(fn(args) { args })
-    // ── Phase 5: the official `spectest` host module's `print*` family (R14, F8). Each
-    //    consumes its argument bit patterns and returns `[]` (the WASM result type `[]`), so it
-    //    is deterministic + node-safe (tier-P/O) and a no-op body is spec-adequate — the suite
-    //    NEVER asserts on print output. These are the DISPATCH face of `spectest`; their declared
-    //    signatures are the build-fixed `spectest_func_type` table below (link-matching, §C.3) —
-    //    the two literal cases MUST agree on this exact set of seven names. A `spectest` print is
-    //    still DENIED unless the instance's `HostPolicy` admits `#("spectest", name)`
-    //    (`profiles.safe_spectest()`), so the fail-closed conjunction is unchanged.
-    "spectest", "print" -> Ok(fn(_args) { [] })
-    "spectest", "print_i32" -> Ok(fn(_args) { [] })
-    "spectest", "print_i64" -> Ok(fn(_args) { [] })
-    "spectest", "print_f32" -> Ok(fn(_args) { [] })
-    "spectest", "print_f64" -> Ok(fn(_args) { [] })
-    "spectest", "print_i32_f32" -> Ok(fn(_args) { [] })
-    "spectest", "print_f64_f64" -> Ok(fn(_args) { [] })
-    // ── Phase 7: the Porffor runtime intrinsics (module ""), keyed on the build-fixed
-    //    creation-order ident LETTER (§A.3, Porffor 0.61.13 `precompile.js`/`wrap.js`).
-    //    print/printChar are SIDE-EFFECTING (append to this instance's output buffer, §E);
-    //    time/timeOrigin read a (deterministic) clock. Each is TOTAL + node-safe (tier-P/O),
-    //    so it perturbs no optimizer differential beyond the CallHost barrier already
-    //    respected. A literal `case` selecting a build-fixed closure written here — never a
-    //    data-derived target (D3a). An `""` name outside {a,b,c,d} falls through to deny.
-    "", "a" -> Ok(porffor_print)
-    // print      : (param f64) -> ()  — a number → its ECMAScript decimal string
-    "", "b" -> Ok(porffor_print_char)
-    // printChar  : (param f64) -> ()  — one UTF-16 code unit → its UTF-8 bytes
-    "", "c" -> Ok(porffor_time)
-    // time       : () -> (result f64) — performance.now() (deterministic 0.0, §B.2)
-    "", "d" -> Ok(porffor_time_origin)
-    // timeOrigin : () -> (result f64) — performance.timeOrigin (deterministic 0.0)
     _, _ -> Error(Nil)
-  }
-}
-
-/// The build-fixed Porffor-0.61.13 intrinsic ident letters (module `""`), in `createImport`
-/// creation order (§A.3, `compiler/builtins.js` `const ident = String.fromCharCode(97 +
-/// importedFuncs.length)`): `print → "a"`, `printChar → "b"`, `time → "c"`, `timeOrigin → "d"`.
-/// The LETTER is the stable identity (the assembler tree-shakes + re-orders the func *index*
-/// but emits each survivor's original ident verbatim, `assemble.js:184`). Named so the pin is
-/// legible and a Porffor version bump is a conscious one-line re-measure, never a silent
-/// mis-dispatch. `#(letter, builtin)`.
-pub const porffor_intrinsics: List(#(String, String)) = [
-  #("a", "print"),
-  #("b", "printChar"),
-  #("c", "time"),
-  #("d", "timeOrigin"),
-]
-
-/// `print` (Porffor `""."a"`, `i => print(i.toString())`). Appends the number's ECMAScript
-/// decimal string (`Number::toString(x, 10)`, §F) to THIS instance's output buffer (§E).
-/// `args` is `[raw_f64_bits]` (D5 — the f64 argument as its raw IEEE-754 64-bit pattern, an
-/// Erlang integer). Returns `[]` (WASM result type `[]`). Total; node-safe; NaN/±Inf/±0
-/// handled by `porffor_abi`. A defensive empty-arg call (impossible post-validation) is a
-/// no-op.
-fn porffor_print(args: List(Int)) -> List(Int) {
-  case args {
-    [bits, ..] -> {
-      append_output(porffor_abi.number_to_string_bytes(bits))
-      []
-    }
-    [] -> []
-  }
-}
-
-/// `printChar` (Porffor `""."b"`, `i => print(String.fromCharCode(i))`). Appends the single
-/// UTF-16 code unit `truncate(f64) & 0xFFFF`, UTF-8-encoded to match Node's `stdout.write`
-/// bytes (§E), to the output buffer. ALL Porffor static console text (string literals, the
-/// trailing `\n`, ANSI color escapes) flows through `printChar` — so capturing print +
-/// printChar captures the COMPLETE console byte stream (§E.2). `args` is `[raw_f64_bits]`.
-/// Returns `[]`. Total; node-safe.
-fn porffor_print_char(args: List(Int)) -> List(Int) {
-  case args {
-    [bits, ..] -> {
-      append_output(porffor_abi.char_code_to_utf8(bits))
-      []
-    }
-    [] -> []
-  }
-}
-
-/// `time` (Porffor `""."c"`, `() => performance.now()`). Returns `[raw_f64_bits]` of a
-/// DETERMINISTIC `0.0` ms — a fixed value (not the real BEAM clock) so a conformance run is
-/// reproducible (§B.2); a program whose output depends on `time`/`timeOrigin` is a categorized
-/// non-judgeable edge, never a false green. `0.0`'s raw pattern is `0`. Total; node-safe.
-fn porffor_time(_args: List(Int)) -> List(Int) {
-  [0]
-}
-
-/// `timeOrigin` (Porffor `""."d"`, `() => performance.timeOrigin`). Returns `[raw_f64_bits]`
-/// of a DETERMINISTIC `0.0` (same reproducibility rationale as `time`). Total; node-safe.
-fn porffor_time_origin(_args: List(Int)) -> List(Int) {
-  [0]
-}
-
-/// The build-fixed `FuncType` of a Porffor intrinsic (module `""`, keyed on the ident letter,
-/// §A.3), the signature face of the four builtins (analogue of `spectest_func_type/1`). A
-/// literal `case` (D3a). `print`/`printChar` are `[f64] -> []`; `time`/`timeOrigin` are
-/// `[] -> [f64]`.
-///
-/// - `letter`: the imported function name under module `""` (`"a"`/`"b"`/`"c"`/`"d"`).
-/// - Returns `Ok(ty)` for a known letter, `Error(Nil)` otherwise. A DIAGNOSTIC/categorization
-///   aid (not a hard link check — Phase-6 gates host imports at the call-site `HostPolicy`, not
-///   at link, so a signature-mismatched Porffor import is a categorizable mismatch, never a
-///   silent accept). Total; never raises.
-pub fn porffor_func_type(letter: String) -> Result(FuncType, Nil) {
-  case letter {
-    "a" | "b" -> Ok(FuncType(params: [TF64], results: []))
-    "c" | "d" -> Ok(FuncType(params: [], results: [TF64]))
-    _ -> Error(Nil)
-  }
-}
-
-/// The build-fixed `FuncType` of a `spectest` host FUNCTION, for link-time import matching
-/// (spec §3.2 function matching / §4.5.4 — a missing or mismatched function import is an
-/// `assert_unlinkable`, §C.3). A literal `case` (D3a — no ambient authority; `name` selects
-/// among build-controlled results, never constructs a target), the LINKING face of the same
-/// seven `spectest` functions the `resolve_handler` arms above DISPATCH; the two literal cases
-/// are kept in lock-step (identical name set).
-///
-/// The reference `spectest` module's signatures (the spec's `imports.wast` host module):
-/// `print : [] -> []`, `print_i32 : [i32] -> []`, `print_i64 : [i64] -> []`,
-/// `print_f32 : [f32] -> []`, `print_f64 : [f64] -> []`, `print_i32_f32 : [i32 f32] -> []`,
-/// `print_f64_f64 : [f64 f64] -> []`.
-///
-/// - `name`: the imported function name under module `"spectest"`.
-/// - Returns `Ok(ty)` for a known `spectest` function (its declared signature), or `Error(Nil)`
-///   otherwise (→ the link resolver's `UnknownImport`). Total; never raises.
-pub fn spectest_func_type(name: String) -> Result(FuncType, Nil) {
-  case name {
-    "print" -> Ok(FuncType(params: [], results: []))
-    "print_i32" -> Ok(FuncType(params: [TI32], results: []))
-    "print_i64" -> Ok(FuncType(params: [TI64], results: []))
-    "print_f32" -> Ok(FuncType(params: [TF32], results: []))
-    "print_f64" -> Ok(FuncType(params: [TF64], results: []))
-    "print_i32_f32" -> Ok(FuncType(params: [TI32, TF32], results: []))
-    "print_f64_f64" -> Ok(FuncType(params: [TF64, TF64], results: []))
-    _ -> Error(Nil)
   }
 }
 
@@ -381,47 +246,50 @@ fn deny(capability: String, name: String) -> List(Int) {
   erlang_error(#(CapabilityDenied, capability, name))
 }
 
-// ───────────────────────────── Phase-7: the Porffor console output buffer (§E) ─────────────────────────────
+// ───────────────────────────── the per-instance host output buffer (§E) ─────────────────────────────
 
-/// Read THIS process's accumulated Porffor output buffer, or `<<>>` if never written. The
+/// Read THIS process's accumulated host output buffer, or `<<>>` if never written. The
 /// `is_unseeded` guard runs FIRST (the same fail-safe as `current_policy`): `erlang:get/1`
 /// yields the atom `undefined` for an absent key, treated as the empty buffer — so a
 /// never-printed (or unseeded) instance reads `<<>>`, never a crash. Private.
 fn read_output_cell() -> BitArray {
-  let raw = erlang_get(CarderRtPorfforOutput)
+  let raw = erlang_get(CarderRtHostOutput)
   case is_unseeded(raw) {
     True -> <<>>
     False -> coerce_bitarray(raw)
   }
 }
 
-/// Append `bytes` to THIS instance's Porffor output buffer (the `print`/`printChar` sink, §B).
-/// Reads the current buffer (or `<<>>` if unseeded — the buffer self-initialises empty per
-/// instance process, so no explicit seed is required), appends, and stores. Private — only the
-/// two print handlers call it. Total; process-local; cannot crash the node.
-fn append_output(bytes: BitArray) -> Nil {
+/// Append `bytes` to THIS instance's host output buffer — the sink a frontend's `print`-style
+/// host handler writes to (e.g. scribbler's Porffor `print`/`printChar` intrinsics). Reads the
+/// current buffer (or `<<>>` if unseeded — the buffer self-initialises empty per instance
+/// process, so no explicit seed is required), appends, and stores.
+///
+/// PUBLIC because the handlers that write to it live in the FRONTEND's repo now, while the
+/// buffer itself must live here: it is process-local to the instance's owned process (E1) and
+/// is drained through carder's own run-ABI (`pipeline.host_output`). Total; process-local;
+/// cannot crash the node — it grants no authority beyond appending bytes to a pdict cell that
+/// is GC'd with the instance.
+pub fn append_output(bytes: BitArray) -> Nil {
   let _ =
-    erlang_put(
-      CarderRtPorfforOutput,
-      bit_array.append(read_output_cell(), bytes),
-    )
+    erlang_put(CarderRtHostOutput, bit_array.append(read_output_cell(), bytes))
   Nil
 }
 
-/// Clear THIS instance's Porffor output buffer to `<<>>`. Provided for an explicit reset (and
-/// for tests); NOT required at instantiate because `append_output` self-initialises the buffer
+/// Clear THIS instance's host output buffer to `<<>>`. Provided for an explicit reset (and for
+/// tests); NOT required at instantiate because `append_output` self-initialises the buffer
 /// empty in each instance's fresh owned process (E1). Total; process-local; cannot crash the
 /// node.
-pub fn porffor_seed_output() -> Nil {
-  let _ = erlang_put(CarderRtPorfforOutput, <<>>)
+pub fn host_output_seed() -> Nil {
+  let _ = erlang_put(CarderRtHostOutput, <<>>)
   Nil
 }
 
-/// Read THIS instance's accumulated Porffor console output as a raw `BitArray` — the exact byte
-/// stream `print`/`printChar` produced (§E), including ANSI escapes (baked in-band, §E.2). Must
-/// run IN the instance's owned process (the buffer is process-local, E1), so the harness routes
-/// a call into that process to collect it (§H.2). Returns `<<>>` for a never-printed (or
-/// unseeded) instance — fail-safe empty, never a crash. Total.
-pub fn porffor_output() -> BitArray {
+/// Read THIS instance's accumulated host output as a raw `BitArray` — the exact byte stream a
+/// frontend's `print`-style handlers produced, including any ANSI escapes (baked in-band).
+/// Must run IN the instance's owned process (the buffer is process-local, E1), so a caller
+/// routes a call into that process to collect it (`pipeline.host_output`). Returns `<<>>` for a
+/// never-printed (or unseeded) instance — fail-safe empty, never a crash. Total.
+pub fn host_output() -> BitArray {
   read_output_cell()
 }

@@ -127,8 +127,9 @@ memories run paged.
 Measured on the Phase-4 reference machine (Apple M2 Pro, macOS, OTP 29 / erts 17.0.2, dev `clang`),
 the smoke `carder_smoke.wasm` (CRC-32 / SHA-256 / DEFLATE real crates) held **fixed**, only the linked
 `Binding` varied, each build **correctness-gated bit-exact vs `wasmtime` before it was timed**.
-Reproduce with `./smoke/bench.sh 100 1024 300` (the `nif` column is compiled out of band and gated;
-absent `cc` it is a categorized dash). See `docs/phase-4-benchmark.md` for the full frame. The figures
+Reproduce with `./smoke/bench.sh 100 1024 300` **from the scribbler repo** (the harness is a wasm
+differential and moved with the frontend; the `nif` column is compiled out of band and gated, absent
+`cc` it is a categorized dash). See `docs/phase-4-benchmark.md` for the full frame. The figures
 below are a single same-run measurement, which reproduced the committed Phase-4 columns within
 run-to-run variance (±~10%, light machine load).
 
@@ -213,11 +214,21 @@ gleam test -- carder/runtime/rt_mem_nif_safety_test  # the C bounds-check securi
 gleam test -- carder/backend/emit_unchecked          # tier-N emits unchecked (the S15-03 flip)
 gleam test -- carder/tier/tier_differential          # the whole-corpus cell_nif tier differential (native)
 gleam test                                            # the full suite (native rows under cc; categorized-skip without)
+
+# …and, from a scribbler checkout (the harness moved there with the wasm frontend):
 ./smoke/bench.sh 100 1024 300                         # the measured nif column (out-of-band .so; dash without cc)
 ```
 
+**Reproduction is cross-repo now.** The `gleam test` rows above are carder's. `smoke/bench.sh` is a
+wasm differential — it cargo-builds the Rust crate to wasm, gates it import-free/MVP-only with
+`wasm-tools`, and cross-checks against `wasmtime` — so it lives in the **scribbler** repo and drives
+scribbler's `build` verb (it was `to-beam-wasm` when these numbers were taken) plus carder's `exec -n`
+for the timing. The tier-N `.so` is still compiled **out of band** from carder's
+`c_src/carder_rt_mem_nif.c`, which — with carder as a Gleam dependency — is unpacked at
+`build/packages/carder/c_src/`.
+
 The native-differential rows are **`cc`-dependent**: under CI `gcc` / dev `clang` they run against the
 real `.so`; with no `cc` they categorized-skip. The conformance headline (`47,734 / 683 / 0`,
-`fail == 0`) is unchanged either way.
+`fail == 0`) is unchanged either way — that triple is now measured and reported in the scribbler repo.
 </content>
 </invoke>

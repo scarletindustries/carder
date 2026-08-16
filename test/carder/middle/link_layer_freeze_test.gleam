@@ -27,6 +27,13 @@ import simplifile
 /// The compiler layers a clean runtime must never reach. A runtime module importing any of these
 /// module roots — or any submodule beneath one (`carder/middle/ir_opt`, `carder/backend/emit_core`,
 /// …) — is exactly the layering inversion Phase 11 removes and freezes shut.
+///
+/// `carder/frontend` is KEPT DELIBERATELY even though carder no longer contains that directory
+/// (the WebAssembly frontend was extracted into the `scribbler` repo). Dropping it would silently
+/// delete a third of this guard's coverage: the invariant being frozen is "the runtime imports no
+/// SOURCE-LANGUAGE frontend", and a future frontend re-landing under `src/carder/frontend/` must
+/// be caught the moment a runtime module reaches into it. An entry naming a directory that does
+/// not exist costs nothing — it simply never matches — so this stays as belt-and-braces.
 const compiler_layers = [
   "carder/frontend",
   "carder/middle",

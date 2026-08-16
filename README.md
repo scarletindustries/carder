@@ -10,51 +10,76 @@ Compiler backend that targets the BEAM.
 
 > this is a large experimental project. the mass majority of  the code was written by claude. no promises made. definitely don't use it in anything production as it's pretty slow right now (that will be fixed in the future)
 
-carder is an attempt to compile WASM to run on the BEAM, where the output is Core Erlang. This isn't a WASM VM, rather, it's trying to actually "convert" the code as much as possible & optimise it for BEAM behaviour and functional programming concepts.
+carder takes a shared, language-neutral IR and compiles it to Core Erlang, then to a real `.beam` you can load and call. this isn't a VM — it's trying to actually "convert" the code as much as possible & optimise it for BEAM behaviour and functional programming concepts.
 
-it works right now! kinda. a good amount of wasm will compile and run in the BEAM, with the supported WASM spec growing everyday. carder has its own IR, and as such supports multiple frontends. WASM is just the first. JS is in the works via [Porffor](https://github.com/CanadaHonk/porffor) (js -> wasm -> beam).
+carder is only the **backend**. it has its own IR, and frontends live in their own repos:
+
+| frontend | source language | repo |
+|---|---|---|
+| [scribbler](https://github.com/scarletindustries/scribbler) | WebAssembly | `wasm -> carder ir` |
+| [arc](https://github.com/alii/arc) | JavaScript | `js -> carder ir` |
+
+a frontend lowers its source into `carder/ir` and hands the module to `carder/pipeline`. carder owns everything from there down — the policy pass, the optimizer, Core Erlang codegen, the linker, and the BEAM runtime the emitted code calls into. **no wasm and no js lives in this repo.**
 
 ### why?
 
-in theory since this is just going to Core Erlang, and can operate without any [NIF](https://www.erlang.org/doc/system/nif.html) usage, the code runs preemptively. this is also just fun. I've done a lot of reading over the past few months on compilers, and have many optimisation methods planned. 
+in theory since this is just going to Core Erlang, and can operate without any [NIF](https://www.erlang.org/doc/system/nif.html) usage, the code runs preemptively. this is also just fun. I've done a lot of reading over the past few months on compilers, and have many optimisation methods planned.
 
 ### how?
-`wasm -> ir -> core erlang -> beam`
+`ir -> core erlang -> beam`
 
-the js path is `js -> wasm (via Porffor) -> ir -> core erlang -> beam` 
+with a frontend in front of it that's `wasm -> ir -> core erlang -> beam` (scribbler) or `js -> ir -> core erlang -> beam` (arc).
 
 memory is a little messy right now. there are a number of modes the compiler can run in which changes how memory is allocated and accessed. throughout the code and the cli
-you will see three modes referenced: (p, o, n). p = pure. runs anywhere. o = uses otp-specifics (atomics), n = custom nif (not built yet).
+you will see three modes referenced: (p, o, n). p = pure. runs anywhere. o = uses otp-specifics (atomics), n = custom nif.
 
-the custom nif will be the fastest, since it gives a full escape hatch to BEAM-fundamentals. but a) it's not as cool, b) it risks crashing the node.
+the custom nif is the fastest, since it gives a full escape hatch to BEAM-fundamentals. but a) it's not as cool, b) it risks crashing the node.
 ideally some optimisations i have planned will close the gap as much as possible. using o mode over p results in a 2-4x speedup right now.
 
 ### let me try it
 
-there is a pretty big corpus of wasm files scattered across the code for testing if you don't have one to hand. for example,
+there's a corpus of `.ir` programs under `test/carder/ir/corpus/` if you don't have one to hand. for example,
 give this a try:
 
 ```shell
-$ gleam run -- run test/carder/conformance/corpus/add.wasm add 3 5
+$ gleam run -- run test/carder/ir/corpus/add.ir add 3 5
 8
 ```
 
-this command is the "all in one", it'll take the wasm, conver it to the ir, turn that into core erlang, then compile it to beam, then load that module and run it.
-the WAT for this file is as follows:
+this command is the "all in one", it'll take the ir, turn it into core erlang, compile it to beam, load that module and run it.
+the `.ir` for that file is:
 
-```webassembly
-;; add(i32,i32) — direct numeric op, params, export, end-to-end plumbing.
-;; mul exercises i32 two's-complement WRAP through codegen (i32.mul is mod 2^32).
-(module
-  (func (export "add") (param i32 i32) (result i32)
-    (i32.add (local.get 0) (local.get 1)))
-  (func (export "mul") (param i32 i32) (result i32)
-    (i32.mul (local.get 0) (local.get 1))))
+```
+module @carder@wasm@add {
+  numerics true
+  memory none
+  export "add" = @f0
+  export "mul" = @f1
+  func @f0 (%p0:i32, %p1:i32) -> (i32) {
+    let (%v1) = num i.add.32 (%p0, %p1)
+    values (%v1)
+  }
+  func @f1 (%p0:i32, %p1:i32) -> (i32) {
+    let (%v1) = num i.mul.32 (%p0, %p1)
+    values (%v1)
+  }
+}
 ```
 
-(so we're calling the add export with params 3 and 5 for the two i32's)
+(so we're calling the add export with params 3 and 5 for the two i32's — arguments and results are raw unsigned bit patterns, so an i32 `-1` is written `4294967295`)
 
-you can also print out each stage of the pipeline. it's all modular. run `gleam run -- help` to see all the commands (e.g. dump the ir, dump the .core, just export to .beam)
+you can also print out each stage of the pipeline. it's all modular. run `gleam run -- help` to see all the commands (e.g. run the policy pass, run just the optimizer, dump the `.core`, dump the erlang abstract forms, or just export to `.beam`).
+
+### writing a frontend
+
+[`specs/FRONTEND-API.md`](specs/FRONTEND-API.md) is the authoritative interface: the value model, the calling convention, every IR node you can emit, and how to lower common constructs. the short version is that you produce a `carder/ir.Module` and call:
+
+```gleam
+pipeline.compile_ir(module, binding)   // -> loadable .beam bytes
+pipeline.run_ir(module, binding, export, args)  // -> compile + run it
+```
+
+`carder/cli` publishes the shared CLI vocabulary (the `--unsafe`/`--portable`/`--tier`/`--cap`/… axis flags and the raw-bit value formatting) so your frontend's binary speaks exactly the same posture language as carder's, and `carder/embed` is the embedder API for running a compiled guest inside a host BEAM program.
 
 ### contributing
 

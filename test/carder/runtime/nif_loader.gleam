@@ -18,11 +18,11 @@
 ////
 //// ## The keystone-probe constraint — why `binding_for` must NOT force a load (`reuse_if_available`)
 ////
-//// gleeunit runs test modules in `filelib:wildcard` (sorted-by-path) order, so `carder/conformance/*`
+//// gleeunit runs test modules in `filelib:wildcard` (sorted-by-path) order, so `carder/harness/*`
 //// runs BEFORE `carder/runtime/rt_mem_nif_build_test` (the S15-01 keystone probe) — which force-reloads
 //// the shim with a `nif_ping`-only probe `.so` whose `load` callback opens the resource type with
 //// `ERL_NIF_RT_CREATE` **only** (not `TAKEOVER`). `enif_open_resource_type(CREATE)` FAILS while ANY
-//// resource of that type is live — and the conformance harness (`carder_conformance_ffi:start_common`)
+//// resource of that type is live — and the conformance harness (`carder_harness_ffi:start_common`)
 //// spawns each instance in an UNLINKED orphan process (`spawn`, one-instance-one-process, E5) that holds
 //// its memory forever. So if the conformance `cell_nif` matrix FORCE-LOADED the native `.so`, its leaked
 //// resources would permanently block the keystone probe's reload (`load_nif_failed`). Neither the probe

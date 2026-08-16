@@ -1,1 +1,0 @@
-(module (tag $e) (func (try (do) (catch $e) (delegate 0))))

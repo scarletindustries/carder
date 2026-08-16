@@ -1,4 +1,4 @@
-//// Phase 11 · P11-04 — tests for the `--link` pre-link fail-closed gate (`carder.link_gate/2`).
+//// Phase 11 · P11-04 — tests for the `--link` pre-link fail-closed gate (`cli.link_gate/2`).
 ////
 //// These assert the DEFINED gate contract from `specs/phase-11/RECONCILIATION.md` (R13/R14) and
 //// `04-cli-and-gate.md` (O4/O8) — NOT whatever the code happens to return. The gate is a PURE
@@ -10,7 +10,7 @@
 ////   - an import-bearing module is rejected (R14) — a bare node has no import providers;
 ////   - a tier-P (Safe/Paged) and a tier-O (Atomics) import-free module are admitted.
 
-import carder
+import carder/cli
 import carder/ir
 import carder/runtime/instance.{type Binding, Binding, Nif}
 import carder/runtime/profiles
@@ -52,8 +52,8 @@ fn unsafe_nif_binding() -> Binding {
 /// the ordinary non-linked build path). A NIF cannot be merged into a `.beam`.
 pub fn gate_rejects_nif_tier_test() {
   let binding = unsafe_nif_binding()
-  assert carder.link_gate(binding, module_with_imports([]))
-    == Error(carder.LinkTierNif)
+  assert cli.link_gate(binding, module_with_imports([]))
+    == Error(cli.LinkTierNif)
   // The load-bearing R13 pin: link/1 admits the identical binding (it is a valid runtime posture).
   let assert Ok(_) = profiles.link(binding)
 }
@@ -67,13 +67,13 @@ pub fn gate_rejects_nif_tier_test() {
 pub fn gate_rejects_import_bearing_test() {
   let fn_import =
     module_with_imports([ir.ImportFn("env", "log", ir.FuncType([ir.TI32], []))])
-  assert carder.link_gate(profiles.safe(), fn_import)
-    == Error(carder.LinkImportBearing(1))
+  assert cli.link_gate(profiles.safe(), fn_import)
+    == Error(cli.LinkImportBearing(1))
 
   let global_import =
     module_with_imports([ir.ImportGlobal("env", "g", ir.TI32, False)])
-  assert carder.link_gate(profiles.safe(), global_import)
-    == Error(carder.LinkImportBearing(1))
+  assert cli.link_gate(profiles.safe(), global_import)
+    == Error(cli.LinkImportBearing(1))
 }
 
 // ═══════════════════════ 3. tier-P / tier-O import-free admitted — O4/O8 ═══════════════════════
@@ -83,8 +83,8 @@ pub fn gate_rejects_import_bearing_test() {
 /// `imports` (empty), so both return `Ok(Nil)` and hand off to the linker.
 pub fn gate_admits_import_free_tier_po_test() {
   // tier-P — the fail-closed default.
-  assert carder.link_gate(profiles.safe(), module_with_imports([])) == Ok(Nil)
+  assert cli.link_gate(profiles.safe(), module_with_imports([])) == Ok(Nil)
   // tier-O — Atomics, bounded cap (the cap is irrelevant to the gate, which only sees the tier).
   let tier_o = Binding(..profiles.ceiling(), safe_max_pages: 16)
-  assert carder.link_gate(tier_o, module_with_imports([])) == Ok(Nil)
+  assert cli.link_gate(tier_o, module_with_imports([])) == Ok(Nil)
 }

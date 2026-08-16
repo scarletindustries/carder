@@ -186,7 +186,7 @@ write_extra(Extra) ->
 %%       Threaded: `element(1, apply(M,F,[St|Args]))`), print `RESULT:` and halt 0; any
 %%       trap is caught, printed as `TRAP:` and halt 0 (a trap is NOT an isolation
 %%       failure). Mirrors the cell/threaded self-detection in
-%%       `carder_conformance_ffi:start_common/2`.
+%%       `carder_harness_ffi:start_common/2`.
 runner(ModuleName, Fun, Args) ->
     MStr = io_lib:format("~w", [ModuleName]),
     FStr = io_lib:format("~w", [Fun]),
@@ -208,7 +208,7 @@ runner(ModuleName, Fun, Args) ->
 %% Drain the child port's stdout/stderr into one binary until it exits, bounded by
 %% `Deadline` (monotonic ms). On the deadline the port is force-closed and `{124, …}`
 %% is returned so a hung child cannot block the suite. Mirrors
-%% `carder_conformance_ffi:collect/2`, plus the bound.
+%% `carder_harness_ffi:collect/2`, plus the bound.
 collect(Port, Acc, Deadline) ->
     Remaining = erlang:max(0, Deadline - erlang:monotonic_time(millisecond)),
     receive

@@ -1,0 +1,52 @@
+module @carder@wasm@isnull {
+  numerics true
+  memory none
+  table @t0 min 3
+  export "isnull" = @f1
+  export "call0" = @f2
+  export "callnull" = @f3
+  export "size" = @f4
+  export "setcall" = @f5
+  export "grow2" = @f6
+  export "fill1" = @f7
+  elem @t0 (values (i32.const 0)) [@f0]
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = num i.add.32 (%p0, i32.const 1)
+    values (%v1)
+  }
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = table.get @t0 %p0
+    let (%v2) = ref.is_null %v1
+    values (%v2)
+  }
+  func @f2 (%p0:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [i32.const 0] : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+  func @f3 (%p0:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [i32.const 2] : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+  func @f4 () -> (i32) {
+    let (%v1) = table.size @t0
+    values (%v1)
+  }
+  func @f5 (%p0:i32) -> (i32) {
+    let (%v1) = ref.func @f0
+    let () = table.set @t0 i32.const 1 %v1
+    let (%v2) = call_indirect @t0 [i32.const 1] : (i32) -> (i32) (%p0)
+    values (%v2)
+  }
+  func @f6 () -> (i32) {
+    let (%v1) = table.grow @t0 i32.const 2 null.funcref
+    values (%v1)
+  }
+  func @f7 () -> (i32) {
+    let (%v1) = ref.func @f0
+    let () = table.fill @t0 i32.const 1 %v1 i32.const 1
+    let (%v2) = table.get @t0 i32.const 1
+    let (%v3) = ref.is_null %v2
+    values (%v3)
+  }
+}
+

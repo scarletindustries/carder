@@ -1,0 +1,18 @@
+module @carder@wasm@fac {
+  numerics true
+  memory none
+  export "fac" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = num i.lt_s.32 (%p0, i32.const 2)
+    let (%v6) = if %v1 : (i32) {
+      values (i32.const 1)
+    } else {
+      let (%v3) = num i.sub.32 (%p0, i32.const 1)
+      let (%v4) = call @f0 (%v3)
+      let (%v5) = num i.mul.32 (%p0, %v4)
+      values (%v5)
+    }
+    values (%v6)
+  }
+}
+

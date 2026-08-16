@@ -480,39 +480,57 @@ pub fn no_accidental_unsafe_or_nif_by_omission_test() {
   )
 }
 
-// ── Phase-5: the `spectest` import-capable Safe binding (§G, R14) ──────────────────
+// ── The host-capable Safe posture: a whitelist is Safe, not an Unsafe opt-out (§G, R14) ──
+//
+// carder used to ship named host-capable profiles (`safe_spectest`/`porffor`/`js`) whose allow
+// lists enumerated a particular guest language's host module. Those lists are the FRONTEND's
+// (they moved to the `scribbler` repo with the WebAssembly frontend, which asserts their exact
+// contents). What carder still owns is the general posture property those profiles relied on,
+// pinned here against an arbitrary caller-supplied allow list: whitelisting named capabilities
+// keeps a binding **Safe** — it is a narrowing of deny-all, never a step towards `HostOpen`.
 
-/// `spectest_allow()` is EXACTLY the seven `#("spectest", print*)` pairs — the official host
-/// module's function set (spec's `imports.wast`), a literal build-fixed list (D3a), nothing more.
-pub fn spectest_allow_is_the_seven_prints_test() {
-  assert profiles.spectest_allow()
-    == [
-      #("spectest", "print"),
-      #("spectest", "print_i32"),
-      #("spectest", "print_i64"),
-      #("spectest", "print_f32"),
-      #("spectest", "print_f64"),
-      #("spectest", "print_i32_f32"),
-      #("spectest", "print_f64_f64"),
-    ]
+/// A Safe binding that whitelists named host capabilities stays SAFE. Spreading an arbitrary
+/// `HostWhitelist` over `profiles.safe()` changes `host_policy` and NOTHING else: `mode` is still
+/// `Safe`, every other policy field is the Safe default, the policy is NOT `HostOpen` (so every
+/// unlisted capability keeps denying, D4/D9), and the binding still links cleanly (no tier/module
+/// divergence is introduced). This is why a host-importing guest never needs `unsafe()`.
+pub fn host_whitelist_is_a_safe_posture_test() {
+  let allow = [#("env", "identity"), #("host", "print_i32")]
+  let b = Binding(..profiles.safe(), host_policy: HostWhitelist(allow))
+
+  assert b.mode == Safe
+  assert b.host_policy == HostWhitelist(allow)
+  // Identical to safe() apart from the host policy — a whitelist is not a bundle of opt-outs.
+  assert b == Binding(..profiles.safe(), host_policy: HostWhitelist(allow))
+  assert b.opt_level == profiles.safe().opt_level
+  assert b.meter == profiles.safe().meter
+  assert b.bif_gate == profiles.safe().bif_gate
+  assert b.stdlib == profiles.safe().stdlib
+  assert b.mem_tier == profiles.safe().mem_tier
+  // Narrowing, not opening: everything outside the list stays fail-closed.
+  assert b.host_policy != HostOpen
+  assert b.host_policy != HostDenyAll
+  // It links cleanly (only host_policy changed).
+  assert profiles.link(b) == Ok(profiles.instantiate(b))
 }
 
-/// `safe_spectest()` is a **Safe** posture that whitelists exactly the `spectest` prints — a
-/// `HostWhitelist(spectest_allow())`, NEVER `HostOpen`. It differs from `safe()` ONLY in
-/// `host_policy`; mode and every other policy field are the Safe defaults (fail-closed — it is not
-/// an Unsafe opt-out).
-pub fn safe_spectest_is_safe_whitelist_test() {
-  let b = profiles.safe_spectest()
-  assert b.mode == Safe
-  assert b.host_policy == HostWhitelist(profiles.spectest_allow())
-  // Identical to safe() apart from the host policy.
-  assert b
-    == Binding(
-      ..profiles.safe(),
-      host_policy: HostWhitelist(profiles.spectest_allow()),
-    )
-  // Not HostOpen — a spectest-importing module stays fail-closed for everything else.
-  assert b.host_policy != HostOpen
-  // It links cleanly (only host_policy changed, no tier/module divergence).
-  assert profiles.link(b) == Ok(profiles.instantiate(b))
+/// The complement, fail-closed: NO `profiles` constructor ships `HostOpen` except the two Unsafe
+/// ones. Every Safe-family constructor is `HostDenyAll` out of the box — host authority is opt-in
+/// per capability (a `HostWhitelist` a caller composes), never granted by omission (D4/D9).
+pub fn safe_family_defaults_to_deny_all_host_test() {
+  list.each(
+    [
+      profiles.safe(),
+      profiles.safe_capped(3),
+      profiles.safe_metered(1000),
+      instance.safe_default(),
+      profiles.portable(),
+    ],
+    fn(b) {
+      assert b.host_policy == HostDenyAll
+    },
+  )
+  // The two Unsafe constructors are the only ones that ship an open host.
+  assert profiles.unsafe().host_policy == HostOpen
+  assert profiles.ceiling().host_policy == HostOpen
 }

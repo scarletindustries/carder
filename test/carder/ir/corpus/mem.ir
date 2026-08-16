@@ -1,0 +1,26 @@
+module @carder@wasm@roundtrip {
+  numerics true
+  memory (min 1)
+  export "roundtrip" = @f0
+  export "load" = @f1
+  export "store" = @f2
+  export "load8" = @f3
+  func @f0 (%p0:i32, %p1:i32) -> (i32) {
+    let () = mem.store 4 %p0 %p1 offset=0
+    let (%v1) = mem.load i32 4 %p0 offset=0
+    values (%v1)
+  }
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = mem.load i32 4 %p0 offset=0
+    values (%v1)
+  }
+  func @f2 (%p0:i32, %p1:i32) -> () {
+    let () = mem.store 4 %p0 %p1 offset=0
+    values ()
+  }
+  func @f3 (%p0:i32) -> (i32) {
+    let (%v1) = mem.load i32 1 %p0 offset=0
+    values (%v1)
+  }
+}
+

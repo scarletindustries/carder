@@ -1,0 +1,12 @@
+module @carder@wasm@spin {
+  numerics true
+  memory none
+  export "spin" = @f0
+  func @f0 () -> () {
+    let () = loop $lbl1 () : () {
+      continue $lbl1 ()
+    }
+    values ()
+  }
+}
+

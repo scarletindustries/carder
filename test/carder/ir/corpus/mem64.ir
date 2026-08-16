@@ -1,0 +1,36 @@
+module @carder@wasm@size {
+  numerics true
+  memory i64 (min 1)
+  export "size" = @f0
+  export "grow_over" = @f1
+  export "grow_big" = @f2
+  export "st_ld" = @f3
+  export "load_hi" = @f4
+  export "oob" = @f5
+  func @f0 () -> (i64) {
+    let (%v1) = mem.size
+    values (%v1)
+  }
+  func @f1 () -> (i64) {
+    let (%v1) = mem.grow i64.const 4294967296
+    values (%v1)
+  }
+  func @f2 () -> (i64) {
+    let (%v1) = mem.grow i64.const 65537
+    values (%v1)
+  }
+  func @f3 () -> (i64) {
+    let () = mem.store 8 i64.const 4294967336 i64.const 81985529216486895 offset=0
+    let (%v1) = mem.load i64 8 i64.const 4294967336 offset=0
+    values (%v1)
+  }
+  func @f4 () -> (i64) {
+    let (%v1) = mem.load i64 8 i64.const 4294967296 offset=0
+    values (%v1)
+  }
+  func @f5 () -> (i64) {
+    let (%v1) = mem.load i64 8 i64.const 4295098368 offset=0
+    values (%v1)
+  }
+}
+

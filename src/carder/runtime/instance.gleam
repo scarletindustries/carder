@@ -239,7 +239,7 @@ pub type DirectHost {
 ///   A `CallHost("js", op, args)` routes to a BUILD-FIXED function in THIS module via a literal
 ///   `case` in `emit_core` (never `apply(Mod,Fn,Args)` from data, D3a). Defaulted to the
 ///   `carder@runtime@rt_js` stub; the real `rt_js` (all JS semantics) is the frontend team's
-///   deliverable (see `specs/phase-8/HANDOFF-arc-frontend.md §4`). Inert for any module that
+///   deliverable (see `specs/phase-8/FRONTEND-API.md §4`). Inert for any module that
 ///   never emits a `"js"` `CallHost` (conformance-neutral, K7).
 /// - `safe_max_pages`: the build-time Safe max-pages cap (E3) `emit_core` bakes into the
 ///   `instantiate/0` entry's `rt_mem:fresh(min, max, safe_cap)` call, so `memory.grow`

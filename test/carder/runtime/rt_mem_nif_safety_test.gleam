@@ -31,7 +31,7 @@
 ////   outside the buffer crashes the test (→ red) or diverges the flat image from the memory-safe paged
 ////   reference (→ red).
 
-import carder
+import carder/cli
 import carder/ir.{type TrapReason, MemoryOutOfBounds}
 import carder/runtime/instance.{type Binding, Binding, Nif}
 import carder/runtime/nif_loader.{BuildError, Loaded, SkipNoToolchain}
@@ -389,7 +389,8 @@ pub fn all_or_nothing_bulk_and_simd_test() {
 /// exec/modules — an active-data segment whose `offset + len` exceeds the memory length traps "out of
 /// bounds memory access"; exec/instructions — the write "is not performed" on a trap.
 ///
-/// The bug: an IMPORTED memory is built with the PAGED tier UNCONDITIONALLY (`link.spectest_export`), so
+/// The bug: an IMPORTED memory is built with the PAGED tier by its embedder-supplied
+/// `link.Provider` (`rt_mem.fresh`, tier-agnostic), so
 /// under a LOADED `.so` the `mem` slot can hold a paged `Mem` (a tuple) even though `nif_available()` is
 /// `true`. Handing that FOREIGN handle to the C `enif_get_resource` fails with `badarg`, NOT the WASM
 /// trap — exactly `data.wast` lines 274/305/320 (imported spectest memory, offsets `0x1_0000` / `-1`).
@@ -769,7 +770,7 @@ pub fn boundary_differential_seed_c_test() {
 // ═══════════════════════════ 6. The four Safe-forbidden gates + the L1 exclusion (S5, read-only) ═══════════════════════════
 //
 // (Test §5.6.) This phase adds capability, NOT posture: `Safe + nif` and `--link + nif` remain
-// IMPOSSIBLE. These are pure `profiles`/`carder` reads (no NIF, no ownership conflict), so the security
+// IMPOSSIBLE. These are pure `profiles`/`carder/cli` reads (no NIF, no ownership conflict), so the security
 // suite is self-proving. Cite G6/O8. The Phase-11 L1 `--link` 8-way matrix (which must NOT gain a `Nif`
 // row) is verified by the whole suite staying green (this unit does not touch that file) — an accidental
 // widening turns it red.
@@ -804,8 +805,8 @@ pub fn gate_safe_profiles_never_name_nif_test() {
 pub fn gate_link_forbids_nif_tier_test() {
   let unsafe_nif =
     profiles.resolve_tiers(Binding(..profiles.unsafe(), mem_tier: Nif))
-  carder.link_gate(unsafe_nif, empty_module())
-  |> should.equal(Error(carder.LinkTierNif))
+  cli.link_gate(unsafe_nif, empty_module())
+  |> should.equal(Error(cli.LinkTierNif))
   // The load-bearing pin: link/1 ADMITS the identical binding (a valid runtime posture) — so the tier
   // gate, not link/1, is the packaging-boundary enforcement point.
   let assert Ok(_) = profiles.link(unsafe_nif)

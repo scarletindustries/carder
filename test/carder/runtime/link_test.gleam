@@ -1,6 +1,6 @@
 //// Spec-grounded tests for `runtime/link` — the non-function-import instantiation/link contract
-//// (H4, R4). Assertions target the WebAssembly SPEC (link/instantiation semantics + the reference
-//// `spectest` module values), never "whatever the code emits":
+//// (H4, R4). Assertions target the WebAssembly SPEC (link/instantiation semantics), never
+//// "whatever the code emits":
 ////
 //// - **Fail-closed linking** — an unprovided import is `UnknownImport` and a type/limits-mismatched
 ////   one is `IncompatibleImportType`; the instance is never created (spec
@@ -9,18 +9,28 @@
 //// - **Import matching** — globals are invariant (type + mutability); table/memory limits match in
 ////   the load-bearing direction `p.min ≥ d.min` / `p.max ≤ d.max` (spec
 ////   [§3.2](https://webassembly.github.io/spec/core/valid/matching.html)).
-//// - **`spectest` reference values** — `global_i32/i64 = 666`, `global_f32/f64 = 666.6` (raw
-////   IEEE-754 bits, D5), `table : funcref 10..20`, `memory : 1..2` (the spec's `imports.wast` host
-////   module).
+//// - **The `Namespace` provider seam** — carder hard-codes NO host module by name. A whole link
+////   namespace is supplied by the caller as `link.Namespace(name, func, state)`, two resolver
+////   closures. Everything `assert_unlinkable` depends on must hold THROUGH that seam: a matched
+////   function import resolves (and its closure dispatches), a mismatched signature is
+////   `IncompatibleImportType`, a name the resolver rejects is `UnknownImport`, and a state export
+////   resolves / mismatches / is unknown the same way. (carder used to ship a built-in `spectest`
+////   provider; that module is the WebAssembly frontend's fixture and left with it to the
+////   `scribbler` repo, where its reference values are asserted. What carder still owns — and what
+////   these tests pin — is the GENERAL seam any such namespace is supplied through.)
+//// - **Provider precedence** — a namespace SOME provider owns is link-checked fail-closed; a
+////   namespace NO provider owns is a generic host capability, NOT link-checked, resolved to a
+////   `call_host` closure gated at its call site by the `HostPolicy`. Getting this backwards
+////   either fabricates an ambient default (an H6 violation) or breaks every host-importing module.
 //// - **Positional, name-free `Imports`** — one `Provided` per STATE import in declaration order;
 ////   function imports contribute no element (they are call-site capabilities, H4).
 
 import carder/ir
 import carder/runtime/instance.{HostDenyAll, HostOpen}
 import carder/runtime/link.{
-  type ImportError, type Provided, IncompatibleImportType, ProvidedFunc,
-  ProvidedGlobal, ProvidedMemory, ProvidedRefGlobal, ProvidedTable, Registered,
-  UnknownImport,
+  type ImportError, type Provided, type Provider, IncompatibleImportType,
+  Namespace, ProvidedFunc, ProvidedGlobal, ProvidedMemory, ProvidedRefGlobal,
+  ProvidedTable, Registered, UnknownImport,
 }
 import carder/runtime/rt_host
 import carder/runtime/rt_mem
@@ -64,6 +74,67 @@ fn module_with_imports(imports: List(ir.ImportDecl)) -> ir.Module {
   )
 }
 
+/// A `link.Namespace` provider under `link_name` backed by two FIXED tables — the general seam a
+/// caller supplies a whole host module through (carder itself knows no host module by name).
+///
+/// - `funcs`: the namespace's function exports, `name -> Provided` (each normally a
+///   `ProvidedFunc(sig, closure)`; a non-function value is allowed on purpose so the
+///   "imported a state export as a function" rejection can be exercised).
+/// - `states`: the namespace's global/table/memory exports, `name -> Provided`.
+/// - The FUNCTION resolver deliberately IGNORES the declared `FuncType` it is handed and answers
+///   from `funcs` alone, so `link` performs the spec §3.2.7 EQUALITY match itself and a
+///   signature mismatch is observable. (A resolver that instead echoes the declared type — the
+///   escape hatch for reference-typed ABIs — matches by construction and so proves nothing here.)
+/// - Any name absent from its table is `Error(Nil)`, which the resolver must turn into the spec's
+///   `UnknownImport` — the `assert_unlinkable "unknown import"` case.
+fn namespace(
+  link_name: String,
+  funcs: List(#(String, Provided)),
+  states: List(#(String, Provided)),
+) -> Provider {
+  let func_table = dict.from_list(funcs)
+  let state_table = dict.from_list(states)
+  Namespace(
+    link_name: link_name,
+    func: fn(name, _declared_ty) { dict.get(func_table, name) },
+    state: fn(name) { dict.get(state_table, name) },
+  )
+}
+
+/// A do-nothing dispatch closure returning no values — a stand-in for a host namespace's handler
+/// where only MATCHING (not the call) is under test.
+fn no_result(_args: List(dynamic.Dynamic)) -> List(dynamic.Dynamic) {
+  []
+}
+
+/// A `Namespace` under link name `"host"` exporting one of EACH import kind — a function
+/// `print_i32 : [i32] -> []`, a global `g_i32 = 666`, a real `funcref` table `10..20` and a real
+/// Idx32 memory `1..2`. The interleaving/ordering tests import all four from it, so the ordering
+/// they assert is genuinely about DECLARATION ORDER rather than about which kinds happen to
+/// resolve.
+fn mixed_namespace() -> Provider {
+  namespace(
+    "host",
+    [#("print_i32", link.provided_func(ir.FuncType([ir.TI32], []), no_result))],
+    [
+      #("g_i32", ProvidedGlobal(666, ir.TI32, False)),
+      #(
+        "memory",
+        ProvidedMemory(
+          rt_mem.fresh(1, Some(2), rt_mem.hard_max_pages),
+          1,
+          Some(2),
+          ir.Idx32,
+        ),
+      ),
+      #(
+        "table",
+        ProvidedTable(rt_table.new(10, Some(20)), ir.FuncRef, 10, Some(20)),
+      ),
+    ],
+  )
+}
+
 // ── 1. Fail-closed: unsatisfied import (spec §4.5.4 "unknown import") ─────────────
 
 /// A global imported from a module carder does NOT provide resolves to `UnknownImport`, and the
@@ -77,15 +148,31 @@ pub fn unknown_state_import_fails_closed_test() {
   phrase_of(link.link_imports(m, [])) |> should.equal(Ok("unknown import"))
 }
 
-/// A MISSING `spectest` FUNCTION import (`#("spectest","not_a_print")`) is ALSO a link error
-/// ("unknown import"), not merely a deferred call denial (§C.3) — the import has no provider.
-pub fn unknown_spectest_function_fails_closed_test() {
+/// A FUNCTION import naming a namespace a provider DOES own, but an export that namespace does
+/// NOT have (`#("host","not_a_print")` against a `Namespace` whose resolver returns `Error(Nil)`)
+/// is a link error ("unknown import"), not merely a deferred call denial (§C.3). This is the
+/// fail-closed half of the precedence rule: once a provider claims the namespace, an unknown name
+/// inside it is rejected AT LINK TIME rather than falling through to the generic host capability.
+pub fn unknown_namespace_function_fails_closed_test() {
+  let provider =
+    namespace(
+      "host",
+      [
+        #(
+          "print_i32",
+          link.provided_func(ir.FuncType([ir.TI32], []), no_result),
+        ),
+      ],
+      [],
+    )
   let m =
     module_with_imports([
-      ir.ImportFn("spectest", "not_a_print", ir.FuncType([], [])),
+      ir.ImportFn("host", "not_a_print", ir.FuncType([], [])),
     ])
-  is_unknown(link.link_imports(m, []), "spectest", "not_a_print")
+  is_unknown(link.link_imports(m, [provider]), "host", "not_a_print")
   |> should.be_true
+  phrase_of(link.link_imports(m, [provider]))
+  |> should.equal(Ok("unknown import"))
 }
 
 // ── 2. Fail-closed: import type-mismatch (spec §3.2 matching) + satisfying counterparts ─
@@ -189,32 +276,30 @@ pub fn ref_global_match_and_mismatch_test() {
   is_incompatible(link.link_imports(m2, [provider]), "M", "r") |> should.be_true
 }
 
-// ── 3. `spectest` provided state — the reference values (spec's imports.wast host module) ─
+// ── 3. The `Namespace` provider seam — a whole host module supplied by the caller ────
+//
+// carder ships NO built-in host module: a namespace like the WebAssembly suite's `spectest`, a
+// TeaVM guest's `teavmJso` or a Porffor guest's `""` intrinsics is handed in by the FRONTEND as
+// `link.Namespace(name, func, state)`. Everything the spec's `assert_unlinkable` depends on must
+// therefore hold THROUGH that seam, which is what this section pins (spec §4.5.4 instantiation,
+// §3.2 matching). The concrete `spectest` reference values (`global_i32 = 666`, `table 10..20`,
+// `memory 1..2`) are the WebAssembly frontend's fixture and are asserted in `scribbler`.
 
-/// The four `spectest` globals read back their reference values: `global_i32 = 666`,
-/// `global_i64 = 666`, and `global_f32 = 666.6` / `global_f64 = 666.6` as their EXACT raw
-/// IEEE-754 bit pattern (D5 — `0x4426A666` / `0x4084D4CCCCCCCCCD`, the f32/f64 nearest to `666.6`,
-/// NOT a re-derived BEAM double). All immutable.
-pub fn spectest_globals_reference_values_test() {
-  link.spectest_export("global_i32")
-  |> should.equal(Ok(ProvidedGlobal(666, ir.TI32, False)))
-  link.spectest_export("global_i64")
-  |> should.equal(Ok(ProvidedGlobal(666, ir.TI64, False)))
-  link.spectest_export("global_f32")
-  |> should.equal(Ok(ProvidedGlobal(0x4426A666, ir.TF32, False)))
-  link.spectest_export("global_f64")
-  |> should.equal(Ok(ProvidedGlobal(0x4084D4CCCCCCCCCD, ir.TF64, False)))
-}
-
-/// A module importing `spectest.global_i32` + `global_i64` resolves to the reference bits in
-/// declaration order (the positional `Imports`). The immutable globals match a `const` import.
-pub fn spectest_global_import_resolves_test() {
+/// A `Namespace`'s STATE resolver satisfies global imports, positionally and in declaration order
+/// — the general replacement for a built-in host module's global exports. Two immutable globals
+/// resolve to exactly the values the resolver returned, in the module's import order.
+pub fn namespace_state_import_resolves_test() {
+  let provider =
+    namespace("host", [], [
+      #("g_i32", ProvidedGlobal(666, ir.TI32, False)),
+      #("g_i64", ProvidedGlobal(666, ir.TI64, False)),
+    ])
   let m =
     module_with_imports([
-      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
-      ir.ImportGlobal("spectest", "global_i64", ir.TI64, False),
+      ir.ImportGlobal("host", "g_i32", ir.TI32, False),
+      ir.ImportGlobal("host", "g_i64", ir.TI64, False),
     ])
-  link.link_imports(m, [])
+  link.link_imports(m, [provider])
   |> should.equal(
     Ok([
       ProvidedGlobal(666, ir.TI32, False),
@@ -223,76 +308,138 @@ pub fn spectest_global_import_resolves_test() {
   )
 }
 
-/// `spectest.table` is a REAL `funcref` table of `min 10` / `max 20`: its declared limits are
-/// `10..20 funcref`, and once installed into a cell the table's `size` is `10` (spec's `spectest`
-/// `(table 10 20 funcref)`).
-pub fn spectest_table_is_real_test() {
-  let assert Ok(ProvidedTable(value, ref_ty, min, max)) =
-    link.spectest_export("table")
-  ref_ty |> should.equal(ir.FuncRef)
-  min |> should.equal(10)
-  max |> should.equal(Some(20))
+/// A STATE name the `Namespace`'s resolver returns `Error(Nil)` for is `UnknownImport` — the
+/// provider is a CLOSED set, never an ambient default (H6). The spec phrase is "unknown import".
+pub fn namespace_unknown_state_export_fails_closed_test() {
+  let provider =
+    namespace("host", [], [#("g", ProvidedGlobal(1, ir.TI32, False))])
+  let m = module_with_imports([ir.ImportGlobal("host", "nope", ir.TI32, False)])
+  is_unknown(link.link_imports(m, [provider]), "host", "nope")
+  |> should.be_true
+  phrase_of(link.link_imports(m, [provider]))
+  |> should.equal(Ok("unknown import"))
+}
 
-  // Install the provided table into a fresh cell and probe its size through `rt_table`.
+/// A `Namespace`-supplied state export is TYPE-MATCHED exactly like a `Registered` one (spec §3.2
+/// — the seam changes WHERE the externval comes from, never WHETHER it is checked): an `i64`
+/// import answered with an `i32` global is `IncompatibleImportType`, not a silent coercion.
+pub fn namespace_state_mismatch_fails_closed_test() {
+  let provider =
+    namespace("host", [], [#("g", ProvidedGlobal(1, ir.TI32, False))])
+  let m = module_with_imports([ir.ImportGlobal("host", "g", ir.TI64, False)])
+  is_incompatible(link.link_imports(m, [provider]), "host", "g")
+  |> should.be_true
+  phrase_of(link.link_imports(m, [provider]))
+  |> should.equal(Ok("incompatible import type"))
+}
+
+/// A `Namespace` can supply REAL table/memory externvals, not just descriptors: a `funcref` table
+/// declared `10..20` and an Idx32 memory declared `1..2` resolve, and once installed into a fresh
+/// instance cell they behave as real state — `table.size = 10`, `memory.size = 1` page. This is
+/// the property the WebAssembly suite's imported-table/imported-memory cases rest on, kept here
+/// against the general seam (the specific `spectest` limits are the frontend's fixture).
+pub fn namespace_provides_real_table_and_memory_test() {
+  let table_value = rt_table.new(10, Some(20))
+  let mem_value = rt_mem.fresh(1, Some(2), rt_mem.hard_max_pages)
+  let provider =
+    namespace("host", [], [
+      #("table", ProvidedTable(table_value, ir.FuncRef, 10, Some(20))),
+      #("memory", ProvidedMemory(mem_value, 1, Some(2), ir.Idx32)),
+    ])
+  let m =
+    module_with_imports([
+      ir.ImportTable("host", "table", ir.FuncRef, 10, Some(20)),
+      ir.ImportMemory("host", "memory", 1, Some(2), ir.Idx32),
+    ])
+  let assert Ok([
+    ProvidedTable(t, ref_ty, tmin, tmax),
+    ProvidedMemory(mem, mmin, mmax, idx),
+  ]) = link.link_imports(m, [provider])
+  ref_ty |> should.equal(ir.FuncRef)
+  tmin |> should.equal(10)
+  tmax |> should.equal(Some(20))
+  mmin |> should.equal(1)
+  mmax |> should.equal(Some(2))
+  idx |> should.equal(ir.Idx32)
+
+  // Install both provided externvals into a fresh cell and probe them through the runtime.
   rt_state.seed_full(
-    rt_state.FullDecl(mems: [], globals: [], tables: [value], ref_globals: []),
+    rt_state.FullDecl(mems: [mem], globals: [], tables: [t], ref_globals: []),
   )
   rt_table.size(0) |> should.equal(10)
-}
-
-/// `spectest.memory` is a REAL Idx32 memory of `min 1` / `max 2`: its declared limits are `1..2`,
-/// and once installed its `memory.size` is `1` page (spec's `spectest` `(memory 1 2)`).
-pub fn spectest_memory_is_real_test() {
-  let assert Ok(ProvidedMemory(value, min_pages, max_pages, idx_type)) =
-    link.spectest_export("memory")
-  min_pages |> should.equal(1)
-  max_pages |> should.equal(Some(2))
-  idx_type |> should.equal(ir.Idx32)
-
-  rt_state.seed_full(
-    rt_state.FullDecl(mems: [value], globals: [], tables: [], ref_globals: []),
-  )
   rt_mem.size_at(0) |> should.equal(1)
-}
-
-/// A non-existent `spectest` STATE export is `Error(Nil)` (→ `UnknownImport`) — the provider is a
-/// closed set, never an ambient default.
-pub fn spectest_unknown_export_is_error_test() {
-  link.spectest_export("not_a_thing") |> should.equal(Error(Nil))
 }
 
 // ── 4. Function-import checking (spec §3.2 function matching, §C.3) ───────────────
 
-/// A `spectest` FUNCTION import that EXISTS and whose signature MATCHES resolves `Ok` and
-/// contributes NO positional state element (a function is a call-site capability, H4). A SIGNATURE
-/// MISMATCH (right name, wrong type) fails `IncompatibleImportType`.
-pub fn spectest_function_import_matching_test() {
-  // print_i32 : [i32] -> []  — exists and matches ⇒ Ok, no state element.
+/// A `Namespace`-provided FUNCTION import that EXISTS and whose signature MATCHES resolves `Ok`
+/// and contributes NO positional state element (a function is a call-site capability, H4). A
+/// SIGNATURE MISMATCH (right name, wrong type) fails `IncompatibleImportType` — the spec matches
+/// function types by EQUALITY (§3.2.7), so a namespace resolver cannot widen or narrow one.
+pub fn namespace_function_import_matching_test() {
+  let provider =
+    namespace(
+      "host",
+      [
+        #(
+          "print_i32",
+          link.provided_func(ir.FuncType([ir.TI32], []), no_result),
+        ),
+      ],
+      [],
+    )
+
+  // [i32] -> []  — exists and matches ⇒ Ok, no state element.
   let ok =
     module_with_imports([
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
+      ir.ImportFn("host", "print_i32", ir.FuncType([ir.TI32], [])),
     ])
-  link.link_imports(ok, []) |> should.equal(Ok([]))
+  link.link_imports(ok, [provider]) |> should.equal(Ok([]))
 
   // Right name, wrong signature ⇒ incompatible import type.
   let bad =
     module_with_imports([
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI64], [])),
+      ir.ImportFn("host", "print_i32", ir.FuncType([ir.TI64], [])),
     ])
-  is_incompatible(link.link_imports(bad, []), "spectest", "print_i32")
+  is_incompatible(link.link_imports(bad, [provider]), "host", "print_i32")
   |> should.be_true
+  phrase_of(link.link_imports(bad, [provider]))
+  |> should.equal(Ok("incompatible import type"))
 }
 
-/// A function import to a GENUINE host capability (`env`, not `spectest` and not a registered
-/// module) is NOT link-checked — it is a call-site capability resolved by the `HostPolicy`, so it
-/// neither errors nor contributes an element (`Ok([])`). This is why the existing corpus's `env`
-/// function imports keep instantiating.
-pub fn host_capability_function_import_not_link_checked_test() {
+/// PRECEDENCE (the rule `assert_unlinkable` rests on). A function import whose namespace NO
+/// provider owns (`env` here, while a provider owns `host`) is a GENERIC HOST CAPABILITY: it is
+/// NOT link-checked — no name lookup, no signature match — so it neither errors nor contributes
+/// an element (`Ok([])`), and its fate is decided at its CALL SITE by the instance's `HostPolicy`
+/// (fail-closed deny by default). This is why an `env`-importing corpus module keeps
+/// instantiating. The complement is `unknown_namespace_function_fails_closed_test`: the moment a
+/// provider DOES claim the namespace, the same shape of import is rejected at link time. Which
+/// side an import falls on is decided ONLY by whether a provider owns its link name.
+pub fn unowned_namespace_function_import_falls_through_to_host_test() {
+  let owner =
+    namespace(
+      "host",
+      [
+        #(
+          "print_i32",
+          link.provided_func(ir.FuncType([ir.TI32], []), no_result),
+        ),
+      ],
+      [],
+    )
   let m =
     module_with_imports([
       ir.ImportFn("env", "anything", ir.FuncType([ir.TI32], [ir.TI32])),
     ])
+  // No providers at all, and with an unrelated namespace provider present: both fall through.
   link.link_imports(m, []) |> should.equal(Ok([]))
+  link.link_imports(m, [owner]) |> should.equal(Ok([]))
+
+  // A name that WOULD be unknown inside the owned namespace still falls through under `env` —
+  // the fall-through is about namespace OWNERSHIP, not about the name existing anywhere.
+  let m2 =
+    module_with_imports([ir.ImportFn("env", "not_a_print", ir.FuncType([], []))])
+  link.link_imports(m2, [owner]) |> should.equal(Ok([]))
 }
 
 // ── 5. (register) → import + positional, name-free ordering ──────────────────────
@@ -312,19 +459,21 @@ pub fn registered_import_resolves_test() {
 /// declaration order, function imports contributing NO element. An interleaved
 /// (fn, global, memory, fn, table) import list yields exactly [global, memory, table].
 pub fn imports_are_positional_state_only_test() {
+  let provider = mixed_namespace()
   let m =
     module_with_imports([
       ir.ImportFn("env", "f1", ir.FuncType([], [])),
-      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
-      ir.ImportMemory("spectest", "memory", 1, Some(2), ir.Idx32),
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
-      ir.ImportTable("spectest", "table", ir.FuncRef, 10, Some(20)),
+      ir.ImportGlobal("host", "g_i32", ir.TI32, False),
+      ir.ImportMemory("host", "memory", 1, Some(2), ir.Idx32),
+      ir.ImportFn("host", "print_i32", ir.FuncType([ir.TI32], [])),
+      ir.ImportTable("host", "table", ir.FuncRef, 10, Some(20)),
     ])
-  // Exactly the three STATE imports, in order (function imports skipped).
-  kind_tags(link.link_imports(m, []))
+  // Exactly the three STATE imports, in order (both function imports skipped — the unowned `env`
+  // host capability AND the namespace-provided one).
+  kind_tags(link.link_imports(m, [provider]))
   |> should.equal(Ok(["global", "memory", "table"]))
-  // The leading global is the reference i32 value.
-  case link.link_imports(m, []) {
+  // The leading global carries the provider's value through unchanged.
+  case link.link_imports(m, [provider]) {
     Ok([ProvidedGlobal(bits, ..), ..]) -> bits
     _ -> -1
   }
@@ -477,14 +626,27 @@ pub fn link_func_imports_resolves_registered_function_test() {
 
 /// `link_func_imports` fails CLOSED (spec §3.2.7 / §4.5.4, the `assert_unlinkable` path) on every
 /// unsatisfied or mismatched function import: a missing registered export, a signature mismatch, a
-/// registered NON-function export, a missing `spectest` function, and a `spectest` signature
+/// registered NON-function export, a missing `Namespace` function, and a `Namespace` signature
 /// mismatch — each a link error, no instance created. The satisfying counterparts link `Ok`.
+/// The `Namespace` arms matter because that seam is how EVERY host module now reaches the linker
+/// (carder ships none by name), so `assert_unlinkable` depends on it rejecting exactly here.
 pub fn link_func_imports_fail_closed_test() {
   let sig = ir.FuncType([], [ir.TI32])
   let provider =
     Registered(
       "A",
       dict.from_list([#("call", link.provided_func(sig, fn(_a) { [] }))]),
+    )
+  let host =
+    namespace(
+      "host",
+      [
+        #(
+          "print_i32",
+          link.provided_func(ir.FuncType([ir.TI32], []), no_result),
+        ),
+      ],
+      [],
     )
 
   // (a) missing registered export → unknown import.
@@ -505,54 +667,67 @@ pub fn link_func_imports_fail_closed_test() {
   is_incompatible(link.link_func_imports(as_func, [state_provider]), "B", "g")
   |> should.be_true
 
-  // (d) a missing `spectest` function → unknown import.
-  let bad_spectest =
-    module_with_imports([ir.ImportFn("spectest", "not_a_print", sig)])
+  // (d) a name the owning `Namespace`'s resolver rejects → unknown import.
+  let bad_namespace =
+    module_with_imports([ir.ImportFn("host", "not_a_print", sig)])
   is_unknown(
-    link.link_func_imports(bad_spectest, []),
-    "spectest",
+    link.link_func_imports(bad_namespace, [host]),
+    "host",
     "not_a_print",
   )
   |> should.be_true
 
-  // (e) a `spectest` function with the wrong signature → incompatible import type.
-  let spectest_mismatch =
+  // (e) a `Namespace` function with the wrong signature → incompatible import type.
+  let namespace_mismatch =
     module_with_imports([
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI64], [])),
+      ir.ImportFn("host", "print_i32", ir.FuncType([ir.TI64], [])),
     ])
   is_incompatible(
-    link.link_func_imports(spectest_mismatch, []),
-    "spectest",
+    link.link_func_imports(namespace_mismatch, [host]),
+    "host",
     "print_i32",
   )
   |> should.be_true
 
-  // The satisfying registered + spectest counterparts link Ok (one slot each).
+  // The satisfying registered + namespace counterparts link Ok (one slot each).
   let ok_reg = module_with_imports([ir.ImportFn("A", "call", sig)])
   let assert Ok([_]) = link.link_func_imports(ok_reg, [provider])
-  let ok_spectest =
+  let ok_namespace =
     module_with_imports([
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
+      ir.ImportFn("host", "print_i32", ir.FuncType([ir.TI32], [])),
     ])
-  let assert Ok([_]) = link.link_func_imports(ok_spectest, [])
+  let assert Ok([_]) = link.link_func_imports(ok_namespace, [host])
   Nil
 }
 
-/// A `spectest` function import's dispatch closure routes through `rt_host.call_host` under THIS
-/// instance's `HostPolicy` (§B.3): admitted (here `HostOpen`), `spectest.print_i32` returns the
-/// empty value list `[]` (WASM result type `[]`). An `env` host import routes the same way —
-/// `env.identity` echoes its argument. Proves the host-closure construction + the value-list ABI.
+/// The `Namespace` seam yields a CALLABLE, not merely a match: the resolver's own closure is what
+/// lands in the function-import vector and what `call_import` dispatches (spec §4.5.4 func
+/// external value). Proves the seam carries authority through, the same way a `Registered`
+/// module's routing closure does — with NO `HostPolicy` involvement, because a provided namespace
+/// is a linked capability, not a generic host call.
+pub fn link_func_imports_dispatches_namespace_closure_test() {
+  let ty = ir.FuncType([ir.TI32], [ir.TI32])
+  let echo_twice = fn(args) {
+    case args {
+      [a] -> [a, a]
+      _ -> []
+    }
+  }
+  let host =
+    namespace("host", [#("dup", link.provided_func(ty, echo_twice))], [])
+  let m = module_with_imports([ir.ImportFn("host", "dup", ty)])
+
+  let assert Ok([pf]) = link.link_func_imports(m, [host])
+  link.call_import(link.provided_func_call(pf), [dynamic.int(5)])
+  |> should.equal([dynamic.int(5), dynamic.int(5)])
+}
+
+/// An UNOWNED-namespace function import's dispatch closure routes through `rt_host.call_host`
+/// under THIS instance's `HostPolicy` (§B.3): admitted (here `HostOpen`), `env.identity :
+/// [i32] -> [i32]` echoes its argument. Proves the host-closure construction + the value-list ABI
+/// on the fall-through side of the precedence rule.
 pub fn link_func_imports_host_closure_dispatches_test() {
   rt_host.seed_policy(HostOpen)
-
-  // spectest.print_i32 : [i32] -> []  → [] (no output; the suite never asserts print output).
-  let print_mod =
-    module_with_imports([
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
-    ])
-  let assert Ok([print_pf]) = link.link_func_imports(print_mod, [])
-  link.call_import(link.provided_func_call(print_pf), [dynamic.int(42)])
-  |> should.equal([])
 
   // env.identity : [i32] -> [i32]  → echoes its argument (the representative host handler).
   let id_mod =
@@ -585,19 +760,23 @@ pub fn link_func_imports_host_closure_denied_under_deny_all_test() {
 /// interleaved (fn, global, memory, fn, table) import list yields exactly the two function slots.
 pub fn link_func_imports_positional_order_test() {
   rt_host.seed_policy(HostOpen)
+  let provider = mixed_namespace()
   let m =
     module_with_imports([
       ir.ImportFn("env", "f1", ir.FuncType([], [])),
-      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
-      ir.ImportMemory("spectest", "memory", 1, Some(2), ir.Idx32),
-      ir.ImportFn("spectest", "print_i32", ir.FuncType([ir.TI32], [])),
-      ir.ImportTable("spectest", "table", ir.FuncRef, 10, Some(20)),
+      ir.ImportGlobal("host", "g_i32", ir.TI32, False),
+      ir.ImportMemory("host", "memory", 1, Some(2), ir.Idx32),
+      ir.ImportFn("host", "print_i32", ir.FuncType([ir.TI32], [])),
+      ir.ImportTable("host", "table", ir.FuncRef, 10, Some(20)),
     ])
-  // Exactly the two FUNCTION imports, in order; the three state imports are absent here.
-  kind_tags(link.link_func_imports(m, [])) |> should.equal(Ok(["func", "func"]))
+  // Exactly the two FUNCTION imports, in order; the three state imports are absent here. Both
+  // resolution routes appear — the unowned `env` host closure and the `Namespace`-provided one —
+  // and each occupies exactly one slot, in declaration order.
+  kind_tags(link.link_func_imports(m, [provider]))
+  |> should.equal(Ok(["func", "func"]))
 
   // And `link_imports` (the STATE list) is UNCHANGED — byte-identical, state-only (H7).
-  kind_tags(link.link_imports(m, []))
+  kind_tags(link.link_imports(m, [provider]))
   |> should.equal(Ok(["global", "memory", "table"]))
 }
 

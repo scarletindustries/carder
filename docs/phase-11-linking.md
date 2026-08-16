@@ -1,6 +1,7 @@
 # `--link` — self-contained single-`.beam` output
 
-> Phase 11 reference. `--link` is an optional flag on `to-beam-wasm` that merges the runtime
+> Phase 11 reference. `--link` is an optional flag on the **build** verb (`to-beam`/`build`
+> in carder, `build` in a frontend such as scribbler) that merges the runtime
 > dependency closure into the generated module, producing **one `.beam` that loads and runs on a bare
 > Erlang/OTP node** — no `carder` app on the code path. The default (non-`--link`) output is
 > unchanged and byte-identical.
@@ -19,7 +20,10 @@ into one module, dead code stripped, so the only remaining remote calls are to O
 every node. The result is a single self-contained `.beam`.
 
 ```
-to-beam-wasm --link app.wasm app.beam
+# carder (IR in):
+to-beam --link app.ir app.beam
+# scribbler (wasm in) — the same flag, passed straight through to carder:
+build   --link app.wasm app.beam
 # → one app.beam; loads via `erl -pa <dir with only app.beam>` and runs `app:<export>(args)`
 #   on a node with NO carder@*/gleam@* beams reachable.
 ```

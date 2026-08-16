@@ -1,0 +1,11 @@
+module @carder@wasm@recurse {
+  numerics true
+  memory none
+  export "recurse" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = call @f0 (i32.const 0)
+    let (%v2) = num i.add.32 (i32.const 1, %v1)
+    values (%v2)
+  }
+}
+

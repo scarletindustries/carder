@@ -1,0 +1,15 @@
+module @carder@wasm@size {
+  numerics true
+  memory (min 0)
+  export "size" = @f0
+  export "grow" = @f1
+  func @f0 () -> (i32) {
+    let (%v1) = mem.size
+    values (%v1)
+  }
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = mem.grow %p0
+    values (%v1)
+  }
+}
+

@@ -15,7 +15,6 @@
 
 import carder/backend/build_beam
 import carder/backend/emit_core
-import carder/conformance/driver
 import carder/ir
 import carder/runtime/instance
 import carder/runtime/link
@@ -485,17 +484,18 @@ fn negative_module() -> ir.Module {
   )
 }
 
-/// §5.4: `emit_core.needs_func_imports` and `driver.module_calls_import` are ONE predicate over the
-/// SAME `irmod`, so the generated `instantiate/1` arity and the driver's supplied `Imports` length
-/// cannot desync (R3). A module import-bearing PURELY through an element-segment `ref.func` (active,
-/// passive) OR a body-level `ref.func` — with NO `CallImport` — is recognised by both; its
-/// `count_import_slots == count_function_imports > 0` (→ `instantiate/1`). The negative twin stays
-/// `False` (→ `instantiate/0`).
+/// §5.4: `emit_core.needs_func_imports` is the SINGLE SOURCE OF TRUTH for import-bearingness, so the
+/// generated `instantiate/1` arity and every caller's supplied `Imports` length cannot desync (R3) —
+/// the harness driver's `module_calls_import` is now a straight delegation to it, so the two are one
+/// predicate BY CONSTRUCTION rather than by agreement. What is still asserted here is the predicate's
+/// CONTRACT and its lockstep with the emitted slot counts: a module import-bearing PURELY through an
+/// element-segment `ref.func` (active, passive) OR a body-level `ref.func` — with NO `CallImport` —
+/// is recognised, and its `count_import_slots == count_function_imports > 0` (→ `instantiate/1`). The
+/// negative twin stays `False` (→ `instantiate/0`, byte-neutral).
 pub fn import_bearing_detection_is_in_lockstep_test() {
-  // Active-segment `ref.func` (no CallImport): both sides fire, arity is instantiate/1.
+  // Active-segment `ref.func` (no CallImport): the predicate fires, arity is instantiate/1.
   let active = consumer_module("s54_active", 2, [dispatch_fn()])
   assert emit_core.needs_func_imports(active) == True
-  assert driver.module_calls_import(active) == True
   assert emit_core.count_import_slots(active)
     == emit_core.count_function_imports(active)
   assert emit_core.count_import_slots(active) > 0
@@ -503,19 +503,20 @@ pub fn import_bearing_detection_is_in_lockstep_test() {
   // Passive-only `ref.func` (never table.init'd): the all-modes element scan still fires (§3.3).
   let passive = passive_only_module()
   assert emit_core.needs_func_imports(passive) == True
-  assert driver.module_calls_import(passive) == True
+  assert emit_core.count_import_slots(passive)
+    == emit_core.count_function_imports(passive)
   assert emit_core.count_import_slots(passive) > 0
 
   // Body-level `ref.func` (no elem, no CallImport): the body scan fires.
   let body = body_only_module()
   assert emit_core.needs_func_imports(body) == True
-  assert driver.module_calls_import(body) == True
+  assert emit_core.count_import_slots(body)
+    == emit_core.count_function_imports(body)
   assert emit_core.count_import_slots(body) > 0
 
   // Negative twin: imports but neither calls nor ref.funcs → instantiate/0, byte-neutral.
   let neg = negative_module()
   assert emit_core.needs_func_imports(neg) == False
-  assert driver.module_calls_import(neg) == False
   assert emit_core.count_import_slots(neg) == 0
 }
 

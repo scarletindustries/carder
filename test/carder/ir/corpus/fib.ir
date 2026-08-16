@@ -1,0 +1,20 @@
+module @carder@wasm@fib {
+  numerics true
+  memory none
+  export "fib" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = num i.lt_s.32 (%p0, i32.const 2)
+    let (%v8) = if %v1 : (i32) {
+      values (%p0)
+    } else {
+      let (%v3) = num i.sub.32 (%p0, i32.const 1)
+      let (%v4) = call @f0 (%v3)
+      let (%v5) = num i.sub.32 (%p0, i32.const 2)
+      let (%v6) = call @f0 (%v5)
+      let (%v7) = num i.add.32 (%v4, %v6)
+      values (%v7)
+    }
+    values (%v8)
+  }
+}
+

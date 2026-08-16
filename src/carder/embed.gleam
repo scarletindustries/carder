@@ -1,9 +1,13 @@
-//// `embed` — the embedder API for running a WASM guest inside a host BEAM program with
+//// `embed` — the embedder API for running a compiled guest inside a host BEAM program with
 //// host functions supplied as native Gleam closures.
 ////
 //// This is the "coexistence seam": a host such as the `dance` platform compiles a guest
 //// module once, then runs many instances, each provided a `host` dispatcher that implements
-//// the guest's imported `(import "cap" "name" (func …))` functions. The dispatcher runs in the
+//// the guest's imported functions.
+////
+//// **IR-entry.** `compile_ir` takes a `carder/ir.Module`, not source bytes — carder is a
+//// backend and knows no source language. A frontend (scribbler for WebAssembly, arc for
+//// JavaScript) lowers its source and wraps this with a source-shaped `compile` of its own. The dispatcher runs in the
 //// instance's own process and may marshal arguments/results over the guest's linear memory via
 //// `mem_read`/`mem_write`.
 ////
@@ -24,13 +28,13 @@
 import carder/backend/build_beam
 import carder/ir
 import carder/pipeline
+import carder/runtime/link
 import carder/runtime/profiles
 import carder/runtime/rt_mem
 import gleam/erlang/atom
 import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
 import gleam/result
 
 /// Target sub-module count when a guest is large enough to split (see `chunk.split_module`). Splitting
@@ -69,103 +73,54 @@ pub opaque type Instance {
 pub type InvokeResult =
   Result(List(Int), String)
 
-/// **Compile** WASM guest bytes to a loadable module under the `Safe` profile.
+/// **Compile** an already-lowered IR module to a loadable `Compiled` under the `Safe` profile —
+/// the embedder's IR-ENTRY seam.
 ///
-/// - `wasm`: the guest's binary `.wasm` bytes.
-/// - Returns `Ok(Compiled)` (beam + IR), or `Error(text)` describing the failing pipeline stage
-///   (decode / validate / lower / codegen). Total.
+/// carder is a backend: it does not know how `m` was produced. A FRONTEND (scribbler's
+/// WebAssembly decoder, arc's JS emitter) lowers its source into `carder/ir` and calls this; the
+/// frontend then re-exports a source-shaped `compile(bytes)` wrapper of its own.
 ///
-/// The generated BEAM module atom is derived from the guest's first exported function
-/// (`carder@wasm@<firstexport>`). NOTE: two guests that share that first export name (e.g. any
-/// two TeaVM/Java modules, which all export `teavm.stringToJs` first) compile to the SAME atom
-/// and CANNOT be loaded into one node together — the second `code:load_binary` overwrites the
-/// first. An embedder deploying MULTIPLE guests to one node (e.g. a Dance app with several WASM
-/// modules) must give each a distinct atom via `compile_named`.
-pub fn compile(wasm: BitArray) -> Result(Compiled, String) {
-  compile_with_name(wasm, None, no_progress)
-}
-
-/// The no-op progress callback for `compile`/`compile_named` (callers that don't want progress).
-fn no_progress(_percent: Int, _phase: String) -> Nil {
-  Nil
-}
-
-/// **Compile** WASM guest bytes like `compile`, but OVERRIDE the generated BEAM module atom with
-/// `name` verbatim (it becomes the `.core`/`.beam` module header AND every intra-module qualified
-/// reference, so the override is fully self-consistent — indirect calls, funcref tables and the
-/// `rt_table` seam all resolve against the same atom).
+/// A large guest is split into balanced CHUNKS and compiled SEQUENTIALLY, bounding peak
+/// `compile:forms` memory to ~the largest chunk instead of the whole module; a guest under
+/// `min_split_defs` top-level Core functions compiles as a SINGLE module, byte-identical to the
+/// unchunked path.
 ///
-/// - `name`: the module atom to bake in. MUST be a valid Erlang atom string and UNIQUE across the
-///   guests an embedder loads into one node (e.g. `"carder@wasm@" <> deployment <> "_" <> slug`).
-///   Passing a colliding name reintroduces the load-overwrite hazard `compile` warns about.
-/// - Returns `Ok(Compiled)` whose `module.name` is `name`, or `Error(text)` (same failure modes as
-///   `compile`; an atom-invalid `name` surfaces as a codegen `Error` from `cmod_to_beam`). Total.
-pub fn compile_named(wasm: BitArray, name: String) -> Result(Compiled, String) {
-  compile_with_name(wasm, Some(name), no_progress)
-}
-
-/// Like `compile_named`, but reports coarse build PROGRESS through `on_progress(percent, phase)` as
-/// it enters each compiler phase — so an embedder (e.g. Dance) can drive a build progress bar.
-///
-/// - `percent` is the work COMPLETED before the phase begins: `0` → analyze (decode/validate/lower),
-///   `20` → generate (IR → Core Erlang), `45` → compile (Core Erlang → BEAM). The last is the long
-///   pole (~half the wall time) and has no internal sub-progress, so the bar dwells at `45` during
-///   it; the embedder owns the tail (its own caching → `100`).
-/// - `phase` is a short EMBEDDER-FACING label ("analyzing"/"generating"/"compiling"); compiler
-///   internals stay internal.
-/// - The callback runs IN the compiling process — keep it cheap and node-safe (a crash there fails
-///   the compile). Returns exactly as `compile_named`.
-pub fn compile_progress(
-  wasm: BitArray,
-  name: String,
+/// - `m`: the IR module. `m.name` becomes the loaded BEAM module atom verbatim — the caller owns
+///   uniqueness. Two guests compiled under the SAME atom cannot coexist on one node (the second
+///   `code:load_binary` overwrites the first), so an embedder deploying several guests must give
+///   each a distinct `m.name` (e.g. `"carder@wasm@" <> deployment <> "_" <> slug`).
+/// - `on_progress(percent, phase)`: coarse build progress, invoked as each phase is ENTERED —
+///   `20` → "generating" (IR → Core Erlang), `45` → "compiling" (Core Erlang → BEAM, the long
+///   pole, ~half the wall time and with no internal sub-progress, so a bar dwells at `45`). The
+///   callback runs IN the compiling process — keep it cheap and node-safe (a crash there fails
+///   the compile). Pass `no_progress` if you do not want it.
+/// - Returns `Ok(Compiled)` (entry beam + IR + helper chunks), or `Error(text)` describing the
+///   failing backend stage (ir-lower / emit / build). Total.
+pub fn compile_ir(
+  m: ir.Module,
   on_progress: fn(Int, String) -> Nil,
 ) -> Result(Compiled, String) {
-  compile_with_name(wasm, Some(name), on_progress)
-}
-
-/// Shared compile path for `compile`/`compile_named`/`compile_progress`. When `name_override` is
-/// `Some`, the IR module's `name` (set by `lower` to `carder@wasm@<firstexport>`) is replaced
-/// BEFORE `ir_to_core` so `emit_core` (which reads the emitted-module atom solely from
-/// `ir.Module.name`, and every downstream stage after `lower` has no wasm to re-derive it from)
-/// threads the override everywhere. `on_progress` is invoked as each phase is ENTERED.
-fn compile_with_name(
-  wasm: BitArray,
-  name_override: Option(String),
-  on_progress: fn(Int, String) -> Nil,
-) -> Result(Compiled, String) {
-  on_progress(0, "analyzing")
-  case pipeline.source_to_ir(wasm) {
+  on_progress(20, "generating")
+  // Emit + split into N balanced chunks (a large guest), or a single chunk (a small one). The
+  // chunks are compiled SEQUENTIALLY, bounding peak compile memory to ~the largest chunk.
+  case pipeline.ir_to_chunks(m, profiles.safe(), chunk_target, min_split_defs) {
     Error(e) -> Error(pipeline.describe(e))
-    Ok(m0) -> {
-      let m = case name_override {
-        Some(name) -> ir.Module(..m0, name: name)
-        None -> m0
-      }
-      on_progress(20, "generating")
-      // Emit + split into N balanced chunks (a large guest), or a single chunk (a small one). The
-      // chunks are compiled SEQUENTIALLY, bounding peak compile memory to ~the largest chunk.
-      case
-        pipeline.source_to_chunks(
-          m,
-          profiles.safe(),
-          chunk_target,
-          min_split_defs,
-        )
-      {
+    Ok(chunks) -> {
+      on_progress(45, "compiling")
+      case pipeline.chunks_to_beams(chunks) {
         Error(e) -> Error(pipeline.describe(e))
-        Ok(chunks) -> {
-          on_progress(45, "compiling")
-          case pipeline.chunks_to_beams(chunks) {
-            Error(e) -> Error(pipeline.describe(e))
-            // Chunk 0 (name == `m.name`) is the entry module; the rest are helper modules.
-            Ok([#(_entry_name, primary), ..extra]) ->
-              Ok(Compiled(beam: primary, module: m, extra: extra))
-            Ok([]) -> Error("codegen produced no output modules")
-          }
-        }
+        // Chunk 0 (name == `m.name`) is the entry module; the rest are helper modules.
+        Ok([#(_entry_name, primary), ..extra]) ->
+          Ok(Compiled(beam: primary, module: m, extra: extra))
+        Ok([]) -> Error("codegen produced no output modules")
       }
     }
   }
+}
+
+/// The no-op progress callback — for callers of `compile_ir` that do not want progress.
+pub fn no_progress(_percent: Int, _phase: String) -> Nil {
+  Nil
 }
 
 /// **Instantiate** a compiled guest in its own process, wiring every imported function to the
@@ -179,13 +134,38 @@ pub fn instantiate(
   compiled: Compiled,
   host: fn(String, String, List(Int)) -> List(Int),
 ) -> Result(Instance, String) {
+  instantiate_with_providers(compiled, host, [])
+}
+
+/// `instantiate` plus caller-supplied `link.Provider`s — for a guest whose imports are not all
+/// expressible over the numeric `host` ABI.
+///
+/// The `host` dispatcher is numeric (`List(Int) -> List(Int)`, D5) and cannot carry a BEAM term,
+/// so a guest importing REFERENCE-typed host functions (externref / funcref / GC refs — e.g. a
+/// TeaVM WASM GC guest's `teavmJso` namespace) or importing host STATE (a global/table/memory it
+/// does not define) supplies those through `providers` instead. A capability no provider owns
+/// still falls back to `host`.
+///
+/// This is the seam that keeps carder free of any producer-toolchain knowledge: the frontend
+/// that understands TeaVM (or Porffor, or the spec suite's `spectest`) describes those namespaces
+/// as `Provider`s in its OWN repo and passes them here (D3a — a handed-in closure is a
+/// capability, never ambient authority).
+///
+/// - `compiled`/`host`: as `instantiate`.
+/// - `providers`: term-native externval sources; `[]` reproduces `instantiate` exactly.
+/// - Returns `Ok(Instance)` once seeded, or `Error(reason)`. Total.
+pub fn instantiate_with_providers(
+  compiled: Compiled,
+  host: fn(String, String, List(Int)) -> List(Int),
+  providers: List(link.Provider),
+) -> Result(Instance, String) {
   let Compiled(beam:, module:, extra:) = compiled
   // Load the helper chunk modules FIRST (pure code, no per-instance state) so the entry module's
   // cross-chunk `call`s resolve, then start the entry instance in its own process.
   case load_helpers(extra) {
     Error(reason) -> Error(reason)
     Ok(Nil) ->
-      pipeline.instantiate_with_host(beam, module, host)
+      pipeline.instantiate_with_host_providers(beam, module, host, providers)
       |> result.map(Instance)
   }
 }

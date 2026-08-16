@@ -1,0 +1,10 @@
+module @carder@wasm@noop {
+  numerics true
+  memory (min 1)
+  export "noop" = @f0
+  data (values (i32.const 65534)) = 0x01020304
+  func @f0 () -> () {
+    values ()
+  }
+}
+

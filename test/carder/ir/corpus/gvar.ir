@@ -1,0 +1,16 @@
+module @carder@wasm@get {
+  numerics true
+  memory none
+  global @g0 : i32 mut = values (i32.const 7)
+  export "get" = @f0
+  export "set" = @f1
+  func @f0 () -> (i32) {
+    let (%v1) = global.get @g0
+    values (%v1)
+  }
+  func @f1 (%p0:i32) -> () {
+    let () = global.set @g0 %p0
+    values ()
+  }
+}
+

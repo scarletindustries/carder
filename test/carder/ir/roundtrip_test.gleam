@@ -997,6 +997,64 @@ pub fn goldens_reprint_and_reparse_stably_test() {
   check_roundtrip(refs_bulk_module())
 }
 
+// ───────────────────────── the .ir corpus gate (post-split keystone) ─────────────────────────
+
+/// The 35 corpus programs under `test/carder/ir/corpus/`. These are carder's end-to-end test
+/// INPUTS: every backend / optimizer / tier / `--link` proof that used to start from a `.wasm`
+/// now starts from one of these. They were generated ONCE, by the pre-split tree's
+/// `carder to-ir <program>.wasm`, and it was measured at that moment that
+/// `wasm → .beam` is byte-identical to `wasm → .ir text → .beam` for all 32 wasm-corpus
+/// programs — which is what makes rebasing those tests onto `.ir` a no-op for what they prove.
+///
+/// Names are the corpus program names; each has a `<name>.ir` and (for 28 of them) a spec-sourced
+/// `<name>.expected` alongside.
+fn corpus_programs() -> List(String) {
+  [
+    "add", "bulkmem", "callind", "ehcatch", "ehcatchall", "ehnested",
+    "ehrethrow", "ehthrow", "fac", "fib", "floatops", "growcap", "gvar",
+    "hostimport", "intops", "iso", "mem", "mem64", "memgrow", "memloop",
+    "multimem", "newsurface_check", "oobdata", "poke", "recurse", "reftab",
+    "simddot", "simdmem", "simdxform", "spin", "sum_to", "tailrec", "trapstart",
+    "trunc", "xlink",
+  ]
+}
+
+/// Read a corpus `.ir` fixture (relative to the project root, the `gleam test` cwd).
+fn read_corpus_ir(name: String) -> String {
+  let assert Ok(bits) = read_file("test/carder/ir/corpus/" <> name <> ".ir")
+  let assert Ok(text) = bit_array.to_string(bits)
+  text
+}
+
+/// **THE GATE that makes the checked-in `.ir` corpus trustworthy as test input.**
+///
+/// Every corpus program must (a) PARSE — otherwise a rebased test is exercising nothing — and
+/// (b) satisfy the D7 round-trip invariant `parse(print(m)) == m` under bit-exact
+/// `module_equal`. (b) is the load-bearing half: it proves the printer and parser agree on
+/// every construct these 35 programs actually use (memories, tables, elem/data segments,
+/// globals, exception tags, SIMD lanes with NaN payloads and `-0.0`, cross-module imports,
+/// tail calls), so the `.ir` text is a faithful, lossless carrier of the module the backend
+/// compiles. If this test fails, every `.ir`-driven test in the suite is suspect — fix this
+/// first.
+pub fn ir_corpus_parses_and_roundtrips_test() {
+  list.each(corpus_programs(), fn(name) {
+    let assert Ok(m) = parser.parse_module(read_corpus_ir(name))
+    check_roundtrip(m)
+  })
+}
+
+/// Every corpus program keeps the module ATOM the pre-split frontend gave it
+/// (`carder@wasm@<base>`). That atom is the name the emitted `.beam` loads under and the name
+/// downstream consumers (the `dance` platform, the TeaVM SDK, `quickjs.beam`) already load, so
+/// it is deliberately STABLE across the frontend extraction — a rename here would silently
+/// break every one of them. Asserted here, at the point the corpus enters the test suite.
+pub fn ir_corpus_module_atoms_are_stable_test() {
+  list.each(corpus_programs(), fn(name) {
+    let assert Ok(m) = parser.parse_module(read_corpus_ir(name))
+    assert string.starts_with(m.name, "carder@wasm@")
+  })
+}
+
 // ───────────────────────────── module_equal tests ─────────────────────────────
 
 pub fn module_equal_reflexive_test() {

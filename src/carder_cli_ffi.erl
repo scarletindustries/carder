@@ -12,7 +12,7 @@
 -module(carder_cli_ffi).
 -export([catch_apply/3, start_instance/1, start_instance_with/2,
          call_instance/3, stop_instance/1, module_name/1, bench_instance/4,
-         porffor_output/1, mem_size/1]).
+         host_output/1, mem_size/1]).
 
 %% Apply Mod:Fun(Args) on the loaded generated module. On a normal return yield
 %% `{ok, V}` (a Gleam `Ok(Int)`) where V is the result rendered as an integer (the raw
@@ -68,7 +68,7 @@ start_instance(Module) ->
 %% process, where `Imports` is the positional `[Provided ...]` list link:link_imports +
 %% link:link_func_imports returned (handed over opaquely as one argument). Same cell/threaded
 %% self-detection + receive loop as start_instance/1 — the ABI difference is only the arity of
-%% the instantiate call. Used by pipeline:run_porffor for a Porffor module (which imports its
+%% the instantiate call. Used by pipeline:instantiate_with_provided for an import-bearing module (which imports its
 %% console intrinsics from module "").
 start_instance_with(Module, Imports) ->
     start_common(Module, fun() -> Module:instantiate(Imports) end).
@@ -121,14 +121,14 @@ call_instance(Pid, Fun, Args) ->
 %% Drain THIS instance's Porffor console output buffer (P7-08, §E/§H.2). The buffer is a
 %% process-DICTIONARY cell in the instance's owned process (rt_host:append_output writes it
 %% during a print/printChar intrinsic call), so it MUST be read IN that process — this routes a
-%% {porffor_output, ...} message into the instance loop, which runs rt_host:porffor_output/0
+%% {host_output, ...} message into the instance loop, which runs rt_host:host_output/0
 %% there and replies with the raw byte stream (a binary). Returns <<>> for a never-printed
-%% instance. Used by pipeline:run_porffor after invoking the entry `m`.
-porffor_output(Pid) ->
+%% instance. Used by pipeline:host_output/1 after invoking an entry that printed.
+host_output(Pid) ->
     Ref = make_ref(),
-    Pid ! {porffor_output, self(), Ref},
+    Pid ! {host_output, self(), Ref},
     receive
-        {porffor_output_reply, Ref, Bin} -> Bin
+        {host_output_reply, Ref, Bin} -> Bin
     end.
 
 %% Read the module name baked into a .beam binary (needed to load a prebuilt .beam whose
@@ -200,12 +200,12 @@ instance_loop(Module) ->
                 end,
             From ! {result, Ref, Result},
             instance_loop(Module);
-        {porffor_output, From, Ref} ->
+        {host_output, From, Ref} ->
             %% Read this instance's Porffor console buffer IN this process (P7-08 §E). The
             %% rt_host module reference is build-fixed (never a data-derived atom, D3a).
-            Bin = try 'carder@runtime@rt_host':porffor_output()
+            Bin = try 'carder@runtime@rt_host':host_output()
                   catch _:_ -> <<>> end,
-            From ! {porffor_output_reply, Ref, Bin},
+            From ! {host_output_reply, Ref, Bin},
             instance_loop(Module);
         {mem_size, From, Ref} ->
             %% Report memory 0's size in 64 KiB pages, read IN this process (the Cell
@@ -267,12 +267,12 @@ threaded_loop(Module, St) ->
                     From ! {result, Ref, Err},
                     threaded_loop(Module, St)
             end;
-        {porffor_output, From, Ref} ->
+        {host_output, From, Ref} ->
             %% Same Porffor console drain as the Cell loop (P7-08 §E); the buffer is a
             %% process-local pdict cell independent of the threaded InstanceState record.
-            Bin = try 'carder@runtime@rt_host':porffor_output()
+            Bin = try 'carder@runtime@rt_host':host_output()
                   catch _:_ -> <<>> end,
-            From ! {porffor_output_reply, Ref, Bin},
+            From ! {host_output_reply, Ref, Bin},
             threaded_loop(Module, St);
         {mem_size, From, Ref} ->
             %% Threaded twin of the Cell `mem_size`: memory 0 lives in the `St`

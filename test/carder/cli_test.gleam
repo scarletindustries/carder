@@ -2,61 +2,61 @@
 //// exactly as `main` does (it is `run(argv.load().arguments)`), proving decision #5: every
 //// stage is independently invokable, and bad input yields a typed error (never a panic).
 ////
-//// These exercise the REAL pipeline + file IO (reading the committed corpus `.wasm` and
-//// golden `.ir` fixtures), so they are true end-to-end CLI tests, not arg-parsing unit
-//// tests.
+//// carder is a compiler BACKEND, so every verb is **IR-entry**: its input is a `.ir` text file
+//// (or, for `exec`, a prebuilt `.beam`). The source-language verbs (`decode`/`validate`/`ir`/
+//// `to-beam-wasm`) left with the WebAssembly frontend and are asserted in `scribbler`.
+////
+//// These exercise the REAL pipeline + file IO (reading the committed `test/carder/ir/golden`
+//// hand-written fixtures and the `test/carder/ir/corpus` programs), so they are true
+//// end-to-end CLI tests, not arg-parsing unit tests.
 
 import carder
 import carder/pipeline
 import gleam/string
 import simplifile
 
-const corpus = "test/carder/conformance/corpus"
+/// The 35-program `.ir` corpus — each file was generated from the corresponding conformance
+/// `.wasm` and is byte-for-byte equivalent compiler input.
+const corpus = "test/carder/ir/corpus"
 
+/// The hand-written `.ir` fixtures used to drive the per-stage verbs.
 const golden = "test/carder/ir/golden"
 
-// ─────────────────────────────── end-to-end `run` ───────────────────────────────
+// ─────────────────────────────── end-to-end `run` (IR entry) ───────────────────────────────
 
-/// `run add.wasm add 2 3` prints `5` (the documented arg convention: raw unsigned decimals).
-/// This is the full Safe pipeline (decode→…→ir_lower→…→invoke) behind one command.
+/// `run <in.ir> <export> <args…>` prints the result (the documented arg convention: raw
+/// unsigned decimals). This is the full Safe backend pipeline (parse `.ir` → ir_lower →
+/// optimize → emit → compile → instantiate → invoke) behind one command: `add(3, 5) == 8`.
 pub fn cli_run_add_test() {
-  assert carder.run(["run", corpus <> "/add.wasm", "add", "2", "3"]) == Ok("5")
+  assert carder.run(["run", corpus <> "/add.ir", "add", "3", "5"]) == Ok("8")
 }
 
-/// `run sum_to.wasm sum_to 100` prints `5050` — the constant-space loop, through ir_lower.
+/// `run sum_to.ir sum_to 100` prints `5050` — the constant-space loop, through ir_lower.
 pub fn cli_run_sum_to_test() {
-  assert carder.run(["run", corpus <> "/sum_to.wasm", "sum_to", "100"])
+  assert carder.run(["run", corpus <> "/sum_to.ir", "sum_to", "100"])
     == Ok("5050")
 }
 
 /// A divide-by-zero is reported as a trap (exit non-zero in `main`); the reason carries the
-/// spec trap kind.
+/// spec trap kind. Mirrors `intops.expected`'s
+/// `invoke divu i32:10 i32:0 => trap integer divide by zero`.
 pub fn cli_run_trap_test() {
   let assert Error(msg) =
-    carder.run(["run", corpus <> "/intops.wasm", "divu", "10", "0"])
+    carder.run(["run", corpus <> "/intops.ir", "divu", "10", "0"])
   assert string.contains(msg, "trap")
   assert string.contains(msg, "int_div_by_zero")
 }
 
+/// `run --unsafe <in.ir> add 3 5` prints `8` — the whole pipeline (parse `.ir` → ir_lower →
+/// optimize(Aggressive) → emit(unsafe) → instantiate(seeds) → invoke) runs correctly under the
+/// Unsafe profile, returning the SAME spec-correct result as Safe (F2 — Unsafe never changes an
+/// observable answer).
+pub fn cli_run_unsafe_add_test() {
+  assert carder.run(["run", "--unsafe", corpus <> "/add.ir", "add", "3", "5"])
+    == Ok("8")
+}
+
 // ─────────────────────────────── per-stage subcommands ───────────────────────────────
-
-/// `ir <in.wasm>` prints the `.ir` (source→IR end-to-end, unit 02's printer).
-pub fn cli_ir_test() {
-  let assert Ok(text) = carder.run(["ir", corpus <> "/add.wasm"])
-  assert string.contains(text, "module @")
-  assert string.contains(text, "i.add.32")
-}
-
-/// `validate <in.wasm>` accepts a well-typed module.
-pub fn cli_validate_test() {
-  assert carder.run(["validate", corpus <> "/fib.wasm"]) == Ok("valid")
-}
-
-/// `decode <in.wasm>` dumps the WASM AST.
-pub fn cli_decode_test() {
-  let assert Ok(text) = carder.run(["decode", corpus <> "/add.wasm"])
-  assert string.contains(text, "Module(")
-}
 
 /// `ir-lower <in.ir>` runs the Safe policy pass and prints `.ir` with the metering `charge`
 /// inserted (the visible evidence that ir_lower ran).
@@ -97,26 +97,26 @@ pub fn cli_to_erl_test() {
   assert string.contains(text, "instantiate()")
 }
 
-/// `to-beam-wasm [--unsafe] <in.wasm> <out.beam>` compiles a `.wasm` to a `.beam` under EACH
-/// profile (the profile-selecting compile the benchmark needs), and `exec` runs the prebuilt
-/// `.beam` — both profiles compute the same spec-correct result (`add(2,3) == 5`), proving the
-/// Safe and Unsafe builds agree end-to-end through the CLI's benchmark path.
-pub fn cli_to_beam_wasm_both_profiles_exec_test() {
-  let wasm = corpus <> "/add.wasm"
+/// `to-beam [--unsafe] <in.ir> <out.beam>` compiles a `.ir` to a `.beam` under EACH profile (the
+/// profile-selecting compile the benchmark needs), and `exec` runs the prebuilt `.beam` — both
+/// profiles compute the same spec-correct result (`add(3,5) == 8`), proving the Safe and Unsafe
+/// builds agree end-to-end through the CLI's benchmark path. `build` is the documented alias for
+/// `to-beam`, so the Unsafe leg drives it instead (same dispatcher arm).
+pub fn cli_to_beam_both_profiles_exec_test() {
+  let src = corpus <> "/add.ir"
   let safe_beam = "build/cli_bench_add_safe.beam"
   let unsafe_beam = "build/cli_bench_add_unsafe.beam"
 
-  let assert Ok(m1) = carder.run(["to-beam-wasm", wasm, safe_beam])
+  let assert Ok(m1) = carder.run(["to-beam", src, safe_beam])
   assert string.contains(m1, "wrote")
-  let assert Ok(m2) =
-    carder.run(["to-beam-wasm", "--unsafe", wasm, unsafe_beam])
+  let assert Ok(m2) = carder.run(["build", "--unsafe", src, unsafe_beam])
   assert string.contains(m2, "wrote")
 
-  // `exec` prints "<result>\n<timing>"; both profiles compute add(2,3) == 5.
-  let assert Ok(safe_out) = carder.run(["exec", safe_beam, "add", "2", "3"])
-  assert string.starts_with(safe_out, "5")
-  let assert Ok(unsafe_out) = carder.run(["exec", unsafe_beam, "add", "2", "3"])
-  assert string.starts_with(unsafe_out, "5")
+  // `exec` prints "<result>\n<timing>"; both profiles compute add(3,5) == 8.
+  let assert Ok(safe_out) = carder.run(["exec", safe_beam, "add", "3", "5"])
+  assert string.starts_with(safe_out, "8")
+  let assert Ok(unsafe_out) = carder.run(["exec", unsafe_beam, "add", "3", "5"])
+  assert string.starts_with(unsafe_out, "8")
 
   let _ = simplifile.delete(safe_beam)
   let _ = simplifile.delete(unsafe_beam)
@@ -142,15 +142,6 @@ pub fn cli_opt_roundtrips_test() {
 pub fn cli_opt_unsafe_succeeds_test() {
   let assert Ok(text) = carder.run(["opt", "--unsafe", golden <> "/sum_to.ir"])
   let assert Ok(_) = pipeline.parse_ir(text)
-}
-
-/// `run --unsafe add.wasm add 2 3` prints `5` — the whole pipeline (decode → … → ir_lower →
-/// optimize(Aggressive) → emit(unsafe) → instantiate(seeds) → invoke) runs correctly under the
-/// Unsafe profile, returning the SAME spec-correct result as Safe (F2 — Unsafe never changes an
-/// observable answer).
-pub fn cli_run_unsafe_add_test() {
-  assert carder.run(["run", "--unsafe", corpus <> "/add.wasm", "add", "2", "3"])
-    == Ok("5")
 }
 
 /// `emit` and `emit --unsafe` produce `.core` IDENTICAL in every function body for the same
@@ -191,6 +182,22 @@ fn bodies_before_instantiate(core: String) -> String {
   }
 }
 
+// ─────────────────────────────── `help` (exit 0) ───────────────────────────────
+
+/// `help` / `--help` / `-h` print the usage text on **stdout** and exit **0** (`Ok`) — a request
+/// for help is a success, unlike an unrecognised invocation which yields the same text as an
+/// `Error` (exit non-zero). All three spellings are the same documented verb, so all three must
+/// return the IDENTICAL text.
+pub fn cli_help_exits_zero_test() {
+  let assert Ok(h) = carder.run(["help"])
+  assert string.contains(h, "Usage")
+  assert carder.run(["--help"]) == Ok(h)
+  assert carder.run(["-h"]) == Ok(h)
+  // The usage text advertises the IR-entry verbs.
+  assert string.contains(h, "to-beam")
+  assert string.contains(h, "<in.ir>")
+}
+
 // ─────────────────────────────── fail-closed dispatch (never panics) ───────────────────────────────
 
 /// No arguments → the usage text as an `Error` (exit non-zero), never a panic.
@@ -208,13 +215,23 @@ pub fn cli_usage_on_unknown_command_test() {
 /// A missing input file → a typed read error (`Error`), never a panic.
 pub fn cli_missing_file_is_typed_error_test() {
   let assert Error(msg) =
-    carder.run(["decode", corpus <> "/does_not_exist.wasm"])
+    carder.run(["ir-lower", corpus <> "/does_not_exist.ir"])
   assert string.contains(msg, "read")
+}
+
+/// A non-`.ir` input (unparseable text) → a typed `parse .ir:` error, never a panic. This is
+/// the backend's ONE frontend-rejection prefix now that decode/validate live in the frontend.
+pub fn cli_unparseable_ir_is_typed_error_test() {
+  let bad = "build/cli_test_not_ir.ir"
+  let assert Ok(Nil) = simplifile.write(bad, "this is not an ir module\n")
+  let assert Error(msg) = carder.run(["to-core", bad])
+  assert string.contains(msg, "parse .ir")
+  let _ = simplifile.delete(bad)
 }
 
 /// A non-integer `run` argument → a typed error, never a panic.
 pub fn cli_bad_run_argument_test() {
   let assert Error(msg) =
-    carder.run(["run", corpus <> "/add.wasm", "add", "two", "3"])
+    carder.run(["run", corpus <> "/add.ir", "add", "two", "3"])
   assert string.contains(msg, "not an integer")
 }

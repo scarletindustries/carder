@@ -1,0 +1,15 @@
+module @carder@wasm@add {
+  numerics true
+  memory none
+  export "add" = @f0
+  export "mul" = @f1
+  func @f0 (%p0:i32, %p1:i32) -> (i32) {
+    let (%v1) = num i.add.32 (%p0, %p1)
+    values (%v1)
+  }
+  func @f1 (%p0:i32, %p1:i32) -> (i32) {
+    let (%v1) = num i.mul.32 (%p0, %p1)
+    values (%v1)
+  }
+}
+

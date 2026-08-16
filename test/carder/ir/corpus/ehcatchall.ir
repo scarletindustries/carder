@@ -1,0 +1,30 @@
+module @carder@wasm@catchall {
+  numerics true
+  memory none
+  tag @tag0 (i32)
+  tag @tag1 ()
+  export "catchall" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v6) = block $lbl1 : (i32) {
+      let () = block $lbl2 : () {
+        let () = try () {
+          let () = block $lbl4 : () {
+            let () = try () {
+              throw @tag0 (%p0)
+            } catch @tag1 () {
+              break $lbl4 ()
+            }
+            break $lbl1 (i32.const 1)
+          }
+          values ()
+        } catch_all () {
+          break $lbl2 ()
+        }
+        values ()
+      }
+      break $lbl1 (i32.const 42)
+    }
+    values (%v6)
+  }
+}
+
