@@ -72,7 +72,11 @@ forms_to_erl(Forms) when is_list(Forms) ->
 %% shapes; `nowarn_unused_vars` silences the one warning class alpha-renamed
 %% codegen output legitimately triggers en masse (fresh pattern binders used
 %% as wildcards), keeping the warning list from growing O(module) on large
-%% guests.
+%% guests. No `no_*_opt` speed knobs: measured on the raytrace forms (2.99M
+%% words, min of 6), no_bool_opt / no_share_opt / no_bsm_opt / no_recv_opt /
+%% no_type_opt each land within 4% of the 17.3 s baseline (their passes cost
+%% <0.5 s combined; beam_ssa_opt's type/rpo walks are the ~11 s). Only
+%% no_ssa_opt halves it, at +36% .beam and every SSA optimisation off.
 compile_forms_guarded(Forms, Extra) ->
     Opts = [binary, return_errors, return_warnings, nowarn_unused_vars | Extra],
     try compile:forms(Forms, Opts) of
