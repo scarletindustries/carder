@@ -74,11 +74,10 @@
 //// policy field: that would break the F5 zero-overhead differential.
 
 import carder/backend/core_erlang.{
-  type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
-  type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase,
-  CClause, CCons, CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop,
-  CTry, CTuple, CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple,
-  PVar,
+  type CClause, type CExpr, type CModule, type CPat, type FName, type FunDef,
+  CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CBytes, CCall, CCase, CClause,
+  CCons, CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import carder/ir.{
   type ConvOp, type Expr, type FuncType, type Function, type IntWidth,
@@ -2794,7 +2793,7 @@ fn join_inlinable(fname: FName, info: JoinInfo) -> Bool {
 /// recursive. `acc` is the accumulator threaded through.
 fn scan_joins(expr: CExpr, scope: Set(FName), acc: JoinInfo) -> JoinInfo {
   case expr {
-    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> acc
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) -> acc
     // A funref REFERENCES an `FName` without applying it, so it is invisible to `counts`. PIN the
     // name: inlining would drop the `letrec` and leave this ref dangling.
     CFunRef(fname) -> JoinInfo(..acc, pinned: set.insert(acc.pinned, fname))
@@ -2879,7 +2878,7 @@ fn inline_expr(
   env: Dict(FName, #(List(String), CExpr)),
 ) -> CExpr {
   case expr {
-    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) -> expr
     CFunRef(_) -> expr
     CCons(h, t) -> CCons(inline_expr(h, info, env), inline_expr(t, info, env))
     CTuple(es) -> CTuple(list.map(es, fn(e) { inline_expr(e, info, env) }))
@@ -3022,7 +3021,7 @@ fn mask_def(def: FunDef) -> FunDef {
 /// against M2 when the child was rewritten).
 fn mask_expr(expr: CExpr) -> CExpr {
   case expr {
-    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil -> expr
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) -> expr
     CFunRef(_) -> expr
     CCons(h, t) -> CCons(mask_expr(h), mask_expr(t))
     CTuple(es) -> CTuple(list.map(es, mask_expr))
@@ -7049,32 +7048,15 @@ fn valtype_atom(t: ValType) -> CExpr {
 
 /// A Core binary STRING literal of `s`'s UTF-8 bytes (e.g. `"g0"` → `<<"g0">>`), byte-exact
 /// with the BEAM binary a Gleam `String` is — so `rt_state.global_get(name: String)` /
-/// `seed`'s global-name keys match. Emitted as a `CBinary` of 8-bit integer segments.
+/// `seed`'s global-name keys match. Emitted as a single `CBytes` literal.
 fn core_binary_string(s: String) -> CExpr {
   core_binary_bytes(bit_array.from_string(s))
 }
 
-/// A Core binary literal of the raw `bytes` (a data-segment payload), each byte an 8-bit
-/// `'integer'` segment — byte-exact with a BEAM `binary`/Gleam `BitArray`.
+/// A Core binary literal of the raw `bytes` (a data-segment payload) as ONE byte-string
+/// segment — byte-exact with a BEAM `binary`/Gleam `BitArray`.
 fn core_binary_bytes(bytes: BitArray) -> CExpr {
-  CBinary(byte_segments(bytes, []))
-}
-
-/// Peel `bytes` into one little-endian-irrelevant 8-bit segment per byte (accumulated in
-/// reverse, then restored). A non-byte-aligned tail (never produced here) ends the scan.
-fn byte_segments(bytes: BitArray, acc: List(CBitSeg)) -> List(CBitSeg) {
-  case bytes {
-    <<b:size(8), rest:bits>> -> byte_segments(rest, [byte_seg(b), ..acc])
-    _ -> list.reverse(acc)
-  }
-}
-
-/// One unsigned 8-bit integer binary segment `#<B>(8,1,'integer',['unsigned','big'])`.
-fn byte_seg(b: Int) -> CBitSeg {
-  CBitSeg(value: CInt(b), size: CInt(8), unit: 1, segtype: "integer", flags: [
-    "unsigned",
-    "big",
-  ])
+  CBytes(bytes)
 }
 
 // ─────────────────────────────── the instantiate/0 entry (E5) ───────────────────────────────

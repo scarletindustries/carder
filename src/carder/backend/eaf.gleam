@@ -49,8 +49,8 @@
 
 import carder/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FunDef,
-  CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CCall, CCase, CClause, CCons,
-  CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CBytes, CCall, CCase, CClause,
+  CCons, CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
   CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import carder/backend/core_printer
@@ -80,6 +80,11 @@ fn raw(term: a) -> Form
 /// this module's private `EAtom` so raw atoms never leak.
 @external(erlang, "erlang", "binary_to_atom")
 fn atom_of(name: String) -> EAtom
+
+/// `erlang:binary_to_list/1` — a whole-byte binary as its byte list (each
+/// 0..255), the payload of a `{string, Anno, Bytes}` segment value.
+@external(erlang, "erlang", "binary_to_list")
+fn bytes_to_list(bytes: BitArray) -> List(Int)
 
 /// Why the Core-shaped AST could not be lowered to abstract forms. Every
 /// variant is an `emit_core` INVARIANT violation (the shapes `emit_core`
@@ -172,15 +177,16 @@ type St {
   St(counter: Int)
 }
 
-/// Mint a globally-fresh (within the current function) Erlang variable name
-/// for the raw Core name `raw_name`: the printer's injective legalization
-/// (`V…`) plus an `@<counter>` suffix, so the name is simultaneously legal,
-/// traceable to its Core origin, and provably unbound at its binding site.
-fn fresh(st: St, raw_name: String) -> #(String, St) {
-  #(
-    core_printer.legalize_var(raw_name) <> "@" <> int.to_string(st.counter),
-    St(st.counter + 1),
-  )
+/// Mint a fresh (within the current function) Erlang variable name: `V` plus
+/// the counter. The raw Core name is deliberately NOT part of it — every
+/// distinct variable atom is interned permanently by `compile:forms`, and
+/// origin-tagged names (`Vg3010@7`) are unique per module, so a large guest
+/// interned tens of thousands of atoms. Counter-only names repeat across
+/// functions and modules, so the whole atom cost is one atom per counter
+/// value ever reached. `_raw_name` stays in the signature so a debug build
+/// can switch the naming back without touching the call sites.
+fn fresh(st: St, _raw_name: String) -> #(String, St) {
+  #("V" <> int.to_string(st.counter), St(st.counter + 1))
 }
 
 /// Bind `raw_name` to a fresh Erlang variable: mint the name and extend the
@@ -291,6 +297,15 @@ fn e_bin_element(ln: Int, value: Form, size: Form, tsl: List(Form)) -> Form {
   raw(#(atom_of("bin_element"), ln, value, size, tsl))
 }
 
+/// One `{bin_element, Anno, {string, Anno, Bytes}, default, default}` segment
+/// holding a whole byte string: the default 8-bit integer type is byte-exact for
+/// bytes 0..255, so the binary is `Bytes` verbatim in ONE segment.
+fn e_bytes_element(ln: Int, bytes: BitArray) -> Form {
+  let default = atom_of("default")
+  let value = #(atom_of("string"), ln, bytes_to_list(bytes))
+  raw(#(atom_of("bin_element"), ln, value, default, default))
+}
+
 /// A proper-list EAF term `[E1, E2, …]` (a `{cons,…}` chain ending `{nil,…}`)
 /// — used for the packed argument list of a multi-def `letrec` dispatch call,
 /// and as the matching list PATTERN (same shape) on the receiving clause.
@@ -328,11 +343,12 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
   case expr {
     CVar(name) -> {
       // A reference must resolve to an in-scope binder. The fallback (raw
-      // legalized name) is defensively deterministic for an unbound
-      // reference — erl_lint then reports it as unbound, fail-closed.
+      // legalized name under a prefix no `fresh` name can wear) is
+      // defensively deterministic for an unbound reference — erl_lint then
+      // reports it as unbound, fail-closed.
       let v = case dict.get(env.vars, name) {
         Ok(n) -> n
-        Error(_) -> core_printer.legalize_var(name)
+        Error(Nil) -> "Unbound@" <> core_printer.legalize_var(name)
       }
       Ok(#(e_var(ln, v), st))
     }
@@ -359,6 +375,7 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       )
       Ok(#(e_bin(ln, list.reverse(rev)), st1))
     }
+    CBytes(bytes) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
     CValues(values) -> Error(BareValueList(list.length(values)))
     CFun(vars, body) -> {
       let #(params, env2, st1) = bind_params(vars, env, st)

@@ -116,6 +116,11 @@ pub type CExpr {
   /// A binary/bitstring, printed `#{ Segments }#`. Lock-now placeholder; the
   /// Phase-1 integer corpus does not exercise it.
   CBinary(segments: List(CBitSeg))
+  /// A byte-string binary literal: the raw `bytes` verbatim (a whole-byte
+  /// `BitArray`). Lowered as ONE `{bin_element, _, {string, _, Bytes}, default,
+  /// default}` segment rather than one 8-bit segment per byte; the printer
+  /// still spells it as per-byte `#<B>(8,1,'integer',['unsigned','big'])`.
+  CBytes(bytes: BitArray)
   /// A value list `<E1, E2, …>`. Used where Core Erlang expects multiple values
   /// (e.g. a multi-result `case` scrutinee or the RHS of a multi-binder `let`).
   CValues(values: List(CExpr))
