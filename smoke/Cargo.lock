@@ -109,7 +109,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "twocore-smoke"
+name = "carder-smoke"
 version = "0.1.0"
 dependencies = [
  "crc32fast",

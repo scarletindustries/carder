@@ -1,9 +1,9 @@
-# 2core
+# carder
 > this is a large experimental project. the mass majority of  the code was written by claude. no promises made. definitely don't use it in anything production as it's pretty slow right now (that will be fixed in the future)
 
-2core is an attempt to compile WASM to run on the BEAM, where the output is Core Erlang. This isn't a WASM VM, rather, it's trying to actually "convert" the code as much as possible & optimise it for BEAM behaviour and functional programming concepts.
+carder is an attempt to compile WASM to run on the BEAM, where the output is Core Erlang. This isn't a WASM VM, rather, it's trying to actually "convert" the code as much as possible & optimise it for BEAM behaviour and functional programming concepts.
 
-it works right now! kinda. a good amount of wasm will compile and run in the BEAM, with the supported WASM spec growing everyday. 2core has its own IR, and as such supports multiple frontends. WASM is just the first. JS is in the works via [Porffor](https://github.com/CanadaHonk/porffor) (js -> wasm -> beam).
+it works right now! kinda. a good amount of wasm will compile and run in the BEAM, with the supported WASM spec growing everyday. carder has its own IR, and as such supports multiple frontends. WASM is just the first. JS is in the works via [Porffor](https://github.com/CanadaHonk/porffor) (js -> wasm -> beam).
 
 ## why?
 
@@ -26,7 +26,7 @@ there is a pretty big corpus of wasm files scattered across the code for testing
 give this a try:
 
 ```shell
-$ gleam run -- run test/twocore/conformance/corpus/add.wasm add 3 5
+$ gleam run -- run test/carder/conformance/corpus/add.wasm add 3 5
 8
 ```
 
@@ -63,4 +63,4 @@ for planning new phases. that's worked pretty well so far to get to where the pr
 
 ## license
 
-2core is licensed under the [Apache License 2.0](LICENSE). you're free to use, modify, and distribute it — including in commercial and closed-source products — provided you keep the license and attribution notices intact. the Apache license also carries an explicit patent grant. see [LICENSE](LICENSE) and [NOTICE](NOTICE) for the full terms.
+carder is licensed under the [Apache License 2.0](LICENSE). you're free to use, modify, and distribute it — including in commercial and closed-source products — provided you keep the license and attribution notices intact. the Apache license also carries an explicit patent grant. see [LICENSE](LICENSE) and [NOTICE](NOTICE) for the full terms.

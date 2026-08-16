@@ -1,6 +1,6 @@
-//! Smoke-test surface for 2core: real external crates (CRC-32, SHA-256, DEFLATE)
+//! Smoke-test surface for carder: real external crates (CRC-32, SHA-256, DEFLATE)
 //! compiled to a no-import, MVP-only wasm, exercised via i32-in/i32-out exports so
-//! 2core (compile → .beam → run) can be differential-tested against wasmtime.
+//! carder (compile → .beam → run) can be differential-tested against wasmtime.
 #![no_std]
 extern crate alloc;
 use alloc::vec::Vec;

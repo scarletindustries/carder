@@ -108,7 +108,7 @@ Phase 13 was expected to unblock the two official EH `.wast` files "blocked pure
 So `eh_conformance_test` keeps **4 files driven green** (153 asserts × 3 profiles, `fail == 0`) and lists
 the two newly-convertible files as **categorized-deferred on the deeper scope** (never a false green;
 the two un-`wast2json`-able files `tag.wast`/`try_table.wast` stay deferred on **GC / typed-refs**, no
-longer on tail-call). See the module doc + `eh_unconvertible` in `test/twocore/conformance/eh_conformance_test.gleam`.
+longer on tail-call). See the module doc + `eh_unconvertible` in `test/carder/conformance/eh_conformance_test.gleam`.
 
 ---
 
@@ -127,15 +127,15 @@ longer on tail-call). See the module doc + `eh_unconvertible` in `test/twocore/c
 
 | Proof | Test |
 |---|---|
-| Official `return_call.wast` + `return_call_indirect.wast` run green (`fail == 0`, +117 pass) | `test/twocore/conformance/conformance_test.gleam` (vendored via `vendor/ALLOWLIST` + `vendor.sh`) |
-| Constant stack — direct `return_call` self-loop to 1,000,000 in bounded live memory | `test/twocore/tier/tailcall_capstone_test.gleam` (`count_down_constant_space_test`) |
+| Official `return_call.wast` + `return_call_indirect.wast` run green (`fail == 0`, +117 pass) | `test/carder/conformance/conformance_test.gleam` (vendored via `vendor/ALLOWLIST` + `vendor.sh`) |
+| Constant stack — direct `return_call` self-loop to 1,000,000 in bounded live memory | `test/carder/tier/tailcall_capstone_test.gleam` (`count_down_constant_space_test`) |
 | Constant stack — mutual `is_even`/`is_odd` recursion to 1,000,000 | `tailcall_capstone_test.gleam` (`even_odd_constant_space_test`) |
 | Constant stack — `return_call_indirect` self-loop, both table tiers | `tailcall_capstone_test.gleam` (`indirect_constant_space_test`) |
 | Typing rule — result-type-mismatch `assert_invalid` rejected | Q13-03 suite (re-run green) |
-| Indirect fail-closed — 3 ordered traps, driven across every combo | `test/twocore/conformance/corpus/tailrec.{wat,wasm,expected}` via `tier_differential_test` |
-| Differential — `tailrec` result-identical across every shipped combo | `test/twocore/tier/tier_differential_test.gleam` (`corpus_programs` enrolls `tailrec`) |
+| Indirect fail-closed — 3 ordered traps, driven across every combo | `test/carder/conformance/corpus/tailrec.{wat,wasm,expected}` via `tier_differential_test` |
+| Differential — `tailrec` result-identical across every shipped combo | `test/carder/tier/tier_differential_test.gleam` (`corpus_programs` enrolls `tailrec`) |
 | `OptNone ≡ Baseline ≡ Aggressive` bit-identical on `tailrec`, every combo | `tailcall_capstone_test.gleam` (`tailrec_opt_level_bit_identical_test`) |
 | Default unaffected — non-funcref byte-identical, funcref (`callind`) result-identical | `tailcall_capstone_test.gleam` (`tailrec_default_byte_identical_test`) |
 | Imported tail call value-correct / bounded frame | Q13-05 suite (re-run green + cited) |
-| EH: 4 files driven green; 2 convert but categorized-deferred (measured) | `test/twocore/conformance/eh_conformance_test.gleam` |
-| Skip audit honest + tight (`"return_call"`/`"call stack"` phrases removed) | `test/twocore/conformance/{skipcount,residual_audit}_test.gleam` |
+| EH: 4 files driven green; 2 convert but categorized-deferred (measured) | `test/carder/conformance/eh_conformance_test.gleam` |
+| Skip audit honest + tight (`"return_call"`/`"call stack"` phrases removed) | `test/carder/conformance/{skipcount,residual_audit}_test.gleam` |

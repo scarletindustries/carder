@@ -1,7 +1,0 @@
-# ehthrow — LEGACY try/catch (the encoding PORFFOR emits). run(x): try { if x≠0 throw $e(x); else 7 }
-# catch $e { payload+1 }. run(0)=7 (no throw); run(x≠0)=x+1 (payload bound + 1). Spec-sourced from
-# the exception-handling proposal's legacy try/catch semantics; the official legacy/throw.wast (in
-# eh_conformance_test) independently validates 2core's legacy path. Raw unsigned bit patterns (D5).
-invoke run i32:0 => return i32:7
-invoke run i32:5 => return i32:6
-invoke run i32:9 => return i32:10

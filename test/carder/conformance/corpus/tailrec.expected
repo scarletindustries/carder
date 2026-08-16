@@ -1,0 +1,14 @@
+# Phase-13 tail-call acceptance. Values cross-checked with the carder pipeline (Tier-A) + wat2wasm.
+# Direct + mutual recursion (spec: tail-call proposal — result types equal; stack-polymorphic).
+invoke count_down i32:0    => return i32:0
+invoke count_down i32:1000 => return i32:0
+invoke is_even i32:1000    => return i32:1
+invoke is_even i32:1001    => return i32:0
+invoke is_odd  i32:1001    => return i32:1
+invoke is_odd  i32:1000    => return i32:0
+# Indirect tail-call self-loop.
+invoke ind_count_down i32:1000 => return i32:0
+# Indirect fail-closed, three ordered guards (spec exec/instructions: bounds -> null -> type).
+invoke ind_oob  i32:0      => trap undefined element
+invoke ind_null i32:0      => trap uninitialized element
+invoke ind_type i32:0 i32:0 => trap indirect call type mismatch

@@ -17,10 +17,10 @@ export — the "beautiful `.gleam` file with the exports typed for me."
 
 ```
 to-beam-wasm --threaded --bindings gleam --out ./out math.wasm
-# → ./out/twocore@wasm@<base>.beam                     (the compiled module, unchanged)
-#   ./out/twocore_wasm_<base>_bindings.gleam           (the typed API)
-#   ./out/twocore_wasm_<base>_bindings_ffi.erl         (the trap catch-shim, Gleam only)
-#   ./out/twocore_wasm_<base>_bindings_README.md       (usage note, Gleam only)
+# → ./out/carder@wasm@<base>.beam                     (the compiled module, unchanged)
+#   ./out/carder_wasm_<base>_bindings.gleam           (the typed API)
+#   ./out/carder_wasm_<base>_bindings_ffi.erl         (the trap catch-shim, Gleam only)
+#   ./out/carder_wasm_<base>_bindings_README.md       (usage note, Gleam only)
 ```
 
 `--bindings <langs>` takes a comma list of `gleam`/`erlang`/`elixir`; `--out <dir>` is the output
@@ -93,7 +93,7 @@ none of a later call's writes — result-equality, not shared mutable state.
   `.beam` export through the shim's `try/catch`, which matches `error:{wasm_trap, _}` **structurally**
   (never a bare catch-all). Both files go under the consuming project's `src/` (Gleam discovers `.erl`
   FFI tree-wide under `src/`), and a README explains the drop + the value-ABI cheat-sheet. The binding
-  module is named `twocore_wasm_<base>_bindings` (legalized from the module atom), so it never
+  module is named `carder_wasm_<base>_bindings` (legalized from the module atom), so it never
   collides with the loaded `.beam` module atom.
 - **Erlang** — a **single `.erl`** with `-spec`/`-doc` on every function. Erlang catches the BEAM
   exception in-language (`try … catch error:{wasm_trap, _} -> {error, Trap}`), so there is **no
@@ -121,7 +121,7 @@ the typed-error surface — it is documented, not modelled. The trap surface is 
 ## 6. Runtime dependency — the un-linked binding is NOT self-contained
 
 **The compiled `.beam` the binding dispatches into is a thin module** of module-qualified calls into
-the shared runtime (`twocore@runtime@*` + `gleam@*`). So an un-linked binding's call chain
+the shared runtime (`carder@runtime@*` + `gleam@*`). So an un-linked binding's call chain
 transitively needs those ebins on the code path — the binding is **not portable on its own**. For a
 **droppable, self-contained** artifact, compile the module with **Phase-11 `--link`** (which merges
 the runtime closure into the one `.beam`); the typed binding then dispatches into that self-contained
@@ -136,4 +136,4 @@ back to raw bits — is asserted **identical** to the in-process pipeline oracle
 matrix (i32/i64 signed, f32/f64 finite and non-finite, v128, funcref/externref, multi-value, zero
 result), plus a genuine trap → the language's error idiom, plus threaded-state accumulation with an
 immutable old instance. Floats are compared by **raw IEEE bits**, so a sign/rounding/NaN divergence
-would be caught. The proof lives in `test/twocore/backend/bindings_compile_call_test.gleam`.
+would be caught. The proof lives in `test/carder/backend/bindings_compile_call_test.gleam`.

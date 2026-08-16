@@ -1,4 +1,4 @@
-# Phase-3 benchmark — 2core on the BEAM vs hand-written Erlang & the native ceiling
+# Phase-3 benchmark — carder on the BEAM vs hand-written Erlang & the native ceiling
 
 > **The one claim Phase 3 makes about the outside world — "the fastest possible code, potentially
 > faster than hand-written Erlang" — is *measured here, not asserted*.** This is a committed
@@ -8,7 +8,7 @@
 ## What is measured
 
 Three real, external, permissively-licensed crates, compiled to a single **no-import, MVP-only**
-`twocore_smoke.wasm` (72,933 bytes, 80 functions, 0 imports — the same artifact `smoke/run.sh`
+`carder_smoke.wasm` (72,933 bytes, 80 functions, 0 imports — the same artifact `smoke/run.sh`
 already differential-checks **bit-exact vs `wasmtime`**), exposed as `i32`-in / `i32`-out exports:
 
 | Kernel | Crate | Exercises |
@@ -22,15 +22,15 @@ recomputes the same input per call does the same total work.
 
 ## Contenders
 
-1. **2core-Unsafe** — compiled under `profiles.unsafe()` (Aggressive optimizer, `MeterOff`,
+1. **carder-Unsafe** — compiled under `profiles.unsafe()` (Aggressive optimizer, `MeterOff`,
    passthrough stdlib, open BIF/host), `.beam` timed with `gleam run -- exec -n N` (times **only**
    the invocations — the ABI already exists).
-2. **2core-Safe** — compiled under `profiles.safe()` (Baseline optimizer, enforcing fuel,
+2. **carder-Safe** — compiled under `profiles.safe()` (Baseline optimizer, enforcing fuel,
    allowlist, own stdlib), same `exec -n N` timing.
 3. **hand-written Erlang** — a **pure-Erlang, table-driven CRC-32** (the honest hand-written
    baseline; recomputes the *same* input, so its result is **bit-identical** to the wasm export).
    For SHA-256 and DEFLATE this column instead reports the **native NIF ceiling** — `crypto:hash/2`
-   and `zlib` — which are **NIF-backed C, NOT hand-written Erlang**; 2core is expected to sit below
+   and `zlib` — which are **NIF-backed C, NOT hand-written Erlang**; carder is expected to sit below
    them, and does. Clearly labelled as such.
 4. **`wasmtime`** — bit-exact **correctness** is already cross-checked by `smoke/run.sh`. A
    per-call *timing* comparison is deliberately **omitted**: `wasmtime run --invoke` measures a
@@ -56,23 +56,23 @@ recomputes the same input per call does the same total work.
 
 ## Results (ns per call, this machine)
 
-| kernel | 2core-Unsafe | 2core-Safe | hand-Erl / native | notes |
+| kernel | carder-Unsafe | carder-Safe | hand-Erl / native | notes |
 |---|---:|---:|---:|---|
 | `crc32(4096)` | n/a¹ | 4,006,910 | **52,800** (hand-written Erlang) | Erlang ~**76× faster**; results **bit-identical** (`2538352202`) |
 | `sha256_word(4096)` | n/a¹ | 19,781,600 | 41,620 (native `crypto`) | native NIF ceiling ~**475×** faster |
 | `deflate_roundtrip(2000)` | n/a¹ | 62,098,600 | 38,650 (native `zlib`) | native NIF ceiling ~**1600×** faster |
 
-¹ **2core-Unsafe = n/a on these crates** — see limitation (1). The Aggressive optimizer's inliner
+¹ **carder-Unsafe = n/a on these crates** — see limitation (1). The Aggressive optimizer's inliner
 does not finish compiling this 80-function module in practical time.
 
-`crc32(4096)`: 2core = `2538352202` = hand-written-Erlang `2538352202` = wasmtime (`run.sh`). A
+`crc32(4096)`: carder = `2538352202` = hand-written-Erlang `2538352202` = wasmtime (`run.sh`). A
 clean, bit-identical head-to-head.
 
 ## The honest reading
 
 - **"Faster than hand-written Erlang?" — measured: NO, on the current tier-O runtime.** For the one
   faithful head-to-head (CRC-32, bit-identical), pure hand-written Erlang is ~**76×** faster than
-  2core-Safe. Against the native-NIF ceiling (SHA-256, DEFLATE) 2core is two-to-three orders of
+  carder-Safe. Against the native-NIF ceiling (SHA-256, DEFLATE) carder is two-to-three orders of
   magnitude slower — as expected for compiled-from-wasm code vs hand-optimized C NIFs. **The high-
   level aspiration is therefore *not yet* met by Phase 3, and this benchmark says so plainly.**
 - **Why:** the dominant cost is the **tier-O memory model** — `rt_mem`'s paged *immutable-binary*
@@ -84,7 +84,7 @@ clean, bit-identical head-to-head.
   passes). The passthrough/open-BIF path ships as a **mechanism with zero active routes** (every
   shared stdlib function stays in-house under *both* profiles), so it contributes **no** speedup
   here — as designed (F8). Correctness under the optimizer is proven byte-for-byte by the capstone
-  differentials (`test/twocore/optimize/differential_test.gleam`): `OptNone` ≡ `Baseline` ≡
+  differentials (`test/carder/optimize/differential_test.gleam`): `OptNone` ≡ `Baseline` ≡
   `Aggressive`, and `Safe` ≡ `Unsafe`, on the whole acceptance corpus.
 
 ## Limitations (stated, not hidden)

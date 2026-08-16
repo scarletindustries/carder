@@ -1,8 +1,8 @@
-# 2core smoke test — real programs on the BEAM
+# carder smoke test — real programs on the BEAM
 
 An end-to-end smoke test that takes **real, external, permissively-licensed libraries**,
 compiles their source to a **no-import, MVP-only WebAssembly** module, runs it through the
-full 2core pipeline (`decode → validate → lower → IR → Core Erlang → .beam → instantiate →
+full carder pipeline (`decode → validate → lower → IR → Core Erlang → .beam → instantiate →
 invoke`), and **differential-tests every result against `wasmtime`**.
 
 ```sh
@@ -30,14 +30,14 @@ DEFLATE compress/decompress roundtrip of 2000 bytes. The wasm is ~73 KB / ~80 fu
 **0 imports**, and validates as `wasm1 + mutable-globals` (pure MVP).
 
 ```
-crc32 4096               2core=2538352202  wasmtime=2538352202  ok
-sha256_word 4096         2core=2927598936  wasmtime=2927598936  ok
-deflate_roundtrip 2000   2core=2010787627  wasmtime=2010787627  ok   (compress+decompress on the BEAM)
+crc32 4096               carder=2538352202  wasmtime=2538352202  ok
+sha256_word 4096         carder=2927598936  wasmtime=2927598936  ok
+deflate_roundtrip 2000   carder=2010787627  wasmtime=2010787627  ok   (compress+decompress on the BEAM)
 ```
 
 ## The toolchain (how to add more targets)
 
-2core supports the **WASM 1.0 MVP only, with no imports** (see the repo README). So a smoke
+carder supports the **WASM 1.0 MVP only, with no imports** (see the repo README). So a smoke
 target must be import-free and avoid bulk-memory / reference-types / SIMD / threads.
 
 - **Rust** (used here): the `wasm32v1-none` target (stable since Rust 1.84) emits pure
@@ -49,17 +49,17 @@ target must be import-free and avoid bulk-memory / reference-types / SIMD / thre
   `clang --target=wasm32 -mcpu=mvp -msign-ext -mnontrapping-fptoint -mmultivalue -nostdlib
   -ffreestanding -fno-builtin -O2 -Wl,--no-entry -Wl,--export-all -o out.wasm prog.c`.
   `-mcpu=mvp` is essential: LLVM ≥19 enables `reference-types`/`bulk-memory` by default,
-  which emit opcodes/encodings 2core doesn't support. Provide `memcpy`/`memset`/`memmove`/
+  which emit opcodes/encodings carder doesn't support. Provide `memcpy`/`memset`/`memmove`/
   `memcmp` as plain C so they don't become `memory.copy`/`memory.fill`.
 
-Gate any candidate before feeding 2core:
+Gate any candidate before feeding carder:
 ```sh
 wasm-tools print x.wasm | grep -c '(import'                                   # must be 0
 wasm-tools print x.wasm | grep -cE 'memory\.(copy|fill|init)|data\.drop|v128' # must be 0
 wasm-tools validate --features=wasm1,mutable-global x.wasm
 ```
 
-## SQLite — the north-star (feasible to build; a real 2core stress test)
+## SQLite — the north-star (feasible to build; a real carder stress test)
 
 SQLite is **public domain** (free to clone, build, run, redistribute). A no-import,
 MVP-only, self-contained `sqlite.wasm` **is buildable** via SQLite's officially-supported
@@ -72,10 +72,10 @@ It is **not yet a passing smoke test**, for two reasons worth tracking:
 1. The clean build must force `-mno-bulk-memory` and supply the libc subset SQLite needs
    (a ~0.5–2 day build effort cribbing the musl subset + memvfs shim).
 2. The result is ~1 MB / thousands of functions with a few very large functions and a big
-   active data segment. 2core's atom/function-count scaling is fine, but it would stress the
+   active data segment. carder's atom/function-count scaling is fine, but it would stress the
    single-module `compile:forms` on the giant functions and the paged-immutable-binary
    memory on SQLite's memcpy/memset-heavy code (each byte-store rebuilds a 4 KB chunk).
 
-So SQLite is a genuine **north-star**: reaching it motivates concrete 2core work
+So SQLite is a genuine **north-star**: reaching it motivates concrete carder work
 (bulk-memory lowering, compact data-segment emission, possibly multi-module output). The
 crate ladder above is the calibrated stepping stone that passes today.

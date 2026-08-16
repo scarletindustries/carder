@@ -1,7 +1,7 @@
 # Phase 15 — production tier-N C NIF for linear memory
 
 > The tier-N `nif` memory backend, deferred since Phase 4 for want of a native toolchain, is now a
-> **real `erl_nif` C backend** (`c_src/twocore_rt_mem_nif.c`) over a **reserved raw byte buffer**
+> **real `erl_nif` C backend** (`c_src/carder_rt_mem_nif.c`) over a **reserved raw byte buffer**
 > managed by an ERTS resource — the raw `O(1)` native memory ceiling — replacing the paged-delegating
 > skeleton. It is **bit-identical to the paged reference for every access** (the differential is the
 > proof), **Unsafe-only / Safe-forbidden** (the four fail-closed gates, unchanged), and
@@ -15,13 +15,13 @@
 ## What shipped
 
 A runtime-tier phase: **no frontend, no IR, no optimizer-semantics change**. The tier stays a
-build-time module swap behind the `emit_core` seam (`mem_module = "twocore@runtime@rt_mem_nif"`), so
+build-time module swap behind the `emit_core` seam (`mem_module = "carder@runtime@rt_mem_nif"`), so
 `emit_core` routes to it unchanged the moment `binding.mem_tier == Nif`.
 
 | Piece | What landed |
 |---|---|
-| **The native C core** (`c_src/twocore_rt_mem_nif.c`, S15-02) | The 16 frozen ops — `load`/`store`/`size`/`grow`/`init_data`/`load_bytes`/`store_bytes`/`fill`/`copy`/`init` (+ `_unchecked` twins, `nif_available`, `nif_ping`, `to_flat`) — over a `twocore_mem_t { size_t byte_len; size_t max_bytes; unsigned char data[]; }` reserved buffer via an ERTS resource. Little-endian byte moves; f32/f64 raw IEEE-bit moves (never a BEAM `double` round-trip); sub-word signed sign-extension to the result width; `grow` bumps `byte_len` within the reserved `max_bytes` (a moving watermark, **never** `enif_realloc`'d — the resource identity is stable). |
-| **The Gleam heads** (`src/twocore/runtime/rt_mem_nif.gleam`, S15-02) | Every frozen head (Cell + Threaded, `_at` twins, bulk, SIMD byte seam, `*_unchecked`) dispatches on `nif_available()`: native `@external` when the `.so` is attached, else the byte-identical paged delegate (`rt_mem`). The Gleam keeps the pdict/record/mem-index plumbing **and the `rt_meter` fuel charges** (metering byte-identical to paged/atomics); the C owns only the pure `mem_*` algebra. The combined no-wrap effective address `ea = addr + offset` is computed Gleam-side as a BEAM bignum — the C never re-adds. |
+| **The native C core** (`c_src/carder_rt_mem_nif.c`, S15-02) | The 16 frozen ops — `load`/`store`/`size`/`grow`/`init_data`/`load_bytes`/`store_bytes`/`fill`/`copy`/`init` (+ `_unchecked` twins, `nif_available`, `nif_ping`, `to_flat`) — over a `carder_mem_t { size_t byte_len; size_t max_bytes; unsigned char data[]; }` reserved buffer via an ERTS resource. Little-endian byte moves; f32/f64 raw IEEE-bit moves (never a BEAM `double` round-trip); sub-word signed sign-extension to the result width; `grow` bumps `byte_len` within the reserved `max_bytes` (a moving watermark, **never** `enif_realloc`'d — the resource identity is stable). |
+| **The Gleam heads** (`src/carder/runtime/rt_mem_nif.gleam`, S15-02) | Every frozen head (Cell + Threaded, `_at` twins, bulk, SIMD byte seam, `*_unchecked`) dispatches on `nif_available()`: native `@external` when the `.so` is attached, else the byte-identical paged delegate (`rt_mem`). The Gleam keeps the pdict/record/mem-index plumbing **and the `rt_meter` fuel charges** (metering byte-identical to paged/atomics); the C owns only the pure `mem_*` algebra. The combined no-wrap effective address `ea = addr + offset` is computed Gleam-side as a BEAM bignum — the C never re-adds. |
 | **The unchecked lever** (S15-03) | `Nif` added to `emit_core.mem_supports_unchecked` (a one-line fail-closed whitelist entry) + the `emit_unchecked_test` flip (`nif_emits_unchecked_test`). The Phase-10 BCE fast arm now emits `nif_load_unchecked`/`nif_store_unchecked` on tier-N; the slow arm keeps the **checked** native seam — trap-preservation is absolute (the range guard proves the whole span in-bounds before the unchecked arm runs). |
 | **The security fuzz + native matrix** (S15-04) | The C bounds-check fuzz (`rt_mem_nif_safety_test.gleam`) + `combos.cell_nif` driving the **real native buffer** across the corpus tier differential. |
 
@@ -125,7 +125,7 @@ memories run paged.
 ## The measured ceiling (honest, no hero number)
 
 Measured on the Phase-4 reference machine (Apple M2 Pro, macOS, OTP 29 / erts 17.0.2, dev `clang`),
-the smoke `twocore_smoke.wasm` (CRC-32 / SHA-256 / DEFLATE real crates) held **fixed**, only the linked
+the smoke `carder_smoke.wasm` (CRC-32 / SHA-256 / DEFLATE real crates) held **fixed**, only the linked
 `Binding` varied, each build **correctness-gated bit-exact vs `wasmtime` before it was timed**.
 Reproduce with `./smoke/bench.sh 100 1024 300` (the `nif` column is compiled out of band and gated;
 absent `cc` it is a categorized dash). See `docs/phase-4-benchmark.md` for the full frame. The figures
@@ -162,7 +162,7 @@ CRC-32 least. That is the honest ceiling:
   DEFLATE kernel gains most), and on the loop-versioned fast arms tier-N now emits **native unchecked
   derefs** (the bounds compare elided — the S15-03/S4 lever).
 - **The floor that remains.** The **per-access inter-module seam call** (`call
-  'twocore@runtime@rt_mem_nif':'<op>'(...)`, a build-controlled module atom **never inlined** into the
+  'carder@runtime@rt_mem_nif':'<op>'(...)`, a build-controlled module atom **never inlined** into the
   caller) is present in **every** tier including `nif`; the NIF removes it **only** for the unchecked
   loop bodies the optimizer strips to a raw deref, never for the checked per-op seam. And **tier-P
   `bif` numerics are untouched** (tier-N numerics is out of scope, S8) — so on the numerics-dominated,
@@ -171,7 +171,7 @@ CRC-32 least. That is the honest ceiling:
 - **State plainly: the tier-N memory ceiling does NOT reach hand-written Erlang.** It removes the
   *memory* constant, not the *numeric* one and not the *seam*. `nif → ref` on the pure CRC-32
   head-to-head is still **~19× slower** than hand-written Erlang (whose `band`/`bxor`/`bsr` are inlined
-  machine ops, while 2core's are tier-P bignum BIF calls); SHA-256 / DEFLATE remain ~131× / ~267× below
+  machine ops, while carder's are tier-P bignum BIF calls); SHA-256 / DEFLATE remain ~131× / ~267× below
   the native `crypto`/`zlib` **ceiling** (compiled-from-wasm code vs hand-optimised C NIFs — a ceiling,
   not a peer). No hero number.
 
@@ -180,12 +180,12 @@ CRC-32 least. That is the honest ceiling:
 ## The production `priv/*.so` packaging follow-on (S8, explicit)
 
 The test-time build is **proof, not deployment**. A real deployment ships a **prebuilt per-platform
-`priv/twocore_rt_mem_nif.so`** loaded by the shim's `-on_load` from `priv/` — a build step **Gleam
+`priv/carder_rt_mem_nif.so`** loaded by the shim's `-on_load` from `priv/` — a build step **Gleam
 cannot hook natively**, so it is out of scope this phase and documented as the next unit of work:
 compile-per-target-triple + `priv/` packaging + a load-path resolution convention. The benchmark's
 out-of-band `.so` step (`smoke/bench.sh` §0.5) is this follow-on **in miniature** — it demonstrates
 precisely what production packaging will generalize per-platform. Until then, the shim resolves the
-`.so` via the `TWOCORE_RT_MEM_NIF_SO` env override (test/bench time) else `priv/twocore_rt_mem_nif`
+`.so` via the `CARDER_RT_MEM_NIF_SO` env override (test/bench time) else `priv/carder_rt_mem_nif`
 (deployment), and falls back to the paged delegate on a bare BEAM.
 
 ---
@@ -208,10 +208,10 @@ precisely what production packaging will generalize per-platform. Until then, th
 ## Reproduce
 
 ```
-gleam test -- twocore/runtime/rt_mem_nif_test         # per-op nif ≡ paged ≡ oracle differential (gated on cc)
-gleam test -- twocore/runtime/rt_mem_nif_safety_test  # the C bounds-check security fuzz (incl. memory64 vectors)
-gleam test -- twocore/backend/emit_unchecked          # tier-N emits unchecked (the S15-03 flip)
-gleam test -- twocore/tier/tier_differential          # the whole-corpus cell_nif tier differential (native)
+gleam test -- carder/runtime/rt_mem_nif_test         # per-op nif ≡ paged ≡ oracle differential (gated on cc)
+gleam test -- carder/runtime/rt_mem_nif_safety_test  # the C bounds-check security fuzz (incl. memory64 vectors)
+gleam test -- carder/backend/emit_unchecked          # tier-N emits unchecked (the S15-03 flip)
+gleam test -- carder/tier/tier_differential          # the whole-corpus cell_nif tier differential (native)
 gleam test                                            # the full suite (native rows under cc; categorized-skip without)
 ./smoke/bench.sh 100 1024 300                         # the measured nif column (out-of-band .so; dash without cc)
 ```

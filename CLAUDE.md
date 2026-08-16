@@ -1,4 +1,4 @@
-# 2core
+# carder
 
 A Gleam project (targets Erlang/BEAM by default). Built and tested with the standard Gleam toolchain — **Gleam 1.17+**, Erlang/OTP, and `gleeunit` for tests.
 
@@ -64,8 +64,8 @@ The typical inner loop: **edit → `gleam format` → `gleam test`**.
 
 ## Project layout & conventions
 
-- Entry point: `src/twocore.gleam` (`pub fn main`).
-- Add new modules under `src/twocore/` and import them as `import twocore/<module>` (e.g. `src/twocore/decoder.gleam` → `import twocore/decoder`).
+- Entry point: `src/carder.gleam` (`pub fn main`).
+- Add new modules under `src/carder/` and import them as `import carder/<module>` (e.g. `src/carder/decoder.gleam` → `import carder/decoder`).
 - Tests live under `test/`, mirroring the `src/` layout. `gleeunit` auto-discovers every function whose name ends in `_test`. Run a focused module with `gleam test -- <module>`.
 - This is a **Gleam** codebase — ignore any parent-directory JavaScript/Bun guidance; it does not apply here. To target JavaScript instead of Erlang, set `target = "javascript"` in `gleam.toml`.
 - Prefer total functions returning `Result`/`Option` over partial functions; reserve `let assert`/`panic` for genuinely-impossible states and document them when used.

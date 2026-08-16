@@ -2,26 +2,26 @@
 
 > Phase 11 reference. `--link` is an optional flag on `to-beam-wasm` that merges the runtime
 > dependency closure into the generated module, producing **one `.beam` that loads and runs on a bare
-> Erlang/OTP node** — no `twocore` app on the code path. The default (non-`--link`) output is
+> Erlang/OTP node** — no `carder` app on the code path. The default (non-`--link`) output is
 > unchanged and byte-identical.
 
 ## 1. What it is (and is not)
 
 By default (see [`../specs/01-status.md`](../specs/01-status.md) §5) an emitted `.beam` is a **thin
-module** of module-qualified calls into a shared runtime — `call 'twocore@runtime@rt_num':'i32_add'(…)`
+module** of module-qualified calls into a shared runtime — `call 'carder@runtime@rt_num':'i32_add'(…)`
 — that must already be resident on the target node. Copy that module to a bare node and its first
 runtime call fails `undef`.
 
 `--link` removes that dependency for a single build. It runs the **same** compile pipeline (decode →
 validate → lower → `ir_to_core` under the chosen `Binding`), then performs a **whole-program Core Erlang
-merge**: the generated module plus its entire transitive `twocore@*`/`gleam@*`/FFI closure are merged
+merge**: the generated module plus its entire transitive `carder@*`/`gleam@*`/FFI closure are merged
 into one module, dead code stripped, so the only remaining remote calls are to OTP modules present on
 every node. The result is a single self-contained `.beam`.
 
 ```
 to-beam-wasm --link app.wasm app.beam
 # → one app.beam; loads via `erl -pa <dir with only app.beam>` and runs `app:<export>(args)`
-#   on a node with NO twocore@*/gleam@* beams reachable.
+#   on a node with NO carder@*/gleam@* beams reachable.
 ```
 
 It is **not** an escript, an OTP release, or a multi-module bundle. It links **one** generated module +
@@ -31,8 +31,8 @@ transform, and the linked artifact is behaviour-identical (bit pattern + traps) 
 
 ## 2. The merge, at a high level
 
-The engine is `beam_link.link_program` (Gleam orchestration) over `twocore_linker_ffi.erl` (the `cerl`
-surgery, pinned to OTP 29 — the same compiler-internals trust boundary as `twocore_codegen_ffi`):
+The engine is `beam_link.link_program` (Gleam orchestration) over `carder_linker_ffi.erl` (the `cerl`
+surgery, pinned to OTP 29 — the same compiler-internals trust boundary as `carder_codegen_ffi`):
 
 1. **Acquire Core.** The generated module from its `.core` text (`core_scan`/`core_parse`); every
    discovered closure member from its RESIDENT `.beam` via `beam_lib` `debug_info(core_v1)` (no `.erl`
@@ -61,7 +61,7 @@ assertion).
 `--link` is **fail-closed**. It supports **tier-P and tier-O** builds only, and refuses three things:
 
 - **tier-N (`nif`)** — a NIF runs custom native code that cannot be baked into a `.beam`. Rejected at
-  the CLI/linker boundary (`twocore.link_gate → LinkTierNif`) under **any** mode (Unsafe+`nif` too).
+  the CLI/linker boundary (`carder.link_gate → LinkTierNif`) under **any** mode (Unsafe+`nif` too).
   This is distinct from `profiles.link/1`, which legitimately admits Unsafe+`nif` for the ordinary
   non-linked build.
 - **import-bearing modules** — a module with WASM imports compiles to `instantiate/1(Imports)` and needs
@@ -104,7 +104,7 @@ other two.
 
 ## 6. Proof (Phase 11 capstone, P11-06)
 
-`test/twocore/backend/linked_selfcontained_test.gleam` proves the acceptance table objectively — every
+`test/carder/backend/linked_selfcontained_test.gleam` proves the acceptance table objectively — every
 value is bit-pattern-compared against the WebAssembly spec (`corpus/*.expected`), every trap against its
 spec phrase, and the linked output is diffed against the non-linked in-process oracle:
 
@@ -115,7 +115,7 @@ spec phrase, and the linked output is diffed against the non-linked in-process o
   `instantiate/1` in-process.
 - **L2 — bare-node differential.** Over the import-free subset × strategy × tier, the P11-05 harness
   boots a scrubbed fresh `erl` with only the merged `.beam` on `-pa`, its `code:which` gate proving no
-  `twocore@`/`gleam@` reachable, and each value/trap matches the in-process oracle — plus a
+  `carder@`/`gleam@` reachable, and each value/trap matches the in-process oracle — plus a
   `sum_to(100000)` constant-space proof.
 - **Determinism (R10):** `link_program` twice ⇒ byte-identical `.beam`.
 - **D3a (R9):** structural assertion over the merged Core of the whole corpus.

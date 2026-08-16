@@ -7,9 +7,9 @@
 # self-contained, GitHub-README-renderable SVG to docs/wasm-conformance.svg.
 #
 # The image reflects whatever `*.json` fixtures are present under
-# test/twocore/conformance/fixtures/. A fresh checkout only ships the curated
+# test/carder/conformance/fixtures/. A fresh checkout only ships the curated
 # subset; for the FULL allowlist numbers, regenerate the (gitignored) fixtures
-# first — either run test/twocore/conformance/vendor/vendor.sh by hand, or set
+# first — either run test/carder/conformance/vendor/vendor.sh by hand, or set
 # RUN_VENDOR=1 when invoking this script:
 #
 #     RUN_VENDOR=1 scripts/gen-conformance-svg.sh
@@ -35,10 +35,10 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 
-conf_test="twocore/conformance/conformance_test"
+conf_test="carder/conformance/conformance_test"
 out_svg="docs/wasm-conformance.svg"
-pin="test/twocore/conformance/vendor/PIN"
-allowlist="test/twocore/conformance/vendor/ALLOWLIST"
+pin="test/carder/conformance/vendor/PIN"
+allowlist="test/carder/conformance/vendor/ALLOWLIST"
 # Vendored testsuite checkout to enumerate. Top-level `.wast` files only; any
 # `proposals/` subdirectory is naturally excluded (the glob matches files, not
 # the subdir). Override with TESTSUITE_DIR if the checkout lives elsewhere.
@@ -47,7 +47,7 @@ testsuite_dir="${TESTSUITE_DIR:-build/conformance-vendor}"
 # Optionally regenerate the full (gitignored) fixture set before measuring.
 if [ "${RUN_VENDOR:-0}" = "1" ]; then
   echo "gen-conformance-svg: RUN_VENDOR=1 → regenerating fixtures via vendor.sh" >&2
-  bash test/twocore/conformance/vendor/vendor.sh
+  bash test/carder/conformance/vendor/vendor.sh
 fi
 
 # Run the conformance test; its stdout carries the per-file + TOTAL report.
@@ -77,7 +77,7 @@ allow_count="$(grep -vcE '^[[:space:]]*#|^[[:space:]]*$' "$allowlist" || echo 0)
 # Enumerate EVERY top-level testsuite `.wast` file (basename, `.wast` stripped),
 # sorted. awk set-differences this list against the report's per-file lines: any
 # enumerated file that produced no report line is rendered as a "not run" skip.
-allfiles_tmp="$(mktemp "${TMPDIR:-/tmp}/2core-allwast.XXXXXX")"
+allfiles_tmp="$(mktemp "${TMPDIR:-/tmp}/carder-allwast.XXXXXX")"
 trap 'rm -f "$allfiles_tmp"' EXIT
 if compgen -G "$testsuite_dir/*.wast" > /dev/null 2>&1; then
   for f in "$testsuite_dir"/*.wast; do

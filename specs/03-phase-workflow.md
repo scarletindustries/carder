@@ -184,7 +184,7 @@ These are the load-bearing rules every phase preserved. They are the difference 
   `state.md`) — justified because Gleam has no default field values.
 - **D3a — No ambient authority / no ambient `apply`.** Runtime layers are reached only through the
   binding chokepoint (`emit_core`). The emitted call is **always** a static
-  `call '<twocore@runtime@rt_*>':'<fn>'(...)`, **never** a data-driven `apply(Mod,Fun,Args)` with
+  `call '<carder@runtime@rt_*>':'<fn>'(...)`, **never** a data-driven `apply(Mod,Fun,Args)` with
   Mod/Fun from table/program/runtime data. `call_indirect` dispatches via build-controlled closures
   with three ordered fail-closed guards (index-in-bounds → `UndefinedElement`; slot-non-null →
   `UninitializedElement`; exact structural `FuncType` match → `IndirectCallTypeMismatch`). Cross-module
@@ -234,7 +234,7 @@ These are the load-bearing rules every phase preserved. They are the difference 
   still preempts. A **tested** acceptance property (`sum_to(100000)` and a store-loop in constant
   space), not an assertion.
 - **The instance is the unit of policy, realized at compile time (B3).** Safe.beam ≠ Unsafe.beam,
-  threaded ≠ cell, nif ≠ paged — distinct builds sharing identical `twocore@runtime@rt_*` modules;
+  threaded ≠ cell, nif ≠ paged — distinct builds sharing identical `carder@runtime@rt_*` modules;
   per-instance policy (fuel budget, host policy) is seeded once in the synthesized `instantiate/0` (the
   sole documented exception to posture-agnostic function bodies). The single-`.beam` runtime-dispatch
   model (B1) stays deferred.

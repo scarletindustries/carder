@@ -20,15 +20,15 @@ jobs:
           # elixir-version: "1"
 
       # --- WASM spec-suite toolchain --------------------------------------------
-      # The conformance runner (test/twocore/conformance) drives the official
+      # The conformance runner (test/carder/conformance) drives the official
       # WebAssembly spec-suite through the compiler. The full fixture set is
       # gitignored and regenerated from a PINNED testsuite revision by vendor.sh,
       # which needs wabt (wat2wasm / wast2json / spectest-interp). Versions live in
-      # test/twocore/conformance/vendor/PIN so this stays the single source of truth.
+      # test/carder/conformance/vendor/PIN so this stays the single source of truth.
       - name: Read pinned toolchain versions
         id: pin
         run: |
-          PIN=test/twocore/conformance/vendor/PIN
+          PIN=test/carder/conformance/vendor/PIN
           echo "wabt=$(sed -n 's/^WABT_VERSION=//p' "$PIN")"        >> "$GITHUB_OUTPUT"
           echo "sha=$(sed -n 's/^TESTSUITE_SHA=//p' "$PIN")"        >> "$GITHUB_OUTPUT"
 
@@ -61,7 +61,7 @@ jobs:
       # committed subset. The runner gate is: zero genuine FAILS (skips are expected
       # and reported for constructs beyond the current frontend slice).
       - name: Vendor WASM spec-suite fixtures (full allowlist)
-        run: bash test/twocore/conformance/vendor/vendor.sh
+        run: bash test/carder/conformance/vendor/vendor.sh
 
       - run: gleam test
       - run: gleam format --check src test

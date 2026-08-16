@@ -87,13 +87,13 @@ of the enumerated categories (the closed-residual invariant).
 
 | Proof | Test |
 |---|---|
-| 1 — complete new surface, green end-to-end (both modes + the portable posture) | `test/twocore/conformance/new_surface_test.gleam` |
-| 1 — new surface byte-identical across every `state_strategy × mem_tier` | `test/twocore/conformance/refexpansion_differential_test.gleam` (P5-11) |
-| 2 — the pass-rise headline (`fail == 0 && pass > baseline`) | `test/twocore/conformance/conformance_test.gleam` (full Safe/Unsafe runs) |
-| 2 — the closed-residual invariant (every skip categorized) | `test/twocore/conformance/skipcount_test.gleam` (P5-11) |
-| 2 — full-matrix `fail == 0` under every shipped binding | `test/twocore/conformance/conformance_test.gleam` (matrix combos) |
-| 3 — conformance-neutral: Phase-1..4 corpus byte-identical across modes | `test/twocore/conformance/new_surface_test.gleam` |
-| 3 — emitter-level byte-identity (index-0 module ⇒ Phase-4 `.core`) | `test/twocore/backend/emit_core_test.gleam` (`mem_load_index_routing_test`) |
-| 4 — runs-anywhere re-confirmed for the new surface (grep + executed) | `test/twocore/conformance/runs_anywhere_test.gleam` |
-| 5 — `wasmtime` differential (new surface, skips gracefully if absent) | `test/twocore/conformance/refexpansion_wasmtime_test.gleam` (P5-11) |
-| 5 — WAT `parse_module ≡ decode∘wat2wasm` / `parse_script ≡ wast2json` | `test/twocore/frontend/wasm/wat*_test.gleam` (P5-10) |
+| 1 — complete new surface, green end-to-end (both modes + the portable posture) | `test/carder/conformance/new_surface_test.gleam` |
+| 1 — new surface byte-identical across every `state_strategy × mem_tier` | `test/carder/conformance/refexpansion_differential_test.gleam` (P5-11) |
+| 2 — the pass-rise headline (`fail == 0 && pass > baseline`) | `test/carder/conformance/conformance_test.gleam` (full Safe/Unsafe runs) |
+| 2 — the closed-residual invariant (every skip categorized) | `test/carder/conformance/skipcount_test.gleam` (P5-11) |
+| 2 — full-matrix `fail == 0` under every shipped binding | `test/carder/conformance/conformance_test.gleam` (matrix combos) |
+| 3 — conformance-neutral: Phase-1..4 corpus byte-identical across modes | `test/carder/conformance/new_surface_test.gleam` |
+| 3 — emitter-level byte-identity (index-0 module ⇒ Phase-4 `.core`) | `test/carder/backend/emit_core_test.gleam` (`mem_load_index_routing_test`) |
+| 4 — runs-anywhere re-confirmed for the new surface (grep + executed) | `test/carder/conformance/runs_anywhere_test.gleam` |
+| 5 — `wasmtime` differential (new surface, skips gracefully if absent) | `test/carder/conformance/refexpansion_wasmtime_test.gleam` (P5-11) |
+| 5 — WAT `parse_module ≡ decode∘wat2wasm` / `parse_script ≡ wast2json` | `test/carder/frontend/wasm/wat*_test.gleam` (P5-10) |

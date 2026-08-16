@@ -1,7 +1,7 @@
 # Phase-4 benchmark revisit — does tier-O `atomics` memory close the gap? (honest, G8)
 
 > **Phase 3 named the villain in one number: on the tier-P `paged` immutable-binary memory model,
-> 2core-Safe was ~76× slower than hand-written Erlang on the one faithful head-to-head (CRC-32,
+> carder-Safe was ~76× slower than hand-written Erlang on the one faithful head-to-head (CRC-32,
 > bit-identical), and orders of magnitude below the native NIF ceiling on SHA-256/DEFLATE.** Phase 4
 > built the lever — the tier-O `atomics` O(1) memory backend (unit 04) — and this report re-measures
 > the **same** committed kernels with that lever engaged. It reports, **measured, with no hero
@@ -17,7 +17,7 @@
 
 ## What is measured
 
-The **same** artifact as Phase 3 — one no-import, MVP-only `twocore_smoke.wasm` (72,933 bytes,
+The **same** artifact as Phase 3 — one no-import, MVP-only `carder_smoke.wasm` (72,933 bytes,
 80 functions, 0 imports; the same file `smoke/run.sh` differential-checks bit-exact vs `wasmtime`),
 built from three real, permissively-licensed crates, exposed as `i32`-in / `i32`-out exports:
 
@@ -45,9 +45,9 @@ Phase-3 policy axis, so each measured delta is attributable to **exactly one** c
 ratio between them is the uncontaminated `paged → atomics` effect. `atomics-safe` is a **legal Safe
 tier-O posture** (Safe permits tier P **or** O, never N — G6), not an Unsafe-only measurement.
 
-## Contenders & baselines (unchanged Phase-3 references, new 2core column set)
+## Contenders & baselines (unchanged Phase-3 references, new carder column set)
 
-1. **the five 2core builds above** — each compiled to a persisted `.beam` under its `Binding` and
+1. **the five carder builds above** — each compiled to a persisted `.beam` under its `Binding` and
    timed with `gleam run -- exec -n N <beam> <fn> <arg>`, which loads + instantiates the `.beam`
    **once** then invokes `N` times in the instance's owned process and times **only the loop**
    (compile / load / instantiate excluded).
@@ -55,7 +55,7 @@ tier-O posture** (Safe permits tier P **or** O, never N — G6), not an Unsafe-o
    result is **bit-identical** to the wasm export. The one true head-to-head; carried over verbatim
    from Phase 3.
 3. **native NIF ceiling** — `crypto:hash(sha256, _)` and `zlib` for SHA-256/DEFLATE. **NIF-backed C,
-   NOT hand-written Erlang** — a raw *ceiling*, clearly labelled; 2core is expected to sit below it.
+   NOT hand-written Erlang** — a raw *ceiling*, clearly labelled; carder is expected to sit below it.
    The tier-N `nif` **memory** tier that attacks the *memory* gap **shipped in Phase 15** (a real
    `erl_nif` C backend over a reserved raw byte buffer) and is now measured as **the `nif` column**
    below (§Results); the `crypto`/`zlib` native figures remain the raw *numeric* ceiling that tier-N
@@ -98,7 +98,7 @@ tier-O posture** (Safe permits tier P **or** O, never N — G6), not an Unsafe-o
 
 ## Results (ns per call, this machine, `REPEAT=100`, `--cap 1024`)
 
-Every 2core build below was **correctness-gated bit-exact vs `wasmtime` before it was timed.**
+Every carder build below was **correctness-gated bit-exact vs `wasmtime` before it was timed.**
 
 | kernel | safe / paged | atomics-safe | portable (thr/paged) | unsafe-paged | ceiling (uns/atomics) | nif (uns/native) † | hand-Erl / native |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -132,7 +132,7 @@ residual to hand-Erl/native. `atomics → nif` is **1.5×–1.9×** (largest on 
 on the pure CRC-32 head-to-head — tier-N *memory* does **not** reach hand-written Erlang, because the
 tier-P `bif` numeric floor and the per-access seam-call floor remain.
 
-`crc32(4096)`: 2core (every build) = `2538352202` = hand-written-Erlang `2538352202` = `wasmtime`. A
+`crc32(4096)`: carder (every build) = `2538352202` = hand-written-Erlang `2538352202` = `wasmtime`. A
 clean, bit-identical head-to-head.
 
 **Against Phase 3** (which measured `safe/paged` on this machine at crc `4,006,910` / sha `19,781,600`
@@ -167,7 +167,7 @@ so a reader should read neither the closed half as a failure nor the residual as
 
 - **`rt_num` stays tier-P `bif`** — pure Gleam over BEAM bignums, **not native** (tier-N numerics is
   explicitly out of Phase-4 scope, G8). `atomics` attacks the **memory** constant, never the
-  **numeric** one; hand-written Erlang's `band`/`bxor`/`bsr` are inlined machine ops, while 2core's
+  **numeric** one; hand-written Erlang's `band`/`bxor`/`bsr` are inlined machine ops, while carder's
   are bignum BIF calls. CRC-32 is almost pure numerics over cheap loads — which is exactly why its
   residual (31.6×) is the *largest fraction of the remaining gap* even though its paged→atomics win
   was the smallest.
@@ -183,7 +183,7 @@ so a reader should read neither the closed half as a failure nor the residual as
 SHA-256 and DEFLATE remain ~193× / ~525× below the **native NIF ceiling** (`crypto` / `zlib`), as
 expected for compiled-from-wasm code vs hand-optimised C NIFs — a *ceiling*, not a peer.
 
-**3. The composed `ceiling` (Unsafe + `atomics`, all levers).** The fastest 2core produces this
+**3. The composed `ceiling` (Unsafe + `atomics`, all levers).** The fastest carder produces this
 phase. Two honest sub-findings:
 
 - On **load-heavy CRC-32 and SHA-256 the Aggressive optimizer adds essentially nothing** on top of
@@ -212,7 +212,7 @@ Phase-4-deferred `nif` column is now a real `erl_nif` C backend over a reserved 
   isolated from every other variable, and the store-intensity ordering (deflate > sha > crc) holds
   precisely.
 - **The floor that remains — why `nif → ref` is still 19.2× on CRC-32.** The **per-access inter-module
-  seam call** (`call 'twocore@runtime@rt_mem_nif':'<op>'(...)`, a build-controlled module atom **never
+  seam call** (`call 'carder@runtime@rt_mem_nif':'<op>'(...)`, a build-controlled module atom **never
   inlined**) is present in **every** tier including `nif`; the NIF removes it **only** for the unchecked
   loop bodies the optimizer strips to a raw deref, never for the checked per-op seam. And **tier-P `bif`
   numerics are untouched** (tier-N numerics is out of scope, G8) — so on the numerics-dominated,
@@ -246,13 +246,13 @@ beside it — and it is honestly still short.**
    dominant residual on CRC-32 and is **out of Phase-4 scope** (G8) — tier-N `nif` numerics is the
    biggest remaining lever the residual analysis points at, and it is deferred.
 3. **The `nif` memory column shipped in Phase 15 (measured).** Tier-N `nif` memory (the raw O(1)
-   native ceiling for a 2core build) is now a real `erl_nif` C backend, measured as the `nif` column
+   native ceiling for a carder build) is now a real `erl_nif` C backend, measured as the `nif` column
    above: **1.5×–1.9× over `atomics`** (most on store-heavy DEFLATE), and **3.10×–5.73×** on the clean
    same-`.beam` native-vs-paged-delegate isolation. It is measured **same-run** (†, toolchain-gated;
    a categorized dash absent `cc`, never a fabricated number). It does **not** reach hand-written
    Erlang (`nif → ref` still ~19.2× on CRC-32): tier-N *memory* removes the memory constant, not the
    tier-P `bif` **numeric** floor (still out of scope, G8) nor the per-access inter-module **seam-call**
-   floor. The native `crypto`/`zlib` figures remain the raw *numeric* ceiling, not a 2core tier.
+   floor. The native `crypto`/`zlib` figures remain the raw *numeric* ceiling, not a carder tier.
 4. **`atomics` requires a bounded cap.** The reported `atomics` numbers depend on a `--cap` (here
    1024 pages) that exceeds the kernels' 18–22-page working set. A crate whose memory cannot be
    bounded to the reserve cap (`4096` pages) without changing the crate could not be measured under
@@ -272,7 +272,7 @@ beside it — and it is honestly still short.**
 The Phase-4 performance question is **answered, measured**: tier-O `atomics` closes 2.3×–2.9× of the
 paged gap (most on store-heavy kernels, as predicted), the runs-anywhere `threaded` build costs almost
 nothing, and the Aggressive optimizer becomes measurable on a real module for the first time — but
-2core is **still not faster than hand-written Erlang**, held above the floor by the two costs
+carder is **still not faster than hand-written Erlang**, held above the floor by the two costs
 `atomics` does not touch. The residual analysis names the next levers precisely: **tier-N `bif→nif`
 numerics** (the biggest remaining constant, and the dominant CRC-32 residual, still out of scope), a
 **tier-N `nif` memory** backend (the raw memory ceiling — **shipped and measured in Phase 15**: 1.5×–1.9×

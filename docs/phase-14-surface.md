@@ -89,7 +89,7 @@ just another build-controlled closure in a slot.
 `corpus/xlink` is deliberately a **single-table** importer so it drives cleanly **end-to-end on all
 three table tiers** (`TablePaged`/`TableEts`/`TableAtomics` × Cell/Threaded), satisfying the "every tier
 proven e2e" acceptance row. During capstone bring-up a **pre-existing, Phase-14-orthogonal** limitation
-surfaced: `twocore_rt_table_ets_ffi:new/0` uses a single process-dictionary slot for its
+surfaced: `carder_rt_table_ets_ffi:new/0` uses a single process-dictionary slot for its
 delete-prior-on-reinstantiation discipline, so a module declaring **two or more tables** deletes its
 first ETS table when the second is created in the *same* instantiation (`instantiate: badarg`). This is
 a `rt_table_ets` **multi-table** gap, independent of imported funcrefs (a plain two-table defined-funcref
@@ -105,14 +105,14 @@ cross-module phase.
 
 | Proof | Test |
 |---|---|
-| `table_copy.wast` runs green (1,649/0/0); headline 47,734/683/0, `fail == 0` | `test/twocore/conformance/conformance_test.gleam` (vendored via `vendor/ALLOWLIST` + `vendor.sh`) |
-| Skip audit honest + tight (`"UnknownFunction"`/`"call_indirect_table"` removed; ceiling lowered; pass floor added) | `test/twocore/conformance/{skipcount,residual_audit}_test.gleam` |
-| Imported funcref via `call_indirect` == a direct call of the import, across the matrix | `test/twocore/tier/xlink_capstone_test.gleam` (`imported_funcref_matches_direct_call_test`) |
+| `table_copy.wast` runs green (1,649/0/0); headline 47,734/683/0, `fail == 0` | `test/carder/conformance/conformance_test.gleam` (vendored via `vendor/ALLOWLIST` + `vendor.sh`) |
+| Skip audit honest + tight (`"UnknownFunction"`/`"call_indirect_table"` removed; ceiling lowered; pass floor added) | `test/carder/conformance/{skipcount,residual_audit}_test.gleam` |
+| Imported funcref via `call_indirect` == a direct call of the import, across the matrix | `test/carder/tier/xlink_capstone_test.gleam` (`imported_funcref_matches_direct_call_test`) |
 | Cross-strategy / cross-tier bit-identity (Cell/Threaded × Paged/Ets/Atomics) | `xlink_capstone_test.gleam` (`imported_funcref_cross_combo_bit_identical_test`) |
 | `OptNone ≡ Baseline ≡ Aggressive` result-identical on `xlink` | `xlink_capstone_test.gleam` (`imported_funcref_opt_level_result_identical_test`) |
 | The 3 ordered fail-closed guards fire on import-routed slots | `xlink_capstone_test.gleam` (`imported_funcref_fail_closed_guards_test`) + `corpus/xlink.{wat,wasm,expected}` |
 | Arity lockstep — a `ref.func`-of-import-only module instantiates as `instantiate/1` and dispatches | `xlink_capstone_test.gleam` (`ref_func_import_only_arity_lockstep_test`) + R14-02's `reffunc_import_emit_test.gleam` (re-run + cited) |
-| D3a clean — the adapter captures only the slot; `link.call_import`, no `erlang:apply` on program data | `test/twocore/backend/emit_core_security_test.gleam` (`imported_funcref_adapter_has_no_ambient_authority_test`, re-run + cited) |
-| Emit / dispatch / mixed-segment / non-zero-table / multi-value / passive-segment coverage | `test/twocore/backend/reffunc_import_emit_test.gleam` (R14-02) |
-| IR node freeze + `.ir` round-trip + pure-barrier arms | `test/twocore/reffunc_import_freeze_test.gleam` (R14-01) |
-| Runtime differential — import-routed slot store/dispatch identical across tiers × strategies | `test/twocore/runtime/rt_table_reftype_differential_test.gleam` (R14-03) |
+| D3a clean — the adapter captures only the slot; `link.call_import`, no `erlang:apply` on program data | `test/carder/backend/emit_core_security_test.gleam` (`imported_funcref_adapter_has_no_ambient_authority_test`, re-run + cited) |
+| Emit / dispatch / mixed-segment / non-zero-table / multi-value / passive-segment coverage | `test/carder/backend/reffunc_import_emit_test.gleam` (R14-02) |
+| IR node freeze + `.ir` round-trip + pure-barrier arms | `test/carder/reffunc_import_freeze_test.gleam` (R14-01) |
+| Runtime differential — import-routed slot store/dispatch identical across tiers × strategies | `test/carder/runtime/rt_table_reftype_differential_test.gleam` (R14-03) |

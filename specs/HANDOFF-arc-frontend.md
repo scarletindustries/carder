@@ -1,19 +1,19 @@
-# Handoff — the 2core IR spec for the JavaScript frontend
+# Handoff — the carder IR spec for the JavaScript frontend
 
-> **Audience: the team writing the JS→2core-IR emitter** (reusing arc's parser + scope/capture
+> **Audience: the team writing the JS→carder-IR emitter** (reusing arc's parser + scope/capture
 > analysis). This is the **complete, authoritative interface**: the value model, the calling
 > convention, every IR node you emit, the compiled-code↔`rt_js` ABI, and how to lower each JS
-> construct. You never touch `emit_core`/`build_beam` — you produce a `twocore/ir.Module` and hand it
+> construct. You never touch `emit_core`/`build_beam` — you produce a `carder/ir.Module` and hand it
 > to the existing pipeline (`decode`-free direct-IR entry → `ir_lower` → `emit_core` → `build_beam` →
-> BEAM). 2core team owns the IR + backend (the Phase-8 value layer, now shipped — see `specs/01-status.md` §3); **you own the emitter + `rt_js`**.
+> BEAM). carder team owns the IR + backend (the Phase-8 value layer, now shipped — see `specs/01-status.md` §3); **you own the emitter + `rt_js`**.
 
 > **Status (rt-unify P3).** The emitter and the JS runtime both live in the arc repo now: the runtime is
 > `arc/src/arc/rt/**` (+ `arc/src/arc_rt_*_ffi.erl`), the emitter and its op table are `arc/aot/`
 > (`arc_aot/emit/`, `arc_aot/host_ops.gleam`), and the run driver is `arc_aot/run.gleam`. Nothing JS-specific
-> remains in 2core beyond the Phase-8 `rt_js` stub and its legacy `"js"` dispatch. arc reaches 2core through
+> remains in carder beyond the Phase-8 `rt_js` stub and its legacy `"js"` dispatch. arc reaches carder through
 > `pipeline.compile_ir(module, profiles.direct(DirectHost("js", ops)))`: the frontend passes its own op table
 > (`Binding.direct_host`), so **adding an op is an entry in arc's `host_ops.table()`, not a change here**. The
-> `emit2core` specs that used to sit under `specs/emit2core/` are in `arc/specs/emit2core/`.
+> `emitcarder` specs that used to sit under `specs/emitcarder/` are in `arc/specs/emitcarder/`.
 
 ---
 
@@ -23,20 +23,20 @@
 JS source ──arc.parser──▶ AST ──arc.scope.finalize──▶ scope-resolved AST + capture/box sets
           │                                                    │
           │                                    YOUR NEW CODE:  ▼
-          │                                   emit_2core(ast, scope_tree) ──▶ twocore/ir.Module
+          │                                   emit_carder(ast, scope_tree) ──▶ carder/ir.Module
           │                                                                        │
           └─ rt_js.gleam (YOUR JS runtime: coercion, prototypes, builtins, cells)  │
                               ▲ reached only via CallHost("js", op, args)          ▼
-                                            2core (unchanged): ir_lower ─▶ emit_core ─▶ build_beam ─▶ BEAM
+                                            carder (unchanged): ir_lower ─▶ emit_core ─▶ build_beam ─▶ BEAM
 ```
 
 - **Reuse from arc, verbatim:** the parser (AST) and `scope.finalize` (slot allocation + which locals
   are captured / boxed). `scope.lookup` gives you a per-identifier `Resolution` — use it directly.
-- **You write:** `emit_2core` (AST → IR, this doc) and **`rt_js`** (all JS *semantics* — the IR carries
+- **You write:** `emit_carder` (AST → IR, this doc) and **`rt_js`** (all JS *semantics* — the IR carries
   none). Register every op in the frontend's `DirectHost.ops` table handed to `profiles.direct(...)`
   (D3a: no dynamic apply — each entry is a build-time `HostOp(module, function, kind)` literal; adding
-  an op = adding a table entry in arc, no 2core change).
-- **2core guarantees:** the IR nodes below lower to idiomatic, preemptive, GC'd Core Erlang; the WASM
+  an op = adding a table entry in arc, no carder change).
+- **carder guarantees:** the IR nodes below lower to idiomatic, preemptive, GC'd Core Erlang; the WASM
   surface is untouched; the numeric fast paths are bit-exact (D5).
 
 ---
@@ -59,7 +59,7 @@ the IR only needs these to be *some* term. Recommended encodings (BEAM-native, f
 | bignum | a BEAM `integer` (arbitrary precision — free) | `BoxInt(W64)` won't fit >64b; use `rt_js` for bigint ops |
 | symbol | your encoding (e.g. a tagged tuple / unique ref) | `MakeTuple` / `rt_js` |
 
-> **The number note (important — two different float layers).** 2core has *two* float representations:
+> **The number note (important — two different float layers).** carder has *two* float representations:
 > (1) the IR's unboxed `TF64` layer is a **raw IEEE-754 bit pattern in an integer** (WASM semantics,
 > D5), bridged to/from a term losslessly by `Box/UnboxFloat` — use this only for **raw f64 storage**
 > (e.g. a `Float64Array` element), never as a JS `number`, because a bit-pattern integer answers
@@ -70,7 +70,7 @@ the IR only needs these to be *some* term. Recommended encodings (BEAM-native, f
 > `CallHost("js",…)` for string-`+`/NaN/Inf/`/0`/mixed — see unit 06's composed proof.
 
 ### Calling convention (recommended, you may choose your own)
-Compile every JS function to a same-module 2core `Function` of a **uniform shape**, e.g.
+Compile every JS function to a same-module carder `Function` of a **uniform shape**, e.g.
 `f(This, Args)` where `This` is a `TTerm` and `Args` is a **cons list** of `TTerm`. Then:
 - a JS **closure** = `MakeClosure("f", [captured…], arity=2)` → a `fun(This, Args)` that forwards to
   `f(captured…, This, Args)`. Captured cells (for mutated `let`s, per arc's `is_boxed`) are captured as
@@ -141,7 +141,7 @@ in the fixed dispatch.
 ## 4. The `rt_js` ABI (the runtime YOU provide)
 
 `rt_js` (arc's `src/arc/rt/**`) implements JS semantics, reached only via `CallHost("js", op, args)`.
-Register each op in your `DirectHost.ops` table (the 2core Phase-8 `rt_js` stub is only the legacy
+Register each op in your `DirectHost.ops` table (the carder Phase-8 `rt_js` stub is only the legacy
 fallback when no `direct_host` is bound). Suggested core surface (name → args → result), all on boxed
 `TTerm`s:
 

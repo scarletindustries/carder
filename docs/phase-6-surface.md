@@ -119,7 +119,7 @@ fail red if a skip matches none of the enumerated categories (the closed-residua
 
 ## Phase 7 is UNBLOCKED — JS on the BEAM via Porffor
 
-With the WebAssembly **2.0 surface complete** after Phase 6, *any Porffor application runs via 2core
+With the WebAssembly **2.0 surface complete** after Phase 6, *any Porffor application runs via carder
 on the BEAM* becomes **buildable**. Porffor's JS→WASM output — SIMD, bulk memory, reference types,
 multi-value — is now fully runnable through `fe_wasm`; the remaining work is a **Porffor-ABI
 `rt_host` shim** (Porffor's own console/memory/string/intrinsic ABI, not WASI) + a JS-subset
@@ -132,14 +132,14 @@ buildable phase. **The next move is JS on the BEAM.**
 
 | Proof | Test |
 |---|---|
-| 1 — SIMD spec-correct end-to-end (integer/float/memory kernels, both modes + portable, byte-identical) | `test/twocore/conformance/new_surface_test.gleam` (`simd_kernels_*`) |
-| 1 — SIMD whole-suite `fail == 0` (59 files, per-family) | `test/twocore/conformance/simd_conformance_test.gleam` (P6-10) |
-| 1 — SIMD byte-identical across every `state_strategy × mem_tier` + `wasmtime` differential | `test/twocore/conformance/simd_differential_test.gleam` (P6-10) |
-| 2 — memory64 runs (i64 addressing, page-cap grow → -1, OOB trap, byte-identical) | `test/twocore/conformance/new_surface_test.gleam` (`mem64_runtime_*`) |
-| 2 — memory64 op-by-op oracle differential | `test/twocore/runtime/rt_mem_test.gleam` (P6-08) |
-| 3 — cross-module function linking (call across instances + fail-closed unlinkable) | `test/twocore/conformance/new_surface_test.gleam` (`cross_module_linking_*`) |
-| 4 — conformance-neutral: Phase-1..5 corpus byte-identical across modes | `test/twocore/conformance/new_surface_test.gleam` (`phase_1_to_5_corpus_*`) |
-| 4 — emitter-level byte-identity (non-SIMD/32-bit/no-import module ⇒ Phase-5 `.core`) | `test/twocore/backend/emit_core_test.gleam` (P6-06) |
-| 5 — the measured skip-drop headline (`fail == 0 && pass ~doubled`, closed residual) | `test/twocore/conformance/skipcount_test.gleam` (P6-10) |
-| 5 — the R16 empirical residual audit (every skip categorized) | `test/twocore/conformance/residual_audit_test.gleam` (P6-10) |
-| 5 — runs-anywhere re-confirmed for the SIMD + memory64 surface (grep + executed) | `test/twocore/conformance/runs_anywhere_test.gleam` (`portable_p6_surface_*`, `portable_simd_kernels_*`, `portable_mem64_*`) |
+| 1 — SIMD spec-correct end-to-end (integer/float/memory kernels, both modes + portable, byte-identical) | `test/carder/conformance/new_surface_test.gleam` (`simd_kernels_*`) |
+| 1 — SIMD whole-suite `fail == 0` (59 files, per-family) | `test/carder/conformance/simd_conformance_test.gleam` (P6-10) |
+| 1 — SIMD byte-identical across every `state_strategy × mem_tier` + `wasmtime` differential | `test/carder/conformance/simd_differential_test.gleam` (P6-10) |
+| 2 — memory64 runs (i64 addressing, page-cap grow → -1, OOB trap, byte-identical) | `test/carder/conformance/new_surface_test.gleam` (`mem64_runtime_*`) |
+| 2 — memory64 op-by-op oracle differential | `test/carder/runtime/rt_mem_test.gleam` (P6-08) |
+| 3 — cross-module function linking (call across instances + fail-closed unlinkable) | `test/carder/conformance/new_surface_test.gleam` (`cross_module_linking_*`) |
+| 4 — conformance-neutral: Phase-1..5 corpus byte-identical across modes | `test/carder/conformance/new_surface_test.gleam` (`phase_1_to_5_corpus_*`) |
+| 4 — emitter-level byte-identity (non-SIMD/32-bit/no-import module ⇒ Phase-5 `.core`) | `test/carder/backend/emit_core_test.gleam` (P6-06) |
+| 5 — the measured skip-drop headline (`fail == 0 && pass ~doubled`, closed residual) | `test/carder/conformance/skipcount_test.gleam` (P6-10) |
+| 5 — the R16 empirical residual audit (every skip categorized) | `test/carder/conformance/residual_audit_test.gleam` (P6-10) |
+| 5 — runs-anywhere re-confirmed for the SIMD + memory64 surface (grep + executed) | `test/carder/conformance/runs_anywhere_test.gleam` (`portable_p6_surface_*`, `portable_simd_kernels_*`, `portable_mem64_*`) |

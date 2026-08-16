@@ -35,24 +35,24 @@ a `todo`-free stub, or a documented single-owner gap. `fail=0` holds regardless.
 
 ## A. Frontends (the biggest strategic moves)
 
-- **Native JS frontend + real `rt_js` — the arc track. NOT 2core-team scope.** The IR value layer this
+- **Native JS frontend + real `rt_js` — the arc track. NOT carder-team scope.** The IR value layer this
   project owns is built and shipped (native closures, maps/objects, boxing bridge, guarded arithmetic,
   the `rt_js` boundary) — that was Phase 8's payoff and it stays here. **The frontend itself
-  (`emit_2core` reusing arc's parser + scope/capture analysis) and the real `rt_js` runtime holding JS
+  (`emit_carder` reusing arc's parser + scope/capture analysis) and the real `rt_js` runtime holding JS
   semantics are the arc project's deliverable, built on the arc side against**
-  [`HANDOFF-arc-frontend.md`](HANDOFF-arc-frontend.md) — not work 2core picks up as a phase. The
-  `src/twocore/runtime/rt_js.gleam` boundary stub in this repo was **merged in by an arc maintainer**;
+  [`HANDOFF-arc-frontend.md`](HANDOFF-arc-frontend.md) — not work carder picks up as a phase. The
+  `src/carder/runtime/rt_js.gleam` boundary stub in this repo was **merged in by an arc maintainer**;
   leave it alone (it is arc's to grow, not ours to fill). This is the way past Porffor's ~⅓-of-ECMA
   ceiling and its closure wall, because targeting the BEAM makes closures/GC/maps/bignums native — but
-  the 2core side of that contract (the IR) is already met.
+  the carder side of that contract (the IR) is already met.
   - **Value-layer follow-ups (deferred from the Phase-8 IR work):** shaped-object inline caches (needs
     a `CMap` literal IR node), guarded division, first-class mutable cells, and generators/async/`eval`.
-    These sharpen the term path **once arc's frontend exists and emits a workload** — 2core would take
+    These sharpen the term path **once arc's frontend exists and emits a workload** — carder would take
     them then, driven by measured object-heavy IR (see §E escape analysis, same gate).
 - **Erlang/Gleam frontend (`fe_beam`, spec §8.3).** Ingest Core Erlang / Gleam, restrict unsafe
   functionality (the Safe allowlist as a *frontend* security boundary that fails closed), emit IR.
   Never taken by any phase — deferred since Phase 1. The payoff: write Gleam, deploy sandboxed,
-  provably unable to take over the VM. (2core scope, when prioritized.)
+  provably unable to take over the VM. (carder scope, when prioritized.)
 
 ---
 
@@ -84,7 +84,7 @@ WASM 2.0 fixed-width is **complete**. What's left is post-2.0 proposals, each a 
   node → an inline D3a adapter funcref `#(FuncType, fun(Args) -> link:call_import(func_import_at(slot),
   Args))` (reshaped to the package-ABI the post-Phase-13 `rt_table` expects), tier/strategy-uniform.
 - **`rt_table_ets` multi-table instances.** ⓘ **Newly found by Phase 14 (pre-existing, orthogonal).**
-  `twocore_rt_table_ets_ffi:new/0` uses a single process-dictionary slot for its
+  `carder_rt_table_ets_ffi:new/0` uses a single process-dictionary slot for its
   delete-prior-on-reinstantiation discipline, so a module declaring **2+ tables** under `TableEts`
   deletes the first ETS table on the second `new` → `instantiate: badarg`. Independent of imported
   funcrefs (a plain two-table *defined*-funcref module fails identically); never surfaced before because
@@ -143,7 +143,7 @@ Deferred (each a categorized rejection today, not a false green):
 - **Cross-language `funcref`/`externref` construction** — refs are opaque passthrough today, not
   host-constructible callable values.
 - **Async / streaming binding surfaces**, and additional binding languages (the
-  `twocore_bindings_ffi.erl` compile+call harness is reusable for any new emitter).
+  `carder_bindings_ffi.erl` compile+call harness is reusable for any new emitter).
 
 ---
 
@@ -154,7 +154,7 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 - **Escape analysis for the term/object value path.** *Not* a linear-memory lever (our process-local,
   one-instance-one-process design already pre-satisfies its linear-memory payoff). This is **object
   speed** — scalar-replace objects, avoid boxing closures — gated on **arc's frontend emitting
-  object-heavy IR to measure against (coming soon).** 2core takes this once that workload exists; until
+  object-heavy IR to measure against (coming soon).** carder takes this once that workload exists; until
   then there is nothing to measure and the pass would be speculative. Deferred by Phases 9 & 10 for want
   of a workload.
 - **A general (polyhedral) range solver.** Phase-10 BCE handles the single-affine-induction-variable
@@ -169,7 +169,7 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 
 ---
 
-## F. JS / Porffor path (measured gaps, not 2core bugs)
+## F. JS / Porffor path (measured gaps, not carder bugs)
 
 - **Heap-typed run results.** The JS harness observes via `console.log` (Porffor's `printChar` emits
   bytes in-band). Decoding heap-typed `(f64,i32)` return values (string/object/array results from
@@ -177,7 +177,7 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 - **Two-profile (Safe/Unsafe) optimizer-soundness roll-up over the JS corpus.** `run_porffor`
   hardwires `profiles.porffor()`; a `run_porffor_with(binding)` seam is left to a later phase.
 - **The 3 JS skips are Porffor's own bugs** (measured: `-0` rendering + broken lexical closures in
-  0.61.13, which Porffor's authors call the "closure wall" / "terminal"). 2core reproduces `porf run`
+  0.61.13, which Porffor's authors call the "closure wall" / "terminal"). carder reproduces `porf run`
   byte-for-byte on them — they bound Porffor, and are the reason the **arc frontend (§A, arc-owned)** is
   the real JS road forward.
 
@@ -216,7 +216,7 @@ The memory optimizer is complete (Phases 9–10). Remaining passes:
 
 ## Suggested sequencing (not binding)
 
-The current 2core-team menu, roughly by leverage. **The native JS frontend is arc's, not on this menu**
+The current carder-team menu, roughly by leverage. **The native JS frontend is arc's, not on this menu**
 (§A); the value-layer + escape-analysis follow-ups unlock once arc emits IR.
 
 **Done (Phases 13–15):** ✅ tail-call (§B), ✅ cross-module funcref-in-`elem` (§C — largest residual

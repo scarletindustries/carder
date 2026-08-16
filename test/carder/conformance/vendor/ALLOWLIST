@@ -1,0 +1,204 @@
+# Phase-2 conformance allowlist (units 07 + 11).
+#
+# The set of WebAssembly spec-suite `.wast` files that carder's compiled slice is
+# expected to drive. One entry per line; `#` starts a comment.
+#
+# FORMAT (Phase-2): `<name>` optionally followed by a whitespace-separated trailing
+# FLAG COLUMN passed verbatim to `wast2json` (e.g. `align<TAB>--enable-memory64`).
+# Tier-A/Phase-1 entries are flagless. The `.wast` extension is implied.
+#
+# All counts were measured by running `wast2json` at the pinned testsuite SHA
+# (vendor/PIN) with wabt 1.0.41 — a WASM-3.0-era testsuite, so "root file name == MVP"
+# is FALSE. Several files carry WITHIN-FILE skips (reftype/extended-const/memory64/
+# text-format asserts the IR/decoder/validator deliberately lack); those fall out of
+# the runner's fail-closed paths (a rejected module skips its dependent asserts; an
+# unhandled command skips; a text module_type skips) and are counted as honest skips,
+# never silent passes. See specs/phase-2/11-capstone.md §C.
+
+# ── Phase-1 slice (i32/i64 integer + control-flow + locals + direct calls + convert)
+i32
+i64
+int_exprs
+int_literals
+const
+local_get
+local_set
+local_tee
+block
+loop
+if
+br
+br_if
+br_table
+return
+labels
+select
+nop
+call
+conversions          # ALSO Phase-2: its 67 float→int trapping converts now PASS (rt_num floats)
+traps
+func
+fac
+
+# ── Phase-2 Tier A — linear memory (bounds-check → trap), plain wast2json (no flags)
+memory_trap          # 180: 170 assert_trap OOB load/store — the bounds-check workhorse
+address              # 256: 206 ret + 49 trap — i32/i64/f32/f64 load/store w/ static offset
+endianness           # 68:  little-endian load/store of every width
+float_memory         # 84:  f32/f64 load/store incl NaN-bit preservation (D5)
+memory_size          # 38:  memory.size + MVP memory.grow growth semantics
+memory_redundancy    # 7:   load/store aliasing / no-spurious-reorder
+
+# ── Phase-2 Tier A — tables / call_indirect (runtime type-check → trap)
+call_indirect        # 169: SKIP 2 assert_exhaustion + the reftype multi-table module
+
+# ── Phase-2 Tier A — globals (mutable/immutable get/set)
+global               # 114: SKIP ~6 externref/funcref asserts + 2 extended-const inits ($z3,$z5)
+
+# ── Phase-2 Tier A — full scalar floats (abs/neg/sqrt/ceil/floor/trunc/nearest/copysign,
+#    the 6 comparisons, convert/promote/demote) — pure-MVP, plain-convert
+f32
+f64
+f32_cmp
+f64_cmp
+f32_bitwise
+f64_bitwise
+float_misc
+float_exprs
+float_literals       # 99 binary assert_return in scope; SKIP its 78 text-format assert_malformed
+
+# ── Phase-2 Tier B — MVP memarg alignment validation (per-file feature flag)
+align	--enable-memory64   # SKIP the 2 memory64 assert_invalid (64-bit offset) — the flag makes them VALID
+
+# ── Phase-5 — REFERENCE TYPES (funcref/externref values, ref.func/ref.is_null, typed tables).
+#    All convert with wast2json's DEFAULT flags at wabt 1.0.41 (reference-types is default-on);
+#    empirically re-verified at the pin (R16). The harness marshals externref/funcref via the
+#    term invoke-ABI (rt_ref) and judges references by null-ness / externref identity.
+ref_func             # ref.func + a null-slot call_indirect trap
+table_get            # table.get returning externref/funcref (null + non-null identity)
+table_set            # table.set of externref/funcref
+table_size           # table.size
+table_grow           # table.grow(+delta, init) — SKIP its ~2 cross-module (register) table-import asserts
+table_fill           # table.fill(offset, value, count) — externref stores
+table_copy           # table.copy (overlap = memmove) — 1727 asserts
+
+# ── Phase-5 — BULK MEMORY (memory.fill/copy/init + data.drop; eager-bounds trap, no partial write).
+#    Default flags (bulk-memory default-on at 1.0.41); re-verified at the pin (R16).
+bulk                 # memory.fill/copy/init + data.drop mixed
+memory_fill          # memory.fill (eager bounds; d>size,n=0 traps; d=size,n=0 ok)
+memory_copy          # memory.copy overlap-correct (memmove) — 4450 asserts
+memory_init          # memory.init + data.drop (dropped seg = length 0)
+data                 # active/passive data segments + data.drop
+
+# ── Phase-6 — FIXED-WIDTH SIMD (the v128 value + ~236 lane instructions). The single largest slice
+#    of the whole testsuite. All 58 below convert FLAGLESSLY at wabt 1.0.41 (SIMD is default-on);
+#    `simd_memory-multi` needs --enable-multi-memory. Empirically re-verified convertible at the pin
+#    (R16/S11): 58 flagless + 1 multi-memory, 0 un-convertible. Measured 24281 assert_return + 54
+#    assert_trap (execution) + 671 assert_invalid + 509 assert_malformed (frontend). The v128 rides
+#    the term invoke-ABI as 16 raw little-endian bytes (S14); the oracle judges v128 LANE-WISE
+#    (integer lanes exact, float lanes by bit-or-NaN-class — M3). SIMD TEXT-format frontend asserts
+#    (assert_malformed/invalid with a .wat module) are OUT OF SCOPE for the WAT parser (S13) → a
+#    categorized parse-skip; every BINARY SIMD assert runs.
+simd_address
+simd_align
+simd_bit_shift
+simd_bitwise
+simd_boolean
+simd_const
+simd_conversions
+simd_f32x4
+simd_f32x4_arith
+simd_f32x4_cmp
+simd_f32x4_pmin_pmax
+simd_f32x4_rounding
+simd_f64x2
+simd_f64x2_arith
+simd_f64x2_cmp
+simd_f64x2_pmin_pmax
+simd_f64x2_rounding
+simd_i16x8_arith
+simd_i16x8_arith2
+simd_i16x8_cmp
+simd_i16x8_extadd_pairwise_i8x16
+simd_i16x8_extmul_i8x16
+simd_i16x8_q15mulr_sat_s
+simd_i16x8_sat_arith
+simd_i32x4_arith
+simd_i32x4_arith2
+simd_i32x4_cmp
+simd_i32x4_dot_i16x8
+simd_i32x4_extadd_pairwise_i16x8
+simd_i32x4_extmul_i16x8
+simd_i32x4_trunc_sat_f32x4
+simd_i32x4_trunc_sat_f64x2
+simd_i64x2_arith
+simd_i64x2_arith2
+simd_i64x2_cmp
+simd_i64x2_extmul_i32x4
+simd_i8x16_arith
+simd_i8x16_arith2
+simd_i8x16_cmp
+simd_i8x16_sat_arith
+simd_int_to_int_extend
+simd_lane
+simd_linking          # structural: v128 globals across modules (register + import) — cross-module state
+simd_load
+simd_load16_lane
+simd_load32_lane
+simd_load64_lane
+simd_load8_lane
+simd_load_extend
+simd_load_splat
+simd_load_zero
+simd_memory-multi	--enable-multi-memory   # structural: multi-memory v128 access
+simd_select
+simd_splat
+simd_store
+simd_store16_lane
+simd_store32_lane
+simd_store64_lane
+simd_store8_lane
+
+# ── Phase-13 — TAIL CALLS (the tail-call proposal: return_call 0x12 / return_call_indirect 0x13).
+#    Lowered to GENUINE constant-stack BEAM tail calls (direct reuses the KReturn tail path; indirect
+#    goes through the `rt_table.call_indirect_lookup` seam then tail-applies the package-ABI target;
+#    imported reuses the import path under KReturn — value-correct/bounded-frame). At wabt 1.0.41 the
+#    tail-call opcode is NOT default-on, so `wast2json` needs the trailing FLAG COLUMN
+#    `--enable-tail-call` (measured: bare conversion errors "opcode not allowed: return_call"). Both
+#    files self-consistency-check under `spectest-interp --enable-tail-call` (47/47, 79/79). The single
+#    `spectest.print_i32_f32` host tail call in each is a categorized skip under the deny-all Safe host
+#    (a POLICY denial, not a spec trap — it PASSES under the open-host `unsafe` profile).
+return_call	--enable-tail-call
+return_call_indirect	--enable-tail-call
+
+# ── DEFERRED — honest, MEASURED categorized skips (R16); NOT added (would be false-green):
+#   GC-proposal reference types (typed function references / anyref / array) — un-wast2json-able at
+#   the pin AND out of our funcref/externref scope (H8):
+#     ref_null.wast   — `(ref.null any)` / anyref            (GC)
+#     ref_is_null.wast— `(param (ref null $t))` typed refs   (GC)
+#     elem.wast       — `(table $t 10 (ref func) …)` typed refs (GC)
+#     select.wast     — `(result (ref null func))` typed refs (GC) — typed `select` value asserts blocked
+#     table_init.wast — `(type $arr (array (mut arrayref)))`  (GC array)
+#   Exception-handling / module-linking / multi-memory syntax un-parseable at the pin:
+#     imports.wast    — `(tag …)` exception-handling proposal (EH)
+#     memory.wast / table.wast — `(module definition …)` module-linking + 2^32 literals
+#     memory_grow.wast— 100% multi-memory at pin (spectest-interp 0/50; MVP grow is in memory_size)
+#   NOTE: the reftype/bulk files above import NO spectest; `global.wast` (already listed) now passes
+#   its previously-skipped externref/funcref get/set asserts via the reference value model.
+#
+# ── Phase-6 measured residual + the WAT-route target files (R16/S11/S12/S13) ──────────────────────
+#   * memory64.wast + linking.wast are UN-`wast2json`-able at the pin (measured): memory64 aborts at
+#     `(module definition …)` (module-linking, line 8); linking aborts at `(ref null func)` typed-ref
+#     globals (GC syntax, line 99). Per R16 they route through OUR WAT parser (P5-10) where the
+#     parser accepts the in-scope subset, categorizing the out-of-scope modules as parse-skips. Driven
+#     by wat_fixture.gleam (NOT this list) — kept OUT of the wast2json allowlist deliberately.
+#   * table_copy.wast (allowlisted above): CLOSED in Phase 14 — now FULLY DRIVEN, 1649/0/0 (measured).
+#     Its verifier imports module `a`'s functions and inits `elem` segments with `ref.func` of those
+#     IMPORTED functions (cross-module funcref-in-elem-segment init) then dispatches via call_indirect;
+#     Phase 14 landed the `RefFuncImport` IR distinction + the D3a import-adapter closure
+#     (link.call_import over the func-import slot), so the once-~1080 residual is GONE — a positive
+#     movement, not a residual (docs/phase-14-surface.md). NOT the impossible "1649 flip" framing (S11).
+#   * TAIL CALL (return_call.wast / return_call_indirect.wast) is now DRIVEN (Phase 13, allowlisted
+#     above with `--enable-tail-call`) — no longer deferred. The remaining post-2.0 proposals stay
+#     categorized-deferred (S12): GC (typed refs / struct/array/i31), stack-switching, the component
+#     model, relaxed-SIMD. (Exception-handling's engine suite is driven separately via the `eh/`
+#     subdir; Phase 13 additionally unblocked its two `return_call`-blocked legacy files.)

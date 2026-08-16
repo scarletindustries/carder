@@ -109,8 +109,8 @@ range solver; nested/multi-dimensional BCE; tier-N unchecked native access.
 ## 5. Reproduce
 
 ```
-gleam test -- twocore/optimize/phase10_capstone_test   # LICM + BCE fire in the pipeline (deterministic) + convergence
-gleam test -- twocore/optimize/phase10_bench_test      # the wall-clock measurements (§2, §3)
+gleam test -- carder/optimize/phase10_capstone_test   # LICM + BCE fire in the pipeline (deterministic) + convergence
+gleam test -- carder/optimize/phase10_bench_test      # the wall-clock measurements (§2, §3)
 gleam test                                             # the full corpus/spec/tier differential (§1)
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 2core Phase-4 benchmark revisit (unit P4-10, overview G8) — HONEST numbers, methodology +
+# carder Phase-4 benchmark revisit (unit P4-10, overview G8) — HONEST numbers, methodology +
 # limitations in docs/phase-4-benchmark.md. Holds the committed smoke wasm (CRC-32 / SHA-256 /
 # DEFLATE real crates) FIXED and varies only the linked `Binding` along the Phase-4 tier axes:
 #
@@ -18,7 +18,7 @@
 # RESERVES like atomics, so it rides `--ceiling` with `--tier nif` overriding the memory tier and the
 # same mandatory `--cap`. Because `gleam build` has NO native pre-build hook, the `.so` is compiled
 # OUT OF BAND here (§0.5) — a toolchain-gated `cc -shared -fPIC` reusing the frozen keystone flag
-# vector — then pointed at via `TWOCORE_RT_MEM_NIF_SO` so the shim's `-on_load` attaches it and
+# vector — then pointed at via `CARDER_RT_MEM_NIF_SO` so the shim's `-on_load` attaches it and
 # `rt_mem_nif` dispatches native (else the paged-delegate fallback, byte-identical). No `cc` (or a
 # build failure) ⇒ the `nif` column is a CATEGORIZED DASH, never a fabricated (or paged-delegate)
 # number. This out-of-band `.so` step is the production `priv/*.so` packaging follow-on in miniature.
@@ -44,7 +44,7 @@
 # Usage: ./smoke/bench.sh [REPEAT] [CAP] [COMPILE_TIMEOUT_SECS]   (defaults: 100, 1024, 300)
 set -uo pipefail
 cd "$(dirname "$0")/.."                       # repo root
-WASM=smoke/target/wasm32v1-none/release/twocore_smoke.wasm
+WASM=smoke/target/wasm32v1-none/release/carder_smoke.wasm
 REL=smoke/target/wasm32v1-none/release
 REPEAT=${1:-100}
 CAP=${2:-1024}
@@ -68,14 +68,14 @@ if [ ! -f "$WASM" ]; then
   ( cd smoke && cargo build --release --target wasm32v1-none ) || { echo "cargo build failed"; exit 1; }
 fi
 imp=$(wasm-tools print "$WASM" 2>/dev/null | grep -c '(import' || true)
-[ "${imp:-1}" = 0 ] || { echo "FAIL: $imp imports (2core has no import support)"; exit 1; }
+[ "${imp:-1}" = 0 ] || { echo "FAIL: $imp imports (carder has no import support)"; exit 1; }
 echo "== smoke wasm: $(wc -c <"$WASM") bytes, $(wasm-tools print "$WASM"|grep -c '(func ') funcs, 0 imports =="
 gleam build >/dev/null 2>&1
 
 # ── 0.5 the out-of-band tier-N `.so` (Phase 15) — toolchain-gated, else the `nif` column dashes ──
 # `gleam build` compiles `src/*.erl` but NOT `c_src/*.c` (Gleam has no native pre-build hook — the
 # exact constraint Phase 15 turns on), so the tier-N native memory backend is compiled here, once,
-# reusing the FROZEN keystone build recipe (`test/twocore_rt_mem_nif_build_ffi.erl`): resolve `cc`
+# reusing the FROZEN keystone build recipe (`test/carder_rt_mem_nif_build_ffi.erl`): resolve `cc`
 # (fallback `gcc`) + the `erl_nif.h` include dir via the candidate-list resolver (the bare
 # `code:lib_dir(erts,include)` is header-less on homebrew OTP 29), and carry the platform flag vector
 # (`-undefined dynamic_lookup` is MANDATORY on darwin — a NIF's `enif_*` symbols are undefined at link
@@ -84,7 +84,7 @@ gleam build >/dev/null 2>&1
 # categorized dash (never the paged-delegate timing mislabelled as native).
 HAVE_NIF=0
 CC_BIN="$(command -v cc || command -v gcc || true)"
-if [ -n "$CC_BIN" ] && [ -f c_src/twocore_rt_mem_nif.c ]; then
+if [ -n "$CC_BIN" ] && [ -f c_src/carder_rt_mem_nif.c ]; then
   # erl_nif.h include dir — the frozen candidate-list resolver (pick the first that holds the header).
   ERTS_INC="$(erl -noshell -eval '
     Root = code:root_dir(), Vsn = erlang:system_info(version),
@@ -95,11 +95,11 @@ if [ -n "$CC_BIN" ] && [ -f c_src/twocore_rt_mem_nif.c ]; then
     case F of [Dir|_] -> io:format("~s",[Dir]); [] -> ok end, halt().' 2>/dev/null)"
   if [ -n "$ERTS_INC" ] && [ -f "$ERTS_INC/erl_nif.h" ]; then
     PLATFORM_FLAGS=(); [ "$(uname -s)" = "Darwin" ] && PLATFORM_FLAGS=(-undefined dynamic_lookup)
-    SO="$OUT/twocore_rt_mem_nif.so"; SO_BASE="$OUT/twocore_rt_mem_nif"
-    if "$CC_BIN" -shared -fPIC -O2 -I"$ERTS_INC" "${PLATFORM_FLAGS[@]}" -o "$SO" c_src/twocore_rt_mem_nif.c 2>"$OUT/cc.log"; then
+    SO="$OUT/carder_rt_mem_nif.so"; SO_BASE="$OUT/carder_rt_mem_nif"
+    if "$CC_BIN" -shared -fPIC -O2 -I"$ERTS_INC" "${PLATFORM_FLAGS[@]}" -o "$SO" c_src/carder_rt_mem_nif.c 2>"$OUT/cc.log"; then
       # `-on_load` reads this env override (basename, no extension); exported so `gleam run -- exec`
       # (both the correctness gate and the timing loop) inherits it and dispatches native.
-      export TWOCORE_RT_MEM_NIF_SO="$SO_BASE"
+      export CARDER_RT_MEM_NIF_SO="$SO_BASE"
       HAVE_NIF=1
       echo "== tier-N .so built: $SO ($(wc -c <"$SO") bytes) via $CC_BIN — native memory ENGAGED =="
     else
@@ -137,7 +137,7 @@ declare -a HAVE                                    # HAVE[i]=1 iff build i compi
 # Precompute the wasmtime oracle (u32) for each kernel once.
 declare -a ORACLE
 for k in "${!SPEC_FN[@]}"; do
-  w=$(cd "$REL" && wasmtime run --invoke "${SPEC_FN[$k]}" twocore_smoke.wasm "${SPEC_ARG[$k]}" 2>/dev/null | tail -1)
+  w=$(cd "$REL" && wasmtime run --invoke "${SPEC_FN[$k]}" carder_smoke.wasm "${SPEC_ARG[$k]}" 2>/dev/null | tail -1)
   ORACLE[$k]=$(u32 "$w")
 done
 for i in "${!BUILDS[@]}"; do
@@ -252,7 +252,7 @@ for k in "${!SPEC_FN[@]}"; do
     "$(ratio "${REF[$k]}" "$ceil")×"
 done
 echo
-echo "crc32(4096): 2core=$(exec_val 1 "$OUT/smoke.safe.beam" crc32 4096)  hand-written-Erlang=$ERL_CRC_VAL  (bit-identical head-to-head; both cross-check vs wasmtime in run.sh)"
+echo "crc32(4096): carder=$(exec_val 1 "$OUT/smoke.safe.beam" crc32 4096)  hand-written-Erlang=$ERL_CRC_VAL  (bit-identical head-to-head; both cross-check vs wasmtime in run.sh)"
 echo "hand-Erl/native col: crc32 = hand-written PURE Erlang; sha256/deflate = native NIF ceiling (crypto/zlib), NOT hand-written."
 echo "paged→atomics = safe/paged ÷ atomics-safe (mem_tier the ONLY change → the pure tier-O effect); atomics→nif = the tier-O→tier-N memory delta; nif/ceiling→ref = the residual to hand-written-Erlang/native."
 echo "nif (tier-N): REAL erl_nif C backend over a reserved raw byte buffer — measured ONLY when the .so built (HAVE_NIF=$HAVE_NIF); a dash means no C toolchain (categorized, never a paged-delegate number mislabelled native)."

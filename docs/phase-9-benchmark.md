@@ -28,7 +28,7 @@ differential:
   and identical traps — over the whole acceptance corpus **and** the official WASM spec `.wast`
   suite (46 529 passing asserts, `fail = 0`), run under **every** shipped `(state_strategy ×
   mem_tier)` combo (`cell`/`threaded` × `paged`/`atomics`/`nif`) and **both** profiles
-  (`test/twocore/optimize/differential_test.gleam`, the tier-matrix suites). Wiring the memory
+  (`test/carder/optimize/differential_test.gleam`, the tier-matrix suites). Wiring the memory
   passes in changed **no** observable result on any real program.
 - The passes only ever *remove* a `MemStore` (DSE) or *replace* a `MemLoad` with an already-bound
   `Value` (forwarding/RLE); they add no IR node, reorder no effect, introduce no call/`apply`. Every
@@ -44,7 +44,7 @@ differential:
 baseline pass) ever *constructs* one, the difference before/after the memory passes is exactly the
 work they did — a deterministic number, independent of any timer.
 
-| Kernel (`test/twocore/optimize/memory_differential_test.gleam`) | mem-ops at `OptNone` | mem-ops at `Baseline` | eliminated |
+| Kernel (`test/carder/optimize/memory_differential_test.gleam`) | mem-ops at `OptNone` | mem-ops at `Baseline` | eliminated |
 |---|---|---|---|
 | `churn` (1 dead store + store→load-forward + a disjoint-offset load + RLE, straight-line) | **6** | **2** | **4** (1 store via DSE, 3 loads via forwarding/RLE) |
 | `bench` loop body (3 dead stores + 1 live store + 1 forwardable load, per iteration) | **5** | **1** | **4** per iteration (3 stores via DSE, 1 load via forwarding) |
@@ -57,7 +57,7 @@ oscillation).
 
 ---
 
-## 3. The wall-clock measurement (`test/twocore/optimize/mem_bench_test.gleam`)
+## 3. The wall-clock measurement (`test/carder/optimize/mem_bench_test.gleam`)
 
 **Method — the memory-pass delta, isolated.** The benchmark builds the *same* lowered kernel two
 ways that differ in **exactly** the memory passes: `baseline.baseline_passes()` alone, versus
@@ -151,8 +151,8 @@ forwarding, which removes the whole load, check included.
 ## 6. Reproduce
 
 ```
-gleam test -- twocore/optimize/memory_differential_test   # the deterministic firing metric (§2)
-gleam test -- twocore/optimize/mem_bench_test              # the wall-clock measurement (§3)
+gleam test -- carder/optimize/memory_differential_test   # the deterministic firing metric (§2)
+gleam test -- carder/optimize/mem_bench_test              # the wall-clock measurement (§3)
 gleam test                                                 # the full corpus/spec/tier differential (§1)
 ```
 
