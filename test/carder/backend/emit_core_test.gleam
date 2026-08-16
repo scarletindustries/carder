@@ -208,28 +208,18 @@ pub fn loop_is_tail_recursive_letrec_test() {
   assert entry == lname
   // The body's `continue` is a tail self-apply of the same head → constant space.
   assert applies_to(lbody, lname)
-  // The body computes the loop condition, then `case`s on it: `<0>` (false) breaks with the
-  // bare accumulator (no join point, since the exit is in tail position / KReturn). The
-  // condition is the INLINED `i64.le_u` — a raw unsigned BEAM `=<` compare reified to an i32
-  // truth value (`bool_bif_to_i32`), no `rt_num` seam. Its 1/0 internals are pinned in the
-  // numeric tests; here we only assert it IS the unsigned-`=<` shape and focus on the
+  // The body `case`s straight on the loop condition: `'false'` breaks with the bare
+  // accumulator (no join point, since the exit is in tail position / KReturn). The
+  // condition is the INLINED `i64.le_u` — a raw unsigned BEAM `=<` compare, no `rt_num`
+  // seam; `cond` is read once (by the `If`), so no `1`/`0` truth value is bound
+  // (`apply_cont_bool`). Here we only assert it IS the unsigned-`=<` shape and focus on the
   // loop/case/continue skeleton.
-  let assert CLet(
-    ["cond"],
-    CCase(
-      CCall(CAtom("erlang"), CAtom("=<"), _),
-      [
-        CClause([PAtom("true")], CAtom("true"), CInt(1)),
-        CClause([PAtom("false")], CAtom("true"), CInt(0)),
-      ],
-    ),
-    CCase(
-      CVar("cond"),
-      [
-        CClause([PInt(0)], CAtom("true"), CVar("acc")),
-        CClause([PVar(_)], CAtom("true"), _),
-      ],
-    ),
+  let assert CCase(
+    CCall(CAtom("erlang"), CAtom("=<"), _),
+    [
+      CClause([PAtom("true")], CAtom("true"), _),
+      CClause([PAtom("false")], CAtom("true"), CVar("acc")),
+    ],
   ) = lbody
 }
 

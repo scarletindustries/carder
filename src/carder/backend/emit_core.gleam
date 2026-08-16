@@ -336,6 +336,12 @@ type EmitState {
     /// try, so a `Break`/`Continue` to one of them (or a `Return`) leaves the
     /// body through an exit record (see `KTryFall`).
     try_outer: Option(Int),
+    /// How many times each IR variable is READ in the function being emitted
+    /// (`use_counts`); a binder read exactly once feeds the bool fusion in
+    /// `apply_cont_bool`.
+    uses: Dict(String, Int),
+    /// How many times each IR variable is BOUND in the function being emitted.
+    binds: Dict(String, Int),
   )
 }
 
@@ -720,6 +726,7 @@ fn emit_function(
   counter_seed: Int,
 ) -> Result(FunDef, EmitError) {
   let reserved_vars = collect_vars(f)
+  let #(uses, binds) = var_counts(f)
   let reserved_fns = set.from_list(dict.keys(ctx.fn_arity))
   let state0 =
     EmitState(
@@ -729,6 +736,8 @@ fn emit_function(
       labels: [],
       float: None,
       try_outer: None,
+      uses: uses,
+      binds: binds,
     )
   case is_threaded(ctx) && set.contains(ctx.fn_state_reaching, f.name) {
     True -> {
@@ -1483,8 +1492,57 @@ fn emit_term_test(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let guard = bool_bif_to_i32(term_test_bif(kind), [emit_value(arg)])
-  apply_cont(cont, [guard], sc, state, ctx)
+  let bif_call =
+    CCall(CAtom("erlang"), CAtom(term_test_bif(kind)), [emit_value(arg)])
+  apply_cont_bool(cont, bif_call, sc, state, ctx)
+}
+
+/// Dispose a boolean-atom-valued BIF call `bif_call` through `cont`. When `cont`
+/// binds it to a name that is read ONCE, as the condition of an immediately
+/// following `If`, the `If` is emitted straight on the boolean (`case bif_call
+/// of 'true' -> then; 'false' -> else`) — no `1`/`0` round-trip. Otherwise the
+/// i32 truth value (`bool_to_i32`) is bound as usual.
+fn apply_cont_bool(
+  cont: Cont,
+  bif_call: CExpr,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let fused = case cont {
+    KBind([v], body, next) -> fused_if(v, body, next, state)
+    _ -> None
+  }
+  case fused {
+    Some(FusedIf(result, t, e, next)) ->
+      emit_if_on(BoolCond(bif_call), result, t, e, next, sc, sc, sc, state, ctx)
+    None -> apply_cont(cont, [bool_to_i32(bif_call)], sc, state, ctx)
+  }
+}
+
+/// An `If` on the just-bound truth value `v`, ready to emit on the boolean
+/// itself: its result arity, arms, and the cont the `If` continues into.
+type FusedIf {
+  FusedIf(result: List(ir.ValType), t: Expr, e: Expr, next: Cont)
+}
+
+/// `Some` iff `body` (bound under `KBind([v], body, next)`) starts with an
+/// `If` on `v` and `v` is read nowhere else. The `If` either IS `body`, or
+/// heads it as a `Let` rhs (`let xs = if v … in rest`, the let-case shape).
+fn fused_if(
+  v: String,
+  body: Expr,
+  next: Cont,
+  state: EmitState,
+) -> Option(FusedIf) {
+  let once = dict.get(state.uses, v) == Ok(1)
+  case body {
+    If(Var(c), result, t, e) if c == v && once ->
+      Some(FusedIf(result, t, e, next))
+    Let(xs, If(Var(c), result, t, e), rest) if c == v && once ->
+      Some(FusedIf(result, t, e, KBind(xs, rest, next)))
+    _ -> None
+  }
 }
 
 /// The `erlang:is_*` BIF name for a `TermKind` (Phase-8 unit 06): `IsInt`→`is_integer`,
@@ -1504,12 +1562,12 @@ fn term_test_bif(kind: ir.TermKind) -> String {
   }
 }
 
-/// Wrap a boolean-returning `erlang` BIF call (`fn_name(args)` → `'true'`/`'false'`) into an i32
-/// truth value: `case call 'erlang':'<fn_name>'(args) of 'true' -> 1; 'false' -> 0 end`. The BIF
-/// always returns a boolean atom, so the two clauses are exhaustive (no fresh wildcard needed).
-/// Shared by `TermTest` (an `is_*` test) and `NumTerm`'s comparisons (a relational BIF).
-fn bool_bif_to_i32(fn_name: String, args: List(CExpr)) -> CExpr {
-  CCase(CCall(CAtom("erlang"), CAtom(fn_name), args), [
+/// Wrap a boolean-atom-valued BIF call into an i32 truth value:
+/// `case <bif_call> of 'true' -> 1; 'false' -> 0 end`. The BIF always returns a boolean atom,
+/// so the two clauses are exhaustive (no fresh wildcard needed). Shared by `TermTest` (an
+/// `is_*` test), `NumTerm`'s comparisons and the inlined integer compares.
+fn bool_to_i32(bif_call: CExpr) -> CExpr {
+  CCase(bif_call, [
     CClause([PAtom("true")], CAtom("true"), CInt(1)),
     CClause([PAtom("false")], CAtom("true"), CInt(0)),
   ])
@@ -1561,7 +1619,7 @@ fn term_tag_case(x: CExpr) -> CExpr {
 /// `sc` flows through unchanged (a bare `erlang` BIF touches no threaded instance state):
 /// - `NAdd`/`NSub`/`NMul` → `call 'erlang':'+'/'-'/'*'(A, B)` → a **number term** (`TTerm`).
 /// - `NLt`/`NLe`/`NGt`/`NGe`/`NEq` → `case A </=</>/>=/=:= B of 'true' -> 1; 'false' -> 0 end` → an
-///   i32 truth value (via `bool_bif_to_i32` — the relational BIFs return boolean atoms).
+///   i32 truth value (via `bool_to_i32` — the relational BIFs return boolean atoms).
 ///
 /// A non-number operand raises a NATIVE BEAM `badarith` at run time (the frontend guards with
 /// `TermTest(IsNumber)`; the IR's effect classifier marks `NumTerm` a barrier so the optimizer never
@@ -1577,19 +1635,19 @@ fn emit_num_term(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let a = emit_value(lhs)
   let b = emit_value(rhs)
-  let result = case op {
+  let bif = fn(name) { CCall(CAtom("erlang"), CAtom(name), [a, b]) }
+  case op {
     // arithmetic → a number term (a bare BIF call)
-    ir.NAdd -> CCall(CAtom("erlang"), CAtom("+"), [a, b])
-    ir.NSub -> CCall(CAtom("erlang"), CAtom("-"), [a, b])
-    ir.NMul -> CCall(CAtom("erlang"), CAtom("*"), [a, b])
+    ir.NAdd -> apply_cont(cont, [bif("+")], sc, state, ctx)
+    ir.NSub -> apply_cont(cont, [bif("-")], sc, state, ctx)
+    ir.NMul -> apply_cont(cont, [bif("*")], sc, state, ctx)
     // comparison → an i32 truth value (`=<` is Erlang's ≤; `=:=` is exact-equal)
-    ir.NLt -> bool_bif_to_i32("<", [a, b])
-    ir.NLe -> bool_bif_to_i32("=<", [a, b])
-    ir.NGt -> bool_bif_to_i32(">", [a, b])
-    ir.NGe -> bool_bif_to_i32(">=", [a, b])
-    ir.NEq -> bool_bif_to_i32("=:=", [a, b])
+    ir.NLt -> apply_cont_bool(cont, bif("<"), sc, state, ctx)
+    ir.NLe -> apply_cont_bool(cont, bif("=<"), sc, state, ctx)
+    ir.NGt -> apply_cont_bool(cont, bif(">"), sc, state, ctx)
+    ir.NGe -> apply_cont_bool(cont, bif(">="), sc, state, ctx)
+    ir.NEq -> apply_cont_bool(cont, bif("=:="), sc, state, ctx)
   }
-  apply_cont(cont, [result], sc, state, ctx)
 }
 
 /// Lower `MakeClosure(fn_name, captures, arity)` — the Phase-8 native-closure constructor (K3/K8,
@@ -2170,20 +2228,23 @@ fn emit_value_state_pair(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(vvar, state2) = fresh_var(state)
-  let #(stvar, state3) = fresh_var(state2)
-  use #(rest, state4) <- result.try(apply_cont(
+  let #(stvar, state2) = fresh_var(state)
+  use #(vvars, rest, state3) <- result.try(bind_results(
     cont,
-    [CVar(vvar)],
+    1,
     Threading(stvar),
-    state3,
+    state2,
     ctx,
   ))
   Ok(#(
     CCase(call, [
-      CClause([PTuple([PVar(vvar), PVar(stvar)])], CAtom("true"), rest),
+      CClause(
+        [PTuple(list.append(list.map(vvars, PVar), [PVar(stvar)]))],
+        CAtom("true"),
+        rest,
+      ),
     ]),
-    state4,
+    state3,
   ))
 }
 
@@ -2226,30 +2287,63 @@ fn emit_state_rebind_or_miss(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(rvar, state2) = fresh_var(state)
-  let #(st2, state3) = fresh_var(state2)
-  use #(rest, state4) <- result.try(apply_cont(
-    cont,
-    [CVar(rvar)],
-    Threading(st2),
-    state3,
-    ctx,
-  ))
-  Ok(#(
-    CLet(
-      [rvar],
-      call,
-      CLet(
-        [st2],
-        CCase(CCall(CAtom("erlang"), CAtom("is_atom"), [CVar(rvar)]), [
-          CClause([PAtom("true")], CAtom("true"), CVar(cur)),
-          CClause([PAtom("false")], CAtom("true"), CVar(rvar)),
-        ]),
-        rest,
-      ),
-    ),
-    state4,
-  ))
+  // Fused: `let r = call in let b = is_atom(r) in if b …` with `b` read once
+  // and `r` bound once → ONE `case is_atom(r)`, the miss arm under `cur`, the
+  // hit arm under `r` itself (no `St2` rebind, no second test).
+  let fused = case cont {
+    KBind([r], Let([b], ir.TermTest(ir.IsAtom, Var(r2)), body), next)
+      if r == r2
+    ->
+      case dict.get(state.binds, r) == Ok(1) {
+        True -> option.map(fused_if(b, body, next, state), fn(f) { #(r, f) })
+        False -> None
+      }
+    _ -> None
+  }
+  case fused {
+    Some(#(r, FusedIf(result, t, e, next))) -> {
+      let is_atom = CCall(CAtom("erlang"), CAtom("is_atom"), [CVar(r)])
+      use #(rest, state2) <- result.try(emit_if_on(
+        BoolCond(is_atom),
+        result,
+        t,
+        e,
+        next,
+        Threading(cur),
+        Threading(cur),
+        Threading(r),
+        state,
+        ctx,
+      ))
+      Ok(#(CLet([r], call, rest), state2))
+    }
+    None -> {
+      let #(st2, state2) = fresh_var(state)
+      use #(rvars, rest, state3) <- result.try(bind_results(
+        cont,
+        1,
+        Threading(st2),
+        state2,
+        ctx,
+      ))
+      let rvar = list.map(rvars, CVar)
+      Ok(#(
+        CLet(
+          rvars,
+          call,
+          CLet(
+            [st2],
+            CCase(CCall(CAtom("erlang"), CAtom("is_atom"), rvar), [
+              CClause([PAtom("true")], CAtom("true"), CVar(cur)),
+              CClause([PAtom("false")], CAtom("true"), value_list(rvar)),
+            ]),
+            rest,
+          ),
+        ),
+        state3,
+      ))
+    }
+  }
 }
 
 /// Sequence a threaded RECORD-rebinding effect: reduce a trapping
@@ -2464,7 +2558,42 @@ fn apply_cont_call_unpack(
     }
     1 -> apply_cont(cont, [produced], sc, state, ctx)
     _ -> {
-      let #(names, state2) = fresh_n_vars(state, r)
+      use #(names, rest, state2) <- result.try(bind_results(
+        cont,
+        r,
+        sc,
+        state,
+        ctx,
+      ))
+      let clause = CClause([PTuple(list.map(names, PVar))], CAtom("true"), rest)
+      Ok(#(CCase(produced, [clause]), state2))
+    }
+  }
+}
+
+/// The `n` Core names a call's results are bound to, plus the continuation
+/// body under `sc`. A `KBind` of exactly `n` distinct names binds them
+/// directly (the pattern/`let` names ARE the IR names — no `let X = G in`
+/// alias); any other cont gets fresh names fed through `apply_cont`.
+fn bind_results(
+  cont: Cont,
+  n: Int,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(List(String), CExpr, EmitState), EmitError) {
+  let direct = case cont {
+    KBind(names, _, _) ->
+      list.length(names) == n && set.size(set.from_list(names)) == n
+    _ -> False
+  }
+  case cont, direct {
+    KBind(names, body, next), True -> {
+      use #(rest, state2) <- result.try(emit(body, next, sc, state, ctx))
+      Ok(#(names, rest, state2))
+    }
+    _, _ -> {
+      let #(names, state2) = fresh_n_vars(state, n)
       use #(rest, state3) <- result.try(apply_cont(
         cont,
         list.map(names, CVar),
@@ -2472,8 +2601,7 @@ fn apply_cont_call_unpack(
         state2,
         ctx,
       ))
-      let clause = CClause([PTuple(list.map(names, PVar))], CAtom("true"), rest)
-      Ok(#(CCase(produced, [clause]), state3))
+      Ok(#(names, rest, state3))
     }
   }
 }
@@ -3151,6 +3279,13 @@ fn shift_count_expr(w: IntWidth, b: CExpr) -> CExpr {
   bif("band", [b, CInt(mask)])
 }
 
+/// An inlined `NumOp`: a plain value, or a boolean-atom test still to be
+/// disposed through `apply_cont_bool`.
+type Inlined {
+  Term(CExpr)
+  Truth(CExpr)
+}
+
 /// Try to lower a non-trapping integer `NumOp` to an INLINE BEAM guard BIF instead of an
 /// `rt_num` seam call, so a `rt_num:i32_add` local function call becomes a folded `+`/`band`
 /// instruction (per-op function-call overhead is a large fraction of a wasm-lowered guest's
@@ -3163,24 +3298,24 @@ fn shift_count_expr(w: IntWidth, b: CExpr) -> CExpr {
 /// no mask; `eqz`/`eq`/`ne` and the UNSIGNED comparisons (`lt_u`/`gt_u`/`le_u`/`ge_u`) are raw
 /// BEAM comparisons on the stored unsigned bit patterns. SIGNED compares/shifts need a
 /// `signed(a,n)` reinterpret first, so they deliberately stay on the seam.
-fn inline_num_op(op: NumOp, args: List(CExpr)) -> Result(CExpr, Nil) {
+fn inline_num_op(op: NumOp, args: List(CExpr)) -> Result(Inlined, Nil) {
   case op, args {
-    IAnd(_), [a, b] -> Ok(bif("band", [a, b]))
-    IOr(_), [a, b] -> Ok(bif("bor", [a, b]))
-    IXor(_), [a, b] -> Ok(bif("bxor", [a, b]))
-    IAdd(w), [a, b] -> Ok(mask_to_width(w, bif("+", [a, b])))
-    ISub(w), [a, b] -> Ok(mask_to_width(w, bif("-", [a, b])))
-    IMul(w), [a, b] -> Ok(mask_to_width(w, bif("*", [a, b])))
+    IAnd(_), [a, b] -> Ok(Term(bif("band", [a, b])))
+    IOr(_), [a, b] -> Ok(Term(bif("bor", [a, b])))
+    IXor(_), [a, b] -> Ok(Term(bif("bxor", [a, b])))
+    IAdd(w), [a, b] -> Ok(Term(mask_to_width(w, bif("+", [a, b]))))
+    ISub(w), [a, b] -> Ok(Term(mask_to_width(w, bif("-", [a, b]))))
+    IMul(w), [a, b] -> Ok(Term(mask_to_width(w, bif("*", [a, b]))))
     IShl(w), [a, b] ->
-      Ok(mask_to_width(w, bif("bsl", [a, shift_count_expr(w, b)])))
-    IShrU(w), [a, b] -> Ok(bif("bsr", [a, shift_count_expr(w, b)]))
-    IEqz(_), [a] -> Ok(bool_bif_to_i32("=:=", [a, CInt(0)]))
-    IEq(_), [a, b] -> Ok(bool_bif_to_i32("=:=", [a, b]))
-    INe(_), [a, b] -> Ok(bool_bif_to_i32("=/=", [a, b]))
-    ILtU(_), [a, b] -> Ok(bool_bif_to_i32("<", [a, b]))
-    IGtU(_), [a, b] -> Ok(bool_bif_to_i32(">", [a, b]))
-    ILeU(_), [a, b] -> Ok(bool_bif_to_i32("=<", [a, b]))
-    IGeU(_), [a, b] -> Ok(bool_bif_to_i32(">=", [a, b]))
+      Ok(Term(mask_to_width(w, bif("bsl", [a, shift_count_expr(w, b)]))))
+    IShrU(w), [a, b] -> Ok(Term(bif("bsr", [a, shift_count_expr(w, b)])))
+    IEqz(_), [a] -> Ok(Truth(bif("=:=", [a, CInt(0)])))
+    IEq(_), [a, b] -> Ok(Truth(bif("=:=", [a, b])))
+    INe(_), [a, b] -> Ok(Truth(bif("=/=", [a, b])))
+    ILtU(_), [a, b] -> Ok(Truth(bif("<", [a, b])))
+    IGtU(_), [a, b] -> Ok(Truth(bif(">", [a, b])))
+    ILeU(_), [a, b] -> Ok(Truth(bif("=<", [a, b])))
+    IGeU(_), [a, b] -> Ok(Truth(bif(">=", [a, b])))
     _, _ -> Error(Nil)
   }
 }
@@ -3206,7 +3341,8 @@ fn emit_num(
     ctx.binding.num_module == "carder@runtime@rt_num",
     inline_num_op(op, cargs)
   {
-    True, Ok(inlined) -> apply_cont(cont, [inlined], sc, state, ctx)
+    True, Ok(Term(inlined)) -> apply_cont(cont, [inlined], sc, state, ctx)
+    True, Ok(Truth(bif_call)) -> apply_cont_bool(cont, bif_call, sc, state, ctx)
     _, _ -> {
       let call = seam_call(ctx.binding.num_module, num_op_name(op), cargs)
       case is_trapping(op) {
@@ -5935,6 +6071,43 @@ fn emit_if(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  emit_if_on(
+    I32Cond(cond),
+    result,
+    then_branch,
+    else_branch,
+    cont,
+    sc,
+    sc,
+    sc,
+    state,
+    ctx,
+  )
+}
+
+/// What an `If` scrutinises: the IR's i32 truth value (`0` → else), or a
+/// boolean-atom BIF call fused in by `apply_cont_bool` (`'false'` → else).
+type IfCond {
+  I32Cond(Value)
+  BoolCond(CExpr)
+}
+
+/// `sc` is the channel the join/`cont` runs under; `then_sc`/`else_sc` are the
+/// arms' own (same kind as `sc`; they differ only for the fused `MutMiss`
+/// test, where the miss arm keeps the pre-call record and the hit arm takes
+/// the returned one — see `emit_state_rebind_or_miss`).
+fn emit_if_on(
+  cond: IfCond,
+  result: List(ir.ValType),
+  then_branch: Expr,
+  else_branch: Expr,
+  cont: Cont,
+  sc: StateChan,
+  then_sc: StateChan,
+  else_sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
   // perf5 richards-gate: when one arm is a bottom transfer (Break/Continue/
   // Return/Trap/Throw/Unreachable), `cont` is reachable from ONE arm only —
   // materialising it as a letrec join costs one `apply` (~4ns) per If in the
@@ -6000,18 +6173,43 @@ fn emit_if(
     True -> EmitState(..state2, float: None)
     False -> state2
   }
-  use #(then_c, state3) <- result.try(emit(then_branch, jcont, sc, state2, ctx))
-  use #(else_c, state4) <- result.try(emit(else_branch, jcont, sc, state3, ctx))
+  use #(then_c, state3) <- result.try(emit(
+    then_branch,
+    jcont,
+    then_sc,
+    state2,
+    ctx,
+  ))
+  use #(else_c, state4) <- result.try(emit(
+    else_branch,
+    jcont,
+    else_sc,
+    state3,
+    ctx,
+  ))
   let state4 = case let_case {
     True -> EmitState(..state4, float: outer_float)
     False -> state4
   }
-  let #(wild, state5) = fresh_var(state4)
-  let case_expr =
-    CCase(emit_value(cond), [
-      CClause([PInt(0)], CAtom("true"), else_c),
-      CClause([PVar(wild)], CAtom("true"), then_c),
-    ])
+  let #(case_expr, state5) = case cond {
+    I32Cond(v) -> {
+      let #(wild, state5) = fresh_var(state4)
+      #(
+        CCase(emit_value(v), [
+          CClause([PInt(0)], CAtom("true"), else_c),
+          CClause([PVar(wild)], CAtom("true"), then_c),
+        ]),
+        state5,
+      )
+    }
+    BoolCond(bif_call) -> #(
+      CCase(bif_call, [
+        CClause([PAtom("true")], CAtom("true"), then_c),
+        CClause([PAtom("false")], CAtom("true"), else_c),
+      ]),
+      state4,
+    )
+  }
   // perf6 let-case tail: KValues chosen HERE (block_can_let_case ⇒ cont was a
   // KBind, not an inherited KValues from an outer let-case) → wrap; else the
   // arms already flow to jcont directly. `emit_if` never opens a float scope
@@ -6043,21 +6241,24 @@ fn emit_let_case_wrap(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(names, state2) = fresh_n_vars(state, arity)
-  let #(tup_names, state3, sc_out) = case sc {
-    NoState -> #(names, state2, sc)
+  let #(state2, sc_out) = case sc {
+    NoState -> #(state, sc)
     Threading(_) -> {
-      let #(st_out, s) = fresh_var(state2)
-      #([st_out, ..names], s, Threading(st_out))
+      let #(st_out, s) = fresh_var(state)
+      #(s, Threading(st_out))
     }
   }
-  use #(cont_c, state4) <- result.try(apply_cont(
+  use #(names, cont_c, state4) <- result.try(bind_results(
     cont,
-    list.map(names, CVar),
+    arity,
     sc_out,
-    state3,
+    state2,
     ctx,
   ))
+  let tup_names = case sc_out {
+    NoState -> names
+    Threading(st_out) -> [st_out, ..names]
+  }
   case multi {
     True -> {
       // Multi-value `let <st,r..> = body_c in cont_c`. `defs` (the l_miss
@@ -7278,6 +7479,8 @@ fn emit_instantiate_full(
       labels: [],
       float: None,
       try_outer: None,
+      uses: dict.new(),
+      binds: dict.new(),
     )
   let n_imports = count_import_slots(module)
   // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
@@ -7749,6 +7952,8 @@ fn emit_instantiate_cell(
       labels: [],
       float: None,
       try_outer: None,
+      uses: dict.new(),
+      binds: dict.new(),
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   let seed_effect = seam_call(ctx.binding.state_module, "seed", [decl_term])
@@ -7805,6 +8010,8 @@ fn emit_instantiate_threaded(
       labels: [],
       float: None,
       try_outer: None,
+      uses: dict.new(),
+      binds: dict.new(),
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   // (0) The unchanged metering/host seed discards.
@@ -8688,11 +8895,42 @@ fn collect_vars(f: Function) -> Set(String) {
   let base =
     list.fold(f.params, set.new(), fn(acc, l) { set.insert(acc, l.name) })
   let base = list.fold(f.locals, base, fn(acc, l) { set.insert(acc, l.name) })
-  collect_expr(f.body, base)
+  walk_vars(f.body, base, set.insert, set.insert)
 }
 
-/// Accumulate variable names appearing in `expr` into `acc`.
-fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
+/// Per variable of `f`'s body: how many times it is READ (a `Var` operand) and
+/// how many times it is BOUND (`Let`/loop/handler binder). Params/locals are
+/// not binders here, so a name absent from `binds` is not a body binder.
+fn var_counts(f: Function) -> #(Dict(String, Int), Dict(String, Int)) {
+  let bump = fn(d, name) {
+    dict.upsert(d, name, fn(n) { option.unwrap(n, 0) + 1 })
+  }
+  walk_vars(
+    f.body,
+    #(dict.new(), dict.new()),
+    fn(acc, name) { #(acc.0, bump(acc.1, name)) },
+    fn(acc, name) { #(bump(acc.0, name), acc.1) },
+  )
+}
+
+/// Fold every variable occurrence in `expr` into `acc`: `bind` for each binder
+/// (`Let`/loop/handler names), `read` for each `Var` operand.
+fn walk_vars(
+  expr: Expr,
+  acc: a,
+  bind: fn(a, String) -> a,
+  read: fn(a, String) -> a,
+) -> a {
+  let collect_expr = fn(e, a) { walk_vars(e, a, bind, read) }
+  let collect_value = fn(v, a) {
+    case v {
+      Var(name) -> read(a, name)
+      _ -> a
+    }
+  }
+  let collect_values = fn(vs, a) {
+    list.fold(vs, a, fn(a2, v) { collect_value(v, a2) })
+  }
   case expr {
     Values(vs) -> collect_values(vs, acc)
     Return(vs) -> collect_values(vs, acc)
@@ -8757,7 +8995,7 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
       collect_values(args, collect_value(index, acc))
     CallHost(_, _, args) -> collect_values(args, acc)
     Let(names, rhs, body) -> {
-      let acc = list.fold(names, acc, set.insert)
+      let acc = list.fold(names, acc, bind)
       collect_expr(body, collect_expr(rhs, acc))
     }
     If(cond, _, t, e) ->
@@ -8775,7 +9013,7 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     Loop(_, params, _, body) -> {
       let acc =
         list.fold(params, acc, fn(a, p) {
-          collect_value(p.init, set.insert(a, p.name))
+          collect_value(p.init, bind(a, p.name))
         })
       collect_expr(body, acc)
     }
@@ -8812,26 +9050,13 @@ fn collect_expr(expr: Expr, acc: Set(String)) -> Set(String) {
     ir.Try(_, body, handlers) -> {
       let acc = collect_expr(body, acc)
       list.fold(handlers, acc, fn(a, h) {
-        let a = list.fold(h.payload, a, set.insert)
+        let a = list.fold(h.payload, a, bind)
         let a = case h.exnref {
-          Some(name) -> set.insert(a, name)
+          Some(name) -> bind(a, name)
           None -> a
         }
         collect_expr(h.handler, a)
       })
     }
   }
-}
-
-/// Accumulate the name of `value` if it is a `Var`.
-fn collect_value(value: Value, acc: Set(String)) -> Set(String) {
-  case value {
-    Var(name) -> set.insert(acc, name)
-    _ -> acc
-  }
-}
-
-/// Accumulate every `Var` name among `values`.
-fn collect_values(values: List(Value), acc: Set(String)) -> Set(String) {
-  list.fold(values, acc, fn(a, v) { collect_value(v, a) })
 }
