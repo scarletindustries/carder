@@ -19,7 +19,6 @@
 //// suite (paged ≡ oracle) across several chunk sizes; (3) cell-backed wrapper tests
 //// (seed → op → observe persistence + grow fuel); (4) a constant-space store-loop smoke.
 
-import carder/frontend/wasm/validate
 import carder/ir.{MemoryOutOfBounds}
 import carder/runtime/instance
 import carder/runtime/rt_mem
@@ -1200,7 +1199,9 @@ fn sample16() -> BitArray {
 
 // The runtime cap is a documented, spec-cited constant, NOT a guess: 2^32 pages = 2^48 bytes =
 // 256 TiB. It sits strictly between the i32 hard cap (65_536) and the DECLARABLE type-level max
-// (validate's 2^48-page `memory64_page_limit`), and the Binding single-sources it.
+// (the 2^48-page `rt_mem.mem64_spec_page_limit` — the source-language ceiling a frontend
+// enforces, which now lives in the runtime so both sides read one definition), and the Binding
+// single-sources it.
 pub fn mem64_hard_max_pages_constant_test() {
   // 2^32 pages, exactly.
   rt_mem.mem64_hard_max_pages |> should.equal(4_294_967_296)
@@ -1208,9 +1209,9 @@ pub fn mem64_hard_max_pages_constant_test() {
   // A 64-bit memory can exceed the i32 range (else it is indistinguishable from i32).
   { rt_mem.mem64_hard_max_pages > rt_mem.hard_max_pages } |> should.be_true
   // The runtime cap is <= the DECLARABLE spec type max (2^32 <= 2^48) — the two must not conflate.
-  { rt_mem.mem64_hard_max_pages <= validate.memory64_page_limit }
+  { rt_mem.mem64_hard_max_pages <= rt_mem.mem64_spec_page_limit }
   |> should.be_true
-  validate.memory64_page_limit |> should.equal(bsl(1, 48))
+  rt_mem.mem64_spec_page_limit |> should.equal(bsl(1, 48))
   // The single-source seam: safe_default's Binding field == this unit's pinned constant.
   let binding = instance.safe_default()
   binding.mem64_max_pages |> should.equal(rt_mem.mem64_hard_max_pages)

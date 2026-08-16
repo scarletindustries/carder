@@ -14,8 +14,16 @@
 //// (`in_process`) — the one-instance-one-process posture — so seeds cannot leak. The unseeded
 //// default is `HostDenyAll`, so the shared eunit process (never seeded here) keeps denying,
 //// which is exactly why the Phase-1 deny-all tests below stay green unchanged.
+////
+//// **What carder still owns here.** carder ships NO host module by name: the WebAssembly spec
+//// suite's `spectest` print family and the Porffor intrinsics (with their handler arms and
+//// `spectest_func_type`) moved out with the frontend to the `scribbler` repo, which asserts
+//// them. What remains — and what this module pins — is the POLICY MACHINERY every frontend's
+//// handlers are gated by (`HostDenyAll`/`HostWhitelist`/`HostOpen`, `seed_policy`/
+//// `current_policy`, the fail-closed `{capability_denied, Cap, Name}` raise, the unseeded-pdict
+//// fail-safe and the representative `("env","identity")` handler) plus the per-instance host
+//// OUTPUT buffer a frontend's `print`-style handlers write into.
 
-import carder/ir
 import carder/runtime/instance.{HostDenyAll, HostOpen, HostWhitelist}
 import carder/runtime/rt_host
 import gleam/erlang/process
@@ -229,78 +237,82 @@ pub fn current_policy_reflects_seed_test() {
   |> should.equal(wl)
 }
 
-// ── Phase-5: the official `spectest` print family (R14, F8) ───────────────────────
+// ── The host OUTPUT buffer — a per-instance byte sink, no authority ───────────────
+//
+// carder ships no `print`-style handler of its own any more (the WebAssembly frontend's
+// `spectest` prints and the Porffor intrinsics moved to `scribbler`), but the BUFFER those
+// handlers write into must stay here: it is process-local to the instance's owned process (E1)
+// and is drained through carder's run-ABI (`pipeline.host_output`). `append_output` is public
+// exactly so a frontend-owned handler can write to it. These pin the buffer's contract, which
+// is deliberately NOT a capability: appending bytes to a pdict cell grants no authority and is
+// therefore not gated by the `HostPolicy`.
 
-/// The seven `#("spectest", print*)` pairs — the official host-module set (spec's `imports.wast`).
-/// A LITERAL list here so the whitelist test mirrors `profiles.spectest_allow()` without coupling.
-fn spectest_pairs() -> List(#(String, String)) {
-  [
-    #("spectest", "print"),
-    #("spectest", "print_i32"),
-    #("spectest", "print_i64"),
-    #("spectest", "print_f32"),
-    #("spectest", "print_f64"),
-    #("spectest", "print_i32_f32"),
-    #("spectest", "print_f64_f64"),
-  ]
+/// The buffer SELF-INITIALISES empty: an instance process that never seeded and never printed
+/// reads `<<>>` rather than crashing on the unseeded pdict cell (the same `is_unseeded`
+/// fail-safe the policy read uses). Fail-safe empty, never a raise.
+pub fn host_output_unseeded_is_empty_test() {
+  in_process(fn() { rt_host.host_output() })
+  |> should.equal(<<>>)
 }
 
-/// Under a whitelist admitting the seven `spectest` prints, EVERY `print*` is dispatched and
-/// returns `[]` (the WASM result type `[]` — a side-effecting host fn that consumes its args and
-/// yields nothing). Proves all seven arms exist and are handler-backed.
-pub fn spectest_prints_dispatched_under_whitelist_test() {
-  let allow = spectest_pairs()
-  call_under(HostWhitelist(allow), "spectest", "print", [])
-  |> should.equal(Ok([]))
-  call_under(HostWhitelist(allow), "spectest", "print_i32", [42])
-  |> should.equal(Ok([]))
-  call_under(HostWhitelist(allow), "spectest", "print_i64", [42])
-  |> should.equal(Ok([]))
-  call_under(HostWhitelist(allow), "spectest", "print_f32", [0x4426A666])
-  |> should.equal(Ok([]))
-  call_under(HostWhitelist(allow), "spectest", "print_f64", [0x4084D4CCCCCCCCCD])
-  |> should.equal(Ok([]))
-  call_under(HostWhitelist(allow), "spectest", "print_i32_f32", [1, 0x4426A666])
-  |> should.equal(Ok([]))
-  call_under(HostWhitelist(allow), "spectest", "print_f64_f64", [0, 0])
-  |> should.equal(Ok([]))
+/// `append_output` accumulates IN ORDER and `host_output` reads back the exact concatenated byte
+/// stream — raw bytes, no framing, no re-encoding (a frontend's escapes stay in-band).
+pub fn append_output_accumulates_in_order_test() {
+  in_process(fn() {
+    rt_host.append_output(<<"he">>)
+    rt_host.append_output(<<"llo">>)
+    rt_host.append_output(<<0x1B, "[0m">>)
+    rt_host.host_output()
+  })
+  |> should.equal(<<"hello", 0x1B, "[0m">>)
 }
 
-/// Under the fail-closed deny-all default, a `spectest` print DENIES (a `spectest`-importing
-/// module linked without the whitelist gets no host authority) — the same fail-closed conjunction
-/// as any other capability.
-pub fn spectest_print_denied_under_deny_all_test() {
-  denial_under(HostDenyAll, "spectest", "print_i32", [42])
-  |> should.equal(Ok(#("spectest", "print_i32")))
+/// `host_output_seed` CLEARS the buffer to `<<>>` — the explicit reset — and appending after a
+/// seed starts from empty again.
+pub fn host_output_seed_clears_the_buffer_test() {
+  in_process(fn() {
+    rt_host.append_output(<<"stale">>)
+    rt_host.host_output_seed()
+    rt_host.host_output()
+  })
+  |> should.equal(<<>>)
+
+  in_process(fn() {
+    rt_host.append_output(<<"stale">>)
+    rt_host.host_output_seed()
+    rt_host.append_output(<<"fresh">>)
+    rt_host.host_output()
+  })
+  |> should.equal(<<"fresh">>)
 }
 
-/// The whitelist conjunction is per-pair: a whitelist admitting ONLY `print_i32` dispatches it
-/// (`Ok([])`) but DENIES `print_f32` (listed-set membership is required, not merely being a
-/// `spectest` name).
-pub fn spectest_whitelist_is_per_pair_test() {
-  let allow = [#("spectest", "print_i32")]
-  call_under(HostWhitelist(allow), "spectest", "print_i32", [42])
-  |> should.equal(Ok([]))
-  denial_under(HostWhitelist(allow), "spectest", "print_f32", [0])
-  |> should.equal(Ok(#("spectest", "print_f32")))
+/// The buffer is PROCESS-LOCAL, exactly like the policy (E1/F4): bytes appended in one instance
+/// process are INVISIBLE to another, which still reads `<<>>`. Two instances on one node never
+/// see each other's output.
+pub fn host_output_is_process_local_test() {
+  let written =
+    in_process(fn() {
+      rt_host.append_output(<<"mine">>)
+      rt_host.host_output()
+    })
+  let other = in_process(fn() { rt_host.host_output() })
+
+  written |> should.equal(<<"mine">>)
+  other |> should.equal(<<>>)
 }
 
-/// `spectest_func_type` returns each print's declared signature (the reference `spectest` module's
-/// types) for link-time matching, and `Error(Nil)` for a non-`spectest` name (→ `UnknownImport`).
-pub fn spectest_func_type_signatures_test() {
-  rt_host.spectest_func_type("print")
-  |> should.equal(Ok(ir.FuncType([], [])))
-  rt_host.spectest_func_type("print_i32")
-  |> should.equal(Ok(ir.FuncType([ir.TI32], [])))
-  rt_host.spectest_func_type("print_i64")
-  |> should.equal(Ok(ir.FuncType([ir.TI64], [])))
-  rt_host.spectest_func_type("print_f32")
-  |> should.equal(Ok(ir.FuncType([ir.TF32], [])))
-  rt_host.spectest_func_type("print_f64")
-  |> should.equal(Ok(ir.FuncType([ir.TF64], [])))
-  rt_host.spectest_func_type("print_i32_f32")
-  |> should.equal(Ok(ir.FuncType([ir.TI32, ir.TF32], [])))
-  rt_host.spectest_func_type("print_f64_f64")
-  |> should.equal(Ok(ir.FuncType([ir.TF64, ir.TF64], [])))
-  rt_host.spectest_func_type("not_a_print") |> should.equal(Error(Nil))
+/// The output buffer is NOT a capability: `append_output` writes (and `host_output` reads) under
+/// the fail-closed `HostDenyAll` default, because appending bytes to a process-local cell grants
+/// no authority. The capability boundary is `call_host`, which keeps denying in the very same
+/// process — so this is a widening of NOTHING.
+pub fn output_buffer_is_not_gated_by_policy_test() {
+  in_process(fn() {
+    rt_host.seed_policy(HostDenyAll)
+    rt_host.append_output(<<"written under deny-all">>)
+    #(
+      rt_host.host_output(),
+      host_denial(fn() { rt_host.call_host("fs", "open", []) }),
+    )
+  })
+  |> should.equal(#(<<"written under deny-all">>, Ok(#("fs", "open"))))
 }

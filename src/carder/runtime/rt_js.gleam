@@ -1,4 +1,4 @@
-//// `rt_js` — the JS runtime boundary (Phase-8 unit 05, K6; HANDOFF-arc-frontend.md §4).
+//// `rt_js` — the JS runtime boundary (Phase-8 unit 05, K6; FRONTEND-API.md §4).
 ////
 //// The **real** JS-semantics runtime the arc frontend's emitter targets (v1 surface). Every
 //// JS *semantic* that is not a first-class IR node — coercion, sentinel-aware IEEE arithmetic,

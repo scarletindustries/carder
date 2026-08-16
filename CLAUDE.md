@@ -1,6 +1,32 @@
 # carder
 
-A Gleam project (targets Erlang/BEAM by default). Built and tested with the standard Gleam toolchain — **Gleam 1.17+**, Erlang/OTP, and `gleeunit` for tests.
+The compiler **backend**: a shared, language-neutral IR lowered to Core Erlang and compiled to
+loadable `.beam` modules, plus the BEAM runtime the emitted code calls into.
+
+A Gleam project (targets Erlang/BEAM by default). Built and tested with the standard Gleam
+toolchain — **Gleam 1.16+**, Erlang/OTP, and `gleeunit` for tests.
+
+## carder is the backend — frontends live elsewhere
+
+carder does **not** know any source language. A frontend owns its source format, lowers it into
+`carder/ir`, and calls carder's public API. Frontends live in their own repos and depend on this
+one as an ordinary Gleam package:
+
+| frontend | source | repo |
+|---|---|---|
+| scribbler | WebAssembly | `scarletindustries/scribbler` |
+| arc | JavaScript | `alii/arc` |
+
+**Never add source-language knowledge to this repo.** No wasm binary/text format, no JS syntax,
+no producer-toolchain shim (TeaVM, Porffor), no source-language conformance suite. If a task
+seems to need one, the right change is almost always a more general seam here plus the specific
+knowledge in the frontend — the existing examples are `link.Provider.Namespace` (a frontend
+supplies a host module carder has never heard of) and `instance.DirectHost` (a frontend supplies
+its own runtime op table).
+
+The frontend-facing contract is [`specs/FRONTEND-API.md`](specs/FRONTEND-API.md); the shared CLI
+vocabulary every frontend binary imports is `src/carder/cli.gleam`. Both are public API — a
+breaking change to either breaks every frontend, with no deprecation window.
 
 ---
 
@@ -12,7 +38,8 @@ A change is **not done** until all of the following hold. Treat this as a hard g
 
 - **Always run the existing tests** before and after a change: `gleam test`. A change that breaks existing tests is not done.
 - **Always write tests for new code.** Every new public function or behavior gets test coverage.
-- **Write objective tests against the spec, not the implementation.** Do *not* write tests that merely lock in whatever the current code happens to output (change-detector tests). Go back to the **original specification** for the behavior — for WebAssembly semantics that means the [WebAssembly spec](https://webassembly.github.io/spec/), for any other behavior the relevant RFC/standard/design doc — and assert what the spec says *should* happen. If a test and the spec disagree, the spec wins and the code is wrong.
+- **Write objective tests against the spec, not the implementation.** Do *not* write tests that merely lock in whatever the current code happens to output (change-detector tests). Go back to the **original specification** for the behavior — for Core Erlang and the BEAM that means the [Core Erlang specification](https://www.erlang.org/doc/apps/compiler/) and the Erlang/OTP docs, for the IR's own semantics [`specs/FRONTEND-API.md`](specs/FRONTEND-API.md) and the IR grammar, for anything else the relevant RFC/standard/design doc — and assert what the spec says *should* happen. If a test and the spec disagree, the spec wins and the code is wrong.
+- **Test inputs are `.ir`, not source.** There is no frontend in this repo, so an end-to-end test starts from a `.ir` file (`test/carder/ir/corpus/*.ir`, with its spec-sourced `.expected` values alongside) or from a hand-built `ir.Module` (`test/carder/milestone0_test.gleam` is the model). Never reach for a `.wasm`.
 - When a bug is found, first add a failing test that encodes the correct (spec-defined) behavior, then fix the code until it passes.
 
 ### 2. Every function is documented for the next agent
@@ -29,12 +56,14 @@ A change is **not done** until all of the following hold. Treat this as a hard g
   - `//` — ordinary inline comment (not documentation).
 
 ```gleam
-/// Decodes a single LEB128-encoded unsigned integer from `bytes`.
+/// Compile a `CModule` to an in-memory `.beam` binary WITHOUT loading it: lower to Erlang
+/// Abstract Format and compile in-process via `compile:forms/2`.
 ///
-/// Returns `Ok(#(value, rest))` where `rest` is the unconsumed tail, or
-/// `Error(Truncated)` if the input ends mid-number. Per the WebAssembly
-/// spec, values wider than 32 bits are rejected with `Error(Overflow)`.
-pub fn decode_uleb128(bytes: BitArray) -> Result(#(Int, BitArray), DecodeError) {
+/// Returns `Ok(beam_bytes)`, or `Error(BuildFailed(diagnostics))` carrying the compiler's
+/// messages if the forms are rejected. Total — a malformed module becomes `Error`, never a
+/// panic. `cmod.name` is the atom baked into the binary; the caller owns its uniqueness,
+/// because loading two modules under one atom silently replaces the first.
+pub fn cmod_to_beam(cmod: CModule) -> Result(BitArray, PipelineError) {
   // ...
 }
 ```
@@ -64,8 +93,10 @@ The typical inner loop: **edit → `gleam format` → `gleam test`**.
 
 ## Project layout & conventions
 
-- Entry point: `src/carder.gleam` (`pub fn main`).
+- Entry point: `src/carder.gleam` (`pub fn main`) — the IR-entry CLI (`run`, `ir-lower`, `opt`, `emit`, `to-core`, `to-erl`, `to-beam`/`build`, `exec`, `help`).
 - Add new modules under `src/carder/` and import them as `import carder/<module>` (e.g. `src/carder/decoder.gleam` → `import carder/decoder`).
+- Layers, outermost first: `carder/ir*` (the IR + its text form) → `carder/middle/**` (policy pass + optimizer) → `carder/backend/**` (Core Erlang, linking, bindings) → `carder/runtime/**` (what the emitted code calls at run time). `test/carder/middle/link_layer_freeze_test.gleam` enforces that `runtime/**` imports none of the others.
+- Every Erlang FFI file must be named `carder_*_ffi.erl`. BEAM module names are one flat global atom namespace with no package scoping, so an unprefixed `.erl` can be silently shadowed by a consumer package's file of the same name — **no compiler error and no warning**. CI greps for this.
 - Tests live under `test/`, mirroring the `src/` layout. `gleeunit` auto-discovers every function whose name ends in `_test`. Run a focused module with `gleam test -- <module>`.
 - This is a **Gleam** codebase — ignore any parent-directory JavaScript/Bun guidance; it does not apply here. To target JavaScript instead of Erlang, set `target = "javascript"` in `gleam.toml`.
 - Prefer total functions returning `Result`/`Option` over partial functions; reserve `let assert`/`panic` for genuinely-impossible states and document them when used.

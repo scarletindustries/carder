@@ -1,0 +1,38 @@
+module @carder@wasm@via_ci {
+  numerics true
+  memory none
+  table @t0 min 4
+  import "a" "ef0" : (i32) -> (i32)
+  import "a" "ef1" : (i32) -> (i32)
+  export "via_ci" = @f3
+  export "direct" = @f4
+  export "ci_oob" = @f5
+  export "ci_null" = @f6
+  export "ci_type" = @f7
+  elem funcref @t0 (values (i32.const 0)) [ref.func_import 0 : (i32) -> (i32), ref.func @f2, ref.func_import 1 : (i32) -> (i32)]
+  func @f2 (%p0:i32) -> (i32) {
+    let (%v1) = num i.sub.32 (%p0, i32.const 1)
+    values (%v1)
+  }
+  func @f3 (%p0:i32, %p1:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [%p0] : (i32) -> (i32) (%p1)
+    values (%v1)
+  }
+  func @f4 (%p0:i32) -> (i32) {
+    let (%v1) = call_import 0 : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+  func @f5 (%p0:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [i32.const 9] : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+  func @f6 (%p0:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [i32.const 3] : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+  func @f7 (%p0:i32) -> (i32) {
+    let (%v1) = call_indirect @t0 [i32.const 0] : (i32, i32) -> (i32) (%p0, %p0)
+    values (%v1)
+  }
+}
+

@@ -23,8 +23,8 @@
 //// not a WASM trap and does not exist on the BEAM — which is exactly what these tests prove.
 
 import carder/backend/build_beam
-import carder/conformance/driver
-import carder/conformance/ffi
+import carder/harness/driver
+import carder/harness/ffi
 import carder/ir
 import carder/opt_level.{type OptLevel, Aggressive, Baseline, OptNone}
 import carder/pipeline
@@ -39,9 +39,14 @@ import gleam/list
 /// module atom (a PROCESS-UNIQUE name per call so repeated loads never clobber). Mirrors
 /// `constant_space_threaded_test.compile_load`. Panics via `let assert` only on a genuinely-broken
 /// pipeline (the corpus + binding are known-good), which is a test failure, not a silent pass.
+///
+/// The corpus fixture is `.ir` SOURCE TEXT (the wasm frontend moved to `scribbler`), so the front
+/// half is `driver.parse` (UTF-8 decode + `pipeline.parse_ir`); the measured half —
+/// `ir_to_cmod(_, binding)` → `compile_and_load` → the run ABI, where the tail-call emission lives —
+/// is unchanged, and each `.ir` was measured to produce the byte-identical `.beam` its `.wasm` did.
 fn compile_load(name: String, binding: Binding) -> atom.Atom {
-  let assert Ok(bytes) = combos.read_wasm(name)
-  let assert Ok(m0) = pipeline.source_to_ir(bytes)
+  let assert Ok(bytes) = combos.read_ir(name)
+  let assert Ok(m0) = driver.parse(bytes)
   let m =
     ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
   let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)

@@ -7,14 +7,25 @@
 //// differential: it never asserts against "whatever bytes the compiler emits", it asserts
 //// against the WebAssembly spec (`corpus/*.expected`, bit-pattern values, spec trap phrases)
 //// and against the linked-vs-non-linked DIFFERENTIAL (O5 — a pure packaging transform must
-//// change no observable). Two layers plus three correctness-hygiene assertions:
+//// change no observable).
+////
+//// **Input note (post-frontend-split).** carder is the BACKEND: its entry language is `.ir` text,
+//// so every corpus program is read as `test/carder/ir/corpus/<name>.ir` (`combos.read_ir`) and
+//// parsed with `driver.parse` (UTF-8 → `pipeline.parse_ir`). Each `.ir` fixture was generated from
+//// the corresponding `.wasm` by the pre-split `to-ir`, and `wasm → .beam` was measured
+//// byte-identical to `wasm → .ir text → .beam`, so every merge/differential below is over the
+//// exact same artifact it always was; the `.expected` files (export name + raw bit-pattern
+//// args/results + spec trap phrase) are frontend-independent and reused verbatim.
+////
+//// Two layers plus three correctness-hygiene assertions:
 ////
 //// - **L1 — in-process linked ≡ non-linked differential (isolates merge-correctness, cheap).**
 ////   Over the corpus × `{Safe,Unsafe} × {Cell,Threaded} × {Paged,Atomics}`, the LINKED output
 ////   (via `beam_link.link_program`, loaded in-process) must return bit-identical, trap-identical
 ////   `Outcome`s to the non-linked oracle (`driver.pipeline_with`). Fun-captures (R4),
 ////   intra-module apply (R5) and the `instantiate/N` DCE root (R6) fall out as organic
-////   regressions. One authored import-bearing fixture (an imported `spectest` global) exercises
+////   regressions. One authored import-bearing fixture (an imported host global, supplied by a
+////   test-local `link.Registered` provider — carder hard-codes no host module) exercises
 ////   the merged `instantiate/1` in-process (honest-scope home, R14 keeps it out of L2).
 //// - **L2 — bare-node differential (measured, not asserted).** Over the import-free subset ×
 ////   `state_strategy × {tier-P, tier-O}`, the P11-05 harness (`carder_linked_boot_ffi`) boots a
@@ -33,7 +44,6 @@
 //// bounds/traps <https://webassembly.github.io/spec/core/exec/instructions.html>. Every value
 //// is bit-pattern-compared (D5/D7); every trap via `runner.trap_matches` / raw-reason identity.
 
-import carder
 import carder/backend/beam_link.{
   type LinkError, AmbientAuthorityFound, CoreAcquisitionFailed, MalformedCore,
   MangleCollision, MissingClosureModule, OffAllowlistRemote,
@@ -44,12 +54,10 @@ import carder/backend/core_erlang
 import carder/backend/core_printer
 import carder/backend/eaf
 import carder/backend/link_manifest
-import carder/conformance/driver
-import carder/conformance/ffi
-import carder/conformance/runner
-import carder/frontend/wasm/decode
-import carder/frontend/wasm/lower
-import carder/frontend/wasm/validate
+import carder/cli
+import carder/harness/driver
+import carder/harness/ffi
+import carder/harness/runner
 import carder/ir
 import carder/pipeline.{Returned, Trapped}
 import carder/runtime/instance.{
@@ -143,16 +151,14 @@ fn describe_link_error(e: LinkError) -> String {
 // A `runner.Driver` identical to `driver.pipeline_with(binding)` (the oracle) EXCEPT the tail:
 // where the oracle does `build_beam.compile_and_load(core)` (a THIN module over the resident
 // runtime), the linked driver does `beam_link.link_program(core, name, ambient) → load_module` (a
-// SELF-CONTAINED merged module). Everything upstream — decode/validate/lower, the import link, the
-// `ir_to_core(binding)` codegen — is the SAME public chain the oracle runs, so the differential
-// isolates the merge as the only difference. Because L1 asserts linked ≡ oracle, any drift of this
-// ported chain from the oracle's private `instantiate_typed` would itself turn the differential red
-// — the replica is self-checking.
+// SELF-CONTAINED merged module). Everything upstream — the `.ir` parse (`driver.parse`), the import
+// link (`driver.resolve_provided`) and the `ir_to_cmod(binding)` codegen — is the SAME public chain
+// the oracle runs, shared with it rather than re-implemented, so the differential isolates the merge
+// as the only difference and the two paths cannot drift.
 
 /// Build the linked driver for `binding`: the oracle's `invoke`/`check_frontend`/`get_global`
 /// unchanged, with the instantiate seam swapped to interpose the whole-program merge at the
-/// `.core → .beam` boundary. Only `instantiate`/`instantiate_env` are used by `combos.evaluate`;
-/// the AST seam is unused here.
+/// `.core → .beam` boundary. Only `instantiate`/`instantiate_env` are used by `combos.evaluate`.
 fn linked_driver(binding: Binding) -> runner.Driver {
   runner.Driver(
     check_frontend: driver.check_frontend,
@@ -161,59 +167,32 @@ fn linked_driver(binding: Binding) -> runner.Driver {
     },
     invoke: driver.invoke,
     instantiate_env: fn(bytes, env) { linked_instantiate(binding, bytes, env) },
-    instantiate_ast: fn(_m, _env) { Error("linked driver: ast path unused") },
-    check_frontend_ast: driver.check_frontend_ast,
     get_global: driver.get_global,
   )
 }
 
 /// Compile `bytes` under `binding` through the REAL pipeline, MERGE the result into a self-contained
 /// `.beam` (`link_program`), load it, and instantiate it in its own owned process (E5) — the linked
-/// analog of `driver.instantiate_under`. Mirrors `driver.gleam`'s private `instantiate_typed`,
-/// swapping ONLY `compile_and_load` for `link_program` + `load_module`.
+/// analog of `driver.instantiate_under`, swapping ONLY `compile_and_load` for `link_program` +
+/// `load_module`. The `.ir` parse and the fail-closed link contract are the oracle's own public
+/// functions (`driver.parse` / `driver.resolve_provided`), so there is no ported copy to drift.
 ///
-/// - `binding`: the build-time posture (mode × tiers × strategy) — drives `ir_to_core`.
-/// - `bytes`: the `.wasm` module bytes.
-/// - `env`: the import environment (`spectest` is built into `link.link_imports`; extra providers
-///   come from `env`). `combos.evaluate` passes the empty env.
+/// - `binding`: the build-time posture (mode × tiers × strategy) — drives `ir_to_cmod`.
+/// - `bytes`: UTF-8 `.ir` SOURCE TEXT (carder's entry language — not a wasm binary).
+/// - `env`: the import environment. carder ships no built-in host namespace, so every provider a
+///   module's imports resolve against comes from here; `combos.evaluate` passes the empty env,
+///   under which a called function import is rejected fail-closed.
 /// - Returns `Ok(Instance)` (a live merged instance) or `Error(reason)` for any stage that rejects
-///   fail-closed (decode/validate/lower/link/`link_program`/load/instantiate-trap) — never a panic.
+///   fail-closed (`parse .ir:` / `link:` / `link_program:` / `load:` / `instantiate:`) — never a
+///   panic.
 fn linked_instantiate(
   binding: Binding,
   bytes: BitArray,
   env: runner.ImportEnv,
 ) -> Result(runner.Instance, String) {
-  use m <- result.try(
-    decode.decode(bytes)
-    |> result.map_error(fn(e) { "decode: " <> string.inspect(e) }),
-  )
-  use tm <- result.try(
-    validate.validate(m)
-    |> result.map_error(fn(e) { "validate: " <> string.inspect(e) }),
-  )
-  use irmod0 <- result.try(
-    lower.lower(tm)
-    |> result.map_error(fn(e) { "lower: " <> string.inspect(e) }),
-  )
+  use irmod0 <- result.try(driver.parse(bytes))
   let irmod = ir.Module(..irmod0, name: uniquify(irmod0.name))
-  use state_provided <- result.try(
-    link.link_imports(irmod, env.providers)
-    |> result.map_error(fn(e) { "link: " <> link.import_error_phrase(e) }),
-  )
-  use provided <- result.try(case module_calls_import(irmod) {
-    False -> Ok(state_provided)
-    True ->
-      case func_imports_all_provided(irmod, env.providers) {
-        False ->
-          Error(
-            "link: unknown import (host capability not provided under the deny-all host)",
-          )
-        True ->
-          link.link_func_imports(irmod, env.providers)
-          |> result.map(fn(fp) { list.append(state_provided, fp) })
-          |> result.map_error(fn(e) { "link: " <> link.import_error_phrase(e) })
-      }
-  })
+  use provided <- result.try(driver.resolve_provided(irmod, env))
   use cmod <- result.try(
     pipeline.ir_to_cmod(irmod, binding)
     |> result.map_error(pipeline.describe),
@@ -282,55 +261,6 @@ fn export_types(m: ir.Module) -> dict.Dict(String, List(ir.ValType)) {
         }
       ir.ExportTable(..) | ir.ExportMemory(..) | ir.ExportTag(..) -> acc
     }
-  })
-}
-
-/// True iff `module` CALLS an imported function (contains a `CallImport`) — mirrors the oracle's
-/// gate for weaving the function-import dispatch vector into `instantiate/1`.
-fn module_calls_import(module: ir.Module) -> Bool {
-  list.any(module.functions, fn(f) { expr_calls_import(f.body) })
-}
-
-/// True iff `expr` (recursively) contains a `CallImport` — mirrors `driver.gleam`'s private helper.
-fn expr_calls_import(expr: ir.Expr) -> Bool {
-  case expr {
-    ir.CallImport(..) -> True
-    ir.Let(_, rhs, body) -> expr_calls_import(rhs) || expr_calls_import(body)
-    ir.If(_, _, t, e) -> expr_calls_import(t) || expr_calls_import(e)
-    ir.Switch(_, _, arms, default) ->
-      list.any(arms, fn(a) {
-        let ir.SwitchArm(_, b) = a
-        expr_calls_import(b)
-      })
-      || expr_calls_import(default)
-    ir.Block(_, _, body) -> expr_calls_import(body)
-    ir.Loop(_, _, _, body) -> expr_calls_import(body)
-    ir.Charge(_, body) -> expr_calls_import(body)
-    _ -> False
-  }
-}
-
-/// True iff EVERY function import resolves to a REAL provider (`spectest` or a registered instance)
-/// — mirrors the oracle so an under-provided host capability (e.g. `hostimport`'s `env.forbidden`)
-/// is rejected fail-closed IDENTICALLY in the linked path.
-fn func_imports_all_provided(
-  module: ir.Module,
-  providers: List(link.Provider),
-) -> Bool {
-  list.all(module.imports, fn(imp) {
-    case imp {
-      ir.ImportFn(capability, _name, _ty) ->
-        capability == "spectest" || is_registered(capability, providers)
-      _ -> True
-    }
-  })
-}
-
-/// True iff some `Registered` provider carries the link-name `capability`.
-fn is_registered(capability: String, providers: List(link.Provider)) -> Bool {
-  list.any(providers, fn(p) {
-    let link.Registered(link_name, _exports) = p
-    link_name == capability
   })
 }
 
@@ -496,11 +426,15 @@ pub fn l1_instantiate_root_seeds_state_test() {
 }
 
 /// **L1 import-bearing (honest-scope home, R6/R14).** An authored module importing
-/// `spectest.global_i32` (= 666) and reading it from an export. Its merged `instantiate/1` seeds the
+/// `host.global_i32` (= 666) and reading it from an export. Its merged `instantiate/1` seeds the
 /// provided import vector (a reachability root) and the export reads the provided global — proving
 /// import-bearing merge-correctness IN-PROCESS (a bare node has no providers, so this is omitted
 /// from L2, R14). Driven under Safe (metered) to also exercise the metering closure through the
 /// merge.
+///
+/// The provider is supplied EXPLICITLY (`link.Registered`): carder hard-codes no host namespace by
+/// name, so `link.link_imports` resolves the import only against the caller's providers. That is the
+/// same value the departed built-in `spectest.global_i32` carried, so the assertion is unchanged.
 pub fn l1_import_bearing_instantiate1_merges_test() {
   let m = import_bearing_module("carder@link@importfix")
   let binding = combos.binding_for(combos.cell_paged)
@@ -508,14 +442,25 @@ pub fn l1_import_bearing_instantiate1_merges_test() {
   let assert Ok(#(mod, beam)) =
     beam_link.link_program(forms_of(cmod), m.name, ambient())
   let assert Ok(_) = build_beam.load_module(mod, "importfix.beam", beam)
-  let assert Ok(imports) = link.link_imports(m, [])
+  let assert Ok(imports) = link.link_imports(m, [host_global_provider()])
   // seed the merged instantiate/1 with the provided import vector, then read the global.
   let assert Ok(_) =
     catch_apply_dyn(mod, atom.create("instantiate"), [to_dynamic(imports)])
   assert catch_apply(mod, atom.create("read_global"), []) == Ok(666)
 }
 
-/// An import-bearing `ir.Module`: imports `spectest.global_i32 : i32` (its local name is the
+/// The test-local host namespace `host` exporting the immutable `i32` global `global_i32 = 666` —
+/// the externval `import_bearing_module`'s single import resolves against.
+fn host_global_provider() -> link.Provider {
+  link.Registered(
+    "host",
+    dict.from_list([
+      #("global_i32", link.ProvidedGlobal(666, ir.TI32, False)),
+    ]),
+  )
+}
+
+/// An import-bearing `ir.Module`: imports `host.global_i32 : i32` (its local name is the
 /// positional `g0`) and exports `read_global` returning it — the smallest merged `instantiate/1`
 /// fixture (mirrors the `emit_core_e2e` import module).
 fn import_bearing_module(name: String) -> ir.Module {
@@ -524,7 +469,7 @@ fn import_bearing_module(name: String) -> ir.Module {
     uses_numerics: True,
     memories: [],
     globals: [],
-    imports: [ir.ImportGlobal("spectest", "global_i32", ir.TI32, False)],
+    imports: [ir.ImportGlobal("host", "global_i32", ir.TI32, False)],
     functions: [
       ir.Function("read_global", [], [ir.TI32], [], ir.GlobalGet("g0")),
     ],
@@ -544,8 +489,7 @@ fn import_bearing_module(name: String) -> ir.Module {
 /// order). Byte-stability is what makes the linked artifact diffable/cacheable. Checked over a
 /// stateful program (its closure spans the memory + numeric + state runtime).
 pub fn determinism_link_twice_byte_identical_test() {
-  let assert Ok(bytes) = combos.read_wasm("mem")
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = corpus_module("mem")
   let assert Ok(cmod) = pipeline.ir_to_cmod(m, profiles.unsafe())
   let forms = forms_of(cmod)
   let assert Ok(#(_, beam1)) = beam_link.link_program(forms, m.name, ambient())
@@ -575,8 +519,7 @@ pub fn d3a_structural_over_merged_corpus_test() {
 /// imports absent) are skipped — they never reach a bare node (R14). A merge that fails the linker's
 /// OWN fail-closed D3a check surfaces as an `Error` from `link_to_core` and is reported.
 fn d3a_failures(name: String) -> List(String) {
-  let assert Ok(bytes) = combos.read_wasm(name)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = corpus_module(name)
   case pipeline.ir_to_cmod(m, profiles.unsafe()) {
     // Import-bearing / out-of-scope programs never compile to a linkable core; skip (not a bare-node
     // artifact). The differential (L1) already proves they REJECT identically.
@@ -662,8 +605,7 @@ pub fn merged_exports_exactly_original_plus_instantiate_plus_module_info_test() 
 /// exports (public + `instantiate/N`) ∪ `{module_info/0, module_info/1}`; actual = the merged
 /// header's exports. Any extra or missing export is reported.
 fn export_failures(name: String) -> List(String) {
-  let assert Ok(bytes) = combos.read_wasm(name)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = corpus_module(name)
   let assert Ok(cmod) = pipeline.ir_to_cmod(m, profiles.unsafe())
   let core = core_printer.print_module(cmod)
   let assert Ok(#(_, merged)) =
@@ -707,7 +649,7 @@ fn header_exports(core: String) -> List(String) {
 //
 // Over the IMPORT-FREE subset × state_strategy × {tier-P, tier-O}: link → boot the merged `.beam` on
 // a scrubbed isolated `erl` (P11-05) → the child's value/trap must equal the in-process oracle
-// (`pipeline.run_source`). A `RESULT:` at exit 0 PROVES isolation held (the in-child gate halts
+// (`pipeline.run_ir`). A `RESULT:` at exit 0 PROVES isolation held (the in-child gate halts
 // before the invoke on any `carder@`/`gleam@` hit), so the differential is also the isolation proof.
 
 /// One bare-node point: the program, export, args, the binding it is built under, and the label.
@@ -764,8 +706,8 @@ pub fn l2_bare_node_import_free_differential_test() {
 /// The bare-node differential failures for one `L2Point` (empty ⇒ the child matched the in-process
 /// oracle bit/trap-identically on an isolated node).
 fn l2_point_failures(p: L2Point) -> List(String) {
-  let assert Ok(bytes) = combos.read_wasm(p.program)
-  let oracle = pipeline.run_source(bytes, p.binding, p.export_, p.args)
+  let oracle =
+    pipeline.run_ir(corpus_module(p.program), p.binding, p.export_, p.args)
   let where = p.program <> "." <> p.export_ <> " [" <> p.label <> "]"
   case linked_beam_pair(p.program, p.binding) {
     Error(reason) -> [where <> ": link failed: " <> reason]
@@ -875,9 +817,9 @@ pub fn l2_bare_node_isolation_gate_fires_test() {
 ///       artifact's own runtime holds the loop in constant space.
 pub fn l2_constant_space_sum_to_100000_bare_node_test() {
   let binding = combos.binding_for(combos.cell_paged)
-  let assert Ok(bytes) = combos.read_wasm("sum_to")
+  let m = corpus_module("sum_to")
   let assert Ok(pipeline.Returned([want])) =
-    pipeline.run_source(bytes, binding, "sum_to", [100_000])
+    pipeline.run_ir(m, binding, "sum_to", [100_000])
 
   // (a) bare node: 100k iterations complete on the isolated child with the exact wrapped value.
   let assert Ok(#(mod, beam)) = linked_beam_pair("sum_to", binding)
@@ -888,7 +830,6 @@ pub fn l2_constant_space_sum_to_100000_bare_node_test() {
   assert cv == want
 
   // (b) measured constant space on the merged artifact (its own runtime), in-process.
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
   let um = ir.Module(..m, name: m.name <> "_cspace")
   let assert Ok(cmod2) = pipeline.ir_to_cmod(um, binding)
   let assert Ok(#(mod2, beam2)) =
@@ -915,14 +856,12 @@ pub fn l2_constant_space_sum_to_100000_bare_node_test() {
 /// admitted.
 pub fn cli_link_rejects_tier_n_and_import_bearing_test() {
   let nif = profiles.resolve_tiers(Binding(..profiles.unsafe(), mem_tier: Nif))
-  assert carder.link_gate(nif, gate_module([])) == Error(carder.LinkTierNif)
+  assert cli.link_gate(nif, gate_module([])) == Error(cli.LinkTierNif)
 
-  let imp =
-    gate_module([ir.ImportGlobal("spectest", "global_i32", ir.TI32, False)])
-  assert carder.link_gate(profiles.safe(), imp)
-    == Error(carder.LinkImportBearing(1))
+  let imp = gate_module([ir.ImportGlobal("host", "global_i32", ir.TI32, False)])
+  assert cli.link_gate(profiles.safe(), imp) == Error(cli.LinkImportBearing(1))
 
-  assert carder.link_gate(profiles.safe(), gate_module([])) == Ok(Nil)
+  assert cli.link_gate(profiles.safe(), gate_module([])) == Ok(Nil)
 }
 
 /// A minimal `ir.Module` carrying exactly `imports` — the only field (besides the binding's tier)
@@ -946,6 +885,15 @@ fn gate_module(imports: List(ir.ImportDecl)) -> ir.Module {
 
 // ───────────────────────── link helpers ─────────────────────────
 
+/// Read + parse corpus program `name` from `test/carder/ir/corpus/<name>.ir` into its `ir.Module`,
+/// through the SAME front half the oracle driver uses (`combos.read_ir` → `driver.parse`). `let
+/// assert` — a missing or unparseable corpus fixture is a genuine test failure, never a skip.
+fn corpus_module(name: String) -> ir.Module {
+  let assert Ok(bytes) = combos.read_ir(name)
+  let assert Ok(m) = driver.parse(bytes)
+  m
+}
+
 /// Merge corpus `name` under `binding` into a self-contained `.beam`, returning `#(module_atom,
 /// beam)`. `Error(reason)` on any compile/merge failure. The generated module name is uniquified so
 /// repeated links never collide on a BEAM atom.
@@ -953,18 +901,13 @@ fn linked_beam_pair(
   name: String,
   binding: Binding,
 ) -> Result(#(Atom, BitArray), String) {
-  let assert Ok(bytes) = combos.read_wasm(name)
-  case pipeline.source_to_ir(bytes) {
+  let m0 = corpus_module(name)
+  let m = ir.Module(..m0, name: uniquify(m0.name))
+  case pipeline.ir_to_cmod(m, binding) {
     Error(e) -> Error(pipeline.describe(e))
-    Ok(m0) -> {
-      let m = ir.Module(..m0, name: uniquify(m0.name))
-      case pipeline.ir_to_cmod(m, binding) {
-        Error(e) -> Error(pipeline.describe(e))
-        Ok(cmod) ->
-          beam_link.link_program(forms_of(cmod), m.name, ambient())
-          |> result.map_error(describe_link_error)
-      }
-    }
+    Ok(cmod) ->
+      beam_link.link_program(forms_of(cmod), m.name, ambient())
+      |> result.map_error(describe_link_error)
   }
 }
 

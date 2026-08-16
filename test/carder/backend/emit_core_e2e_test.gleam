@@ -14,7 +14,9 @@ import carder/ir
 import carder/pipeline
 import carder/runtime/instance
 import carder/runtime/link
+import carder/runtime/rt_mem
 import carder/runtime/rt_meter
+import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
@@ -1496,9 +1498,36 @@ pub fn multi_memory_threaded_e2e_test() {
   assert v0 == 0
 }
 
-/// An import module: imports `spectest.global_i32 : i32` (= 666) and `spectest.memory (1 2)`.
-/// The imported global is local name `g0`; the imported memory is memory index 0. Reads the
-/// global; stores/loads the imported memory.
+/// The externvals the caller-supplied `host` namespace provides to `import_module/1`:
+/// `global_i32 : i32` (immutable, = 666 — the value the departed built-in `spectest` module
+/// carried, kept so the assertions below are byte-for-byte the ones they always were) and
+/// `memory (1 2)` — a REAL `rt_mem` externval, so the store/load round-trip genuinely exercises
+/// PROVIDED memory rather than a stub. A fresh memory is built per call, so two tests never share
+/// one.
+///
+/// carder ships no built-in host module: every namespace a guest imports from is handed in by the
+/// embedder, so this provider IS the linking contract under test.
+fn host_provider() -> link.Provider {
+  link.Registered(
+    "host",
+    dict.from_list([
+      #("global_i32", link.ProvidedGlobal(666, ir.TI32, False)),
+      #(
+        "memory",
+        link.ProvidedMemory(
+          rt_mem.fresh(1, option.Some(2), rt_mem.hard_max_pages),
+          1,
+          option.Some(2),
+          ir.Idx32,
+        ),
+      ),
+    ]),
+  )
+}
+
+/// An import module: imports `host.global_i32 : i32` (= 666) and `host.memory (1 2)`, both
+/// supplied by `host_provider/0`. The imported global is local name `g0`; the imported memory is
+/// memory index 0. Reads the global; stores/loads the imported memory.
 fn import_module(name: String) -> ir.Module {
   let read_global =
     ir.Function("read_global", [], [ir.TI32], [], ir.GlobalGet("g0"))
@@ -1510,8 +1539,8 @@ fn import_module(name: String) -> ir.Module {
     memories: [],
     globals: [],
     imports: [
-      ir.ImportGlobal("spectest", "global_i32", ir.TI32, False),
-      ir.ImportMemory("spectest", "memory", 1, option.Some(2), ir.Idx32),
+      ir.ImportGlobal("host", "global_i32", ir.TI32, False),
+      ir.ImportMemory("host", "memory", 1, option.Some(2), ir.Idx32),
     ],
     functions: [read_global, store, load],
     exports: [
@@ -1527,30 +1556,39 @@ fn import_module(name: String) -> ir.Module {
   )
 }
 
-/// IMPORT end-to-end (Cell): a module importing a `spectest` global + memory is linked via
-/// `link.link_imports` (fail-closed matching) and instantiated through the generated
-/// `instantiate/1(Imports)`; it reads the provided global (`= 666`, the official `spectest`
-/// value) and round-trips the provided memory. Cite H4 (imported globals/memories are provided
-/// state, wired at the low indices) + R14 (`spectest.global_i32 = 666`).
-pub fn import_spectest_e2e_test() {
+/// IMPORT end-to-end (Cell): a module importing a `host` global + memory is linked via
+/// `link.link_imports` against the embedder-supplied provider (fail-closed matching) and
+/// instantiated through the generated `instantiate/1(Imports)`; it reads the provided global
+/// (`= 666`) and round-trips the provided memory. Cite H4 (imported globals/memories are provided
+/// state, wired at the low indices).
+pub fn import_host_e2e_test() {
   let m = import_module("import")
   let mod = load(m)
-  let assert Ok(imports) = link.link_imports(m, [])
+  let assert Ok(imports) = link.link_imports(m, [host_provider()])
   let assert Ok(_) =
     catch_apply_dyn(mod, atom.create("instantiate"), [to_dynamic(imports)])
-  // the imported global's value is the official spectest 666.
+  // the imported global's value is the provider's 666.
   assert catch_apply(mod, atom.create("read_global"), []) == Ok(666)
   // the imported memory round-trips a store/load.
   let assert Ok(_) = catch_apply(mod, atom.create("store32"), [0, 123_456])
   assert catch_apply(mod, atom.create("load32"), [0]) == Ok(123_456)
 }
 
+/// Fail-closed complement (spec §4.5.4): with NO provider owning the `host` namespace, the very
+/// same module's state imports are `UnknownImport` — carder has no ambient/built-in host module,
+/// so an unprovided global/memory import can never silently resolve.
+pub fn import_without_provider_is_unlinkable_test() {
+  let m = import_module("importunlinked")
+  assert link.link_imports(m, [])
+    == Error(link.UnknownImport("host", "global_i32"))
+}
+
 /// IMPORT end-to-end (Threaded): the same import wiring under `Threaded` — `instantiate/1(Imports)`
 /// RETURNS the seeded record, then the reads thread it.
-pub fn import_spectest_threaded_e2e_test() {
+pub fn import_host_threaded_e2e_test() {
   let m = import_module("importthreaded")
   let mod = load_threaded(m)
-  let assert Ok(imports) = link.link_imports(m, [])
+  let assert Ok(imports) = link.link_imports(m, [host_provider()])
   let assert Ok(st0) = t_instantiate_with(mod, to_dynamic(imports))
   let assert Ok(#(g, st1)) =
     t_invoke_int(mod, atom.create("read_global"), st0, [])

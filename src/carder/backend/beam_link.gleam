@@ -148,3 +148,36 @@ pub fn link_to_core(
     Error(err) -> Error(to_link_error(err))
   }
 }
+
+/// Human-readable rendering of a `LinkError` for a CLI's stderr — the user-facing face of the
+/// whole-program linker's fail-closed refusals (P11-03). Lives HERE, next to the type, so no
+/// caller (least of all a frontend in another repo) has to pattern-match carder's backend error
+/// enum to print it; mirrors the `bindings.describe_error/1` convention. Diagnostic only, total.
+pub fn describe_error(e: LinkError) -> String {
+  case e {
+    OffAllowlistRemote(m, f) ->
+      "link failed: a call to "
+      <> m
+      <> ":"
+      <> f
+      <> " survived to a module outside the OTP-ambient allowlist (missing from the merged closure)"
+    MissingClosureModule(m) ->
+      "link failed: the in-closure module "
+      <> m
+      <> " could not be located (its .beam was not on the code path)"
+    AmbientAuthorityFound(detail) ->
+      "link failed: refusing to bake ambient authority into the artifact (D3a): "
+      <> detail
+    UnmergeableConstruct(detail) ->
+      "link failed: a closure module carries a construct that cannot be merged into a .beam: "
+      <> detail
+    MangleCollision(a, b) ->
+      "link failed: mangle-injectivity violated (a module atom contains \"__\"): "
+      <> a
+      <> " / "
+      <> b
+    MalformedCore(detail) -> "link failed: malformed Core Erlang: " <> detail
+    CoreAcquisitionFailed(m, reason) ->
+      "link failed: could not acquire Core for " <> m <> ": " <> reason
+  }
+}

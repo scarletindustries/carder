@@ -1,0 +1,11 @@
+module @carder@wasm@useimport {
+  numerics true
+  memory none
+  import "env" "forbidden" : (i32) -> (i32)
+  export "useimport" = @f1
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = call_import 0 : (i32) -> (i32) (%p0)
+    values (%v1)
+  }
+}
+

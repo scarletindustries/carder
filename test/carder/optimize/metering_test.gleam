@@ -4,10 +4,10 @@
 //// the resource bound BITES: a runaway program traps `FuelExhausted` at a deterministic finite
 //// fuel bound, the trap surfaces through the run-ABI, and enforcement stays constant-space for a
 //// tail loop (bounds recursion DEPTH for non-tail recursion). Two runaway shapes:
-////   - `spin.wat`  — an unbounded TAIL loop (`(loop $l (br $l))`), charged every iteration. The
-////     back-edge is a tail-`apply`; fuel lives in the process dictionary, never loop-carried, so
-////     the runaway stays CONSTANT SPACE until it traps (E1/F5).
-////   - `recurse.wat` — unbounded NON-TAIL recursion (its call result is consumed), charged
+////   - `spin.ir`  — an unbounded TAIL loop (`(loop $l (br $l))` in the original WAT), charged
+////     every iteration. The back-edge is a tail-`apply`; fuel lives in the process dictionary,
+////     never loop-carried, so the runaway stays CONSTANT SPACE until it traps (E1/F5).
+////   - `recurse.ir` — unbounded NON-TAIL recursion (its call result is consumed), charged
 ////     `fn_cost` per call, so fuel bounds recursion DEPTH. Unlike the tail spin, the process
 ////     stack grows to O(budget) frames before the trap — node memory O(budget), NOT constant (the
 ////     residual caveat, unit 05 §C.3). The bound still bites: the runaway TERMINATES
@@ -24,21 +24,34 @@
 //// cross-test pdict leak. The trap is matched on the RAISED ATOM `fuel_exhausted` directly (NOT
 //// `runner.trap_matches`, which is for WASM spec phrases), keeping the policy trap out of the
 //// conformance trap-phrase table.
+////
+//// ## Corpus input: `.ir` TEXT, not a `.wasm` binary
+////
+//// carder is now the BACKEND only — the WebAssembly frontend moved to the `scribbler` repo — so
+//// the two runaway programs enter through `pipeline.parse_ir` over
+//// `test/carder/ir/corpus/{spin,recurse}.ir` instead of `source_to_ir` over their `.wasm`s. Each
+//// `.ir` was produced from the very same `.wasm` by the pre-split `to-ir`, and `wasm -> .beam`
+//// was measured byte-identical to `wasm -> .ir text -> .beam`, so these tests still meter the
+//// exact same compiled artifact.
 
 import carder/backend/build_beam
-import carder/conformance/ffi
-import carder/conformance/runner
+import carder/harness/ffi
+import carder/harness/runner
 import carder/ir
 import carder/pipeline
 import carder/runtime/instance.{type Binding}
 import carder/runtime/profiles
 import carder/runtime/rt_trap
+import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/int
 import gleam/list
+import gleam/result
 import gleam/string
 
-const corpus_dir = "test/carder/optimize/corpus"
+/// The `.ir` corpus directory — the frontend-independent text form of the acceptance corpus
+/// (`spin.ir` / `recurse.ir` here). See the module doc for why this replaced the `.wasm` corpus.
+const corpus_dir = "test/carder/ir/corpus"
 
 // ─────────────────────────── (a) it TRAPS FuelExhausted ───────────────────────────
 
@@ -148,13 +161,25 @@ pub fn fuel_exhausted_not_in_spec_phrase_table_test() {
 
 // ─────────────────────────── compile helper ───────────────────────────
 
-/// Compile a `optimize/corpus/<name>.wasm` program through the full pipeline under `binding` and
+/// Compile an `ir/corpus/<name>.ir` program through the full pipeline under `binding` and
 /// LOAD it, returning its BEAM module atom (a unique name per call). The metered runaway tests
 /// pass a SMALL `profiles.safe_metered(budget)` here, and drive the loaded module via
 /// `ffi.start_instance` so `instantiate/0` seeds the budget in the instance's OWN process.
+///
+/// - `name`: a corpus program's base name (no extension), e.g. `"spin"`.
+/// - `binding`: the build-time posture; the budget rides in `binding` via `safe_metered`.
+/// - Returns the loaded module's atom. `let assert Ok` at every stage is the contract — a
+///   missing/unparseable corpus file or a compile failure is a broken checkout or a real
+///   regression, never an expected path.
 fn compile_load(name: String, binding: Binding) -> Atom {
-  let assert Ok(bytes) = ffi.read_file(corpus_dir <> "/" <> name <> ".wasm")
-  let assert Ok(m0) = pipeline.source_to_ir(bytes)
+  let assert Ok(m0) = {
+    use bytes <- result.try(ffi.read_file(corpus_dir <> "/" <> name <> ".ir"))
+    use text <- result.try(
+      bit_array.to_string(bytes)
+      |> result.replace_error("non-UTF8 .ir source"),
+    )
+    pipeline.parse_ir(text) |> result.map_error(string.inspect)
+  }
   let m =
     ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
   let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)

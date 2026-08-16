@@ -1,0 +1,13 @@
+module @carder@wasm@noop {
+  numerics true
+  memory none
+  export "noop" = @f1
+  start @f0
+  func @f0 () -> () {
+    trap unreachable
+  }
+  func @f1 () -> () {
+    values ()
+  }
+}
+

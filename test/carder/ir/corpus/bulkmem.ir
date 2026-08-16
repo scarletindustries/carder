@@ -1,0 +1,31 @@
+module @carder@wasm@load8 {
+  numerics true
+  memory (min 1)
+  export "load8" = @f0
+  export "fill" = @f1
+  export "copy" = @f2
+  export "init" = @f3
+  export "dropd" = @f4
+  data passive = 0x61626364
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = mem.load i32 1 %p0 offset=0
+    values (%v1)
+  }
+  func @f1 (%p0:i32, %p1:i32, %p2:i32) -> () {
+    let () = mem.fill %p0 %p1 %p2
+    values ()
+  }
+  func @f2 (%p0:i32, %p1:i32, %p2:i32) -> () {
+    let () = mem.copy %p0 %p1 %p2
+    values ()
+  }
+  func @f3 (%p0:i32, %p1:i32, %p2:i32) -> () {
+    let () = mem.init %p0 %p1 %p2 seg=0
+    values ()
+  }
+  func @f4 () -> () {
+    let () = data.drop seg=0
+    values ()
+  }
+}
+

@@ -1,0 +1,66 @@
+module @carder@wasm@count_down {
+  numerics true
+  memory none
+  table @t0 min 2
+  export "count_down" = @f0
+  export "is_even" = @f1
+  export "is_odd" = @f2
+  export "ind_count_down" = @f4
+  export "ind_oob" = @f5
+  export "ind_null" = @f6
+  export "ind_type" = @f7
+  elem @t0 (values (i32.const 0)) [@f3]
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v1) = num i.eqz.32 (%p0)
+    let (%v4) = if %v1 : (i32) {
+      values (i32.const 0)
+    } else {
+      let (%v3) = num i.sub.32 (%p0, i32.const 1)
+      return_call @f0 (%v3)
+    }
+    values (%v4)
+  }
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = num i.eqz.32 (%p0)
+    let (%v4) = if %v1 : (i32) {
+      values (i32.const 1)
+    } else {
+      let (%v3) = num i.sub.32 (%p0, i32.const 1)
+      return_call @f2 (%v3)
+    }
+    values (%v4)
+  }
+  func @f2 (%p0:i32) -> (i32) {
+    let (%v1) = num i.eqz.32 (%p0)
+    let (%v4) = if %v1 : (i32) {
+      values (i32.const 0)
+    } else {
+      let (%v3) = num i.sub.32 (%p0, i32.const 1)
+      return_call @f1 (%v3)
+    }
+    values (%v4)
+  }
+  func @f3 (%p0:i32) -> (i32) {
+    let (%v1) = num i.eqz.32 (%p0)
+    let (%v4) = if %v1 : (i32) {
+      values (i32.const 0)
+    } else {
+      let (%v3) = num i.sub.32 (%p0, i32.const 1)
+      return_call_indirect @t0 [i32.const 0] : (i32) -> (i32) (%v3)
+    }
+    values (%v4)
+  }
+  func @f4 (%p0:i32) -> (i32) {
+    return_call_indirect @t0 [i32.const 0] : (i32) -> (i32) (%p0)
+  }
+  func @f5 (%p0:i32) -> (i32) {
+    return_call_indirect @t0 [i32.const 5] : (i32) -> (i32) (%p0)
+  }
+  func @f6 (%p0:i32) -> (i32) {
+    return_call_indirect @t0 [i32.const 1] : (i32) -> (i32) (%p0)
+  }
+  func @f7 (%p0:i32, %p1:i32) -> (i32) {
+    return_call_indirect @t0 [i32.const 0] : (i32, i32) -> (i32) (%p0, %p1)
+  }
+}
+

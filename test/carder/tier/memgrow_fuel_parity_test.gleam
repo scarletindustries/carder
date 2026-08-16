@@ -24,11 +24,9 @@
 //// in its OWN spawned process via the driver's `ffi.start_instance`, so the budget lives in that
 //// process's dictionary, never the shared eunit runner process — no cross-test pdict leak.
 
-import carder/conformance/driver
-import carder/conformance/fixture.{I32Val}
-import carder/conformance/runner.{
-  type InvokeResult, DriverError, Returned, Trapped,
-}
+import carder/harness/driver
+import carder/harness/fixture.{I32Val}
+import carder/harness/runner.{type InvokeResult, DriverError, Returned, Trapped}
 import carder/tier/combos.{type Combo, type Outcome, Trap, Value}
 import gleam/list
 import gleam/string
@@ -48,7 +46,7 @@ const tight: Int = 40_000
 /// on success, or traps `FuelExhausted` when the dynamic grow charge over-spends `budget`.
 fn grow_outcome(c: Combo, budget: Int) -> Outcome {
   let d = driver.pipeline_with(combos.binding_for_metered(c, budget))
-  let assert Ok(bytes) = combos.read_wasm("memgrow")
+  let assert Ok(bytes) = combos.read_ir("memgrow")
   let assert Ok(inst) = d.instantiate(bytes)
   to_outcome(d.invoke(inst, "grow", [I32Val(1)]))
 }

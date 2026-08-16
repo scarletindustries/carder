@@ -37,7 +37,7 @@
 //// `mem_tier`/`table_tier` (`Paged`/`Atomics`/`Nif` · …) — are **build-time fields on the
 //// one `Binding`** that already threads through every stage. The pipeline runs the **same
 //// five stages in the same order** regardless of them:
-////   `source_to_ir → lower_ir → optimize_ir → ir_to_cmod (emit_core) → cmod_to_beam`.
+////   `parse_ir → lower_ir → optimize_ir → ir_to_cmod (emit_core) → cmod_to_beam`.
 //// **No stage branches on a Phase-4 axis.** The axes are consumed at exactly two points, both
 //// downstream of the stage graph:
 ////   - **codegen** — `emit_core` reads `binding.state_strategy` (the one codegen-shape switch:
@@ -52,7 +52,7 @@
 ////
 //// ## The strategy-aware run-ABI (unit P4-08 §C — signature-stable, self-detecting)
 ////
-//// `instantiate`/`invoke_instance`/`run_source` do **not** gain a `Binding` parameter. The
+//// `instantiate`/`invoke_instance`/`run_ir` do **not** gain a `Binding` parameter. The
 //// owned process (`carder_cli_ffi.erl`) discriminates the state strategy from
 //// `instantiate/0`'s **return value** (unambiguous by the keystone shapes): the atom `'ok'`
 //// → the `Cell` loop (apply `Fun(Args)`, state in the pdict cell); the `InstanceState` record
@@ -65,25 +65,17 @@ import carder/backend/chunk
 import carder/backend/core_erlang.{type CModule}
 import carder/backend/core_printer
 import carder/backend/emit_core
-import carder/frontend/wasm/ast
-import carder/frontend/wasm/decode
-import carder/frontend/wasm/lower
-import carder/frontend/wasm/validate
 import carder/ir
 import carder/ir/parser as ir_parser
 import carder/middle/ir_lower
 import carder/middle/ir_opt
 import carder/runtime/instance.{type Binding}
 import carder/runtime/link
-import carder/runtime/porffor_abi.{type PorfValue}
-import carder/runtime/profiles
-import carder/runtime/rt_teavm
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
@@ -94,17 +86,15 @@ import gleam/string
 /// `Result(_, PipelineError)` is `Error(variant)` iff that named stage rejected the input
 /// (fail-closed) — never a panic.
 ///
+/// These are the IR-ENTRY stages only. A frontend (scribbler's WebAssembly decoder, arc's JS
+/// emitter) owns its own source→IR error type and wraps this one for the backend half, so the
+/// combined diagnostic reads end-to-end without carder knowing any source language.
+///
 /// Variants (in pipeline order):
-/// - `DecodeFailed`: the WASM binary decoder rejected the bytes (unit 05).
-/// - `ValidateFailed`: the `full` validator rejected the module (unit 10a).
-/// - `FrontendLowerFailed`: WASM-AST → IR lowering failed (unit 10b).
 /// - `IrLowerFailed`: the IR→IR Safe policy pass rejected a `CallHost` (unit 11a).
 /// - `EmitFailed`: `emit_core` could not produce Core Erlang (unit 08).
 /// - `BuildFailed`: the Core Erlang → `.beam` build/load step failed (unit 04).
 pub type PipelineError {
-  DecodeFailed(ast.DecodeError)
-  ValidateFailed(validate.ValidateError)
-  FrontendLowerFailed(lower.LowerError)
   IrLowerFailed(ir_lower.LowerError)
   EmitFailed(emit_core.EmitError)
   BuildFailed(build_beam.BuildError)
@@ -115,9 +105,6 @@ pub type PipelineError {
 /// should match the variant, not parse this string.
 pub fn describe(error: PipelineError) -> String {
   case error {
-    DecodeFailed(e) -> "decode: " <> string.inspect(e)
-    ValidateFailed(e) -> "validate: " <> string.inspect(e)
-    FrontendLowerFailed(e) -> "lower: " <> string.inspect(e)
     IrLowerFailed(e) -> "ir-lower: " <> string.inspect(e)
     EmitFailed(e) -> "emit: " <> string.inspect(e)
     BuildFailed(e) -> "build: " <> string.inspect(e)
@@ -153,7 +140,12 @@ pub type RunResult {
 /// `Trapped(reason)`. The tag id is always recovered; the payload is best-effort (a payload of
 /// all-printable bytes that `~0p` rendered as a string decodes to `[]`, harmless — the tag id is
 /// the load-bearing discriminant). Total — never panics.
-fn classify_run_error(reason: String) -> RunResult {
+///
+/// PUBLIC because a frontend that composes its own `load → instantiate → invoke` loop (rather
+/// than calling `run_ir`) must classify an INSTANTIATION-time failure identically — otherwise an
+/// uncaught exception thrown by a `start` function is silently reported as a trap, a wrong
+/// ANSWER rather than a compile error.
+pub fn classify_run_error(reason: String) -> RunResult {
   case string.starts_with(reason, "{wasm_exn,") {
     False -> Trapped(reason)
     True -> {
@@ -352,18 +344,48 @@ pub fn instantiate_with_host(
   m: ir.Module,
   host: fn(String, String, List(Int)) -> List(Int),
 ) -> Result(InstanceProc, String) {
-  case link.link_imports(m, []) {
+  instantiate_with_host_providers(beam, m, host, [])
+}
+
+/// `instantiate_with_host` plus caller-supplied `link.Provider`s — the entry point for a guest
+/// whose imports are NOT all expressible over the numeric `host` ABI.
+///
+/// The embedder `host` dispatcher is numeric (`List(Int) -> List(Int)`, D5), which cannot carry a
+/// BEAM term, so a guest importing REFERENCE-typed host functions (externref / funcref / GC refs
+/// — e.g. a TeaVM WASM GC guest's `teavmJso` namespace) or importing host STATE (a global, table
+/// or memory it does not define) needs a term-native source. That source is a `Provider`, handed
+/// in by the frontend/embedder: `providers` is consulted FIRST for both the state imports
+/// (`link.link_imports`) and each function import, and only a capability no provider owns falls
+/// back to the numeric `host` dispatcher.
+///
+/// This is why carder needs no knowledge of any producer toolchain: the namespaces a TeaVM or
+/// Porffor guest imports from are described entirely by the caller's `Provider` list (D3a — a
+/// handed-in closure is a capability, never ambient authority).
+///
+/// - `beam`/`m`/`host`: as `instantiate_with_host`.
+/// - `providers`: term-native externval sources (see `link.Provider`). `[]` reproduces
+///   `instantiate_with_host` exactly.
+/// - Returns `Ok(InstanceProc)`, or `Error(reason)` on an unsatisfied/mismatched state import, a
+///   load failure, or an instantiation-time trap. Total — never panics.
+pub fn instantiate_with_host_providers(
+  beam: BitArray,
+  m: ir.Module,
+  host: fn(String, String, List(Int)) -> List(Int),
+  providers: List(link.Provider),
+) -> Result(InstanceProc, String) {
+  case link.link_imports(m, providers) {
     Error(e) -> Error(link.import_error_phrase(e))
     Ok(state) -> {
-      // Mirror `link_porffor_imports`: append the function-import dispatch vector ONLY when the
-      // module actually calls an imported function, so the woven `Imports` arity matches the
-      // generated `instantiate/1` byte-for-byte (an import-but-never-called module stays
-      // state-only). The func vector is one closure per `ImportFn`, in declaration order.
-      let provided = case module_calls_import(m) {
+      // Append the function-import dispatch vector ONLY when the module actually USES an
+      // imported function, so the woven `Imports` arity matches the generated `instantiate/1`
+      // byte-for-byte (an import-but-never-used module stays state-only). `emit_core` decides
+      // that arity, so its `needs_func_imports` is the SINGLE predicate both sides read (R3) —
+      // a second, weaker copy here would desync the two on a `return_call`/`ref.func`-only use.
+      let provided = case emit_core.needs_func_imports(m) {
         False -> state
-        True -> list.append(state, host_func_vector(m, host))
+        True -> list.append(state, host_func_vector(m, host, providers))
       }
-      start_provided_instance(beam, m.name, provided)
+      instantiate_with_provided(beam, m.name, provided)
     }
   }
 }
@@ -376,19 +398,18 @@ pub fn instantiate_with_host(
 fn host_func_vector(
   m: ir.Module,
   host: fn(String, String, List(Int)) -> List(Int),
+  providers: List(link.Provider),
 ) -> List(link.Provided) {
   list.filter_map(m.imports, fn(imp) {
     case imp {
       ir.ImportFn(capability:, name:, ty:) ->
-        case rt_teavm.is_teavm_capability(capability) {
-          // A TeaVM WASM GC runtime import (teavmJso/wasm:js-string/teavmMemory/teavmDate/teavm) is
-          // REFERENCE-typed (externref/funcref/GC refs), which the numeric `host` ABI cannot carry.
-          // Resolve it to `rt_teavm`'s TERM-native handler, exactly as `link.resolve_func_provided`
-          // does — so a Java/TeaVM guest instantiates while the embedder's `host` still services the
-          // (i32-only) `dance.*`/`env`/… imports numerically.
-          True ->
-            Ok(link.provided_func(ty, rt_teavm.dispatch(capability, name)))
-          False ->
+        // A provider-owned capability resolves TERM-natively (it may carry references / GC refs
+        // the numeric `host` ABI cannot express); anything else is serviced numerically by the
+        // embedder's dispatcher. `link.link_func_imports` applies the identical precedence, so
+        // both instantiate paths agree on which closure a given import gets.
+        case link.link_func_imports(one_import_module(m, imp), providers) {
+          Ok([resolved]) if providers != [] -> Ok(resolved)
+          _ ->
             Ok(
               link.provided_func(ty, fn(args) {
                 host(capability, name, list.map(args, dyn_to_int))
@@ -399,6 +420,13 @@ fn host_func_vector(
       _ -> Error(Nil)
     }
   })
+}
+
+/// A single-import projection of `m` — the same module with `imports` narrowed to just `imp`.
+/// Lets `host_func_vector` reuse `link.link_func_imports` (the ONE definition of function-import
+/// matching) per import, instead of re-implementing provider precedence. Total.
+fn one_import_module(m: ir.Module, imp: ir.ImportDecl) -> ir.Module {
+  ir.Module(..m, imports: [imp])
 }
 
 /// **Exec** a PREBUILT `.beam` (the run-ABI on an already-compiled module — NO compile step).
@@ -496,11 +524,11 @@ fn ffi_call_instance_pair(
   args: List(Int),
 ) -> Result(#(Int, Int), String)
 
-/// Drain an instance's Porffor console output buffer (P7-08 §E/§H.2) — routes into the
-/// instance's owned process and reads `rt_host:porffor_output/0` THERE (the buffer is
+/// Drain an instance's host console output buffer (P7-08 §E/§H.2) — routes into the
+/// instance's owned process and reads `rt_host:host_output/0` THERE (the buffer is
 /// process-local). Returns the raw byte stream (`<<>>` if the program never printed).
-@external(erlang, "carder_cli_ffi", "porffor_output")
-fn ffi_porffor_output(proc: Pid) -> BitArray
+@external(erlang, "carder_cli_ffi", "host_output")
+fn ffi_host_output(proc: Pid) -> BitArray
 
 /// Ask an instance's owned process to exit (cell GC'd with it).
 @external(erlang, "carder_cli_ffi", "stop_instance")
@@ -529,42 +557,9 @@ fn ffi_bench_instance(
 
 // ─────────────────────────────── composable stage drivers ───────────────────────────────
 
-/// Decode → validate → frontend-lower a `.wasm` binary into the shared IR (the unit-10
-/// frontend slice). Each stage's typed error is mapped to its `PipelineError` variant.
-///
-/// - `wasm`: untrusted `.wasm` bytes.
-/// - Return: `Ok(ir.Module)` or the first failing stage's `Error(PipelineError)`. No policy
-///   pass or codegen is run here (use `ir_to_cmod` for those). Total — never panics.
-pub fn source_to_ir(wasm: BitArray) -> Result(ir.Module, PipelineError) {
-  source_to_ir_with(wasm, False)
-}
-
-/// As `source_to_ir`, but `narrow_carried` selects the frontend liveness narrowing (lever 5). Pass
-/// `binding.narrow_carried` from a binding-carrying compile path (e.g. `run_source`); `False` (the
-/// `source_to_ir/1` default) reproduces the byte-identical no-narrowing lowering. The narrowing only
-/// ever removes a carried local it can PROVE dead at its construct's exit, so `True` is behaviour-
-/// preserving.
-pub fn source_to_ir_with(
-  wasm: BitArray,
-  narrow_carried: Bool,
-) -> Result(ir.Module, PipelineError) {
-  case decode.decode(wasm) {
-    Error(e) -> Error(DecodeFailed(e))
-    Ok(m) ->
-      case validate.validate(m) {
-        Error(e) -> Error(ValidateFailed(e))
-        Ok(tm) ->
-          case lower.lower_with(tm, narrow_carried) {
-            Error(e) -> Error(FrontendLowerFailed(e))
-            Ok(irmod) -> Ok(irmod)
-          }
-      }
-  }
-}
-
 /// Run the IR→IR Safe policy pass (`ir_lower`, unit 11a) over `m` under `binding`.
 ///
-/// - `m`: the IR module (e.g. from `source_to_ir` or `ir/parser`).
+/// - `m`: the IR module (e.g. from `parse_ir`, or handed in by a frontend package).
 /// - `binding`: the build-time runtime binding (its `mode`/`stdlib_module` drive policy).
 /// - Return: `Ok(rewritten_module)` (CallHosts gated, metering inserted), or
 ///   `Error(IrLowerFailed(_))` on the first policy violation (fail-closed). Total.
@@ -580,7 +575,7 @@ pub fn lower_ir(
 
 /// Run the shared IR→IR optimizer over `m` at the level carried by the profile (F1/F7).
 ///
-/// The optimizer sits BETWEEN `ir_lower` and `emit_core`: `source_to_ir → ir_lower →
+/// The optimizer sits BETWEEN `ir_lower` and `emit_core`: `parse_ir → ir_lower →
 /// optimize_ir → emit_core`. The level is read from `binding.opt_level` (F7 — the profile is
 /// the single source of truth), so `profiles.safe()` optimizes at `Baseline` (trust-neutral
 /// passes) and `profiles.unsafe()` at `Aggressive` (baseline + Unsafe-only passes).
@@ -609,7 +604,7 @@ pub fn optimize_ir(m: ir.Module, binding: Binding) -> ir.Module {
 /// mode R17 guards against (a mutation-carrying export misclassified pure, silently dropping `St'`).
 /// `ir_to_cmod/2` is exactly this seam with the module discarded.
 ///
-/// - `m`: the IR module to compile (e.g. from `source_to_ir` or `ir/parser`).
+/// - `m`: the IR module to compile (e.g. from `parse_ir`, or handed in by a frontend package).
 /// - `binding`: the build-time runtime binding (chokepoint module names + policy mode + the
 ///   optimizer level).
 /// - Return: `Ok(#(lowered_optimized_module, cmod))`, or `Error(IrLowerFailed/EmitFailed)`.
@@ -633,7 +628,7 @@ pub fn ir_to_lowered_cmod(
 
 /// IR → the backend `CModule`: `ir_lower` (Safe policy pass / metering) → `ir_opt` (level from
 /// `binding.opt_level`, F1) → `emit_core`. The canonical "IR → backend" seam the CLI's
-/// `run`/`to-beam-wasm` and the test drivers compile through (`cmod_to_beam` /
+/// `run`/`to-beam` and the test drivers compile through (`cmod_to_beam` /
 /// `build_beam.compile_and_load` consume the result directly — no textual round trip).
 ///
 /// Delegates to `ir_to_lowered_cmod/2` (the same three stages) and discards the module.
@@ -691,7 +686,7 @@ pub fn cmod_to_beam(cmod: CModule) -> Result(BitArray, PipelineError) {
 /// - `m`: the IR module. `binding`: the build-time binding. `target`: desired chunk count.
 ///   `min_split_defs`: don't split a module smaller than this (keeps small guests untouched).
 /// - Return: `Ok([CModule])` (chunk order), or `Error(IrLowerFailed/EmitFailed)`. Total.
-pub fn source_to_chunks(
+pub fn ir_to_chunks(
   m: ir.Module,
   binding: Binding,
   target: Int,
@@ -712,7 +707,7 @@ pub fn source_to_chunks(
 /// Compile chunk `CModule`s to loadable `.beam`s, **sequentially** — this is what bounds the peak
 /// (each chunk's compile transients are reclaimed before the next starts).
 ///
-/// - `chunks`: from `source_to_chunks` (chunk 0 first).
+/// - `chunks`: from `ir_to_chunks` (chunk 0 first).
 /// - Return: `Ok([#(module_atom, beam)])` in chunk order — chunk 0's atom is the guest's run-ABI
 ///   module name; the rest are its `_c<i>` helper modules that must be loaded alongside it. Or the
 ///   first chunk's `Error(BuildFailed(_))`. Total — never panics.
@@ -755,246 +750,20 @@ pub fn parse_ir(text: String) -> Result(ir.Module, ir_parser.ParseError) {
   ir_parser.parse_module(text)
 }
 
-/// End-to-end: `.wasm` bytes → result on the BEAM, through the Phase-2 run-ABI
-/// `load → instantiate → invoke` with one-instance-one-process isolation (E5).
-///
-/// Composes `source_to_ir` → `ir_to_cmod(binding)` → `cmod_to_beam` → `instantiate` (spawn
-/// the instance's owned process + run `instantiate/0`) → `invoke_instance` → `stop_instance`.
-/// This is the CLI `run` subcommand's engine and the shape the acceptance corpus proves
-/// green. The raw-bit-pattern argument/result ABI (D5) is unchanged.
-///
-/// **Posture-agnostic (unit P4-08 §C.3):** `binding` carries the chosen `state_strategy` and
-/// tiers **unchanged** through every stage. `emit_core` links the tier via `binding.mem_module`
-/// and picks the state seam via `binding.state_strategy`; the run-ABI self-detects the strategy
-/// (§C.2). So a `Threaded`/`atomics` binding runs the SAME driver code as `Cell`/`paged` and
-/// returns **byte-identical** results (G7) — the difference is confined to the loaded `.beam`
-/// (calling convention) and the linked runtime module. The caller is expected to pass a binding
-/// already validated through `profiles.link/1` (the CLI does so via `resolve_binding`); a
-/// tier/strategy incoherence is a linker rejection surfaced there, not a `PipelineError` here.
-///
-/// - `wasm`: the `.wasm` bytes.
-/// - `binding`: the build-time runtime binding (e.g. `profiles.safe()`/`portable()`, or a
-///   `resolve_binding`-validated composition).
-/// - `export`: the exported function name to invoke.
-/// - `args`: raw unsigned bit-pattern integer arguments.
-/// - Return: `Ok(Returned(_))` on a normal return; `Ok(Trapped(reason))` for an
-///   INSTANTIATION-TIME trap (OOB active segment / trapping `start`) OR a runtime trap —
-///   both are runtime outcomes, surfaced identically; or the first compile-stage
-///   `Error(PipelineError)`. Total — never panics.
-pub fn run_source(
-  wasm: BitArray,
-  binding: Binding,
-  export: String,
-  args: List(Int),
-) -> Result(RunResult, PipelineError) {
-  case source_to_ir_with(wasm, binding.narrow_carried) {
-    Error(e) -> Error(e)
-    Ok(m) ->
-      case ir_to_cmod(m, binding) {
-        Error(e) -> Error(e)
-        Ok(cmod) ->
-          case cmod_to_beam(cmod) {
-            Error(e) -> Error(e)
-            Ok(beam) ->
-              case instantiate(beam, m.name) {
-                // An instantiation-time trap / uncaught throw (e.g. a throwing `start`) is a
-                // runtime outcome, not a compile error — split exn vs trap identically (T8).
-                Error(reason) -> Ok(classify_run_error(reason))
-                Ok(proc) -> {
-                  let result = invoke_instance(proc, export, args)
-                  stop_instance(proc)
-                  Ok(result)
-                }
-              }
-          }
-      }
-  }
-}
-
-/// Like `run_source`, but compiles the guest as N balanced CHUNKS (see `source_to_chunks`), loads
-/// every chunk beam, then instantiates + invokes the entry (chunk 0). Used to prove chunked
-/// compilation is behaviour-identical to the whole-module path (a chunked guest must return
-/// byte-identical results / traps), and it is the shape the memory-bounded server path uses.
-///
-/// - `wasm`/`binding`/`export`/`args`: as `run_source`. `target`/`min_split_defs`: chunk controls
-///   (a small `min_split_defs` forces a split even on a small guest, for testing).
-/// - Return: identical to `run_source` (`Ok(Returned/Trapped/…)` or the first compile `Error`). The
-///   helper chunks are inter-module `call` targets of the entry, so they are loaded FIRST; a helper
-///   that fails to load surfaces as an instantiation error. Total — never panics.
-pub fn run_source_chunked(
-  wasm: BitArray,
-  binding: Binding,
-  export: String,
-  args: List(Int),
-  target: Int,
-  min_split_defs: Int,
-) -> Result(RunResult, PipelineError) {
-  case source_to_ir_with(wasm, binding.narrow_carried) {
-    Error(e) -> Error(e)
-    Ok(m) ->
-      case source_to_chunks(m, binding, target, min_split_defs) {
-        Error(e) -> Error(e)
-        Ok(chunks) ->
-          case chunks_to_beams(chunks) {
-            Error(e) -> Error(e)
-            // Unreachable: `source_to_chunks` always yields at least one chunk.
-            Ok([]) ->
-              Error(
-                BuildFailed(
-                  build_beam.CompileFailed([
-                    "chunking produced no output modules",
-                  ]),
-                ),
-              )
-            Ok([#(name, beam), ..extras]) -> {
-              // Load the helper chunks first so the entry's cross-chunk `call`s resolve.
-              list.each(extras, fn(nb) {
-                let _ =
-                  build_beam.load_module(atom.create(nb.0), "carder_cli", nb.1)
-                Nil
-              })
-              case instantiate(beam, name) {
-                Error(reason) -> Ok(classify_run_error(reason))
-                Ok(proc) -> {
-                  let result = invoke_instance(proc, export, args)
-                  stop_instance(proc)
-                  Ok(result)
-                }
-              }
-            }
-          }
-      }
-  }
-}
-
-// ─────────────────────────────── Phase-7: the Porffor JS-on-BEAM run path (P7-08) ───────────────────────────────
-
-/// The outcome of running a Porffor-compiled JS program on the BEAM under `profiles.porffor()`
-/// (P7-08 §C/§E). The **console output is the primary observable** (T12).
-///
-/// - `output`: the captured `console.log` byte stream (§E) — the exact bytes `print`/`printChar`
-///   produced, ANSI escapes in-band; compared byte-for-byte against `porf run` (T13).
-/// - `result`: the decoded completion value of the exported entry (§D) — a scalar
-///   (`PNumber`/`PBool`/`PUndefined`) for the common case; a heap-typed result (string/object)
-///   is `POpaque` here (its memory read is P7-09's FFI, §H.2 — but a `console.log` of a string
-///   still appears in `output`).
-/// - `trapped`: `Some(reason)` if the program trapped (an uncaught throw surfaced as a BEAM
-///   exception, a denied/unprovided intrinsic, an instantiation-time trap, or a WASM trap) —
-///   the rendered BEAM reason; `None` on a clean completion.
-pub type PorfforRun {
-  PorfforRun(output: BitArray, result: PorfValue, trapped: Option(String))
-}
-
-/// A fail-closed `porffor_abi.MemReader` for `run_porffor`: every read is denied, so a
-/// heap-typed (pointer) completion value decodes to `POpaque` (T12 — scalar + console only in
-/// this unit; the routed instance-memory reader that lets pointer results decode is P7-09's,
-/// §H.2). Scalars (number/boolean/undefined) need no memory, so they decode precisely.
-fn no_mem_reader(_addr: Int, _len: Int) -> Result(BitArray, Nil) {
-  Error(Nil)
-}
-
-/// Compile + run a Porffor-emitted `.wasm` on the BEAM under `profiles.porffor()` and collect
-/// its console output + decoded completion value (the JS-on-BEAM run path, P7-08 §C/§E). This
-/// is the headline seam: `source_to_ir` → `ir_to_cmod(porffor())` → `cmod_to_beam` →
-/// `instantiate` (owned process) → invoke the entry `main` (multi-value `(f64, i32)` return via
-/// `ffi_call_instance_pair`) → drain the console buffer (`ffi_porffor_output`) → decode the pair
-/// (`porffor_abi.porf_decode`). Conformance-neutral: a non-Porffor module never reaches this
-/// path (the four `""` intrinsics, the buffer, and `porffor()` are inert for it).
-///
-/// - `wasm`: the Porffor-emitted `.wasm` bytes (EH-free subset for this unit; the EH pipeline
-///   P7-03..07 extends it to `try/catch` programs).
-/// - `main`: the entry export name — Porffor's top-level `#main` is always `"m"` (T10).
-/// - Return: `Ok(PorfforRun)` with the captured output + decoded result (+ `trapped`), or a
-///   compile-stage `Error(PipelineError)`. A runtime trap / uncaught throw is a `PorfforRun`
-///   with `trapped: Some(_)` (still `Ok`), so a thrown program is judgeable distinctly from a
-///   clean one. Total — never panics.
-pub fn run_porffor(
-  wasm: BitArray,
-  main: String,
-) -> Result(PorfforRun, PipelineError) {
-  case source_to_ir(wasm) {
-    Error(e) -> Error(e)
-    Ok(m) ->
-      // Resolve the import vector (state + function-import closures) under the porffor()
-      // posture, where the four `""` intrinsics resolve to host closures (the "genuine host
-      // capability" branch of link_func_imports — gated at call time by the HostWhitelist).
-      case link_porffor_imports(m) {
-        Error(reason) ->
-          Ok(PorfforRun(<<>>, porffor_abi.PUndefined, Some("link: " <> reason)))
-        Ok(provided) ->
-          case ir_to_cmod(m, profiles.porffor()) {
-            Error(e) -> Error(e)
-            Ok(cmod) ->
-              case cmod_to_beam(cmod) {
-                Error(e) -> Error(e)
-                Ok(beam) ->
-                  case start_provided_instance(beam, m.name, provided) {
-                    Error(reason) ->
-                      Ok(PorfforRun(<<>>, porffor_abi.PUndefined, Some(reason)))
-                    Ok(proc) -> {
-                      let InstanceProc(pid) = proc
-                      let outcome =
-                        ffi_call_instance_pair(pid, atom.create(main), [])
-                      // Drain AFTER the invoke: print/printChar wrote the instance's
-                      // process-local buffer during the call (any partial output before a trap
-                      // is still captured).
-                      let output = ffi_porffor_output(pid)
-                      let run = case outcome {
-                        Ok(#(f64_bits, type_tag)) ->
-                          PorfforRun(
-                            output,
-                            porffor_abi.porf_decode(
-                              f64_bits,
-                              type_tag,
-                              no_mem_reader,
-                            ),
-                            None,
-                          )
-                        Error(reason) ->
-                          PorfforRun(
-                            output,
-                            porffor_abi.PUndefined,
-                            Some(reason),
-                          )
-                      }
-                      stop_instance(proc)
-                      Ok(run)
-                    }
-                  }
-              }
-          }
-      }
-  }
-}
-
-/// Resolve the full positional import vector for a Porffor module under `profiles.porffor()`:
-/// the STATE imports (`link.link_imports` — empty for a typical Porffor module, which imports
-/// only functions) followed by the function-import dispatch closures (`link.link_func_imports`,
-/// appended in emit_core's order) when the module CALLS an imported function. Porffor's `""`
-/// intrinsics are NOT link-checked (the "genuine host capability" branch); they resolve to host
-/// closures gated at call time by the instance's `HostWhitelist`. Returns `Error(phrase)` on the
-/// first link failure (spec §4.5.4), rendered by `link.import_error_phrase`. Total.
-fn link_porffor_imports(m: ir.Module) -> Result(List(link.Provided), String) {
-  case link.link_imports(m, []) {
-    Error(e) -> Error(link.import_error_phrase(e))
-    Ok(state) ->
-      case module_calls_import(m) {
-        False -> Ok(state)
-        True ->
-          case link.link_func_imports(m, []) {
-            Error(e) -> Error(link.import_error_phrase(e))
-            Ok(funcs) -> Ok(list.append(state, funcs))
-          }
-      }
-  }
-}
-
 /// Load `beam` and start the instance's owned process with the matching instantiate ABI (R4): a
 /// module with NO positional imports keeps `instantiate/0` (`ffi_start_instance`); an
 /// import-bearing one gets `instantiate/1(Imports)` (`ffi_start_instance_with`), where `Imports`
-/// is the positional `Provided` vector. Returns `Ok(InstanceProc)` once seeded, or
-/// `Error(reason)` for a load failure / instantiation-time trap. Total.
-fn start_provided_instance(
+/// is the positional `Provided` vector.
+///
+/// PUBLIC because the `instantiate/0`-vs-`instantiate/1` choice must match `emit_core`'s emitted
+/// arity byte-for-byte — a frontend that resolved its own `Provided` vector (e.g. scribbler
+/// linking a Porffor guest's `""` intrinsics) must NOT re-implement this decision.
+///
+/// - `beam`: the compiled module. `mod`: the atom name baked into it.
+/// - `provided`: the positional externval vector (`[]` ⇒ the `instantiate/0` path).
+/// - Returns `Ok(InstanceProc)` once seeded, or `Error(reason)` for a load failure /
+///   instantiation-time trap. Total.
+pub fn instantiate_with_provided(
   beam: BitArray,
   mod: String,
   provided: List(link.Provided),
@@ -1014,30 +783,132 @@ fn start_provided_instance(
   }
 }
 
-/// `True` iff `m` CALLS an imported function anywhere (its IR contains a `CallImport` node) — the
-/// exact condition `emit_core`'s `needs_func_imports` uses to seed the function-import dispatch
-/// vector at `instantiate`. The run-ABI mirrors it so the woven `Imports` arity matches the
-/// generated `instantiate/1` byte-for-byte. Total.
-fn module_calls_import(m: ir.Module) -> Bool {
-  list.any(m.functions, fn(f) { expr_calls_import(f.body) })
+// ─────────────────────────── the IR-entry run drivers (the frontend seam) ───────────────────────────
+
+/// End-to-end from an **IR module**: compile → load → instantiate → invoke → stop, through the
+/// run-ABI's `load → instantiate → invoke` with one-instance-one-process isolation (E5). This is
+/// the single call a frontend makes to *run* what it lowered — carder's half of `wasm → BEAM`,
+/// `js → BEAM`, or any other frontend's end-to-end path.
+///
+/// **Posture-agnostic:** `binding` carries the chosen `state_strategy` and tiers UNCHANGED
+/// through every stage. `emit_core` links the tier via `binding.mem_module` and picks the state
+/// seam via `binding.state_strategy`; the run-ABI self-detects the strategy from `instantiate/0`'s
+/// return. So a `Threaded`/`atomics` binding runs the SAME driver code as `Cell`/`paged` and
+/// returns byte-identical results (G7) — the difference is confined to the loaded `.beam`. The
+/// caller is expected to pass a binding already validated through `profiles.link/1` (`carder/cli`'s
+/// `resolve_binding` does so); a tier/strategy incoherence is a linker rejection surfaced there,
+/// not a `PipelineError` here.
+///
+/// - `m`: the IR module to compile and run; `m.name` is the atom the `.beam` loads under.
+/// - `binding`: the build-time runtime binding.
+/// - `export`: the exported function name to invoke.
+/// - `args`: raw unsigned bit-pattern integer arguments (D5).
+/// - Return: `Ok(Returned(_))` on a normal return; `Ok(Trapped(_))`/`Ok(UncaughtException(_,_))`
+///   for an INSTANTIATION-time or RUNTIME trap/throw — both are runtime outcomes, classified
+///   identically by `classify_run_error` (T8); or the first compile-stage `Error(PipelineError)`.
+///   The instance is always stopped before returning. Total — never panics.
+pub fn run_ir(
+  m: ir.Module,
+  binding: Binding,
+  export: String,
+  args: List(Int),
+) -> Result(RunResult, PipelineError) {
+  case compile_ir(m, binding) {
+    Error(e) -> Error(e)
+    Ok(beam) ->
+      case instantiate(beam, m.name) {
+        // An instantiation-time trap / uncaught throw (e.g. a throwing `start`) is a runtime
+        // outcome, not a compile error — split exn vs trap identically (T8).
+        Error(reason) -> Ok(classify_run_error(reason))
+        Ok(proc) -> {
+          let result = invoke_instance(proc, export, args)
+          stop_instance(proc)
+          Ok(result)
+        }
+      }
+  }
 }
 
-/// `True` iff `expr` (recursively, through the control-flow containers holding sub-`Expr`s)
-/// contains a `CallImport` node. Mirrors `emit_core`'s private `expr_has_call_import`. Total.
-fn expr_calls_import(expr: ir.Expr) -> Bool {
-  case expr {
-    ir.CallImport(..) -> True
-    ir.Let(_, rhs, body) -> expr_calls_import(rhs) || expr_calls_import(body)
-    ir.If(_, _, t, e) -> expr_calls_import(t) || expr_calls_import(e)
-    ir.Switch(_, _, arms, default) ->
-      list.any(arms, fn(a) {
-        let ir.SwitchArm(_, b) = a
-        expr_calls_import(b)
-      })
-      || expr_calls_import(default)
-    ir.Block(_, _, body) -> expr_calls_import(body)
-    ir.Loop(_, _, _, body) -> expr_calls_import(body)
-    ir.Charge(_, body) -> expr_calls_import(body)
-    _ -> False
+/// Like `run_ir`, but compiles the module as N balanced CHUNKS (see `ir_to_chunks`), loads every
+/// chunk beam, then instantiates + invokes the entry (chunk 0). Proves chunked compilation is
+/// behaviour-identical to the whole-module path (a chunked guest must return byte-identical
+/// results / traps), and it is the shape the memory-bounded server path uses.
+///
+/// - `m`/`binding`/`export`/`args`: as `run_ir`. `target`/`min_split_defs`: chunk controls (a
+///   small `min_split_defs` forces a split even on a small module, for testing).
+/// - Return: identical to `run_ir`. The helper chunks are inter-module `call` targets of the
+///   entry, so they are loaded FIRST; a helper that fails to load surfaces as an instantiation
+///   error. Total — never panics.
+pub fn run_ir_chunked(
+  m: ir.Module,
+  binding: Binding,
+  export: String,
+  args: List(Int),
+  target: Int,
+  min_split_defs: Int,
+) -> Result(RunResult, PipelineError) {
+  case ir_to_chunks(m, binding, target, min_split_defs) {
+    Error(e) -> Error(e)
+    Ok(chunks) ->
+      case chunks_to_beams(chunks) {
+        Error(e) -> Error(e)
+        // Unreachable: `ir_to_chunks` always yields at least one chunk.
+        Ok([]) ->
+          Error(
+            BuildFailed(
+              build_beam.CompileFailed(["chunking produced no output modules"]),
+            ),
+          )
+        Ok([#(name, beam), ..extras]) -> {
+          // Load the helper chunks first so the entry's cross-chunk `call`s resolve.
+          list.each(extras, fn(nb) {
+            let _ =
+              build_beam.load_module(atom.create(nb.0), "carder_cli", nb.1)
+            Nil
+          })
+          case instantiate(beam, name) {
+            Error(reason) -> Ok(classify_run_error(reason))
+            Ok(proc) -> {
+              let result = invoke_instance(proc, export, args)
+              stop_instance(proc)
+              Ok(result)
+            }
+          }
+        }
+      }
   }
+}
+
+/// Invoke `export(args)` inside `proc` and return its **two-value** result package — the shape
+/// `emit_core` emits for an export whose result arity is ≥ 2 (R17). `invoke_instance` returns a
+/// single value and cannot express it.
+///
+/// A frontend needs this when its source language's calling convention returns a pair — e.g. a
+/// Porffor-compiled JS entry returns `(f64, i32)`: the value and its type tag.
+///
+/// - `proc`: the live instance. `export`: the exported function name. `args`: raw bit patterns.
+/// - Return: `Ok(#(first, second))` on a normal return, or `Error(rendered_reason)` if the call
+///   raised (pass it through `classify_run_error` to split trap vs uncaught exception). Total.
+pub fn invoke_instance_pair(
+  proc: InstanceProc,
+  export: String,
+  args: List(Int),
+) -> Result(#(Int, Int), String) {
+  let InstanceProc(pid) = proc
+  ffi_call_instance_pair(pid, atom.create(export), args)
+}
+
+/// Drain `proc`'s accumulated **host output** — the exact byte stream this instance's
+/// `print`-style host handlers appended via `rt_host.append_output`, including any ANSI escapes
+/// (in-band).
+///
+/// The buffer is process-local to the instance's owned process (E1), so this routes a call INTO
+/// that process to collect it. **Order matters:** drain AFTER the invoke and BEFORE
+/// `stop_instance`, so partial output written before a trap is still captured.
+///
+/// - `proc`: the live instance.
+/// - Return: the captured bytes, or `<<>>` for an instance that never printed. Total.
+pub fn host_output(proc: InstanceProc) -> BitArray {
+  let InstanceProc(pid) = proc
+  ffi_host_output(pid)
 }

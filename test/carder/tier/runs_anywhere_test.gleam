@@ -28,14 +28,21 @@
 //// (fail-closed, memory-safe by construction). The grep is over emitted text, so it is exhaustive
 //// for the module BOUNDARY a portable instance crosses.
 
+import carder/harness/driver
 import carder/pipeline
 import carder/tier/combos
 
-/// Compile corpus `name` to `.core` text under `binding` (the artifact the grep audits). The
-/// portable build links only pure-BEAM `carder@runtime@*` modules; the grep sees every one.
+/// Compile corpus `name` to `.core` text under `combo`'s binding (the artifact the grep audits).
+/// The portable build links only pure-BEAM `carder@runtime@*` modules; the grep sees every one.
+///
+/// The corpus fixture is `.ir` SOURCE TEXT (the wasm frontend moved to `scribbler`; each `.ir` was
+/// generated from the corresponding `.wasm` by the pre-split `to-ir` and is byte-equivalent input),
+/// so the front half is `driver.parse` (UTF-8 decode + `pipeline.parse_ir`). Everything the grep
+/// audits — `ir_to_core` under the composed `Binding` — is unchanged: the emitted `.core` is the
+/// same text the `.wasm` path produced.
 fn core_of(name: String, combo: combos.Combo) -> String {
-  let assert Ok(bytes) = combos.read_wasm(name)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let assert Ok(bytes) = combos.read_ir(name)
+  let assert Ok(m) = driver.parse(bytes)
   let assert Ok(core) = pipeline.ir_to_core(m, combos.binding_for(combo))
   core
 }

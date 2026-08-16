@@ -6,7 +6,14 @@
 > built the lever — the tier-O `atomics` O(1) memory backend (unit 04) — and this report re-measures
 > the **same** committed kernels with that lever engaged. It reports, **measured, with no hero
 > number**, whether `atomics` closes the gap and by how much. Reproduce with
-> `./smoke/bench.sh [REPEAT] [CAP] [COMPILE_TIMEOUT_SECS]` (defaults `100 1024 300`).
+> `./smoke/bench.sh [REPEAT] [CAP] [COMPILE_TIMEOUT_SECS]` (defaults `100 1024 300`) — **run from the
+> scribbler repo**: the harness is a wasm differential (it cargo-builds the Rust crate to wasm, gates
+> it import-free/MVP-only with `wasm-tools`, and cross-checks against `wasmtime`), so it moved with the
+> WebAssembly frontend and now drives scribbler's `build` verb (it was `to-beam-wasm` when these
+> numbers were taken) plus carder's `exec -n` for the timing; the tier-N `.so` is still compiled out of
+> band from carder's `c_src/carder_rt_mem_nif.c`, which — with carder as a Gleam dependency — is
+> unpacked at `build/packages/carder/c_src/`. **Reproduction is cross-repo now** — the measurements
+> below are carder's record, the harness that produced them is scribbler's.
 >
 > **The measured verdict, up front:** `atomics` **closes roughly half to two-thirds of the paged
 > gap** (2.3× on load-heavy CRC-32, 2.6× on SHA-256, 2.9× on store-heavy DEFLATE — the store-intensity

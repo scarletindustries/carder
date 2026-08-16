@@ -144,12 +144,12 @@ pub fn mangle_injective(closure_modules: List(String)) -> Bool {
 /// `rt_stdlib`/`rt_state`, minus the JS-only `rt_js`), the tier-P/O memory/table impls
 /// (`rt_mem`/`rt_mem_atomics`; `rt_table`/`rt_table_ets`/`rt_table_atomics` — `rt_mem_nif` is tier-N,
 /// excluded), and the 4 fixed atoms `emit_core` reaches without a `Binding` field
-/// (`rt_ref`/`link`/`rt_simd`/`rt_exn`). `porffor_abi` is reached transitively (via `rt_host`) and so
-/// is a member of `frozen_runtime_closure/0` but NOT a root.
+/// (`rt_ref`/`link`/`rt_simd`/`rt_exn`).
 ///
-/// Returns the 16 fully-mangled `carder@runtime@*` module atom strings, sorted. `rt_teavm` (the
-/// TeaVM WASM GC host runtime, experimental) is reachable because `link.resolve_func_provided`
-/// routes TeaVM host imports to it.
+/// Returns the 15 fully-mangled `carder@runtime@*` module atom strings, sorted. No producer-specific
+/// host runtime appears: a frontend's host namespaces (a TeaVM guest's `teavmJso`, a Porffor guest's
+/// `""` intrinsics, the spec suite's `spectest`) are supplied as `link.Provider`s from the frontend's
+/// own package, so they are never reachable from a generated carder module.
 pub fn frozen_runtime_roots() -> List(String) {
   sorted([
     "carder@runtime@link", "carder@runtime@rt_exn", "carder@runtime@rt_host",
@@ -158,22 +158,23 @@ pub fn frozen_runtime_roots() -> List(String) {
     "carder@runtime@rt_simd", "carder@runtime@rt_state",
     "carder@runtime@rt_stdlib", "carder@runtime@rt_table",
     "carder@runtime@rt_table_atomics", "carder@runtime@rt_table_ets",
-    "carder@runtime@rt_teavm", "carder@runtime@rt_trap",
+    "carder@runtime@rt_trap",
   ])
 }
 
 /// The tier-P/O `carder@runtime@*` modules in the closure — a frozen snapshot the drift test diffs
 /// against (R8/R15).
 ///
-/// This is `frozen_runtime_roots/0` plus `carder@runtime@porffor_abi` (reached via `rt_host`). The
-/// JS runtime (`rt_js`) and its FFI are EXCLUDED — they are only reachable via `CallHost("js", …)`,
-/// which the WASM `--link` path never emits (and import-bearing modules are rejected, R14). `rt_bif`
-/// is EXCLUDED — it is a build-time gate consulted by `ir_lower`, not a runtime call target.
-/// `rt_mem_nif` is EXCLUDED — tier-N. `instance`/`profiles` are EXCLUDED — build-time only.
+/// This is exactly `frozen_runtime_roots/0` — the roots pull in no further `carder@runtime@*`
+/// module. The JS runtime (`rt_js`) and its FFI are EXCLUDED — they are only reachable via
+/// `CallHost("js", …)`, which the `--link` path never emits (and import-bearing modules are
+/// rejected, R14). `rt_bif` is EXCLUDED — it is a build-time gate consulted by `ir_lower`, not a
+/// runtime call target. `rt_mem_nif` is EXCLUDED — tier-N. `instance`/`profiles` are EXCLUDED —
+/// build-time only.
 ///
-/// Returns 16 fully-mangled module atom strings, sorted.
+/// Returns 15 fully-mangled module atom strings, sorted.
 pub fn frozen_runtime_closure() -> List(String) {
-  sorted(["carder@runtime@porffor_abi", ..frozen_runtime_roots()])
+  frozen_runtime_roots()
 }
 
 /// The reachable `gleam@*` package modules in the closure — a frozen snapshot (R8/R15).
@@ -211,7 +212,7 @@ pub fn frozen_ffi_erl() -> List(String) {
 /// Every in-closure module atom (runtime ∪ gleam ∪ FFI) — the union the linker merges, and the
 /// domain over which `mangle_injective/1` must hold.
 ///
-/// Returns 35 module atom strings (16 runtime + 12 gleam + 7 FFI), sorted, no duplicates.
+/// Returns 34 module atom strings (15 runtime + 12 gleam + 7 FFI), sorted, no duplicates.
 pub fn frozen_closure_modules() -> List(String) {
   sorted(
     list.flatten([

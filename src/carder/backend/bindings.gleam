@@ -2,7 +2,7 @@
 //// `emit_<lang>(describe(module, binding))` → write the `.beam` + the companion binding source
 //// files into `--out`, deterministically.
 ////
-//// This is the driver behind the `to-beam-wasm --bindings <langs> --out <dir>` CLI surface. It
+//// This is the driver behind the `to-beam|build --bindings <langs> --out <dir>` CLI surface. It
 //// treats each `emit_<lang>` (P12-02/03/04) as a black box returning `List(GeneratedFile)` and the
 //// `iface.describe` gate as the single fail-closed check — it never re-derives from the IR.
 ////

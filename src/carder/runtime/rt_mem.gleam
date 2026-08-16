@@ -85,6 +85,18 @@ pub const page_bytes: Int = 65_536
 /// (`4 GiB`). `grow` enforces this regardless of the declared/Safe max.
 pub const hard_max_pages: Int = 65_536
 
+/// The **spec/architectural** page cap on a 64-bit (memory64) linear memory: `2^48` pages. A
+/// 64-bit linear memory addresses `2^64` bytes; dividing by the 64 KiB (`2^16`) page size gives
+/// `2^48` pages (the memory64 proposal's limit range for an `i64`-indexed memory). A `memory`
+/// whose declared `min`/`max` exceeds this is INVALID and a frontend must reject it.
+///
+/// This is the ceiling the SOURCE-LANGUAGE validator enforces; `mem64_hard_max_pages` below is
+/// carder's stricter RUNTIME cap (`2^32` pages), and the two must never cross —
+/// `mem64_hard_max_pages <= mem64_spec_page_limit` is the invariant that keeps a runtime-capped
+/// memory a subset of a spec-valid one. It lives here (not in a frontend) so both sides read one
+/// definition; a frontend imports it for its own limits check.
+pub const mem64_spec_page_limit: Int = 281_474_976_710_656
+
 /// The documented RUNTIME page cap for a 64-bit (`Idx64`) memory (memory64, S9/§C): `2^32` pages
 /// = `2^48` bytes = **256 TiB**. The i64 analogue of `hard_max_pages` (the frozen 32-bit cap).
 ///
@@ -94,9 +106,9 @@ pub const hard_max_pages: Int = 65_536
 /// beyond the current size traps `MemoryOutOfBounds`. Cited (§C) against the spec's grow-may-fail
 /// licence (`exec/instructions`, `memory.grow` "failure can occur … depending on the resources
 /// available to the embedder") + the 48-bit hardware VA ceiling; strictly BELOW the spec's
-/// `2^48`-PAGE type-level maximum (validate's `memory64_page_limit = 281_474_976_710_656`), which
+/// `2^48`-PAGE type-level maximum (`mem64_spec_page_limit = 281_474_976_710_656` above), which
 /// governs what a `(memory i64 …)` may DECLARE. Invariant: `hard_max_pages (65_536) <
-/// mem64_hard_max_pages <= validate.memory64_page_limit`. Tunable per deployment via
+/// mem64_hard_max_pages <= mem64_spec_page_limit`. Tunable per deployment via
 /// `Binding.mem64_max_pages` (single-sourced to this value in `safe_default`).
 pub const mem64_hard_max_pages: Int = 4_294_967_296
 

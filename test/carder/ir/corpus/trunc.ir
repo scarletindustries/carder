@@ -1,0 +1,10 @@
+module @carder@wasm@trunc_s {
+  numerics true
+  memory none
+  export "trunc_s" = @f0
+  func @f0 (%p0:f32) -> (i32) {
+    let (%v1) = convert trunc_s.f32.i32 %p0
+    values (%v1)
+  }
+}
+

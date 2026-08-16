@@ -1,0 +1,22 @@
+module @carder@wasm@run {
+  numerics true
+  memory none
+  tag @tag0 (i32)
+  export "run" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v6) = try (i32) {
+      let (%v2) = num i.ne.32 (%p0, i32.const 0)
+      let () = if %v2 : () {
+        throw @tag0 (%p0)
+      } else {
+        values ()
+      }
+      values (i32.const 7)
+    } catch @tag0 (%v4) {
+      let (%v5) = num i.add.32 (%v4, i32.const 1)
+      values (%v5)
+    }
+    values (%v6)
+  }
+}
+

@@ -7,6 +7,11 @@ on:
       - main
   pull_request:
 
+# carder is the compiler BACKEND: its input is the shared IR, never a source language. So this
+# workflow needs NO source-toolchain machinery at all — no wabt, no wast2json, no vendored
+# WebAssembly spec suite. That absence is the PROOF the frontend extraction was clean: if
+# `gleam test` ever needs one of those again, something wasm-shaped has leaked back in.
+# The WebAssembly spec suite lives in the scribbler repo, which runs it against this package.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,53 +20,22 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "29"
-          gleam-version: "1.17.0"
+          gleam-version: "1.16.0"
           rebar3-version: "3"
-          # elixir-version: "1"
-
-      # --- WASM spec-suite toolchain --------------------------------------------
-      # The conformance runner (test/carder/conformance) drives the official
-      # WebAssembly spec-suite through the compiler. The full fixture set is
-      # gitignored and regenerated from a PINNED testsuite revision by vendor.sh,
-      # which needs wabt (wat2wasm / wast2json / spectest-interp). Versions live in
-      # test/carder/conformance/vendor/PIN so this stays the single source of truth.
-      - name: Read pinned toolchain versions
-        id: pin
-        run: |
-          PIN=test/carder/conformance/vendor/PIN
-          echo "wabt=$(sed -n 's/^WABT_VERSION=//p' "$PIN")"        >> "$GITHUB_OUTPUT"
-          echo "sha=$(sed -n 's/^TESTSUITE_SHA=//p' "$PIN")"        >> "$GITHUB_OUTPUT"
-
-      - name: Install wabt (pinned)
-        run: |
-          v="${{ steps.pin.outputs.wabt }}"
-          url="https://github.com/WebAssembly/wabt/releases/download/${v}/wabt-${v}-linux-x64.tar.gz"
-          curl -fsSL "$url" -o /tmp/wabt.tar.gz
-          mkdir -p /tmp/wabt
-          tar -xzf /tmp/wabt.tar.gz -C /tmp/wabt --strip-components=1
-          echo "/tmp/wabt/bin" >> "$GITHUB_PATH"
-
-      - name: Verify wabt is on PATH
-        run: |
-          wat2wasm --version
-          command -v wast2json
-          command -v spectest-interp
-
-      # Cache the cloned testsuite by its pinned SHA so we don't re-clone every run.
-      - name: Cache vendored testsuite clone
-        uses: actions/cache@v4
-        with:
-          path: build/conformance-vendor
-          key: wasm-testsuite-${{ steps.pin.outputs.sha }}
 
       - run: gleam deps download
-
-      # Regenerate the FULL allowlisted spec-suite fixtures (gitignored locally), so
-      # `gleam test` runs the whole conformance allowlist rather than only the small
-      # committed subset. The runner gate is: zero genuine FAILS (skips are expected
-      # and reported for constructs beyond the current frontend slice).
-      - name: Vendor WASM spec-suite fixtures (full allowlist)
-        run: bash test/carder/conformance/vendor/vendor.sh
-
       - run: gleam test
       - run: gleam format --check src test
+
+      # Every Erlang FFI module in this package must carry the `carder_` prefix. BEAM module
+      # names are one flat global atom namespace with no package scoping, so if a downstream
+      # package (scribbler, arc) ships an .erl with the same module atom, one silently shadows
+      # the other — NO compiler error and NO warning. This grep is the only defense.
+      - name: FFI module atoms are package-prefixed
+        run: |
+          bad=$(ls src/*.erl test/*.erl 2>/dev/null | xargs -n1 basename | grep -v '^carder_' || true)
+          if [ -n "$bad" ]; then
+            echo "unprefixed .erl module(s) — they can silently shadow a dependency's:"
+            echo "$bad"
+            exit 1
+          fi

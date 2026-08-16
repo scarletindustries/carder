@@ -9,42 +9,55 @@
 //// instantiates in its own owned process (E1), which seeds that instance's runtime policy.
 ////
 //// Two dimensions, at the profile boundary:
-////   - STATE isolation, at corpus scale: two instances of the REAL `iso.wasm` corpus module
+////   - STATE isolation, at corpus scale: two instances of the REAL `iso` corpus module
 ////     (linear memory + a mutable global), one Safe / one Unsafe, on one node — a `global.set` +
 ////     `i32.store` in one is INVISIBLE to the other, and each still sees its own writes. This
 ////     reuses `corpus_test.cross_instance_isolation_test`'s pattern, but ACROSS profiles.
 ////   - CAPABILITY isolation: the Safe instance's `HostDenyAll` still REJECTS a host import while
 ////     an `HostOpen` Unsafe instance ADMITS the same import on the same node — the policy lives on
 ////     the instance (host policy seeded per instance at instantiation), never in ambient node
-////     state (D3a/D9). `iso.wasm` is import-free, so this is asserted with a hand-built
+////     state (D3a/D9). `iso.ir` is import-free, so this is asserted with a hand-built
 ////     host-import fixture (mirroring `acceptance_test`), run under each profile.
 ////
 //// Unit 10's `linker_coexist_test` proves the same for a hand-built stateful module; this
 //// capstone confirms it at CORPUS scale and adds the capability-isolation dimension.
+////
+//// ## Corpus input: `.ir` TEXT, not a `.wasm` binary
+////
+//// carder is now the BACKEND only — the WebAssembly frontend moved to the `scribbler` repo — so
+//// the corpus program enters through `pipeline.parse_ir` over `test/carder/ir/corpus/iso.ir`
+//// instead of `source_to_ir` over `iso.wasm`. That `.ir` was produced from the very same
+//// `iso.wasm` by the pre-split `to-ir`, and `wasm -> .beam` was measured byte-identical to
+//// `wasm -> .ir text -> .beam`, so this capstone still drives the exact same compiled artifact
+//// and proves exactly what it proved before.
 
 import carder/backend/build_beam
-import carder/conformance/ffi
+import carder/harness/ffi
 import carder/ir
 import carder/pipeline
 import carder/runtime/instance.{type Binding}
 import carder/runtime/profiles
+import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/int
 import gleam/option
+import gleam/result
 import gleam/string
 
-// ─────────────────────────── state isolation (real iso.wasm, across profiles) ───────────────────────────
+/// The `.ir` corpus directory — the frontend-independent text form of the Phase-1/2 acceptance
+/// corpus (`iso.ir` here). See the module doc for why this replaced the `.wasm` corpus.
+const corpus_dir = "test/carder/ir/corpus"
 
-/// STATE ISOLATION at corpus scale (F4/B3). The real `iso.wasm` corpus module — linear memory +
+// ─────────────────────────── state isolation (real iso.ir corpus, across profiles) ───────────────────────────
+
+/// STATE ISOLATION at corpus scale (F4/B3). The real `iso` corpus module — linear memory +
 /// a mutable global — compiled twice from ONE source: under `profiles.safe()` (name `base`) and
 /// `profiles.unsafe()` (name `base_unsafe`, via `coexist_name`). Both load and instantiate on one
 /// node, each in its own owned process, alive together. A `global.set` + `i32.store` in the Safe
 /// instance is INVISIBLE to the Unsafe instance and vice versa (disjoint per-process cells), and
 /// each still sees its own writes.
 pub fn safe_unsafe_iso_state_coexist_test() {
-  let assert Ok(bytes) =
-    ffi.read_file("test/carder/conformance/corpus/iso.wasm")
-  let assert Ok(m0) = pipeline.source_to_ir(bytes)
+  let m0 = read_ir("iso")
   let base = m0.name <> "_" <> int.to_string(ffi.unique_int())
   let safe_name = profiles.coexist_name(base, profiles.safe())
   let unsafe_name = profiles.coexist_name(base, profiles.unsafe())
@@ -162,7 +175,24 @@ fn compile_load(m: ir.Module, binding: Binding) -> Atom {
   mod
 }
 
-/// Compile the frontend-lowered `m0` under `binding` after renaming it to `name` (its output
+/// Parse `ir/corpus/<name>.ir` into the `ir.Module` it denotes.
+///
+/// - `name`: a corpus program's base name (no extension), e.g. `"iso"`.
+/// - Returns the parsed module. `let assert Ok` is the contract: a missing/non-UTF-8/unparseable
+///   corpus file is a broken checkout, not an expected path, so it fails the test loudly.
+fn read_ir(name: String) -> ir.Module {
+  let assert Ok(m) = {
+    use bytes <- result.try(ffi.read_file(corpus_dir <> "/" <> name <> ".ir"))
+    use text <- result.try(
+      bit_array.to_string(bytes)
+      |> result.replace_error("non-UTF8 .ir source"),
+    )
+    pipeline.parse_ir(text) |> result.map_error(string.inspect)
+  }
+  m
+}
+
+/// Compile the parsed corpus module `m0` under `binding` after renaming it to `name` (its output
 /// atom), and LOAD it. Used to give one source's Safe and Unsafe builds distinct coexisting atoms.
 fn load_named(m0: ir.Module, name: String, binding: Binding) -> Atom {
   compile_load(ir.Module(..m0, name: name), binding)

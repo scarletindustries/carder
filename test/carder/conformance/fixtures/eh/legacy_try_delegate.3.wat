@@ -1,1 +1,0 @@
-(module (func (try (do) (catch_all) (delegate 0))))

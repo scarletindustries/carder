@@ -1,6 +1,7 @@
 # `--bindings` — typed host-language bindings (Gleam / Erlang / Elixir)
 
-> Phase 12 reference. `--bindings` is an optional flag on `to-beam-wasm` that, alongside the compiled
+> Phase 12 reference. `--bindings` is an optional flag on the **build** verb (`to-beam`/`build`
+> in carder, `build` in a frontend such as scribbler) that, alongside the compiled
 > `.beam`, emits **companion typed host-language source files** — a `.gleam`, an `.erl`, and/or an
 > `.ex` — giving an ergonomic, native-typed API to instantiate the module and call its exports. The
 > `.beam` itself is **unchanged**; the bindings are companions. The default (no-`--bindings`) output
@@ -16,7 +17,10 @@ conversion glue**: `Int`/`Float`/`BitArray`, traps as a `Result`/tagged tuple, o
 export — the "beautiful `.gleam` file with the exports typed for me."
 
 ```
-to-beam-wasm --threaded --bindings gleam --out ./out math.wasm
+# carder (IR in):
+to-beam --threaded --bindings gleam --out ./out math.ir
+# scribbler (wasm in) — the same flags, passed straight through to carder:
+build   --threaded --bindings gleam --out ./out math.wasm
 # → ./out/carder@wasm@<base>.beam                     (the compiled module, unchanged)
 #   ./out/carder_wasm_<base>_bindings.gleam           (the typed API)
 #   ./out/carder_wasm_<base>_bindings_ffi.erl         (the trap catch-shim, Gleam only)

@@ -23,7 +23,8 @@
 //// <https://webassembly.github.io/spec/core/exec/instructions.html>.
 
 import carder/backend/build_beam
-import carder/conformance/ffi
+import carder/harness/driver
+import carder/harness/ffi
 import carder/ir
 import carder/pipeline
 import carder/runtime/instance.{type Binding, Binding}
@@ -35,9 +36,14 @@ import gleam/int
 /// BEAM module atom (a process-unique name per call so repeated loads never clobber). Drive the
 /// loaded module via `ffi.start_instance`, which self-detects the state strategy from
 /// `instantiate/0`'s return (`InstanceState` record → the threaded loop).
+///
+/// The corpus fixture is `.ir` SOURCE TEXT (the wasm frontend moved to `scribbler`), so the front
+/// half is `driver.parse` (UTF-8 decode + `pipeline.parse_ir`); the measured half —
+/// `ir_to_cmod(_, binding)` → `compile_and_load` → the run ABI — is unchanged, and each `.ir` was
+/// measured to produce the byte-identical `.beam` its `.wasm` did.
 fn compile_load(name: String, binding: Binding) -> atom.Atom {
-  let assert Ok(bytes) = combos.read_wasm(name)
-  let assert Ok(m0) = pipeline.source_to_ir(bytes)
+  let assert Ok(bytes) = combos.read_ir(name)
+  let assert Ok(m0) = driver.parse(bytes)
   let m =
     ir.Module(..m0, name: m0.name <> "_" <> int.to_string(ffi.unique_int()))
   let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)

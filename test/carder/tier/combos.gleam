@@ -13,15 +13,15 @@
 //// <https://webassembly.github.io/spec/core/exec/numerics.html>, bounds/traps
 //// <https://webassembly.github.io/spec/core/exec/instructions.html>).
 
-import carder/conformance/corpus.{
+import carder/harness/corpus.{
   type Expect, InstantiateTraps, Rejects, Returns, Traps,
 }
-import carder/conformance/ffi
-import carder/conformance/fixture.{
+import carder/harness/ffi
+import carder/harness/fixture.{
   type SpecValue, F32Bits, F32Nan, F64Bits, F64Nan, I32Val, I64Val,
 }
-import carder/conformance/oracle
-import carder/conformance/runner.{
+import carder/harness/oracle
+import carder/harness/runner.{
   type Driver, type Instance, DriverError, ImportEnv, Returned, Trapped,
   provider_from_instance,
 }
@@ -37,10 +37,17 @@ import gleam/list
 import gleam/result
 import gleam/string
 
-/// The absolute path of the shared acceptance corpus (the spec-`.expected`-bearing
-/// `corpus/*.wat` Phase-1/2 authored). This suite drives the SAME corpus every acceptance /
-/// Phase-3 differential drives — held fixed, varied only over the tier axes.
-pub const corpus_dir = "test/carder/conformance/corpus"
+/// The repo-relative path of the shared acceptance corpus — the spec-`.expected`-bearing programs
+/// Phase-1/2 authored, now checked in as `.ir` SOURCE TEXT (`corpus/*.ir`) plus their verbatim
+/// `corpus/*.expected` oracles. This suite drives the SAME corpus every acceptance / Phase-3
+/// differential drives — held fixed, varied only over the tier axes.
+///
+/// **Provenance (the frontend split).** Each `.ir` was generated from the corresponding `.wasm`
+/// by the pre-split `carder to-ir`, and `wasm → .beam` was MEASURED byte-identical to
+/// `wasm → .ir text → .beam` for all 32 corpus programs — so driving the `.ir` drives the exact
+/// same artifact the `.wasm` used to. The `.expected` files were always frontend-independent
+/// (export name + raw bit-pattern args/results + spec trap phrase) and are reused unchanged.
+pub const corpus_dir = "test/carder/ir/corpus"
 
 /// The Phase-1+2 acceptance-corpus programs that carry a spec-sourced `.expected` (the value
 /// oracle). `growcap`/`iso`/`memloop` are excluded — they have no `.expected` and are driven by
@@ -274,7 +281,7 @@ pub type Outcome {
 ///   `.expected`). Total — never panics; a compile-stage rejection of a value program is itself a
 ///   recorded `Outcome` + failure, so a combo that fails to build shows up in BOTH checks.
 pub fn evaluate(d: Driver, name: String) -> #(List(Outcome), List(String)) {
-  let assert Ok(bytes) = read_wasm(name)
+  let assert Ok(bytes) = read_ir(name)
   let assert Ok(text) = read_expected(name)
   let assert Ok(expects) = corpus.parse(text)
 
@@ -323,14 +330,15 @@ pub fn evaluate(d: Driver, name: String) -> #(List(Outcome), List(String)) {
 /// but supplies the `(register)`ed provider an imported funcref needs:
 ///   1. instantiate the provider from `provider_bytes` (`d.instantiate`),
 ///   2. publish its exports as a cross-module capability (`runner.provider_from_instance`),
-///   3. instantiate the `importer` corpus `.wasm` WITH that provider
+///   3. instantiate the `importer` corpus `.ir` WITH that provider
 ///      (`d.instantiate_env(bytes, ImportEnv([provider]))` — the provider-carrying seam),
 ///   4. reduce every `.expected` point through the SAME `run_point` machinery `evaluate` uses.
 ///
 /// - `d`: a `Driver` bound to one `Combo` (via `driver.pipeline_with(binding_for(combo))`).
 /// - `provider_name`: the link-name to `(register)` the provider under (e.g. `"a"`).
-/// - `provider_bytes`: the provider module's `.wasm` bytes.
-/// - `importer`: the corpus program stem whose `.wasm`/`.expected` are read (e.g. `"xlink"`).
+/// - `provider_bytes`: the provider module's `.ir` SOURCE TEXT as bytes (a `Driver` parses its
+///   `BitArray` as UTF-8 `.ir`, never as a wasm binary).
+/// - `importer`: the corpus program stem whose `.ir`/`.expected` are read (e.g. `"xlink"`).
 /// - Returns `#(outcomes, failures)`: one `Outcome` per `.expected` point (the input to
 ///   `identity_across`) and the spec-correctness violations at THIS combo (empty ⇒ all matched). A
 ///   provider- or importer-instantiation failure is itself a recorded `Rejected` outcome + failure
@@ -341,7 +349,7 @@ pub fn evaluate_linked(
   provider_bytes: BitArray,
   importer: String,
 ) -> #(List(Outcome), List(String)) {
-  let assert Ok(importer_bytes) = read_wasm(importer)
+  let assert Ok(importer_bytes) = read_ir(importer)
   let assert Ok(text) = read_expected(importer)
   let assert Ok(expects) = corpus.parse(text)
 
@@ -495,9 +503,15 @@ pub fn raw_of(v: SpecValue) -> Int {
 
 // ─────────────────────────────── fixture IO ───────────────────────────────
 
-/// Read a corpus program's `.wasm` bytes. `Ok(bytes)` / `Error(posix_reason)`.
-pub fn read_wasm(name: String) -> Result(BitArray, String) {
-  ffi.read_file(corpus_dir <> "/" <> name <> ".wasm")
+/// Read a corpus program's `.ir` SOURCE TEXT as raw bytes — the artifact a `runner.Driver`
+/// consumes (a `Driver`'s `BitArray` is UTF-8 `.ir` text, not a wasm binary; see
+/// `carder/harness/driver`'s module doc).
+///
+/// - `name`: a corpus program stem (e.g. `"mem"`), resolved as `corpus_dir <> "/" <> name <> ".ir"`.
+/// - Returns `Ok(bytes)` — the file's bytes, handed straight to `d.instantiate` /
+///   `d.instantiate_env` — or `Error(posix_reason)` if the fixture is missing/unreadable.
+pub fn read_ir(name: String) -> Result(BitArray, String) {
+  ffi.read_file(corpus_dir <> "/" <> name <> ".ir")
 }
 
 /// Read a corpus program's `.expected` text. `Ok(text)` / `Error(reason)`.

@@ -1,0 +1,27 @@
+module @carder@wasm@rethrow {
+  numerics true
+  memory none
+  tag @tag0 (i32)
+  export "rethrow" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v8) = block $lbl1 : (i32) {
+      let () = try () {
+        let (%v7) = block $lbl4 : (exnref) {
+          let () = try () {
+            throw @tag0 (%p0)
+          } catch_all () ref %v5 {
+            break $lbl4 (%v5)
+          }
+          trap unreachable
+        }
+        throw_ref %v7
+      } catch @tag0 (%v2) {
+        break $lbl1 (%v2)
+      }
+      trap unreachable
+    }
+    let (%v9) = num i.add.32 (%v8, i32.const 1000)
+    values (%v9)
+  }
+}
+

@@ -1,0 +1,26 @@
+module @carder@wasm@store_b {
+  numerics true
+  memory (min 1)
+  memory (min 1)
+  export "store_b" = @f0
+  export "load_a" = @f1
+  export "load_b" = @f2
+  export "copy_b_to_a" = @f3
+  func @f0 (%p0:i32, %p1:i32) -> () {
+    let () = mem.store 4 %p0 %p1 offset=0 mem=1
+    values ()
+  }
+  func @f1 (%p0:i32) -> (i32) {
+    let (%v1) = mem.load i32 4 %p0 offset=0
+    values (%v1)
+  }
+  func @f2 (%p0:i32) -> (i32) {
+    let (%v1) = mem.load i32 4 %p0 offset=0 mem=1
+    values (%v1)
+  }
+  func @f3 (%p0:i32, %p1:i32, %p2:i32) -> () {
+    let () = mem.copy %p0 %p1 %p2 src_mem=1
+    values ()
+  }
+}
+

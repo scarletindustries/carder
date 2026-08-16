@@ -3,18 +3,26 @@
 > The repeatable recipe that got this project to Phase 10. Ten phases were built this way; it works.
 > Follow it. This is the "how we work" reference — read it before scoping anything new.
 >
+> **Scope note (post-split):** this repo is carder, the compiler **backend** — shared IR, middle-end,
+> Core Erlang codegen + linking, the BEAM runtime, the embedder API, the CLI vocabulary. The
+> WebAssembly frontend and the official spec-test conformance suite now live in the **scribbler**
+> repo, which keeps its own copy of this file. §§0–7 (the process) are identical in both; §§8–10
+> (invariants, Definition of Done, differentials) are repo-specific — these are carder's.
+>
 > Companions: [`00-high-level.md`](00-high-level.md) (the vision every phase serves),
 > [`01-status.md`](01-status.md) (what's built), [`02-roadmap.md`](02-roadmap.md) (what to build next),
-> [`state.md`](state.md) (the live ledger you update as you go).
+> [`state.md`](state.md) (the live ledger you update as you go),
+> [`FRONTEND-API.md`](FRONTEND-API.md) (the public contract every frontend compiles against).
 
 ---
 
 ## 0. The shape of a phase
 
-A **phase** is one coherent capability increment (a WASM surface, a runtime tier, an optimizer family).
-It is decomposed into numbered **units**, each single-owner and independently committable. Unit **01 is
-always the keystone** (freezes the interfaces); the **last unit is always the capstone** (proves the
-phase). Everything between builds in parallel behind the frozen interfaces.
+A **phase** is one coherent capability increment (a runtime tier, an optimizer family, a codegen or
+linking surface). It is decomposed into numbered **units**, each single-owner and independently
+committable. Unit **01 is always the keystone** (freezes the interfaces); the **last unit is always
+the capstone** (proves the phase). Everything between builds in parallel behind the frozen
+interfaces.
 
 ```
 overview + decisions ─▶ scoping fan-out ─▶ adversarial critique ─▶ reconcile
@@ -35,7 +43,7 @@ phase, so the keystone must freeze the *whole* surface (all trap reasons, all no
 
 1. **Author the overview** (`00-overview.md` in the phase's working area) to the fixed skeleton in §2.
    Open by restating that **all prior-phase decisions still hold** and cite the running baseline (test
-   count / 0 warnings / conformance triple).
+   count / 0 warnings / defaults byte-identical).
 2. **Scoping fan-out.** Multiple scoping agents propose/refine the unit split from the overview's
    proposed dependency DAG. The overview flags open seams for them to sanity-check (is `emit_core`
    single-agent-sized? does this feature belong in unit 08 or get cut?).
@@ -54,10 +62,10 @@ phase, so the keystone must freeze the *whole* surface (all trap reasons, all no
    green + committable, and updates `state.md` with what it leaves.
 7. **Close with the capstone** (§5). The only unit that edits the single wiring/registration point. It
    runs the corpus-wide differential across every `(mode × state_strategy × mem_tier)`, satisfies the
-   §1 acceptance table, refreshes the conformance image, and produces the measured benchmark.
+   §1 acceptance table, and produces the measured benchmark.
 
-Throughout, the manager QA-gates every unit (format / build / test + conformance `fail=0` + a spec-DoD
-read) before commit + push to `main`.
+Throughout, the manager QA-gates every unit (format / build / test + the corpus differential + a
+spec-DoD read) before commit + push to `main`.
 
 ---
 
@@ -90,12 +98,16 @@ Single-owner, goes **first and alone**. It:
 - **Makes the deliberate, documented cross-file reaches** needed to compile. This is necessary because
   **Gleam has no default field values** — extending `Binding` or a `TrapReason` breaks every
   constructor and every exhaustive match. The keystone updates
-  `instance.gleam`/`profiles.gleam`/`rt_trap.gleam`/`printer`/`parser`/etc. so the tree compiles, and
-  records every reach in `state.md`.
+  `instance.gleam`/`profiles.gleam`/`rt_trap.gleam`/`ir/printer`/`ir/parser`/`cli.gleam`/etc. so the
+  tree compiles, and records every reach in `state.md`.
 - **Lands green with the pipeline still identity** and defaults chosen so **every prior module is
   byte-identical**. Nothing is unsound until a later unit proves the guard.
 - Ships a dedicated freeze test module (e.g. `ir3_freeze_test` / `eh_freeze_test` / `tier_freeze_test`)
   — small spec-tests that the new axes are expressible and the defaults are fail-closed.
+- **Widens the frontend contract, if it widens at all, in one place.** A new IR node / `Binding` field /
+  `Provider` variant is a change to [`FRONTEND-API.md`](FRONTEND-API.md) and must be additive and
+  default-off, so every existing frontend (scribbler, arc) keeps compiling and keeps its current
+  output byte-identical.
 
 **Why first & alone:** an unsound oracle or a missing variant makes every downstream unit unsound; and
 publishing the stable signatures is what lets the parallel units + `emit_core` build without racing on
@@ -106,8 +118,8 @@ names.
 ## 4. The units (02 … N-1)
 
 - **Single-owner** (D1). Additive changes only. Needs only the frozen *signatures* of its dependencies,
-  **not** their bodies — e.g. `emit_core` is built in parallel with the runtime bodies; `validate`
-  gates on the day-1 published AST stub.
+  **not** their bodies — e.g. `emit_core` is built in parallel with the runtime bodies; a new pass
+  gates on the day-1 published IR variant.
 - **Does not touch the single pipeline/registration point** — that's the capstone's job. This is what
   keeps units independently committable without merge races.
 - Ships its code **plus isolated, adversarial fixtures** — including "must-NOT-do-this" fixtures for
@@ -122,15 +134,21 @@ names.
 
 - The **only** unit that edits the single wiring/registration point: `ir_opt.pipeline/1` for optimizer
   phases (append new passes to the **Baseline** arm so **Aggressive inherits them as a strict
-  superset**), or the run-ABI / conformance Driver / profile linker for surface phases.
+  superset**), or the run-ABI / `carder/cli` vocabulary / profile linker for surface phases.
 - **Proves the phase** by owning the §1 acceptance table: the corpus-wide **differential** —
   `optimize(m) ≡ m` / `OptNone ≡ Baseline ≡ Aggressive` producing **byte-identical returned values (by
-  bit pattern) and identical traps (same `TrapReason`, same trap-or-not)** — run under **every** shipped
-  `(mode × state_strategy × mem_tier)` combo and **both** profiles; plus the fail-closed / isolation /
-  trap-preservation properties.
-- **Refreshes** `docs/wasm-conformance.svg` (fail=0, honest categorized skips) and produces a committed,
-  **measured** benchmark with methodology and the honest pattern-dependent ceiling written down
-  (`docs/phase-N-benchmark.md` or `-surface.md`) — *measured, not asserted; no hero number.*
+  bit pattern) and identical traps (same `TrapReason`, same trap-or-not)** — run over the checked-in
+  `.ir` corpus (`test/carder/ir/corpus/*.ir`) under **every** shipped `(mode × state_strategy ×
+  mem_tier)` combo and **both** profiles; plus the fail-closed / isolation / trap-preservation
+  properties.
+- Produces a committed, **measured** benchmark with methodology and the honest pattern-dependent
+  ceiling written down (`docs/phase-N-benchmark.md` or `-surface.md`) — *measured, not asserted; no
+  hero number.* Note that the benchmark harness (`smoke/`) is a **wasm** differential and lives in the
+  scribbler repo; a carder capstone that needs it drives it cross-repo (see the reproduce line in
+  `docs/phase-4-benchmark.md`).
+- **If the phase widened the frontend contract**, says so explicitly and points at the scribbler-side
+  (and, where relevant, arc-side) re-verification: the WASM conformance triple is **scribbler's** gate,
+  not carder's, and a green carder capstone is not by itself evidence that conformance held.
 - Reports the running gleeunit total. Capstones **confirm green, they do not re-derive** prior units.
 
 ---
@@ -146,7 +164,16 @@ for that phase. The letters advance one per phase:
 | 2 | `E1–E8` | 7 | `J1–J8` + `T1–T14` (reconciliation) |
 | 3 | `F1–F8` | 9 | `M1–M8` |
 | 4 | `G1–G8` | 10 | `N1–N8` |
-| 5 | `H1–H8` + `R1–R18` (reconciliation) | *(next)* | continue the letter series |
+| 5 | `H1–H8` + `R1–R18` (reconciliation) | 13 / 14 / 15 | `Q…` / `R…` / `S…` |
+
+**Post-split the series forks, so the two repos can never mint colliding codes.** The unprefixed
+letters `A`–`S` are the **pre-split shared history** (Phases 1–15, one tree, one series) and stay
+readable as written wherever they appear. From the next phase onward:
+
+| Repo | Series | Next |
+|---|---|---|
+| **carder** (this repo) | `C-`-prefixed, continuing the letter run | `C-T`, then `C-U`, `C-V`, … |
+| **scribbler** (wasm frontend) | `S-`-prefixed, restarting at `A` | `S-A`, then `S-B`, `S-C`, … |
 
 Within each list: **#1 = the keystone**, **last = "Honest scope."** When a fan-out + critique surfaces
 conflicts, the resolutions become a separate authoritative `RECONCILIATION.md` with `R`-numbered
@@ -166,8 +193,8 @@ consolidation). Keep it small and current. It carries three things:
 2. **A unit table** — `Unit | Doc | Owner / status | Depends on (freeze) | Leaves`. Status legend:
    `unclaimed` · `in-progress (name)` · `blocked (on …)` · `done`. The **Leaves** column states what
    the unit produces and hands to which downstream unit.
-3. **A landing log** — each landing recorded as a running count (`N tests (was M, +K)`), the
-   conformance triple (`pass/skip/fail`), `0 warnings, format clean`, and `byte-identical`.
+3. **A landing log** — each landing recorded as a running count (`N tests (was M, +K)`), the corpus
+   differential result, `0 warnings, format clean`, and `byte-identical`.
 
 When a phase closes (capstone proven), fold its outcome into `01-status.md` §3, move any new deferrals
 into `02-roadmap.md`, and reset `state.md` to the empty template for the next phase.
@@ -189,8 +216,10 @@ These are the load-bearing rules every phase preserved. They are the difference 
   with three ordered fail-closed guards (index-in-bounds → `UndefinedElement`; slot-non-null →
   `UninitializedElement`; exact structural `FuncType` match → `IndirectCallTypeMismatch`). Cross-module
   calls dispatch through a handed-in closure capability (`link.call_import`), **never**
-  `erlang:apply(Closure, ArgsList)` (arity-spread crash). The spectest/host registry is a build-fixed
-  literal `case`. A structural codegen-security test enforces this and is extended each phase.
+  `erlang:apply(Closure, ArgsList)` (arity-spread crash). **carder hard-codes no host module by name:**
+  a frontend supplies host functions as `link.Provider` values (`Namespace(link_name, func, state)`
+  included), and `carder/cli.resolve_binding` is the fail-closed gate that turns a `Binding` into an
+  `Instance`. A structural codegen-security test enforces this and is extended each phase.
 - **D4 / D9 — Fail closed.** Safe is the default; `profiles` exposes no way to weaken posture by
   omission (Unsafe, lower caps, tier-N are explicit tested opt-ins). An unseeded runtime cell traps
   rather than reading garbage; an unsatisfied import fails at link time; **`Safe + nif` is a link-time
@@ -199,35 +228,39 @@ These are the load-bearing rules every phase preserved. They are the difference 
   bit patterns end to end (NaN payloads, `-0.0`, wrap all exact). A load needs only width+sign
   (`f32.load` == `i32.load` at the byte level). **All result equivalence is compared by bit pattern**,
   so the differential harness catches any bit-level divergence. The `.ir` textual form is the lossless
-  inter-stage contract.
+  inter-stage contract — and, post-split, the **actual repo boundary**: what a frontend hands carder is
+  `.ir`, nothing else.
 - **D6 — Language-neutral, named-label structured IR.** No WASM-isms in the IR core (references are
   term-layer values, bulk ops are generic sequence ops, the memory index is a generic multi-region
   model). The IR carries **no runtime handle operand** (tier-agnostic), so tier/state-strategy
-  retrofits are provably confined to the `emit_core` seam + runtime.
+  retrofits are provably confined to the `emit_core` seam + runtime. This is now enforced by
+  construction: carder contains no source-language code at all.
 - **E6 — Stateful ops are effects (the optimizer's safety boundary).** Made concrete in
   `ir/effect.gleam`: `MemLoad`/`MemStore`/`MemGrow`/`MemSize`/`GlobalGet`/`GlobalSet`/`CallIndirect`/
   `CallHost`/`Charge`/`Trap` and all calls are side-effecting — non-reorderable, non-CSE-able,
   non-DCE-able. The classifier is **conservative** (anything not provably pure is effectful). A memory
   barrier (grow, any call, any bulk-memory op, any control transfer / region boundary) clears all
   memory knowledge.
-- **Trap-preservation is absolute.** A WASM memory access is **trap-or-access, not a pure read/write**.
-  Every rewrite is legal only because it preserves *when and whether* a trap fires: forwarding/RLE rest
-  on a dominating successful access proving in-bounds; DSE's shadowing store bounds-checks the same
-  address; range-based BCE uses **loop versioning** (a pure runtime guard picks the unchecked fast loop
-  only when the whole range is proven in-bounds, else runs the checked loop) — **never**
-  hoist-and-trap-early. Unchecked entry points ship only on BEAM-memory-safe tiers (paged/atomics);
-  nif falls back to checked.
+- **Trap-preservation is absolute.** A linear-memory access is **trap-or-access, not a pure
+  read/write**. Every rewrite is legal only because it preserves *when and whether* a trap fires:
+  forwarding/RLE rest on a dominating successful access proving in-bounds; DSE's shadowing store
+  bounds-checks the same address; range-based BCE uses **loop versioning** (a pure runtime guard picks
+  the unchecked fast loop only when the whole range is proven in-bounds, else runs the checked loop) —
+  **never** hoist-and-trap-early. Unchecked entry points ship only on BEAM-memory-safe tiers
+  (paged/atomics); nif falls back to checked.
 - **Trust-neutral passes run at Baseline.** A semantics/trap-preserving optimization is registered in
   the **Baseline** arm, so it speeds up Safe **and** Unsafe and — because `ir_opt` runs *before* tier +
   mode selection — **every** `(paged/atomics/nif × cell/threaded)` and every present/future frontend
   inherits it with no per-tier code. Aggressive-only passes must each document their trust assumption
-  and provably never change a corpus result (WASM has no UB — every ill-defined op traps).
-- **WASM byte-identical / conformance-neutral by default.** A module using no new surface compiles
-  byte-identically to the prior phase (defaults route new surface away: memory-index 0 defaults away,
-  unchecked nodes are never produced by the frontend, Safe.beam differs from Unsafe.beam only by charge
-  instrumentation + the `instantiate/0` seed). Where a pass legitimately changes emitted code, the bar
-  relaxes to **result-identical** (same values by bit pattern, same traps), proven by the corpus-wide
-  differential.
+  and provably never change a corpus result (the IR's ill-defined operations all trap; there is no UB
+  to exploit).
+- **Byte-identical by default.** A program using no new surface compiles byte-identically to the prior
+  phase (defaults route new surface away: memory-index 0 defaults away, unchecked nodes are never
+  produced by a frontend, Safe.beam differs from Unsafe.beam only by charge instrumentation + the
+  `instantiate/0` seed). Where a pass legitimately changes emitted code, the bar relaxes to
+  **result-identical** (same values by bit pattern, same traps), proven by the corpus-wide
+  differential. *The frontend-facing half of this rule — "WASM byte-identical / conformance-neutral by
+  default" — is now scribbler's invariant, checked against the spec suite in that repo.*
 - **Constant-space loops + preemption, preserved across every strategy.** The tail-`apply` back-edge
   stays byte-for-byte unchanged; the state handle / fuel budget / threaded record never becomes a
   growing loop-carried value; charge/pdict-get are ordinary reduction-consuming ops so the scheduler
@@ -246,35 +279,58 @@ These are the load-bearing rules every phase preserved. They are the difference 
 From `CLAUDE.md` + decision D8 — applied **per unit** and **per phase**. Not a checklist to skim.
 
 **Per unit:**
-1. **Spec-cited tests** written against the original specification (the [WebAssembly spec](https://webassembly.github.io/spec/)
-   for WASM semantics; the relevant RFC/standard otherwise), asserting *defined* behavior — **not**
-   change-detector tests that lock in current output. When a bug is found, add a failing spec-encoding
-   test **first**, then fix. For optimizer passes: the transformation + adversarial "must-NOT" fixtures
-   + end-to-end BEAM value/trap preservation.
+1. **Spec-cited tests** written against the original specification, asserting *defined* behavior —
+   **not** change-detector tests that lock in current output. carder's citation authorities are the
+   [Core Erlang language specification](https://www.erlang.org/doc/apps/compiler/), the OTP/ERTS
+   documentation (`erl_nif`, `atomics`, `persistent_term`, the BEAM file format), and **the IR contract
+   itself** — [`FRONTEND-API.md`](FRONTEND-API.md) plus the `.ir` grammar in `ir/printer` + `ir/parser`,
+   which is normative for what a node *means*. For behavior a frontend inherited from a source
+   language, cite that language's spec **in the frontend's repo**; carder asserts the IR-level
+   contract. When a bug is found, add a failing spec-encoding test **first**, then fix. For optimizer
+   passes: the transformation + adversarial "must-NOT" fixtures + end-to-end BEAM value/trap
+   preservation.
 2. **Doc comments** (`///` items, `////` module-level) on every public function — the *contract* (what
    / params-meaning-units-ranges / `Result`-`Ok`-`Error`-`Some`-`None` semantics / failure-modes +
    anything that can panic), not a restatement of the name.
 3. `gleam format --check src test` **clean** (CI fails otherwise).
 4. `gleam build` with **zero warnings**.
-5. The unit's own conformance/interface suite **passes** — *done is "the suite passes," never "it
+5. The unit's own differential/interface suite **passes** — *done is "the suite passes," never "it
    compiles."*
 
-**Per phase (the capstone bar):** the whole prior acceptance corpus + WASM spec suite stay green and
+**Per phase (the capstone bar):** the whole prior acceptance corpus stays green and
 **result-identical** (by bit pattern, same traps) under both profiles and every
-`(state_strategy × mem_tier)`; conformance `fail=0` with honest categorized skips; a measured
-benchmark. The manager QA-gates every unit before commit + push to `main`.
+`(state_strategy × mem_tier)`, driven from the checked-in `.ir` corpus; a measured benchmark. Where the
+phase touched the frontend contract, the scribbler-side conformance re-run is part of the bar even
+though it happens in another repo — say who ran it and what it measured. The manager QA-gates every
+unit before commit + push to `main`.
 
 ---
 
 ## 10. Differential testing & toolchain pins
 
-- **Spec `.wast`:** Tier-A (values baked in the `.wast`) + Tier-B (an engine oracle — `wasmtime` /
-  `wat2wasm` / `wast2json` / the rebuild oracle), held across the full `(mode × tier)` matrix; every
-  `(state_strategy × tier)` must be **byte-identical**.
+carder's oracle is **itself, under a different configuration**. Every claim is a differential between
+two builds of the same `.ir` program, compared **by bit pattern** (D5/D7) on both returned values and
+traps (same `TrapReason`, same trap-or-not):
+
+- **Optimizer differential:** `OptNone ≡ Baseline ≡ Aggressive`, and `optimize(m) ≡ m` for an empty
+  pipeline. A pass that changes emitted code must still be result-identical.
+- **Tier / strategy matrix:** every `(mem_tier × state_strategy)` — `paged` / `atomics` / `nif` ×
+  `cell` / `threaded` — must agree, and `Safe ≡ Unsafe` on every corpus program. Tier-N rows are
+  `cc`-gated: with a C toolchain they run against the real `.so`, without one they **categorized-skip**
+  (never a paged delegate silently reported as native).
+- **Link differential:** a `--link` self-contained build ≡ the same program built non-linked; the
+  `--bindings` emitters are checked against the generated-module contract, not against their own output.
+- **Corpus:** `test/carder/ir/corpus/*.ir` — 35 checked-in IR programs with spec-sourced `.expected`
+  values copied verbatim from the upstream suites that produced them. It was **measured** that
+  `wasm → .beam` and `wasm → .ir → .beam` are byte-identical for all 32 corpus programs that came from
+  wasm, which is why the pre-split proofs carry over unchanged. New corpus entries arrive as `.ir` —
+  carder never grows a source-language decoder to obtain one.
 - **Greenness is measured, never promised** (decision R16): re-verify empirically at the pinned SHA per
-  file; the headline is whatever is measured (a "skip drops" plan can turn into a "pass roughly
-  doubled" reality — report the reality).
-- **Pins are explicit** (`vendor.sh` + `PIN`): Porffor 0.61.13, Node 22, wabt 1.0.41, wasmtime 46.0.1.
+  file; the headline is whatever is measured, not what was planned.
+- **Pins:** Gleam 1.17+, Erlang/OTP (the reference machine's OTP/erts version is stated in every
+  benchmark doc), and a C compiler for the tier-N rows. The wasm-side pins (Porffor, Node, wabt,
+  wasmtime) and the Tier-A/Tier-B `.wast` harness moved with the frontend and are pinned in the
+  **scribbler** repo; the WASM conformance triple is reported there.
 
 ---
 

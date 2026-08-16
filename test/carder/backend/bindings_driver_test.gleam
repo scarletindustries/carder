@@ -4,17 +4,27 @@
 //// `.beam` untouched) / P8 (honest-scope gates) + the R-corrections — NOT golden change-detectors.
 //// The load-bearing ones:
 ////
-//// - **Default-off byte-identity (P4/P6):** `to-beam-wasm <in> <out.beam>` (no `--bindings`/`--out`)
-////   writes bytes EQUAL to a fresh `pipeline.ir_to_core → core_to_beam` over the same binding —
+//// - **Default-off byte-identity (P4/P6):** `to-beam <in.ir> <out.beam>` (no `--bindings`/`--out`)
+////   writes bytes EQUAL to a fresh `pipeline.ir_to_cmod → cmod_to_beam` over the same binding —
 ////   `describe` is never reached and no directory is created.
 //// - **R17 lower-ONCE seam (the crux):** the module `describe` sees IS the module the `.beam` is
-////   generated from (`pipeline.ir_to_lowered_core`), so a memory-mutating export is `touches_state`
+////   generated from (`pipeline.ir_to_lowered_cmod`), so a memory-mutating export is `touches_state`
 ////   (Threaded) and its `ExportSig.emitted_arity` equals the arity in the REAL emitted `.core` — a
 ////   dropped-mutation misclassification cannot slip through.
+//// - **Flag scoping (R.§3.3, post-split):** `--bindings`/`--out` are **build-verb** flags. carder is
+////   now the BACKEND, so the build verb is `to-beam`/`build` over `.ir` input (the old
+////   `to-beam-wasm` left with the WebAssembly frontend). `to-beam --threaded --bindings … --out …`
+////   ACCEPTS them; every non-build verb (`emit`, `to-core`, `run`) still rejects them fail-closed
+////   via `cli.reject_output_flags`, before any file IO.
 //// - **R12 gate:** `--bindings` without `--threaded` (default `Cell`) surfaces the "re-run with
 ////   `--threaded`" hint and writes NOTHING. **R20:** a mutable tier is rejected.
 //// - **Folder emission + `.beam` non-perturbation:** the emitted `.beam` equals the plain build and
 ////   each companion file's content EQUALS `emit_<lang>(describe(m, binding))` (composition).
+////
+//// **Input note.** Every fixture is read from `test/carder/ir/corpus/<name>.ir` and parsed with
+//// `pipeline.parse_ir` — carder's entry language. Each `.ir` was generated from the corresponding
+//// `.wasm` by the pre-split `to-ir`, and the two routes were measured to produce byte-identical
+//// `.beam`s, so these byte-identity proofs are over the exact same artifact as before.
 
 import carder
 import carder/backend/bindings
@@ -23,6 +33,7 @@ import carder/backend/emit_core
 import carder/backend/emit_erlang_bindings
 import carder/backend/emit_gleam_bindings
 import carder/backend/iface
+import carder/cli
 import carder/ir
 import carder/pipeline
 import carder/runtime/instance
@@ -32,7 +43,8 @@ import gleam/option.{None}
 import gleam/string
 import simplifile
 
-const corpus = "test/carder/conformance/corpus"
+/// The `.ir` corpus root — carder's IR-entry fixtures (`add.ir`, `mem.ir`, …).
+const corpus = "test/carder/ir/corpus"
 
 // ───────────────────────────── fixtures ─────────────────────────────
 
@@ -66,6 +78,14 @@ fn simple_module(base: String, imports: List(ir.ImportDecl)) -> ir.Module {
   )
 }
 
+/// Read + parse a corpus `.ir` fixture into the `ir.Module` the CLI's own `read_ir` would produce.
+/// `let assert` — a missing or unparseable fixture is a genuine test failure.
+fn read_ir_module(path: String) -> ir.Module {
+  let assert Ok(text) = simplifile.read(path)
+  let assert Ok(m) = pipeline.parse_ir(text)
+  m
+}
+
 /// The arity of the emitted `.core` export named `name` (its `FName` arity in the `CModule`).
 fn emitted_core_arity(exports: List(FName), name: String) -> Int {
   let assert Ok(FName(_, arity)) =
@@ -80,7 +100,7 @@ fn emitted_core_arity(exports: List(FName), name: String) -> Int {
 /// TablePaged) — the accepted Phase-12 posture.
 fn threaded_binding() -> instance.Binding {
   let assert Ok(b) =
-    carder.resolve_binding(profiles.safe(), True, False, None, None, None)
+    cli.resolve_binding(profiles.safe(), True, False, None, None, None)
   b
 }
 
@@ -110,24 +130,23 @@ pub fn parse_langs_fail_closed_test() {
 
 // ───────────────────────────── default-off byte-identity (P4/P6) ─────────────────────────────
 
-/// P4/P6 hard requirement — with neither `--bindings` nor `--out`, `to-beam-wasm <in> <out.beam>`
-/// writes bytes EQUAL to the pre-existing default pipeline (`source_to_ir → ir_to_core →
-/// core_to_beam`) over the identical resolved binding: the folder path adds NO default-path code and
-/// `describe` is never reached.
+/// P4/P6 hard requirement — with neither `--bindings` nor `--out`, `to-beam <in.ir> <out.beam>`
+/// writes bytes EQUAL to the pre-existing default pipeline (`parse_ir → ir_to_cmod → cmod_to_beam`)
+/// over the identical resolved binding: the folder path adds NO default-path code and `describe` is
+/// never reached.
 pub fn default_off_byte_identical_test() {
-  let wasm = corpus <> "/add.wasm"
+  let input = corpus <> "/add.ir"
   let out = "build/p12_default_add.beam"
   let _ = simplifile.delete(out)
 
-  let assert Ok(msg) = carder.run(["to-beam-wasm", wasm, out])
+  let assert Ok(msg) = carder.run(["to-beam", input, out])
   assert string.contains(msg, "wrote")
   let assert Ok(cli_beam) = simplifile.read_bits(out)
 
   // Oracle: the default non-bindings path over the identical resolved binding.
-  let assert Ok(bytes) = simplifile.read_bits(wasm)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = read_ir_module(input)
   let assert Ok(binding) =
-    carder.resolve_binding(profiles.safe(), False, False, None, None, None)
+    cli.resolve_binding(profiles.safe(), False, False, None, None, None)
   let assert Ok(cmod) = pipeline.ir_to_cmod(m, binding)
   let assert Ok(oracle_beam) = pipeline.cmod_to_beam(cmod)
 
@@ -141,11 +160,11 @@ pub fn default_off_byte_identical_test() {
 pub fn bindings_without_out_rejected_test() {
   let assert Error(msg) =
     carder.run([
-      "to-beam-wasm",
+      "to-beam",
       "--threaded",
       "--bindings",
       "gleam",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "out.beam",
     ])
   assert string.contains(msg, "--out")
@@ -155,10 +174,10 @@ pub fn bindings_without_out_rejected_test() {
 pub fn out_too_many_positionals_rejected_test() {
   let assert Error(msg) =
     carder.run([
-      "to-beam-wasm",
+      "to-beam",
       "--out",
       "build/p12_x",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "extra",
     ])
   assert string.contains(msg, "with --out")
@@ -168,13 +187,13 @@ pub fn out_too_many_positionals_rejected_test() {
 pub fn bad_lang_token_rejected_test() {
   let assert Error(msg) =
     carder.run([
-      "to-beam-wasm",
+      "to-beam",
       "--threaded",
       "--bindings",
       "rust",
       "--out",
       "build/p12_x",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
     ])
   assert string.contains(msg, "rust")
 }
@@ -183,37 +202,69 @@ pub fn bad_lang_token_rejected_test() {
 pub fn duplicate_output_flags_rejected_test() {
   let assert Error(_) =
     carder.run([
-      "to-beam-wasm",
+      "to-beam",
       "--bindings",
       "gleam",
       "--bindings",
       "erlang",
       "--out",
       "d",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
     ])
   let assert Error(_) =
-    carder.run([
-      "to-beam-wasm",
-      "--out",
-      "d1",
-      "--out",
-      "d2",
-      corpus <> "/add.wasm",
-    ])
+    carder.run(["to-beam", "--out", "d1", "--out", "d2", corpus <> "/add.ir"])
 }
 
-/// R.§3.3 — `--bindings`/`--out` are `to-beam-wasm`-only: every other compile verb rejects them
-/// fail-closed (via `reject_output_flags`), short-circuiting BEFORE any file IO.
-pub fn output_flags_rejected_on_other_verbs_test() {
+/// R.§3.3 (post-split scoping) — `--bindings`/`--out` are **build-verb** flags: `to-beam` (and its
+/// `build` alias) ACCEPT them over `.ir` input, while every non-build compile verb rejects them
+/// fail-closed (via `cli.reject_output_flags`), short-circuiting BEFORE any file IO.
+///
+/// This inverts the pre-split scoping, where the flags lived on the frontend's `to-beam-wasm` verb
+/// and `to-beam` rejected them: carder is now the backend, so `to-beam` IS the build verb.
+pub fn output_flags_scoped_to_build_verb_test() {
+  // ACCEPTED on the build verb, under both spellings.
+  let dir = "build/p12_scope_out"
+  let _ = simplifile.delete(dir)
+  let assert Ok(_) =
+    carder.run([
+      "to-beam",
+      "--threaded",
+      "--bindings",
+      "gleam",
+      "--out",
+      dir,
+      corpus <> "/mem.ir",
+    ])
+  let assert Ok(_) = simplifile.read_bits(dir <> "/carder@wasm@roundtrip.beam")
+  let _ = simplifile.delete(dir)
+
+  let dir2 = "build/p12_scope_out_build"
+  let _ = simplifile.delete(dir2)
+  let assert Ok(_) =
+    carder.run([
+      "build",
+      "--threaded",
+      "--bindings",
+      "gleam",
+      "--out",
+      dir2,
+      corpus <> "/mem.ir",
+    ])
+  let assert Ok(_) = simplifile.read_bits(dir2 <> "/carder@wasm@roundtrip.beam")
+  let _ = simplifile.delete(dir2)
+
+  // REJECTED on every non-build verb, naming the verb, before any IO (the paths below don't exist).
   let assert Error(m1) =
     carder.run(["emit", "--bindings", "gleam", "--out", "d", "x.ir"])
-  assert string.contains(m1, "to-beam-wasm")
+  assert string.contains(m1, "build verb")
+  assert string.contains(m1, "emit")
   let assert Error(m2) = carder.run(["to-core", "--out", "d", "x.ir"])
-  assert string.contains(m2, "to-beam-wasm")
+  assert string.contains(m2, "build verb")
+  assert string.contains(m2, "to-core")
   let assert Error(m3) =
-    carder.run(["run", "--bindings", "erlang", "x.wasm", "add", "1", "2"])
-  assert string.contains(m3, "to-beam-wasm")
+    carder.run(["run", "--bindings", "erlang", "x.ir", "add", "1", "2"])
+  assert string.contains(m3, "build verb")
+  assert string.contains(m3, "run")
 }
 
 // ───────────────────────────── honest-scope gates (P8 / R12 / R20) ─────────────────────────────
@@ -227,12 +278,12 @@ pub fn bindings_without_threaded_rejected_test() {
 
   let assert Error(msg) =
     carder.run([
-      "to-beam-wasm",
+      "to-beam",
       "--bindings",
       "gleam",
       "--out",
       dir,
-      corpus <> "/mem.wasm",
+      corpus <> "/mem.ir",
     ])
   assert string.contains(msg, "--threaded")
   // Nothing written — the `.beam` named after the module atom must be absent.
@@ -277,15 +328,13 @@ pub fn emit_bindings_rejects_import_bearing_test() {
 // ───────────────────────────── R17 lower-ONCE seam (the crux) ─────────────────────────────
 
 /// R17 (correctness crux) — `describe` and the emitted `.beam` see the SAME module. Using the
-/// lower-ONCE seam (`pipeline.ir_to_lowered_core`), a memory-mutating module is classified
+/// lower-ONCE seam (`pipeline.ir_to_lowered_cmod`), a memory-mutating module is classified
 /// `Threaded` with every export `touches_state`, and each `ExportSig.emitted_arity` EQUALS the arity
 /// of the corresponding export in the REAL emitted `.core` (from the identical lowered module) —
 /// value-level proof that a dropped-mutation misclassification cannot slip through.
 pub fn r17_lower_once_seam_test() {
-  let wasm = corpus <> "/mem.wasm"
   let binding = threaded_binding()
-  let assert Ok(bytes) = simplifile.read_bits(wasm)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = read_ir_module(corpus <> "/mem.ir")
 
   // The seam: the module `describe` sees IS the one the `.core` (hence `.beam`) is generated from.
   let assert Ok(#(lowered, _cmod)) = pipeline.ir_to_lowered_cmod(m, binding)
@@ -304,20 +353,19 @@ pub fn r17_lower_once_seam_test() {
 
 // ───────────────────────────── folder emission + `.beam` non-perturbation (P4/P6) ─────────────────────────────
 
-/// P4/P6 — for a real threaded, export-only `.wasm`, the FOLDER path writes
+/// P4/P6 — for a real threaded, export-only module, the FOLDER path writes
 /// `<dir>/<module.name>.beam` whose bytes EQUAL the plain (no-bindings) build of the same module +
 /// binding (bindings do not perturb the `.beam`), plus each requested language's companion files at
 /// the emitters' `GeneratedFile.path`s — each file's content EQUALS `emit_<lang>(describe(m,
 /// binding))` (composition, not a frozen string).
 pub fn folder_emission_and_beam_non_perturbation_test() {
-  let wasm = corpus <> "/mem.wasm"
+  let input = corpus <> "/mem.ir"
   let dir = "build/p12_folder_out"
   let _ = simplifile.delete(dir)
 
   let assert Ok(msg) =
     carder.run([
-      "to-beam-wasm", "--threaded", "--bindings", "gleam,erlang", "--out", dir,
-      wasm,
+      "to-beam", "--threaded", "--bindings", "gleam,erlang", "--out", dir, input,
     ])
   assert string.contains(msg, "wrote")
 
@@ -327,8 +375,7 @@ pub fn folder_emission_and_beam_non_perturbation_test() {
 
   // `.beam` non-perturbation: equals the plain build of the same module + binding (via the seam).
   let binding = threaded_binding()
-  let assert Ok(bytes) = simplifile.read_bits(wasm)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = read_ir_module(input)
   let assert Ok(#(lowered, cmod)) = pipeline.ir_to_lowered_cmod(m, binding)
   let assert Ok(oracle_beam) = pipeline.cmod_to_beam(cmod)
   assert folder_beam == oracle_beam
@@ -355,10 +402,8 @@ pub fn folder_emission_and_beam_non_perturbation_test() {
 /// path order (modulo the output dir) and byte-identical file contents. Uses a real threaded module
 /// + `.beam` from the pipeline.
 pub fn emit_bindings_deterministic_test() {
-  let wasm = corpus <> "/mem.wasm"
   let binding = threaded_binding()
-  let assert Ok(bytes) = simplifile.read_bits(wasm)
-  let assert Ok(m) = pipeline.source_to_ir(bytes)
+  let m = read_ir_module(corpus <> "/mem.ir")
   let assert Ok(#(lowered, cmod)) = pipeline.ir_to_lowered_cmod(m, binding)
   let assert Ok(beam) = pipeline.cmod_to_beam(cmod)
 

@@ -1,0 +1,35 @@
+module @carder@wasm@fma {
+  numerics true
+  memory none
+  export "fma" = @f0
+  export "sqrtmin" = @f1
+  export "shuf" = @f2
+  export "bsel" = @f3
+  func @f0 (%p0:f32) -> (f32) {
+    let (%v1) = simd f32x4.splat (%p0)
+    let (%v2) = simd f32x4.fmul (%v1, v128.const 0x0000c03f000020400000604000009040)
+    let (%v3) = simd f32x4.fadd (%v2, v128.const 0x00002041000020410000204100002041)
+    let (%v4) = simd f32x4.extract_lane.2 (%v3)
+    values (%v4)
+  }
+  func @f1 (%p0:f32) -> (f32) {
+    let (%v1) = simd f32x4.splat (%p0)
+    let (%v2) = simd f32x4.fsqrt (%v1)
+    let (%v3) = simd f32x4.fmin (%v2, v128.const 0x00004040000040400000404000004040)
+    let (%v4) = simd f32x4.extract_lane.0 (%v3)
+    values (%v4)
+  }
+  func @f2 () -> (i32) {
+    let (%v1) = simd.shuffle [4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11] v128.const 0x0a000000140000001e00000028000000 v128.const 0x320000003c0000004600000050000000
+    let (%v2) = simd i32x4.extract_lane.0 (%v1)
+    values (%v2)
+  }
+  func @f3 (%p0:i32) -> (i32) {
+    let (%v1) = simd i32x4.splat (%p0)
+    let (%v2) = simd i32x4.eq (%v1, v128.const 0x07000000000000000000000000000000)
+    let (%v3) = simd v128.bitselect (v128.const 0x6f000000de0000004d010000bc010000, v128.const 0xe703000078030000090300009a020000, %v2)
+    let (%v4) = simd i32x4.extract_lane.0 (%v3)
+    values (%v4)
+  }
+}
+

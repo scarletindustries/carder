@@ -1,26 +1,32 @@
-//// Unit 11d — the Phase-1 GOAL PROOF, now WITH the Safe policy pass (`ir_lower`) in the
-//// chain. It drives unit 07's acceptance corpus (`test/carder/conformance/corpus/*`)
-//// through decode → validate → lower → **ir_lower(Safe)** → emit_core → build_beam → invoke
-//// on the BEAM, and diffs against the spec-sourced `.expected` values — reusing 07's
-//// `corpus`/`oracle`/`runner`/`ffi` UNCHANGED (this file never edits a unit-07 file).
+//// Unit 11d — the **Safe policy pass** (`ir_lower`) acceptance proofs.
 ////
-//// The only difference from 07's own `corpus_test` is that the policy pass is now in the
-//// pipeline (`pipeline.ir_to_core(_, profiles.safe())` runs `ir_lower` before `emit_core`),
-//// so the proof is that the corpus stays green *through the Safe policy pass* — numeric
-//// edges, traps, the constant-space loop, AND the `call_host` capability boundary now gated
-//// by `ir_lower`:
-////   - an allowlisted `("std","gcd")` stdlib call compiles and runs;
-////   - a non-allowlisted `CallHost` is REJECTED fail-closed at BUILD time by `ir_lower`;
-////   - a DECLARED host import is left to run time and REJECTED by the deny-all host.
+//// carder is a compiler BACKEND, so this drives `.ir` (not source bytes): it reads the committed
+//// `test/carder/ir/corpus/*.ir` programs, parses them with `pipeline.parse_ir`, and runs them
+//// through **ir_lower(Safe)** → emit_core → build_beam → invoke on the BEAM, diffing against the
+//// spec-sourced `.expected` values — reusing the harness's `corpus`/`oracle`/`runner`/`ffi`
+//// unchanged. Each `.ir` was generated from the corresponding acceptance `.wasm` and is
+//// byte-for-byte equivalent compiler input, so the artifact under test is unchanged.
+////
+//// What this file asserts is the **policy pass and the capability boundary**, not source decoding:
+////   - the metered/constant-space program stays spec-green *through* `ir_lower`'s `Charge`
+////     insertion (`sum_to`);
+//// - an allowlisted `("std","gcd")` stdlib call compiles and runs;
+//// - a non-allowlisted `CallHost` is REJECTED fail-closed at BUILD time by `ir_lower`;
+//// - a DECLARED host import is left to run time and REJECTED by the deny-all host, and an
+////   unprovided host import cannot become a runnable instance at all (`hostimport`).
+////
+//// The broad "every corpus program is spec-green under every posture" sweep is NOT here: it is
+//// `test/carder/tier/combos.gleam` + the `tier/*` suites, which drive the SAME `.ir` corpus
+//// against the SAME `.expected` oracles across the whole `(strategy × tier × policy)` matrix.
 
 import carder/backend/build_beam
-import carder/conformance/corpus.{type Expect, Rejects, Returns, Traps}
-import carder/conformance/ffi
-import carder/conformance/fixture.{
+import carder/harness/corpus.{type Expect, Rejects, Returns, Traps}
+import carder/harness/ffi
+import carder/harness/fixture.{
   type SpecValue, F32Bits, F32Nan, F64Bits, F64Nan, I32Val, I64Val,
 }
-import carder/conformance/oracle
-import carder/conformance/runner.{type Instance}
+import carder/harness/oracle
+import carder/harness/runner.{type Instance}
 import carder/ir
 import carder/middle/ir_lower
 import carder/pipeline
@@ -34,45 +40,23 @@ import gleam/option
 import gleam/result
 import gleam/string
 
-const corpus_dir = "test/carder/conformance/corpus"
+/// The committed `.ir` acceptance corpus + its spec-sourced `.expected` oracles.
+const corpus_dir = "test/carder/ir/corpus"
 
-// ─────────────────────────────── the corpus, THROUGH ir_lower(Safe) ───────────────────────────────
+// ─────────────────────────────── the Safe policy pass, end-to-end ───────────────────────────────
 
-/// `add` — direct numeric op + i32 two's-complement WRAP — green through the Safe pass.
-pub fn add_through_safe_test() {
-  assert check_program("add") == []
-}
-
-/// `intops` — signed/unsigned divide pair, `div_s(INT_MIN,-1)` & `div_u(_,0)` TRAPS, and
-/// shift-count masking — all hold through codegen with the Safe pass in the chain.
-pub fn intops_through_safe_test() {
-  assert check_program("intops") == []
-}
-
-/// `sum_to` — the loop/break/continue program stays a CONSTANT-SPACE BEAM loop with the
-/// metering `Charge` inserted by `ir_lower` (the corpus drives `sum_to(100)`; the large-n
-/// constant-space proof lives in `ir_lower_test`).
+/// `sum_to` — the loop/break/continue program stays spec-green AND a CONSTANT-SPACE BEAM loop
+/// with the metering `Charge` inserted by `ir_lower` (the corpus drives `sum_to(100)`; the
+/// large-n constant-space proof lives in `ir_lower_test`). This is the end-to-end evidence that
+/// the Safe policy pass does not change an observable answer.
 pub fn sum_to_through_safe_test() {
   assert check_program("sum_to") == []
 }
 
-/// `fib` — if + direct self-call + recursion — green through the Safe pass.
-pub fn fib_through_safe_test() {
-  assert check_program("fib") == []
-}
-
-/// `fac` — if + direct self-call + recursion — green through the Safe pass.
-pub fn fac_through_safe_test() {
-  assert check_program("fac") == []
-}
-
-/// `floatops` — f32/f64 value path (raw IEEE-754 bits, D5) — green through the Safe pass.
-pub fn floatops_through_safe_test() {
-  assert check_program("floatops") == []
-}
-
-/// `hostimport` — a host import the Phase-1 frontend cannot faithfully model is REJECTED
-/// end-to-end (the `.expected` is `reject`); the Safe pass does not change that outcome.
+/// `hostimport` — a module declaring a host import NOBODY provides cannot become a runnable
+/// instance (its `.expected` is `reject`): the generated module takes `instantiate/1(Imports)`,
+/// so the no-provider `instantiate/0` boot fails closed rather than silently running with an
+/// ambient host. The Safe pass does not change that outcome.
 pub fn hostimport_rejected_through_safe_test() {
   assert check_program("hostimport") == []
 }
@@ -105,25 +89,25 @@ pub fn declared_host_import_rejected_at_runtime_test() {
   assert string.contains(reason, "capability_denied")
 }
 
-// ─────────────────────────────── driving machinery (reuses 07's corpus/oracle/ffi) ───────────────────────────────
+// ─────────────────────────────── driving machinery (reuses the harness corpus/oracle/ffi) ───────────────────────────────
 
-/// Compile + run a `corpus/<name>` program through the FULL Safe pipeline (with `ir_lower`)
+/// Compile + run a `corpus/<name>.ir` program through the FULL Safe pipeline (with `ir_lower`)
 /// and return the list of failure descriptions (empty ⇒ every `.expected` line held). A
 /// `reject` program asserts the module fails to instantiate; otherwise it instantiates once
-/// and every expectation is invoked and compared via 07's oracle.
+/// and every expectation is invoked and compared via the harness oracle.
 fn check_program(name: String) -> List(String) {
-  let assert Ok(bytes) = read_bytes(name <> ".wasm")
-  let assert Ok(text) = read_text(name <> ".expected")
-  let assert Ok(expects) = corpus.parse(text)
+  let assert Ok(text) = read_text(name <> ".ir")
+  let assert Ok(expected_text) = read_text(name <> ".expected")
+  let assert Ok(expects) = corpus.parse(expected_text)
 
   case expects {
     [Rejects] ->
-      case instantiate_safe(bytes) {
+      case instantiate_safe(text) {
         Error(_) -> []
         Ok(_) -> [name <> ": expected REJECT, but the module instantiated"]
       }
     _ ->
-      case instantiate_safe(bytes) {
+      case instantiate_safe(text) {
         Error(e) -> [name <> ": module failed to instantiate: " <> e]
         Ok(inst) ->
           list.filter_map(expects, fn(ex) {
@@ -136,15 +120,15 @@ fn check_program(name: String) -> List(String) {
   }
 }
 
-/// Decode → validate → lower → **ir_lower(Safe)** → emit_core → build → load `bytes`, then
-/// **instantiate** it in its own owned process (E5, one-instance-one-process): `start_instance`
-/// runs the generated `instantiate/0` in that process, seeding its cell. Each module gets a
-/// unique name so loads do not clobber. Returns `Error(reason)` — never a panic — for any
-/// stage that rejects, or `Error("instantiate: …")` for an instantiation-time trap.
-fn instantiate_safe(bytes: BitArray) -> Result(Instance, String) {
+/// parse `.ir` → **ir_lower(Safe)** → emit_core → build → load `text`, then **instantiate** it in
+/// its own owned process (E5, one-instance-one-process): `start_instance` runs the generated
+/// `instantiate/0` in that process, seeding its cell. Each module gets a unique name so loads do
+/// not clobber. Returns `Error(reason)` — never a panic — for any stage that rejects, or
+/// `Error("instantiate: …")` for an instantiation-time trap / a missing-provider boot.
+fn instantiate_safe(text: String) -> Result(Instance, String) {
   use m0 <- result.try(
-    pipeline.source_to_ir(bytes)
-    |> result.map_error(pipeline.describe),
+    pipeline.parse_ir(text)
+    |> result.map_error(fn(e) { "parse .ir: " <> string.inspect(e) }),
   )
   let m = ir.Module(..m0, name: uniquify(m0.name))
   // `ir_to_cmod` runs the Safe policy pass (ir_lower) BEFORE emit_core — the proof point.
@@ -169,7 +153,7 @@ fn instantiate_safe(bytes: BitArray) -> Result(Instance, String) {
   ))
 }
 
-/// Check one `.expected` line against the running instance via 07's oracle / trap matcher.
+/// Check one `.expected` line against the running instance via the harness oracle / trap matcher.
 fn run_expect(inst: Instance, ex: Expect) -> Result(Nil, String) {
   case ex {
     Rejects -> Error("unexpected 'reject' among value expectations")
@@ -216,7 +200,7 @@ fn run_expect(inst: Instance, ex: Expect) -> Result(Nil, String) {
 }
 
 /// Invoke export `field` with `args`, tagging the raw result at the export's declared width
-/// (mirrors 07's `driver.invoke`, here driving the Safe-pass instance). Single-result only
+/// (mirrors the harness `driver.invoke`, here driving the Safe-pass instance). Single-result only
 /// (the Phase-1 corpus); a trap / capability denial becomes `Trapped`.
 fn invoke(
   inst: Instance,
@@ -246,7 +230,7 @@ fn invoke(
 }
 
 /// The raw integer bits an argument carries (NaN args, which the corpus never passes, map
-/// to 0). Mirrors 07's `driver.spec_to_raw`.
+/// to 0). Mirrors the harness `driver.spec_to_raw`.
 fn spec_to_raw(v: SpecValue) -> Int {
   case v {
     I32Val(b) | I64Val(b) | F32Bits(b) | F64Bits(b) -> b
@@ -260,9 +244,9 @@ fn spec_to_raw(v: SpecValue) -> Int {
   }
 }
 
-/// Tag a raw result integer as a `SpecValue` at the export's declared width (mirrors 07's
-/// `driver.tag`). `TTerm` (never produced by the WASM numeric path) falls back to an i32 tag
-/// so the function is total.
+/// Tag a raw result integer as a `SpecValue` at the export's declared width (mirrors the harness
+/// `driver.tag`). `TTerm` (never produced by the numeric path) falls back to an i32 tag so the
+/// function is total.
 fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
   case ty {
     ir.TI32 -> I32Val(raw)
@@ -283,6 +267,8 @@ fn tag(ty: ir.ValType, raw: Int) -> SpecValue {
 
 // ─────────────────────────────── hand-built IR fixtures (call_host scenarios) ───────────────────────────────
 
+/// A memoryless, import-free numeric `ir.Module` named uniquely (so repeated loads never clobber),
+/// exporting every function in `fns` under its own name.
 fn numeric_module(name: String, fns: List(ir.Function)) -> ir.Module {
   ir.Module(
     name: "carder@acceptance@" <> name <> "_" <> int.to_string(ffi.unique_int()),
@@ -364,7 +350,7 @@ fn load_ir(m: ir.Module) -> Result(Atom, String) {
   |> result.map_error(fn(e) { "build: " <> string.inspect(e) })
 }
 
-// ─────────────────────────────── value marshalling (mirrors 07's driver) ───────────────────────────────
+// ─────────────────────────────── value marshalling (mirrors the harness driver) ───────────────────────────────
 
 /// Build the `export name → result value-types` table from the IR module.
 fn export_types(m: ir.Module) -> Dict(String, List(ir.ValType)) {
@@ -387,15 +373,13 @@ fn export_types(m: ir.Module) -> Dict(String, List(ir.ValType)) {
   })
 }
 
+/// Suffix a module name with a process-unique integer so repeated loads never clobber.
 fn uniquify(name: String) -> String {
   name <> "_" <> int.to_string(ffi.unique_int())
 }
 
-fn read_bytes(file: String) -> Result(BitArray, String) {
-  ffi.read_file(corpus_dir <> "/" <> file)
-}
-
+/// Read a corpus file as UTF-8 text (`.ir` source or a `.expected` oracle).
 fn read_text(file: String) -> Result(String, String) {
   use bytes <- result.try(ffi.read_file(corpus_dir <> "/" <> file))
-  bit_array.to_string(bytes) |> result.replace_error("non-UTF8 .expected")
+  bit_array.to_string(bytes) |> result.replace_error("non-UTF8 corpus file")
 }

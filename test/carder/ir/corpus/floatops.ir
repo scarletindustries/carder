@@ -1,0 +1,23 @@
+module @carder@wasm@f32const {
+  numerics true
+  memory none
+  export "f32const" = @f0
+  export "f64const" = @f1
+  export "f32toi" = @f2
+  export "f64toi" = @f3
+  func @f0 () -> (f32) {
+    values (f32.const 0x3fc00000)
+  }
+  func @f1 () -> (f64) {
+    values (f64.const 0x4004000000000000)
+  }
+  func @f2 (%p0:f32) -> (i32) {
+    let (%v1) = convert trunc_sat_s.f32.i32 %p0
+    values (%v1)
+  }
+  func @f3 (%p0:f64) -> (i32) {
+    let (%v1) = convert trunc_sat_s.f64.i32 %p0
+    values (%v1)
+  }
+}
+

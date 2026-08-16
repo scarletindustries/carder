@@ -19,8 +19,8 @@
 //// <https://webassembly.github.io/spec/core/exec/numerics.html>, bounds/traps
 //// <https://webassembly.github.io/spec/core/exec/instructions.html>).
 
-import carder/conformance/driver
-import carder/conformance/runner
+import carder/harness/driver
+import carder/harness/runner
 import carder/tier/combos.{type Outcome}
 import gleam/list
 

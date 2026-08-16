@@ -1,0 +1,25 @@
+module @carder@wasm@catch {
+  numerics true
+  memory none
+  tag @tag0 (i32)
+  export "catch" = @f0
+  func @f0 (%p0:i32) -> (i32) {
+    let (%v8) = block $lbl1 : (i32) {
+      let (%v7) = try (i32) {
+        let (%v4) = num i.ne.32 (%p0, i32.const 0)
+        let () = if %v4 : () {
+          let (%v6) = num i.mul.32 (%p0, i32.const 10)
+          throw @tag0 (%v6)
+        } else {
+          values ()
+        }
+        values (i32.const 999)
+      } catch @tag0 (%v2) {
+        break $lbl1 (%v2)
+      }
+      values (%v7)
+    }
+    values (%v8)
+  }
+}
+

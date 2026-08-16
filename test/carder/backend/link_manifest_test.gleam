@@ -136,24 +136,34 @@ pub fn surviving_remotes_subset_of_ambient_test() {
 // Closure snapshot shape (R8/R15) — counts + adversarial exclusions.
 // ---------------------------------------------------------------------------
 
-/// The frozen closure snapshot has the expected shape: 17 runtime + 12 gleam + 7 FFI = 36 in-closure
-/// modules, all duplicate-free, and the roots (16) are the runtime closure minus `porffor_abi` (the
-/// only transitively-reached runtime member). (`rt_teavm`, the experimental TeaVM WASM GC host
-/// runtime reached from `link`, added the 17th runtime member.)
+/// The frozen closure snapshot has the expected shape: 15 runtime + 12 gleam + 7 FFI = 34 in-closure
+/// modules, all duplicate-free, and the runtime closure is EXACTLY its roots (15) — the roots pull
+/// in no further `carder@runtime@*` module.
+///
+/// Historical note: this used to be 17 runtime / 36 total with 16 roots, because two
+/// producer-specific host runtimes lived in carder — `porffor_abi` (transitively reached from
+/// `rt_host`, hence the sole non-root member) and `rt_teavm` (reached from `link`). Both left with
+/// the WebAssembly frontend, so the closure is now purely the language-agnostic backend runtime and
+/// closure ≡ roots. That identity is the stronger claim and is asserted below.
 pub fn frozen_closure_shape_test() {
-  assert list.length(m.frozen_runtime_closure()) == 17
+  assert list.length(m.frozen_runtime_closure()) == 15
   assert list.length(m.frozen_gleam_closure()) == 12
   assert list.length(m.frozen_ffi_erl()) == 7
-  assert list.length(m.frozen_closure_modules()) == 36
+  assert list.length(m.frozen_closure_modules()) == 34
   assert no_duplicates(m.frozen_closure_modules()) == True
 
   let roots = m.frozen_runtime_roots()
-  assert list.length(roots) == 16
+  assert list.length(roots) == 15
   assert subset_of(roots, m.frozen_runtime_closure()) == True
-  // the sole non-root runtime member is porffor_abi (reached via rt_host).
+  // no runtime member is reached only transitively: closure ≡ roots.
   let extra =
     list.filter(m.frozen_runtime_closure(), fn(x) { !list.contains(roots, x) })
-  assert extra == ["carder@runtime@porffor_abi"]
+  assert extra == []
+  // adversarial: the departed producer-specific host runtimes are really gone.
+  assert list.contains(m.frozen_runtime_closure(), "carder@runtime@porffor_abi")
+    == False
+  assert list.contains(m.frozen_runtime_closure(), "carder@runtime@rt_teavm")
+    == False
 }
 
 /// Adversarial: the runtime closure EXCLUDES the modules that must never be merged into the WASM

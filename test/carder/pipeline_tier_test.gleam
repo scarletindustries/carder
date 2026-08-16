@@ -17,6 +17,7 @@
 ////    --portable`, `emit --tier atomics` each print their stage's output.
 
 import carder
+import carder/cli
 import carder/ir
 import carder/pipeline
 import carder/runtime/instance.{type Binding, Atomics, Binding, Nif, Threaded}
@@ -24,8 +25,11 @@ import carder/runtime/profiles
 import gleam/option
 import gleam/string
 
-const corpus = "test/carder/conformance/corpus"
+/// The committed `.ir` corpus — the end-to-end CLI inputs (carder is IR-entry, so `run` takes a
+/// `.ir`; each file is byte-for-byte equivalent compiler input to the `.wasm` it came from).
+const corpus = "test/carder/ir/corpus"
 
+/// The hand-written `.ir` fixtures driving the per-stage verbs.
 const golden = "test/carder/ir/golden"
 
 // ─────────────────────────────── fixtures ───────────────────────────────
@@ -262,7 +266,7 @@ pub fn add_byte_identical_across_postures_test() {
 /// token; omission never yields a non-default posture.
 pub fn resolve_binding_default_is_safe_cell_paged_test() {
   let assert Ok(b) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.safe(),
       False,
       False,
@@ -278,7 +282,7 @@ pub fn resolve_binding_default_is_safe_cell_paged_test() {
 /// `--threaded` selects `state_strategy: Threaded` (the record-threading build).
 pub fn resolve_binding_threaded_test() {
   let assert Ok(b) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.safe(),
       True,
       False,
@@ -294,7 +298,7 @@ pub fn resolve_binding_threaded_test() {
 /// seam links follows it, not the base's stale `paged` module.
 pub fn resolve_binding_atomics_couples_module_test() {
   let assert Ok(b) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.safe(),
       False,
       False,
@@ -310,7 +314,7 @@ pub fn resolve_binding_atomics_couples_module_test() {
 /// Unsafe/`Atomics` perf posture — the two composed deployment profiles selectable by name.
 pub fn resolve_binding_composed_profiles_test() {
   let assert Ok(p) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.portable(),
       False,
       False,
@@ -321,7 +325,7 @@ pub fn resolve_binding_composed_profiles_test() {
   assert p == profiles.portable()
 
   let assert Ok(c) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.ceiling(),
       False,
       False,
@@ -337,7 +341,7 @@ pub fn resolve_binding_composed_profiles_test() {
 /// an `Error` whose message names the incoherence — never silently downgraded to `paged`.
 pub fn resolve_binding_safe_nif_rejected_test() {
   let result =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.safe(),
       False,
       False,
@@ -353,7 +357,7 @@ pub fn resolve_binding_safe_nif_rejected_test() {
 /// (the fail-closed rule is Safe-specific, G6).
 pub fn resolve_binding_unsafe_nif_accepted_test() {
   let assert Ok(b) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.unsafe(),
       False,
       False,
@@ -369,7 +373,7 @@ pub fn resolve_binding_unsafe_nif_accepted_test() {
 /// names the cap requirement — never a silent 4 GiB pre-allocation, never a paged fallback.
 pub fn resolve_binding_uncapped_atomics_rejected_test() {
   let assert Error(msg) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.safe(),
       False,
       False,
@@ -385,7 +389,7 @@ pub fn resolve_binding_uncapped_atomics_rejected_test() {
 /// engages only over a bounded memory reservation (P6/§C).
 pub fn resolve_binding_ceiling_requires_cap_test() {
   let assert Error(msg) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.ceiling(),
       False,
       False,
@@ -396,7 +400,7 @@ pub fn resolve_binding_ceiling_requires_cap_test() {
   assert string.contains(msg, "cap")
 
   let assert Ok(_) =
-    carder.resolve_binding(
+    cli.resolve_binding(
       profiles.ceiling(),
       False,
       False,
@@ -408,13 +412,13 @@ pub fn resolve_binding_ceiling_requires_cap_test() {
 
 // ════════════════════ CLI end-to-end (every posture runs through `carder.run`) ════════════════════
 
-/// `run --threaded add.wasm add 2 3` prints `5` — a `Threaded` build runs end-to-end through the
+/// `run --threaded add.ir add 2 3` prints `5` — a `Threaded` build runs end-to-end through the
 /// strategy-aware run-ABI, byte-identical to the default (G7).
 pub fn cli_run_threaded_add_test() {
   assert carder.run([
       "run",
       "--threaded",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "add",
       "2",
       "3",
@@ -422,26 +426,26 @@ pub fn cli_run_threaded_add_test() {
     == Ok("5")
 }
 
-/// `run --threaded sum_to.wasm sum_to 100` prints `5050` — the constant-space loop runs under
+/// `run --threaded sum_to.ir sum_to 100` prints `5050` — the constant-space loop runs under
 /// the record-threading convention with the SAME spec result as `Cell`.
 pub fn cli_run_threaded_sum_to_test() {
   assert carder.run([
       "run",
       "--threaded",
-      corpus <> "/sum_to.wasm",
+      corpus <> "/sum_to.ir",
       "sum_to",
       "100",
     ])
     == Ok("5050")
 }
 
-/// `run --portable add.wasm add 2 3` prints `5` — the runs-anywhere composed profile runs
+/// `run --portable add.ir add 2 3` prints `5` — the runs-anywhere composed profile runs
 /// end-to-end through the CLI.
 pub fn cli_run_portable_add_test() {
   assert carder.run([
       "run",
       "--portable",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "add",
       "2",
       "3",
@@ -449,7 +453,7 @@ pub fn cli_run_portable_add_test() {
     == Ok("5")
 }
 
-/// `run --ceiling --cap 16 add.wasm add 2 3` prints `5` — the perf posture (Unsafe/atomics) runs
+/// `run --ceiling --cap 16 add.ir add 2 3` prints `5` — the perf posture (Unsafe/atomics) runs
 /// end-to-end once a bounded cap is named.
 pub fn cli_run_ceiling_capped_add_test() {
   assert carder.run([
@@ -457,7 +461,7 @@ pub fn cli_run_ceiling_capped_add_test() {
       "--ceiling",
       "--cap",
       "16",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "add",
       "2",
       "3",
@@ -469,7 +473,7 @@ pub fn cli_run_ceiling_capped_add_test() {
 /// the incoherence — the CLI face of Safe-forbids-nif (G6). It never runs.
 pub fn cli_run_safe_nif_rejected_test() {
   let assert Error(msg) =
-    carder.run(["run", "--tier", "nif", corpus <> "/add.wasm", "add", "2", "3"])
+    carder.run(["run", "--tier", "nif", corpus <> "/add.ir", "add", "2", "3"])
   assert string.contains(msg, "nif")
 }
 
@@ -481,7 +485,7 @@ pub fn cli_run_uncapped_atomics_rejected_test() {
       "run",
       "--tier",
       "atomics",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "add",
       "2",
       "3",
@@ -496,7 +500,7 @@ pub fn cli_conflicting_base_flags_rejected_test() {
       "run",
       "--portable",
       "--unsafe",
-      corpus <> "/add.wasm",
+      corpus <> "/add.ir",
       "add",
       "2",
       "3",

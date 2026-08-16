@@ -3,7 +3,12 @@
 > **The one claim Phase 3 makes about the outside world — "the fastest possible code, potentially
 > faster than hand-written Erlang" — is *measured here, not asserted*.** This is a committed
 > artifact with real numbers, methodology, and stated limitations. There is **no hero number**.
-> Reproduce with `./smoke/bench.sh [REPEAT] [UNSAFE_TIMEOUT_SECS]`.
+> Reproduce with `./smoke/bench.sh [REPEAT] [UNSAFE_TIMEOUT_SECS]` — **run from the scribbler repo**:
+> the harness is a wasm differential (it cargo-builds the Rust crate to wasm, gates it
+> import-free/MVP-only with `wasm-tools`, and cross-checks against `wasmtime`), so it moved with the
+> WebAssembly frontend and now drives scribbler's `build` verb (it was `to-beam-wasm` when these
+> numbers were taken) plus carder's `exec -n` for the timing. **Reproduction is cross-repo now** — the
+> measurements below are carder's record, the harness that produced them is scribbler's.
 
 ## What is measured
 

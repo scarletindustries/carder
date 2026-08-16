@@ -402,25 +402,25 @@ fn compute_oracle(int_proc: pipeline.InstanceProc, term_proc: Pid) -> Oracle {
 
 // ───────────────────────────── term-ABI oracle FFI (conformance harness, R25c) ─────────────────────────────
 
-@external(erlang, "carder_conformance_ffi", "start_instance")
+@external(erlang, "carder_harness_ffi", "start_instance")
 fn start_instance(module: Atom) -> Result(Pid, String)
 
 /// Invoke `function` with raw TERM args inside the instance's owned process, returning the raw
 /// result PACKAGE opaquely (bound to the same `call_instance/3` as the Int path; Erlang is untyped).
-@external(erlang, "carder_conformance_ffi", "call_instance")
+@external(erlang, "carder_harness_ffi", "call_instance")
 fn call_terms(
   proc: Pid,
   function: Atom,
   args: List(Dynamic),
 ) -> Result(Dynamic, String)
 
-@external(erlang, "carder_conformance_ffi", "result_list")
+@external(erlang, "carder_harness_ffi", "result_list")
 fn result_list(arity: Int, package: Dynamic) -> List(Dynamic)
 
-@external(erlang, "carder_conformance_ffi", "extern_payload")
+@external(erlang, "carder_harness_ffi", "extern_payload")
 fn extern_payload(ref: Dynamic) -> Dynamic
 
-@external(erlang, "carder_conformance_ffi", "stop_instance")
+@external(erlang, "carder_harness_ffi", "stop_instance")
 fn stop_instance(proc: Pid) -> Nil
 
 // ───────────────────────────── compile+call FFI (real toolchains) + R16 purge ─────────────────────────────
@@ -1199,5 +1199,5 @@ fn read_text(dir: String, name: String) -> String {
   content
 }
 
-@external(erlang, "carder_conformance_ffi", "unique_int")
+@external(erlang, "carder_harness_ffi", "unique_int")
 fn unique_int() -> Int
