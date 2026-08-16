@@ -353,11 +353,7 @@ fn label_outside_try(state: EmitState, label: String) -> Bool {
 }
 
 /// `{tag, vs…}` — under `Threading(cur)` paired with the live state.
-fn exit_record(
-  tag: String,
-  vs: List(CExpr),
-  sc: StateChan,
-) -> CExpr {
+fn exit_record(tag: String, vs: List(CExpr), sc: StateChan) -> CExpr {
   let rec = CTuple([CAtom(tag), ..vs])
   case sc {
     NoState -> rec
@@ -2323,7 +2319,8 @@ fn apply_cont(
   case cont {
     KReturn ->
       case state.try_outer {
-        Some(_) -> Ok(#(exit_record("$2c_ret", [function_return(vals)], sc), state))
+        Some(_) ->
+          Ok(#(exit_record("$2c_ret", [function_return(vals)], sc), state))
         None ->
           case sc {
             NoState -> Ok(#(function_return(vals), state))
@@ -6695,7 +6692,9 @@ fn exit_dispatch(
   let #(inner_sc, wrap) = case sc {
     NoState -> #(NoState, fn(e: CExpr) { CLet([rec], CVar(rvar), e) })
     Threading(_) -> #(Threading(st), fn(e: CExpr) {
-      CCase(CVar(rvar), [CClause([PTuple([PVar(rec), PVar(st)])], CAtom("true"), e)])
+      CCase(CVar(rvar), [
+        CClause([PTuple([PVar(rec), PVar(st)])], CAtom("true"), e),
+      ])
     })
   }
   let #(fall_vars, state) = fresh_vars(state, arity)
@@ -6767,7 +6766,8 @@ fn outer_transfers(
     }
   }
   case body {
-    Let(_, rhs, b) -> outer_transfers(b, defined, outer_transfers(rhs, defined, acc))
+    Let(_, rhs, b) ->
+      outer_transfers(b, defined, outer_transfers(rhs, defined, acc))
     If(_, _, t, e) ->
       outer_transfers(e, defined, outer_transfers(t, defined, acc))
     Switch(_, _, arms, default) ->
