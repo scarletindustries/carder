@@ -171,14 +171,22 @@ type LocalFun {
 /// how many times each raw variable is READ anywhere in the function (fixed
 /// for the whole body); `local_defs` is the module's own `name/arity` set, so
 /// an `erlang:` BIF is only spelled as a local call when no module function
-/// shadows it.
+/// shadows it (each entry is `#(reads, fun depth of the last read)`). `subst`
+/// holds the binders whose `let` was dropped because the value is read exactly
+/// once and is a literal, a variable, or a pure
+/// constructor: the already-translated RHS form, spliced in at that one read.
+/// `depth` counts the enclosing `fun`s, so a constructor is only spliced at a
+/// read in the same fun (moving an allocation into a closure body would
+/// re-run it per call).
 type Env {
   Env(
     ln: Int,
     vars: Dict(String, String),
     funs: Dict(#(String, Int), LocalFun),
-    uses: Dict(String, Int),
+    uses: Dict(String, #(Int, Int)),
     local_defs: Set(#(String, Int)),
+    subst: Dict(String, Form),
+    depth: Int,
   )
 }
 
@@ -206,7 +214,15 @@ fn fresh(st: St, _raw_name: String) -> #(String, St) {
 /// returned env — Core scoping) resolve to it.
 fn bind_var(env: Env, st: St, raw_name: String) -> #(String, Env, St) {
   let #(name, st2) = fresh(st, raw_name)
-  #(name, Env(..env, vars: dict.insert(env.vars, raw_name, name)), st2)
+  #(
+    name,
+    Env(
+      ..env,
+      vars: dict.insert(env.vars, raw_name, name),
+      subst: dict.delete(env.subst, raw_name),
+    ),
+    st2,
+  )
 }
 
 // ─────────────────────────────── node constructors ───────────────────────────────
@@ -430,11 +446,16 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       // legalized name under a prefix no `fresh` name can wear) is
       // defensively deterministic for an unbound reference — erl_lint then
       // reports it as unbound, fail-closed.
-      let v = case dict.get(env.vars, name) {
-        Ok(n) -> n
-        Error(Nil) -> "Unbound@" <> core_printer.legalize_var(name)
+      case dict.get(env.subst, name) {
+        Ok(spliced) -> Ok(#(spliced, st))
+        Error(Nil) -> {
+          let v = case dict.get(env.vars, name) {
+            Ok(n) -> n
+            Error(Nil) -> "Unbound@" <> core_printer.legalize_var(name)
+          }
+          Ok(#(e_var(ln, v), st))
+        }
       }
-      Ok(#(e_var(ln, v), st))
     }
     CInt(v) -> Ok(#(e_int(ln, v), st))
     CFloat(v) -> Ok(#(e_float(ln, v), st))
@@ -462,7 +483,8 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
     CBytes(bytes) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
     CValues(values) -> Error(BareValueList(list.length(values)))
     CFun(vars, body) -> {
-      let #(params, env2, st1) = bind_params(vars, env, st)
+      let #(params, env2, st1) =
+        bind_params(vars, Env(..env, depth: env.depth + 1), st)
       use #(bodyf, st2) <- result.try(tr_body(body, env2, st1))
       Ok(#(e_fun(ln, [e_clause(ln, params, [], bodyf)]), st2))
     }
@@ -705,7 +727,7 @@ fn tr_body(
     )
       if g == g2
     -> {
-      case binder_pat(pat) && dict.get(env.uses, g) == Ok(1) {
+      case binder_pat(pat) && read_once(env, g) {
         True -> {
           use #(argf, st1) <- result.try(tr_expr(arg, env, st))
           let #(pf, env2, st2) = tr_pat(pat, env, st1)
@@ -777,7 +799,9 @@ fn tr_body(
   }
 }
 
-/// `let X = A in B` → `X@n = A′, B′…`.
+/// `let X = A in B` → `X@n = A′, B′…` — unless `X` is read exactly once and
+/// `A` is a literal, a variable, or a pure constructor (`splice_kind`), in
+/// which case the match is dropped and `A′` is spliced in at that read.
 fn tr_let1(
   x: String,
   arg: CExpr,
@@ -787,42 +811,99 @@ fn tr_let1(
 ) -> Result(#(List(Form), St), EafError) {
   let ln = env.ln
   use #(argf, st1) <- result.try(tr_expr(arg, env, st))
-  let #(xn, env2, st2) = bind_var(env, st1, x)
-  use #(rest, st3) <- result.try(tr_body(body, env2, st2))
-  Ok(#([e_match(ln, e_var(ln, xn), argf), ..rest], st3))
-}
-
-/// How many times each raw variable name is READ (a `CVar` in expression
-/// position; binders and pattern variables do not count) across `expr`.
-fn count_uses(expr: CExpr, acc: Dict(String, Int)) -> Dict(String, Int) {
-  case expr {
-    CVar(name) -> dict.upsert(acc, name, fn(n) { option.unwrap(n, 0) + 1 })
-    CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) | CFunRef(_) -> acc
-    CCons(h, t) -> count_uses(t, count_uses(h, acc))
-    CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, count_uses_)
-    CBinary(segs) ->
-      list.fold(segs, acc, fn(a, seg) {
-        count_uses(seg.size, count_uses(seg.value, a))
-      })
-    CFun(_, body) -> count_uses(body, acc)
-    CLet(_, arg, body) -> count_uses(body, count_uses(arg, acc))
-    CLetrec(defs, body) ->
-      list.fold(defs, count_uses(body, acc), fn(a, d) { count_uses(d.value, a) })
-    CCase(arg, clauses) ->
-      list.fold(clauses, count_uses(arg, acc), fn(a, cl) {
-        count_uses(cl.body, count_uses(cl.guard, a))
-      })
-    CApply(_, args) -> list.fold(args, acc, count_uses_)
-    CApplyExpr(op, args) -> list.fold(args, count_uses(op, acc), count_uses_)
-    CCall(m, f, args) ->
-      list.fold(args, count_uses(f, count_uses(m, acc)), count_uses_)
-    CTry(arg, _, body, _, handler) ->
-      count_uses(handler, count_uses(body, count_uses(arg, acc)))
+  let splice = case dict.get(env.uses, x), splice_kind(arg) {
+    Ok(#(1, _)), Anywhere -> True
+    Ok(#(1, d)), SameFun -> d == env.depth
+    _, _ -> False
+  }
+  case splice {
+    True -> {
+      let env2 = Env(..env, subst: dict.insert(env.subst, x, argf))
+      tr_body(body, env2, st1)
+    }
+    False -> {
+      let #(xn, env2, st2) = bind_var(env, st1, x)
+      use #(rest, st3) <- result.try(tr_body(body, env2, st2))
+      Ok(#([e_match(ln, e_var(ln, xn), argf), ..rest], st3))
+    }
   }
 }
 
-fn count_uses_(acc: Dict(String, Int), expr: CExpr) -> Dict(String, Int) {
-  count_uses(expr, acc)
+/// Is `x` read exactly once in the function?
+fn read_once(env: Env, x: String) -> Bool {
+  case dict.get(env.uses, x) {
+    Ok(#(1, _)) -> True
+    _ -> False
+  }
+}
+
+/// How a `let` RHS may be spliced into its single read: `Anywhere` for a
+/// literal / variable / fun reference (no evaluation to move — a variable
+/// read inside a nested fun is an ordinary closure capture, and the spliced
+/// form is the already-renamed variable, so a later shadowing rebinding of
+/// the raw name cannot capture it); `SameFun` for a tuple / cons of such
+/// values (a pure allocation that must not move into a closure body);
+/// `NoSplice` for anything else (calls, cases, …).
+type Splice {
+  Anywhere
+  SameFun
+  NoSplice
+}
+
+fn splice_kind(arg: CExpr) -> Splice {
+  case arg {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) | CFunRef(_) ->
+      Anywhere
+    CTuple(es) ->
+      case list.all(es, fn(e) { splice_kind(e) != NoSplice }) {
+        True -> SameFun
+        False -> NoSplice
+      }
+    CCons(h, t) ->
+      case splice_kind(h) != NoSplice && splice_kind(t) != NoSplice {
+        True -> SameFun
+        False -> NoSplice
+      }
+    _ -> NoSplice
+  }
+}
+
+/// How many times each raw variable name is READ (a `CVar` in expression
+/// position; binders and pattern variables do not count) across `expr`,
+/// paired with the fun depth of its LAST read (`depth` = enclosing `fun`s /
+/// `letrec` bodies; only meaningful for a variable read once).
+fn count_uses(
+  expr: CExpr,
+  depth: Int,
+  acc: Dict(String, #(Int, Int)),
+) -> Dict(String, #(Int, Int)) {
+  let go = fn(a, e) { count_uses(e, depth, a) }
+  case expr {
+    CVar(name) ->
+      dict.upsert(acc, name, fn(prev) {
+        case prev {
+          option.Some(#(n, _)) -> #(n + 1, depth)
+          option.None -> #(1, depth)
+        }
+      })
+    CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) | CFunRef(_) -> acc
+    CCons(h, t) -> go(go(acc, h), t)
+    CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, go)
+    CBinary(segs) ->
+      list.fold(segs, acc, fn(a, seg) { go(go(a, seg.value), seg.size) })
+    CFun(_, body) -> count_uses(body, depth + 1, acc)
+    CLet(_, arg, body) -> go(go(acc, arg), body)
+    CLetrec(defs, body) ->
+      list.fold(defs, go(acc, body), fn(a, d) { count_uses(d.value, depth, a) })
+    CCase(arg, clauses) ->
+      list.fold(clauses, go(acc, arg), fn(a, cl) {
+        go(go(a, cl.guard), cl.body)
+      })
+    CApply(_, args) -> list.fold(args, acc, go)
+    CApplyExpr(op, args) -> list.fold(args, go(acc, op), go)
+    CCall(m, f, args) -> list.fold(args, go(go(acc, m), f), go)
+    CTry(arg, _, body, _, handler) -> go(go(go(acc, arg), body), handler)
+  }
 }
 
 /// Is `pat` a variable or a tuple whose leaves are all variables?
@@ -872,7 +953,8 @@ fn tr_letrec(
       let #(fvar, st1) = fresh(st, name)
       let env2 =
         Env(..env, funs: dict.insert(env.funs, #(name, arity), DirectFun(fvar)))
-      let #(pforms, env3, st2) = bind_params(params, env2, st1)
+      let #(pforms, env3, st2) =
+        bind_params(params, Env(..env2, depth: env2.depth + 1), st1)
       use #(bodyf, st3) <- result.try(tr_body(fbody, env3, st2))
       let named = e_named_fun(ln, fvar, [e_clause(ln, pforms, [], bodyf)])
       use #(rest, st4) <- result.try(tr_body(inner, env2, st3))
@@ -900,7 +982,8 @@ fn tr_letrec(
           case def {
             FunDef(FName(name, arity), CFun(params, fbody)) -> {
               let tag = name <> "/" <> int.to_string(arity)
-              let #(pforms, env3, stp) = bind_params(params, env2, st0)
+              let #(pforms, env3, stp) =
+                bind_params(params, Env(..env2, depth: env2.depth + 1), st0)
               use #(bodyf, stb) <- result.try(tr_body(fbody, env3, stp))
               Ok(#(
                 [
@@ -988,8 +1071,10 @@ fn tr_def(
           ln: ln,
           vars: dict.new(),
           funs: dict.new(),
-          uses: count_uses(body, dict.new()),
+          uses: count_uses(body, 0, dict.new()),
           local_defs: local_defs,
+          subst: dict.new(),
+          depth: 0,
         )
       let st = St(0)
       let #(pforms, env2, st1) = bind_params(params, env, st)

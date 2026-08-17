@@ -24,11 +24,7 @@ import gleam/string
 fn apply_int(module: Atom, function: Atom, args: List(Int)) -> Int
 
 @external(erlang, "erlang", "apply")
-fn apply_pair(
-  module: Atom,
-  function: Atom,
-  args: List(#(Int, Int)),
-) -> #(Int, Int)
+fn apply_pair(module: Atom, function: Atom, args: List(a)) -> #(Int, Int)
 
 @external(erlang, "erlang", "apply")
 fn apply_triple(
@@ -145,4 +141,61 @@ pub fn single_use_temporary_folds_into_match_test() {
   let assert Ok(mod) = build_beam.compile_and_load(temp_module())
   assert apply_pair(mod, atom.create("swap"), [#(1, 2)]) == #(2, 1)
   assert apply_triple(mod, atom.create("keep"), [#(1, 2)]) == #(2, 1, #(1, 2))
+}
+
+/// `pair/1`: `let T = {X, 1} in let U = {T} in element(1, U)` — both
+/// temporaries are read once, so both splice into the call; `twice/1` reads
+/// `T` twice, so it stays bound; `closure/1` reads `T` inside a nested fun,
+/// so the allocation stays outside the fun.
+fn splice_module() -> CModule {
+  let t = CTuple([CVar("X"), CInt(1)])
+  CModule(
+    name: "carder@test@eaf_splice",
+    exports: [FName("pair", 1), FName("twice", 1), FName("closure", 1)],
+    attributes: [],
+    defs: [
+      FunDef(
+        FName("pair", 1),
+        CFun(
+          ["X"],
+          CLet(
+            ["T"],
+            t,
+            CLet(
+              ["U"],
+              CTuple([CVar("T")]),
+              erlang("element", [CInt(1), CVar("U")]),
+            ),
+          ),
+        ),
+      ),
+      FunDef(
+        FName("twice", 1),
+        CFun(["X"], CLet(["T"], t, CTuple([CVar("T"), CVar("T")]))),
+      ),
+      FunDef(
+        FName("closure", 1),
+        CFun(
+          ["X"],
+          CLet(["T"], t, core_erlang.CApplyExpr(CFun([], CVar("T")), [])),
+        ),
+      ),
+    ],
+  )
+}
+
+pub fn single_read_constructor_splices_into_its_use_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(splice_module())
+  let assert Ok(#(pair_src, rest)) = string.split_once(erl, "twice(")
+  let assert Ok(#(twice_src, closure_src)) = string.split_once(rest, "closure(")
+  // `pair`: no match at all — `element(1, {{V0, 1}})`.
+  assert !string.contains(pair_src, " = ")
+  assert string.contains(pair_src, "{{V0, 1}}")
+  // `twice`: read twice → bound once, referenced twice.
+  assert string.contains(twice_src, "V1 = {V0, 1}")
+  // `closure`: the tuple is built outside the fun, not inside it.
+  assert string.contains(closure_src, "V1 = {V0, 1}")
+  let assert Ok(mod) = build_beam.compile_and_load(splice_module())
+  assert apply_pair(mod, atom.create("pair"), [7]) == #(7, 1)
+  assert apply_pair(mod, atom.create("closure"), [7]) == #(7, 1)
 }
