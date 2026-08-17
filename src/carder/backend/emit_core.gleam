@@ -3023,8 +3023,8 @@ fn materialize_if(
           {
             True -> Ok(#(None, kb, state))
             False ->
-              case sc, pure {
-                NoState, _ -> {
+              case sc, pure, state.float {
+                NoState, _, _ -> {
                   let #(jname, state2) = fresh_fn(state)
                   let fname = FName(jname, arity)
                   let outer_float = state2.float
@@ -3043,7 +3043,11 @@ fn materialize_if(
                 }
                 // State-pure join: no widened state slot — the body runs under
                 // the SAME `cur` every exit still holds (a free var of the fun).
-                Threading(cur), True -> {
+                // Only when no float scope is open: a floated def is hoisted
+                // above the enclosing multi-value `let`, where a `cur` rebound
+                // inside that scope would be out of scope. Under an open scope
+                // the widened twin below takes the record as a parameter.
+                Threading(cur), True, None -> {
                   let #(jname, state2) = fresh_fn(state)
                   let fname = FName(jname, arity)
                   let outer_float = state2.float
@@ -3060,7 +3064,7 @@ fn materialize_if(
                     EmitState(..state3, float: outer_float),
                   )
                 }
-                Threading(_), False -> {
+                Threading(_), _, _ -> {
                   let #(jname, state2) = fresh_fn(state)
                   let #(st_join, state3) = fresh_var(state2)
                   let fname = FName(jname, arity + 1)
