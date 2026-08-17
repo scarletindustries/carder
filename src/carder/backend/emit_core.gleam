@@ -6877,6 +6877,15 @@ fn is_diverging(e: Expr) -> Bool {
         True -> is_diverging(body)
         False -> False
       }
+    // An `If`/`Switch` whose every arm diverges never completes either — the
+    // shape arc's `switch` lowering emits for `case a: … break; case b: return`
+    // (an arity-0 `If` inside a valued Block whose arms all `Break`/`Return`).
+    // Without this, emit_if sees ONE diverging arm, an arity-0 cont slot and
+    // a valued KBind cont → ArityMismatch(0, n).
+    If(_, _, t, e) -> is_diverging(t) && is_diverging(e)
+    Switch(_, _, arms, d) ->
+      is_diverging(d)
+      && list.all(arms, fn(a: SwitchArm) { is_diverging(a.body) })
     _ -> False
   }
 }
