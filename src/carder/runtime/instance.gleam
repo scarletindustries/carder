@@ -186,6 +186,10 @@ pub type TableTier {
 ///
 /// - `Pure`: `M:F(args)`; no `St`; one value; the state channel is unchanged.
 /// - `Read`: `M:F(St, args)`; returns a bare value; the state channel is unchanged.
+/// - `ReadMiss`: `M:F(St, args)`; returns bare `V | miss`; the state channel is unchanged.
+///   When the IR binds the result `r` and tests it at once (`Let([b], NumTerm(NEq, Var(r),
+///   ConstAtom("miss")), If(b, slow, hit))`, `b` read once), probe and test lower to ONE
+///   `case R of 'miss' -> slow; _ -> hit` — the inline hit path with a `miss` sentinel.
 /// - `Mut`: `M:F(St, args)`; returns `{V, St'}`; rebinds the state channel to `St'`.
 /// - `MutMiss`: `M:F(St, args)`; returns bare `St' | miss` (an atom on miss); rebinds to the
 ///   result unless it is an atom, in which case `St` is kept.
@@ -196,6 +200,7 @@ pub type TableTier {
 pub type OpKind {
   Pure
   Read
+  ReadMiss
   Mut
   MutMiss
   MutUnit

@@ -1,21 +1,38 @@
 //// `Binding.direct_host`: a caller-supplied `DirectHost(capability, ops)` routes every
 //// `CallHost(capability, op, args)` to the `HostOp` the table names, under that op's `OpKind`
 //// state-threading convention. Structural checks on the emitted Core (the targets are arbitrary
-//// atoms that need not exist), plus the fail-closed and `ir_lower` admit edges.
+//// atoms that need not exist), plus the fail-closed and `ir_lower` admit edges, and a
+//// differential run of the `ReadMiss` kind against the plain `Read` lowering.
 
+import carder/backend/build_beam
 import carder/backend/core_printer
 import carder/backend/emit_core
 import carder/ir
 import carder/middle/ir_lower
 import carder/runtime/instance.{
   type Binding, Binding, DirectHost, HostOp, MeterOff, Mut, MutMiss, MutUnit,
-  Pure, Read, Threaded,
+  Pure, Read, ReadMiss, Threaded,
 }
 import carder/runtime/profiles
 import gleam/dict
+import gleam/dynamic.{type Dynamic}
+import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
+
+// Test-only FFI (see `test/carder_threaded_test_ffi.erl`): the record-returning
+// `instantiate/0` and a threaded export invoke, traps captured as `Error`.
+@external(erlang, "carder_threaded_test_ffi", "instantiate")
+fn t_instantiate(module: Atom) -> Result(Dynamic, String)
+
+@external(erlang, "carder_threaded_test_ffi", "invoke")
+fn t_invoke(
+  module: Atom,
+  function: Atom,
+  st: Dynamic,
+  args: List(Int),
+) -> Result(#(Int, Dynamic), String)
 
 fn module(name: String, functions: List(ir.Function)) -> ir.Module {
   ir.Module(
@@ -51,6 +68,7 @@ fn binding() -> Binding {
     dict.from_list([
       #("p", HostOp("dh_pure_mod", "pf", Pure)),
       #("r", HostOp("dh_read_mod", "rf", Read)),
+      #("rm", HostOp("dh_rmiss_mod", "rmf", ReadMiss)),
       #("m", HostOp("dh_mut_mod", "mf", Mut)),
       #("mm", HostOp("dh_miss_mod", "mmf", MutMiss)),
       #("u", HostOp("dh_unit_mod", "uf", MutUnit)),
@@ -77,6 +95,7 @@ fn core_for(op: String) -> String {
 pub fn each_kind_calls_its_table_target_test() {
   assert string.contains(core_for("p"), "'dh_pure_mod':'pf'")
   assert string.contains(core_for("r"), "'dh_read_mod':'rf'")
+  assert string.contains(core_for("rm"), "'dh_rmiss_mod':'rmf'")
   assert string.contains(core_for("m"), "'dh_mut_mod':'mf'")
   assert string.contains(core_for("mm"), "'dh_miss_mod':'mmf'")
   assert string.contains(core_for("u"), "'dh_unit_mod':'uf'")
@@ -134,4 +153,103 @@ pub fn direct_profile_routes_through_direct_host_test() {
   let core = core_printer.print_module(cm)
   assert string.contains(core, "'dh_js_mod':'to_num'")
   assert !string.contains(core, "'carder@runtime@rt_js':")
+}
+
+// ───────────────────────────── ReadMiss differential ─────────────────────────────
+
+/// The IR shape arc uses for "inline hit probe, kernel on miss": bind the probe, test it
+/// `=:= miss`, fall to the `Mut` kernel on the sentinel, else yield the probe's value.
+fn probe_then_slow(probe: String) -> ir.Expr {
+  ir.Let(
+    ["v"],
+    ir.CallHost("cap", probe, [ir.Var("p0")]),
+    ir.Let(
+      ["b"],
+      ir.NumTerm(ir.NEq, ir.Var("v"), ir.ConstAtom("miss")),
+      ir.If(
+        ir.Var("b"),
+        [ir.TTerm],
+        ir.CallHost("cap", "slow", [ir.Var("p0")]),
+        ir.Values([ir.Var("v")]),
+      ),
+    ),
+  )
+}
+
+/// A direct host on the real `carder_readmiss_test_ffi`: the same probe under `ReadMiss`
+/// (`rm`) and under plain `Read` (`rr`), plus the `Mut` kernel it falls to.
+fn readmiss_binding() -> Binding {
+  let ops =
+    dict.from_list([
+      #("rm", HostOp("carder_readmiss_test_ffi", "probe", ReadMiss)),
+      #("rr", HostOp("carder_readmiss_test_ffi", "probe", Read)),
+      #("slow", HostOp("carder_readmiss_test_ffi", "slow", Mut)),
+    ])
+  profiles.direct(DirectHost(capability: "cap", ops:))
+}
+
+/// Emit, compile, load `probe_then_slow(probe)` and run it on `arg`; return the value and
+/// the printed Core.
+fn run_probe(probe: String, arg: Int) -> #(Int, String) {
+  let m = module("rmdiff_" <> probe, [fn1("f", probe_then_slow(probe))])
+  let assert Ok(cm) = emit_core.emit_module(m, readmiss_binding())
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
+  let assert Ok(st) = t_instantiate(mod)
+  let assert Ok(#(v, _)) = t_invoke(mod, atom.create("f"), st, [arg])
+  #(v, core_printer.print_module(cm))
+}
+
+/// `ReadMiss` runs identically to the `Read` + `NEq` + `If` lowering on both the hit path
+/// (probe value, kernel not called) and the miss path (kernel value), while its Core is the
+/// single `case V of 'miss' -> …` — no `=:=` compare and no i32 truth binder.
+pub fn readmiss_runs_like_read_neq_if_test() {
+  let #(hit_rm, core_rm) = run_probe("rm", 5)
+  let #(hit_rr, core_rr) = run_probe("rr", 5)
+  assert hit_rm == 10
+  assert hit_rm == hit_rr
+  let #(miss_rm, _) = run_probe("rm", 0)
+  let #(miss_rr, _) = run_probe("rr", 0)
+  assert miss_rm == 100
+  assert miss_rm == miss_rr
+  assert string.contains(core_rm, "'miss'")
+  assert !string.contains(core_rm, "'=:='")
+  assert string.contains(core_rr, "'=:='")
+}
+
+/// A let-bound (non-tail) `If` whose then arm is a bare probe and whose else arm is a plain
+/// value, then a further probe on the result: neither arm rebinds the record, so the
+/// let-case is value-only.
+fn probe_in_pure_if(probe: String) -> ir.Expr {
+  ir.Let(
+    ["b"],
+    ir.NumTerm(ir.NEq, ir.Var("p0"), ir.ConstAtom("none")),
+    ir.Let(
+      ["x"],
+      ir.If(
+        ir.Var("b"),
+        [ir.TTerm],
+        ir.CallHost("cap", probe, [ir.Var("p0")]),
+        ir.Values([ir.Var("p0")]),
+      ),
+      ir.CallHost("cap", "rr", [ir.Var("x")]),
+    ),
+  )
+}
+
+fn core_of_pure_if(probe: String) -> String {
+  let m = module("rmpure_" <> probe, [fn1("f", probe_in_pure_if(probe))])
+  let assert Ok(cm) = emit_core.emit_module(m, readmiss_binding())
+  core_printer.print_module(cm)
+}
+
+/// `ReadMiss` is state-neutral like `Read`: a state-pure `If` around a `ReadMiss` probe
+/// keeps the value-only lowering (no `{St, V}` leaf tuple), exactly as under `Read`.
+pub fn readmiss_keeps_pure_if_value_only_test() {
+  let core_rm = core_of_pure_if("rm")
+  let core_rr = core_of_pure_if("rr")
+  let tuple_leaves = fn(core: String) {
+    core |> string.split("{") |> list.length
+  }
+  assert tuple_leaves(core_rr) == tuple_leaves(core_rm)
+  assert !string.contains(core_rm, "<{")
 }

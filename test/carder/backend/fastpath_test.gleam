@@ -456,3 +456,190 @@ pub fn composed_guarded_add_fast_slow_e2e_test() {
   // the stub's result on the cold path (the REAL rt_js would coerce), surfaced as an Error.
   let assert Error(_) = catch_apply_dyn(mod, g_add, [undefined, to_dynamic(3)])
 }
+
+/// `if c then r1 else r0` as an i32 (`1`/`0`) — the tail of every truth chain below.
+fn truth_result(c: String) -> ir.Expr {
+  ir.If(
+    cond: ir.Var(c),
+    result: [ir.TI32],
+    then_branch: ir.Values([i32(1)]),
+    else_branch: ir.Values([i32(0)]),
+  )
+}
+
+/// `is_int a && is_int b` with both tests bound eagerly (arc's `&&` shape):
+/// ```
+/// let ta = term_test.is_int a
+/// let tb = term_test.is_int b
+/// let c = if ta then tb else 0
+/// if c then 1 else 0
+/// ```
+fn and_chain() -> ir.Function {
+  fn2(
+    "and_chain",
+    ir.TI32,
+    ir.Let(
+      ["ta"],
+      ir.TermTest(ir.IsInt, ir.Var("a")),
+      ir.Let(
+        ["tb"],
+        ir.TermTest(ir.IsInt, ir.Var("b")),
+        ir.Let(
+          ["c"],
+          ir.If(
+            cond: ir.Var("ta"),
+            result: [ir.TI32],
+            then_branch: ir.Values([ir.Var("tb")]),
+            else_branch: ir.Values([i32(0)]),
+          ),
+          truth_result("c"),
+        ),
+      ),
+    ),
+  )
+}
+
+/// Three steps: `is_int a && is_int b && a < b`, the last test arm-local, the
+/// result bound and returned (the consuming `If` as a `Let` rhs).
+fn and_chain3() -> ir.Function {
+  fn2(
+    "and_chain3",
+    ir.TI32,
+    ir.Let(
+      ["ta"],
+      ir.TermTest(ir.IsInt, ir.Var("a")),
+      ir.Let(
+        ["tb"],
+        ir.TermTest(ir.IsInt, ir.Var("b")),
+        ir.Let(
+          ["c1"],
+          ir.If(
+            cond: ir.Var("ta"),
+            result: [ir.TI32],
+            then_branch: ir.Values([ir.Var("tb")]),
+            else_branch: ir.Values([i32(0)]),
+          ),
+          ir.Let(
+            ["c2"],
+            ir.If(
+              cond: ir.Var("c1"),
+              result: [ir.TI32],
+              then_branch: ir.Let(
+                ["w"],
+                ir.NumTerm(ir.NLt, ir.Var("a"), ir.Var("b")),
+                ir.Values([ir.Var("w")]),
+              ),
+              else_branch: ir.Values([i32(0)]),
+            ),
+            ir.Let(["r"], truth_result("c2"), ir.Return([ir.Var("r")])),
+          ),
+        ),
+      ),
+    ),
+  )
+}
+
+/// `!is_int a || a == 0`: `let c = if ta then (let w = a =:= 0 in w) else 1`.
+fn or_local() -> ir.Function {
+  fn2(
+    "or_local",
+    ir.TI32,
+    ir.Let(
+      ["ta"],
+      ir.TermTest(ir.IsInt, ir.Var("a")),
+      ir.Let(
+        ["c"],
+        ir.If(
+          cond: ir.Var("ta"),
+          result: [ir.TI32],
+          then_branch: ir.Let(
+            ["w"],
+            ir.NumTerm(ir.NEq, ir.Var("a"), i32(0)),
+            ir.Values([ir.Var("w")]),
+          ),
+          else_branch: ir.Values([i32(1)]),
+        ),
+        truth_result("c"),
+      ),
+    ),
+  )
+}
+
+/// The step's condition `p` is a plain i32 (read twice) that is REBOUND
+/// between the step and its consumer, so the step cannot be sunk after all —
+/// `tb`, sunk into it, is rebuilt in place. Returns the new `p` when the chain
+/// holds:
+/// ```
+/// let p = term_test.is_int a
+/// let tb = term_test.is_int b
+/// let c = if p then tb else 0
+/// let p = p + 1
+/// if c then p else 0
+/// ```
+fn unfused_step() -> ir.Function {
+  fn2(
+    "unfused_step",
+    ir.TI32,
+    ir.Let(
+      ["p"],
+      ir.TermTest(ir.IsInt, ir.Var("a")),
+      ir.Let(
+        ["tb"],
+        ir.TermTest(ir.IsInt, ir.Var("b")),
+        ir.Let(
+          ["c"],
+          ir.If(
+            cond: ir.Var("p"),
+            result: [ir.TI32],
+            then_branch: ir.Values([ir.Var("tb")]),
+            else_branch: ir.Values([i32(0)]),
+          ),
+          ir.Let(
+            ["p"],
+            ir.Num(ir.IAdd(ir.W32), [ir.Var("p"), i32(1)]),
+            ir.If(
+              cond: ir.Var("c"),
+              result: [ir.TI32],
+              then_branch: ir.Values([ir.Var("p")]),
+              else_branch: ir.Values([i32(0)]),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )
+}
+
+/// `&&`/`||` steps — an i32 `If` whose arms are truth values, feeding an `If`
+/// — fuse into ONE boolean expression (`fuse_truth_if`): no i32 round-trip
+/// between the tests and the branch, and short-circuit order preserved.
+pub fn truth_chain_e2e_test() {
+  let mod =
+    load(
+      module("truth", [and_chain(), and_chain3(), or_local(), unfused_step()]),
+    )
+  let call = fn(name, a, b) { catch_apply_dyn(mod, atom.create(name), [a, b]) }
+  let one = Ok(to_dynamic(1))
+  let zero = Ok(to_dynamic(0))
+  let x = to_dynamic(atom.create("x"))
+  let i = fn(n: Int) { to_dynamic(n) }
+  let f = fn(n: Float) { to_dynamic(n) }
+
+  assert call("and_chain", i(1), i(2)) == one
+  assert call("and_chain", f(1.5), i(2)) == zero
+  assert call("and_chain", i(1), f(2.5)) == zero
+  assert call("and_chain", x, x) == zero
+
+  assert call("and_chain3", i(1), i(2)) == one
+  assert call("and_chain3", i(2), i(1)) == zero
+  assert call("and_chain3", f(1.5), i(2)) == zero
+  assert call("and_chain3", i(1), x) == zero
+
+  assert call("or_local", i(0), x) == one
+  assert call("or_local", i(5), x) == zero
+  assert call("or_local", f(1.5), x) == one
+
+  assert call("unfused_step", i(1), i(2)) == Ok(to_dynamic(2))
+  assert call("unfused_step", i(1), f(2.5)) == zero
+  assert call("unfused_step", f(1.5), i(2)) == zero
+}

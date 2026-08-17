@@ -18,8 +18,8 @@
 
 import carder/backend/build_beam.{CompileFailed}
 import carder/backend/core_erlang.{
-  type CModule, CApply, CAtom, CCall, CCase, CClause, CFun, CInt, CModule, CVar,
-  FName, FunDef, PVar,
+  type CModule, CApply, CAtom, CCall, CCase, CClause, CFun, CInt, CModule,
+  CTuple, CVar, FName, FunDef, PTuple, PVar,
 }
 import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
@@ -39,6 +39,14 @@ fn apply_int(module: Atom, function: Atom, args: List(Int)) -> Int
 /// `erlang:apply(Module, Function, Args)` for exports that return an atom.
 @external(erlang, "erlang", "apply")
 fn apply_atom(module: Atom, function: Atom, args: List(Int)) -> Atom
+
+/// `erlang:apply(Module, Function, Args)` for pair → pair exports.
+@external(erlang, "erlang", "apply")
+fn apply_pair(
+  module: Atom,
+  function: Atom,
+  args: List(#(Int, Int)),
+) -> #(Int, Int)
 
 // ───────────────────────────── fixtures ─────────────────────────────
 
@@ -229,4 +237,49 @@ pub fn split_compile_then_load_test() {
   let assert Ok(loaded) = build_beam.load_module(mod, "fixture.forms", beam)
   assert loaded == mod
   assert apply_int(loaded, atom.create("add"), [40, 2]) == 42
+}
+
+// ───────────────── destructuring case lowers to a match ─────────────────
+
+/// `swap/1`: `case erlang:element(1, {X}) of <{A, B}> when 'true' -> {B, A}` —
+/// the one-clause tuple-binder `case` shape `emit_core` emits for every host
+/// call result.
+fn destructure_module() -> CModule {
+  CModule(
+    name: "carder@test@destructure",
+    exports: [FName("swap", 1)],
+    attributes: [],
+    defs: [
+      FunDef(
+        FName("swap", 1),
+        CFun(
+          ["X"],
+          CCase(
+            CCall(CAtom("erlang"), CAtom("element"), [
+              CInt(1),
+              CTuple([CVar("X")]),
+            ]),
+            [
+              CClause(
+                [PTuple([PVar("A"), PVar("B")])],
+                CAtom("true"),
+                CTuple([CVar("B"), CVar("A")]),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ],
+  )
+}
+
+/// A one-clause unguarded `case` whose pattern only binds variables is a
+/// destructuring bind: it lowers to a `{A, B} = E` match statement (no `case`
+/// in the pretty-printed forms) and still evaluates the same.
+pub fn destructuring_case_lowers_to_match_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(destructure_module())
+  assert !string.contains(erl, "case")
+  assert string.contains(erl, "} =")
+  let assert Ok(mod) = build_beam.compile_and_load(destructure_module())
+  assert apply_pair(mod, atom.create("swap"), [#(1, 2)]) == #(2, 1)
 }

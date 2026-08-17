@@ -57,7 +57,9 @@ import carder/backend/core_printer
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/set.{type Set}
 
 /// An opaque Erlang Abstract Format term — a form, expression, pattern, or
 /// annotation node exactly as `compile:forms/2` / `erl_lint` consume it
@@ -165,9 +167,33 @@ type LocalFun {
 /// anno line (constant for the whole body); `vars` maps a raw Core variable
 /// name to its unique renamed Erlang variable; `funs` maps an in-scope
 /// `letrec`-bound `'name'/arity` to its lowering. An `FName` absent from
-/// `funs` is a top-level module function (a plain local call).
+/// `funs` is a top-level module function (a plain local call). `uses` counts
+/// how many times each raw variable is READ anywhere in the function (fixed
+/// for the whole body); `local_defs` is the module's own `name/arity` set, so
+/// an `erlang:` BIF is only spelled as a local call when no module function
+/// shadows it (each entry is `#(reads, fun depth of the last read)`). `subst`
+/// holds the binders whose `let` was dropped because the value is read exactly
+/// once and is a literal, a variable, or a pure
+/// constructor: the already-translated RHS form, spliced in at that one read.
+/// `depth` counts the enclosing `fun`s, so a constructor is only spliced at a
+/// read in the same fun (moving an allocation into a closure body would
+/// re-run it per call). `consts` maps each constant term (a byte string, or a
+/// tuple / list built only from literals) that occurs more than once in the
+/// function to the variable bound to it at the top of the body — every
+/// occurrence is then a variable read; `sys_core_fold` substitutes a
+/// literal-bound variable back at each read, so the compiled code is the same
+/// and the form carries the literal once.
 type Env {
-  Env(ln: Int, vars: Dict(String, String), funs: Dict(#(String, Int), LocalFun))
+  Env(
+    ln: Int,
+    vars: Dict(String, String),
+    funs: Dict(#(String, Int), LocalFun),
+    uses: Dict(String, #(Int, Int)),
+    local_defs: Set(#(String, Int)),
+    subst: Dict(String, Form),
+    depth: Int,
+    consts: Dict(CExpr, String),
+  )
 }
 
 /// The fresh-name counter, threaded through the whole translation of one
@@ -194,7 +220,15 @@ fn fresh(st: St, _raw_name: String) -> #(String, St) {
 /// returned env — Core scoping) resolve to it.
 fn bind_var(env: Env, st: St, raw_name: String) -> #(String, Env, St) {
   let #(name, st2) = fresh(st, raw_name)
-  #(name, Env(..env, vars: dict.insert(env.vars, raw_name, name)), st2)
+  #(
+    name,
+    Env(
+      ..env,
+      vars: dict.insert(env.vars, raw_name, name),
+      subst: dict.delete(env.subst, raw_name),
+    ),
+    st2,
+  )
 }
 
 // ─────────────────────────────── node constructors ───────────────────────────────
@@ -260,6 +294,78 @@ fn e_call(ln: Int, target: Form, args: List(Form)) -> Form {
 
 fn e_remote(ln: Int, module: Form, function: Form) -> Form {
   raw(#(atom_of("remote"), ln, module, function))
+}
+
+/// `{op, Anno, Op, A}` — a unary operator expression (`-A`, `bnot A`, …).
+fn e_op1(ln: Int, op: String, a: Form) -> Form {
+  raw(#(atom_of("op"), ln, atom_of(op), a))
+}
+
+/// `{op, Anno, Op, A, B}` — a binary operator expression (`A + B`, `A =:= B`, …).
+fn e_op2(ln: Int, op: String, a: Form, b: Form) -> Form {
+  raw(#(atom_of("op"), ln, atom_of(op), a, b))
+}
+
+/// The `erlang` functions Erlang source spells as binary operators.
+const binary_ops = [
+  "+", "-", "*", "/", "==", "/=", "=:=", "=/=", "<", "=<", ">", ">=", "band",
+  "bor", "bxor", "bsl", "bsr", "div", "rem", "and", "or", "xor",
+]
+
+/// The auto-imported `erlang` BIFs a generated module calls, as `name/arity`.
+/// A call to one is a plain local call unless the module defines a function
+/// of the same name and arity (then the qualified form is kept — an
+/// unqualified call would be rejected as ambiguous).
+const auto_bifs = [
+  #("is_atom", 1),
+  #("is_binary", 1),
+  #("is_bitstring", 1),
+  #("is_boolean", 1),
+  #("is_float", 1),
+  #("is_function", 1),
+  #("is_function", 2),
+  #("is_integer", 1),
+  #("is_list", 1),
+  #("is_map", 1),
+  #("is_number", 1),
+  #("is_pid", 1),
+  #("is_port", 1),
+  #("is_reference", 1),
+  #("is_tuple", 1),
+  #("hd", 1),
+  #("tl", 1),
+  #("element", 2),
+  #("setelement", 3),
+  #("tuple_size", 1),
+  #("map_size", 1),
+  #("byte_size", 1),
+  #("bit_size", 1),
+  #("length", 1),
+  #("size", 1),
+  #("abs", 1),
+  #("trunc", 1),
+  #("round", 1),
+  #("float", 1),
+  #("max", 2),
+  #("min", 2),
+]
+
+/// `erlang:F(Args)` as a local call when `F/n` is an auto-imported BIF the
+/// module does not shadow, else the qualified remote call.
+fn erlang_call(
+  ln: Int,
+  f: String,
+  n: Int,
+  argfs: List(Form),
+  env: Env,
+) -> Form {
+  let local =
+    list.contains(auto_bifs, #(f, n)) && !set.contains(env.local_defs, #(f, n))
+  case local {
+    True -> e_call(ln, e_atom(ln, f), argfs)
+    False ->
+      e_call(ln, e_remote(ln, e_atom(ln, "erlang"), e_atom(ln, f)), argfs)
+  }
 }
 
 fn e_fun(ln: Int, clauses: List(Form)) -> Form {
@@ -346,25 +452,38 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       // legalized name under a prefix no `fresh` name can wear) is
       // defensively deterministic for an unbound reference — erl_lint then
       // reports it as unbound, fail-closed.
-      let v = case dict.get(env.vars, name) {
-        Ok(n) -> n
-        Error(Nil) -> "Unbound@" <> core_printer.legalize_var(name)
+      case dict.get(env.subst, name) {
+        Ok(spliced) -> Ok(#(spliced, st))
+        Error(Nil) -> {
+          let v = case dict.get(env.vars, name) {
+            Ok(n) -> n
+            Error(Nil) -> "Unbound@" <> core_printer.legalize_var(name)
+          }
+          Ok(#(e_var(ln, v), st))
+        }
       }
-      Ok(#(e_var(ln, v), st))
     }
     CInt(v) -> Ok(#(e_int(ln, v), st))
     CFloat(v) -> Ok(#(e_float(ln, v), st))
     CAtom(name) -> Ok(#(e_atom(ln, name), st))
     CNil -> Ok(#(e_nil(ln), st))
-    CCons(head, tail) -> {
-      use #(h, st1) <- result.try(tr_expr(head, env, st))
-      use #(t, st2) <- result.try(tr_expr(tail, env, st1))
-      Ok(#(e_cons(ln, h, t), st2))
-    }
-    CTuple(elements) -> {
-      use #(es, st1) <- result.try(tr_exprs(elements, env, st))
-      Ok(#(e_tuple(ln, es), st1))
-    }
+    CCons(head, tail) ->
+      case dict.get(env.consts, expr) {
+        Ok(v) -> Ok(#(e_var(ln, v), st))
+        Error(Nil) -> {
+          use #(h, st1) <- result.try(tr_expr(head, env, st))
+          use #(t, st2) <- result.try(tr_expr(tail, env, st1))
+          Ok(#(e_cons(ln, h, t), st2))
+        }
+      }
+    CTuple(elements) ->
+      case dict.get(env.consts, expr) {
+        Ok(v) -> Ok(#(e_var(ln, v), st))
+        Error(Nil) -> {
+          use #(es, st1) <- result.try(tr_exprs(elements, env, st))
+          Ok(#(e_tuple(ln, es), st1))
+        }
+      }
     CBinary(segments) -> {
       use #(rev, st1) <- result.try(
         list.try_fold(segments, #([], st), fn(acc, seg) {
@@ -375,10 +494,15 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       )
       Ok(#(e_bin(ln, list.reverse(rev)), st1))
     }
-    CBytes(bytes) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
+    CBytes(bytes) ->
+      case dict.get(env.consts, expr) {
+        Ok(v) -> Ok(#(e_var(ln, v), st))
+        Error(Nil) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
+      }
     CValues(values) -> Error(BareValueList(list.length(values)))
     CFun(vars, body) -> {
-      let #(params, env2, st1) = bind_params(vars, env, st)
+      let #(params, env2, st1) =
+        bind_params(vars, Env(..env, depth: env.depth + 1), st)
       use #(bodyf, st2) <- result.try(tr_body(body, env2, st1))
       Ok(#(e_fun(ln, [e_clause(ln, params, [], bodyf)]), st2))
     }
@@ -389,17 +513,20 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
         _ -> Ok(#(e_block(ln, stmts), st1))
       }
     }
-    CCase(arg, clauses) -> {
-      use #(argf, st1) <- result.try(tr_expr(arg, env, st))
-      use #(rev, st2) <- result.try(
-        list.try_fold(clauses, #([], st1), fn(acc, cl) {
-          let #(fs, st0) = acc
-          use #(f, stn) <- result.try(tr_clause(cl, env, st0))
-          Ok(#([f, ..fs], stn))
-        }),
-      )
-      Ok(#(e_case(ln, argf, list.reverse(rev)), st2))
-    }
+    // A short-circuit step over a boolean test — `case T of 'true' -> X;
+    // 'false' -> 'false'` / `'true' -> 'true'; 'false' -> Y` — is spelled
+    // `T andalso X` / `T orelse Y`. `v3_core` lowers the operator back to
+    // this very `case` (its non-boolean arm is dead: `T` is a BIF test), so
+    // the compiled code is identical; the form is ~25 words smaller.
+    CCase(arg, clauses) ->
+      case short_circuit(arg, clauses) {
+        Some(#(op, rhs)) -> {
+          use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+          use #(rhsf, st2) <- result.try(tr_expr(rhs, env, st1))
+          Ok(#(e_op2(ln, op, argf, rhsf), st2))
+        }
+        None -> tr_case(arg, clauses, env, st)
+      }
     CApply(FName(name, arity), args) -> {
       use #(argfs, st1) <- result.try(tr_exprs(args, env, st))
       case dict.get(env.funs, #(name, arity)) {
@@ -427,6 +554,27 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       use #(opf, st1) <- result.try(tr_expr(op, env, st))
       use #(argfs, st2) <- result.try(tr_exprs(args, env, st1))
       Ok(#(e_call(ln, opf, argfs), st2))
+    }
+    // An `erlang:` operator or auto-imported BIF is spelled the way Erlang
+    // source spells it — `A + B` / `is_integer(X)` — instead of a fully
+    // qualified remote call. `v3_core` lowers both spellings to the same
+    // `call 'erlang':'f'`, so the compiled code is identical; the abstract
+    // form is 9–16 words smaller per site (a `remote` node and two atoms).
+    CCall(CAtom("erlang"), CAtom(f), args) -> {
+      use #(argfs, st1) <- result.try(tr_exprs(args, env, st))
+      let n = list.length(args)
+      case argfs {
+        [a] if f == "-" || f == "+" || f == "bnot" || f == "not" ->
+          Ok(#(e_op1(ln, f, a), st1))
+        [a, b] -> {
+          let is_op = list.contains(binary_ops, f)
+          case is_op {
+            True -> Ok(#(e_op2(ln, f, a, b), st1))
+            False -> Ok(#(erlang_call(ln, f, n, argfs, env), st1))
+          }
+        }
+        _ -> Ok(#(erlang_call(ln, f, n, argfs, env), st1))
+      }
     }
     CCall(module, function, args) -> {
       use #(mf, st1) <- result.try(tr_expr(module, env, st))
@@ -471,6 +619,75 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       }
   }
 }
+
+/// `case Arg of Clauses end`.
+fn tr_case(
+  arg: CExpr,
+  clauses: List(CClause),
+  env: Env,
+  st: St,
+) -> Result(#(Form, St), EafError) {
+  use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+  use #(rev, st2) <- result.try(
+    list.try_fold(clauses, #([], st1), fn(acc, cl) {
+      let #(fs, st0) = acc
+      use #(f, stn) <- result.try(tr_clause(cl, env, st0))
+      Ok(#([f, ..fs], stn))
+    }),
+  )
+  Ok(#(e_case(env.ln, argf, list.reverse(rev)), st2))
+}
+
+/// `Some(#(op, rhs))` when `case arg of clauses` is a short-circuit step over
+/// a boolean test — `'true' -> rhs; 'false' -> 'false'` is `arg andalso rhs`,
+/// `'true' -> 'true'; 'false' -> rhs` is `arg orelse rhs` (either clause
+/// order). `v3_core` lowers the operator back to this very `case` (its
+/// non-boolean arm is dead: `arg` is a BIF test), so the compiled code is
+/// identical; the form is ~25 words smaller.
+fn short_circuit(
+  arg: CExpr,
+  clauses: List(CClause),
+) -> Option(#(String, CExpr)) {
+  let arms = case clauses {
+    [
+      CClause([PAtom("true")], CAtom("true"), t),
+      CClause([PAtom("false")], CAtom("true"), e),
+    ] -> Some(#(t, e))
+    [
+      CClause([PAtom("false")], CAtom("true"), e),
+      CClause([PAtom("true")], CAtom("true"), t),
+    ] -> Some(#(t, e))
+    _ -> None
+  }
+  case arms, is_bool_test(arg) {
+    Some(#(t, CAtom("false"))), True -> Some(#("andalso", t))
+    Some(#(CAtom("true"), e)), True -> Some(#("orelse", e))
+    _, _ -> None
+  }
+}
+
+/// A Core expression that always yields a boolean atom: an `erlang` type-test
+/// or comparison BIF call, or a short-circuit `case` over one.
+fn is_bool_test(expr: CExpr) -> Bool {
+  case expr {
+    CCall(CAtom("erlang"), CAtom(f), [_]) -> list.contains(type_tests, f)
+    CCall(CAtom("erlang"), CAtom(f), [_, _]) -> list.contains(compare_ops, f)
+    CCase(arg, clauses) ->
+      case short_circuit(arg, clauses) {
+        Some(#(_, CAtom("true"))) | Some(#(_, CAtom("false"))) -> True
+        Some(#(_, rhs)) -> is_bool_test(rhs)
+        None -> False
+      }
+    _ -> False
+  }
+}
+
+const type_tests = [
+  "is_integer", "is_float", "is_number", "is_atom", "is_binary", "is_tuple",
+  "is_map", "is_function", "is_list", "is_boolean",
+]
+
+const compare_ops = ["<", "=<", ">", ">=", "=:=", "=/=", "==", "/="]
 
 /// One binary segment: `#<V>(Size, Unit, Type, Flags)` →
 /// `{bin_element, Anno, V, Size, [Type, {unit,Unit}, Flags…]}`.
@@ -587,12 +804,30 @@ fn tr_body(
       use #(rest, st2) <- result.try(tr_body(body, env, st1))
       Ok(#([argf, ..rest], st2))
     }
-    CLet([x], arg, body) -> {
-      use #(argf, st1) <- result.try(tr_expr(arg, env, st))
-      let #(xn, env2, st2) = bind_var(env, st1, x)
-      use #(rest, st3) <- result.try(tr_body(body, env2, st2))
-      Ok(#([e_match(ln, e_var(ln, xn), argf), ..rest], st3))
+    // `let G = A in case G of <{V, St}> -> B` where `G` is read nowhere but
+    // in that scrutinee is a destructuring bind spelled through a temporary
+    // (the shape `emit_core`'s let-case tail emits); it lowers to the single
+    // match `{V, St} = A′` — `v3_core` binds a case-valued match through a
+    // fresh variable anyway, so the compiled code is the same and the form is
+    // one match and two variables smaller.
+    CLet(
+      [g],
+      arg,
+      CCase(CVar(g2), [CClause([pat], CAtom("true"), cbody)]) as body,
+    )
+      if g == g2
+    -> {
+      case binder_pat(pat) && read_once(env, g) {
+        True -> {
+          use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+          let #(pf, env2, st2) = tr_pat(pat, env, st1)
+          use #(rest, st3) <- result.try(tr_body(cbody, env2, st2))
+          Ok(#([e_match(ln, pf, argf), ..rest], st3))
+        }
+        False -> tr_let1(g, arg, body, env, st)
+      }
     }
+    CLet([x], arg, body) -> tr_let1(x, arg, body, env, st)
     CLet(vars, CValues(vals), body) -> {
       let nv = list.length(vars)
       case nv == list.length(vals) {
@@ -628,10 +863,202 @@ fn tr_body(
       Ok(#([e_match(ln, pat, argf), ..rest], st3))
     }
     CLetrec(defs, inner) -> tr_letrec(defs, inner, env, st)
+    // A one-clause unguarded `case` in tail position whose pattern is a
+    // variable or a (nested) tuple of variables is Core's spelling of a
+    // destructuring bind (`case E of <{V, St}> when 'true' -> B`); it lowers
+    // to `{V, St} = E′, B′…` — one match statement, no clause list, and the
+    // clause body flattens into the enclosing statement list.
+    CCase(arg, [CClause([pat], CAtom("true"), body)]) -> {
+      case binder_pat(pat) {
+        True -> {
+          use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+          let #(pf, env2, st2) = tr_pat(pat, env, st1)
+          use #(rest, st3) <- result.try(tr_body(body, env2, st2))
+          Ok(#([e_match(ln, pf, argf), ..rest], st3))
+        }
+        False -> {
+          use #(f, st1) <- result.try(tr_expr(expr, env, st))
+          Ok(#([f], st1))
+        }
+      }
+    }
     _ -> {
       use #(f, st1) <- result.try(tr_expr(expr, env, st))
       Ok(#([f], st1))
     }
+  }
+}
+
+/// `let X = A in B` → `X@n = A′, B′…` — unless `X` is read exactly once and
+/// `A` is a literal, a variable, or a pure constructor (`splice_kind`), in
+/// which case the match is dropped and `A′` is spliced in at that read.
+fn tr_let1(
+  x: String,
+  arg: CExpr,
+  body: CExpr,
+  env: Env,
+  st: St,
+) -> Result(#(List(Form), St), EafError) {
+  let ln = env.ln
+  use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+  let splice = case dict.get(env.uses, x), splice_kind(arg) {
+    Ok(#(1, _)), Anywhere -> True
+    Ok(#(1, d)), SameFun -> d == env.depth
+    _, _ -> False
+  }
+  case splice {
+    True -> {
+      let env2 = Env(..env, subst: dict.insert(env.subst, x, argf))
+      tr_body(body, env2, st1)
+    }
+    False -> {
+      let #(xn, env2, st2) = bind_var(env, st1, x)
+      use #(rest, st3) <- result.try(tr_body(body, env2, st2))
+      Ok(#([e_match(ln, e_var(ln, xn), argf), ..rest], st3))
+    }
+  }
+}
+
+/// Is `x` read exactly once in the function?
+fn read_once(env: Env, x: String) -> Bool {
+  case dict.get(env.uses, x) {
+    Ok(#(1, _)) -> True
+    _ -> False
+  }
+}
+
+/// How a `let` RHS may be spliced into its single read: `Anywhere` for a
+/// literal / variable / fun reference (no evaluation to move — a variable
+/// read inside a nested fun is an ordinary closure capture, and the spliced
+/// form is the already-renamed variable, so a later shadowing rebinding of
+/// the raw name cannot capture it); `SameFun` for a tuple / cons of such
+/// values (a pure allocation that must not move into a closure body);
+/// `NoSplice` for anything else (calls, cases, …).
+type Splice {
+  Anywhere
+  SameFun
+  NoSplice
+}
+
+fn splice_kind(arg: CExpr) -> Splice {
+  case arg {
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) | CFunRef(_) ->
+      Anywhere
+    CTuple(es) ->
+      case list.all(es, fn(e) { splice_kind(e) != NoSplice }) {
+        True -> SameFun
+        False -> NoSplice
+      }
+    CCons(h, t) ->
+      case splice_kind(h) != NoSplice && splice_kind(t) != NoSplice {
+        True -> SameFun
+        False -> NoSplice
+      }
+    _ -> NoSplice
+  }
+}
+
+/// How many times each raw variable name is READ (a `CVar` in expression
+/// position; binders and pattern variables do not count) across `expr`,
+/// paired with the fun depth of its LAST read (`depth` = enclosing `fun`s /
+/// `letrec` bodies; only meaningful for a variable read once).
+fn count_uses(
+  expr: CExpr,
+  depth: Int,
+  acc: Dict(String, #(Int, Int)),
+) -> Dict(String, #(Int, Int)) {
+  let go = fn(a, e) { count_uses(e, depth, a) }
+  case expr {
+    CVar(name) ->
+      dict.upsert(acc, name, fn(prev) {
+        case prev {
+          option.Some(#(n, _)) -> #(n + 1, depth)
+          option.None -> #(1, depth)
+        }
+      })
+    CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) | CFunRef(_) -> acc
+    CCons(h, t) -> go(go(acc, h), t)
+    CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, go)
+    CBinary(segs) ->
+      list.fold(segs, acc, fn(a, seg) { go(go(a, seg.value), seg.size) })
+    CFun(_, body) -> count_uses(body, depth + 1, acc)
+    CLet(_, arg, body) -> go(go(acc, arg), body)
+    CLetrec(defs, body) ->
+      list.fold(defs, go(acc, body), fn(a, d) { count_uses(d.value, depth, a) })
+    CCase(arg, clauses) ->
+      list.fold(clauses, go(acc, arg), fn(a, cl) {
+        go(go(a, cl.guard), cl.body)
+      })
+    CApply(_, args) -> list.fold(args, acc, go)
+    CApplyExpr(op, args) -> list.fold(args, go(acc, op), go)
+    CCall(m, f, args) -> list.fold(args, go(go(acc, m), f), go)
+    CTry(arg, _, body, _, handler) -> go(go(go(acc, arg), body), handler)
+  }
+}
+
+/// How many times each constant term worth sharing (`is_const_term`) occurs
+/// across `expr`. A constant nested inside a larger constant counts only as
+/// part of the larger one.
+fn count_consts(expr: CExpr, acc: Dict(CExpr, Int)) -> Dict(CExpr, Int) {
+  let go = fn(a, e) { count_consts(e, a) }
+  case is_const_term(expr) {
+    True -> dict.upsert(acc, expr, fn(n) { option.unwrap(n, 0) + 1 })
+    False ->
+      case expr {
+        CVar(_)
+        | CInt(_)
+        | CFloat(_)
+        | CAtom(_)
+        | CNil
+        | CFunRef(_)
+        | CBytes(_) -> acc
+        CCons(h, t) -> go(go(acc, h), t)
+        CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, go)
+        CBinary(segs) ->
+          list.fold(segs, acc, fn(a, seg) { go(go(a, seg.value), seg.size) })
+        CFun(_, body) -> go(acc, body)
+        CLet(_, arg, body) -> go(go(acc, arg), body)
+        CLetrec(defs, body) ->
+          list.fold(defs, go(acc, body), fn(a, d) { go(a, d.value) })
+        CCase(arg, clauses) ->
+          list.fold(clauses, go(acc, arg), fn(a, cl) {
+            go(go(a, cl.guard), cl.body)
+          })
+        CApply(_, args) -> list.fold(args, acc, go)
+        CApplyExpr(op, args) -> list.fold(args, go(acc, op), go)
+        CCall(m, f, args) -> list.fold(args, go(go(acc, m), f), go)
+        CTry(arg, _, body, _, handler) -> go(go(go(acc, arg), body), handler)
+      }
+  }
+}
+
+/// A byte string, or a tuple / cons cell whose parts are all literals — a
+/// term the compiler turns into one literal, and one whose form is bigger
+/// than a variable read (an atom / integer / `[]` alone is not).
+fn is_const_term(expr: CExpr) -> Bool {
+  case expr {
+    CBytes(_) -> True
+    CTuple(es) -> list.all(es, is_literal)
+    CCons(h, t) -> is_literal(h) && is_literal(t)
+    _ -> False
+  }
+}
+
+fn is_literal(expr: CExpr) -> Bool {
+  case expr {
+    CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) -> True
+    CTuple(es) -> list.all(es, is_literal)
+    CCons(h, t) -> is_literal(h) && is_literal(t)
+    _ -> False
+  }
+}
+
+/// Is `pat` a variable or a tuple whose leaves are all variables?
+fn binder_pat(pat: CPat) -> Bool {
+  case pat {
+    PVar(_) -> True
+    PTuple(elements) -> list.all(elements, binder_pat)
+    PInt(_) | PAtom(_) | PNil | PCons(_, _) -> False
   }
 }
 
@@ -673,7 +1100,8 @@ fn tr_letrec(
       let #(fvar, st1) = fresh(st, name)
       let env2 =
         Env(..env, funs: dict.insert(env.funs, #(name, arity), DirectFun(fvar)))
-      let #(pforms, env3, st2) = bind_params(params, env2, st1)
+      let #(pforms, env3, st2) =
+        bind_params(params, Env(..env2, depth: env2.depth + 1), st1)
       use #(bodyf, st3) <- result.try(tr_body(fbody, env3, st2))
       let named = e_named_fun(ln, fvar, [e_clause(ln, pforms, [], bodyf)])
       use #(rest, st4) <- result.try(tr_body(inner, env2, st3))
@@ -701,7 +1129,8 @@ fn tr_letrec(
           case def {
             FunDef(FName(name, arity), CFun(params, fbody)) -> {
               let tag = name <> "/" <> int.to_string(arity)
-              let #(pforms, env3, stp) = bind_params(params, env2, st0)
+              let #(pforms, env3, stp) =
+                bind_params(params, Env(..env2, depth: env2.depth + 1), st0)
               use #(bodyf, stb) <- result.try(tr_body(fbody, env3, stp))
               Ok(#(
                 [
@@ -775,19 +1204,51 @@ fn term_tuple(elements: List(Form)) -> Form
 /// `{function, Line, Name, Arity, [Clause]}` form. `idx` (0-based def
 /// position) supplies the synthetic line (`idx + 1`) annotating every node in
 /// the function, so runtime stacktrace lines identify the generated function.
-fn tr_def(def: FunDef, idx: Int) -> Result(Form, EafError) {
+fn tr_def(
+  def: FunDef,
+  idx: Int,
+  local_defs: Set(#(String, Int)),
+) -> Result(Form, EafError) {
   let FunDef(FName(name, arity), value) = def
   case value {
     CFun(params, body) -> {
       let ln = idx + 1
-      let env = Env(ln: ln, vars: dict.new(), funs: dict.new())
+      let env =
+        Env(
+          ln: ln,
+          vars: dict.new(),
+          funs: dict.new(),
+          uses: count_uses(body, 0, dict.new()),
+          local_defs: local_defs,
+          subst: dict.new(),
+          depth: 0,
+          consts: dict.new(),
+        )
       let st = St(0)
       let #(pforms, env2, st1) = bind_params(params, env, st)
-      use #(bodyf, _st2) <- result.try(tr_body(body, env2, st1))
+      // Bind each constant term that occurs more than once to a variable
+      // ahead of the body (see `Env.consts`).
+      let repeated =
+        count_consts(body, dict.new())
+        |> dict.filter(fn(_, n) { n > 1 })
+        |> dict.keys
+      use #(hoisted, env3, st2) <- result.try(
+        list.try_fold(repeated, #([], env2, st1), fn(acc, term) {
+          let #(ms, env0, st0) = acc
+          use #(tf, stt) <- result.try(tr_expr(term, env0, st0))
+          let #(v, stn) = fresh(stt, "const")
+          Ok(#(
+            [e_match(ln, e_var(ln, v), tf), ..ms],
+            Env(..env0, consts: dict.insert(env0.consts, term, v)),
+            stn,
+          ))
+        }),
+      )
+      use #(bodyf, _st3) <- result.try(tr_body(body, env3, st2))
       Ok(
         raw(
           #(atom_of("function"), ln, atom_of(name), arity, [
-            e_clause(ln, pforms, [], bodyf),
+            e_clause(ln, pforms, [], list.append(list.reverse(hoisted), bodyf)),
           ]),
         ),
       )
@@ -826,9 +1287,15 @@ pub fn module_forms(m: CModule) -> Result(List(Form), EafError) {
       }
     }),
   )
+  let local_defs =
+    list.map(m.defs, fn(def) {
+      let FName(name, arity) = def.name
+      #(name, arity)
+    })
+    |> set.from_list
   use defs <- result.try(
     list.index_map(m.defs, fn(def, idx) { #(def, idx) })
-    |> list.try_map(fn(pair) { tr_def(pair.0, pair.1) }),
+    |> list.try_map(fn(pair) { tr_def(pair.0, pair.1, local_defs) }),
   )
   Ok(list.flatten([[mod_attr, exp_attr], attrs, defs]))
 }
