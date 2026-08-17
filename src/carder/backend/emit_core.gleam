@@ -106,6 +106,7 @@ import carder/runtime/instance.{
 }
 import carder/runtime/profiles
 import gleam/bit_array
+import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -356,8 +357,9 @@ type EmitState {
     /// How many times each IR variable is BOUND in the function being emitted.
     binds: Dict(String, Int),
     /// Truth-value binders whose i32 `let` was dropped by `apply_cont_bool`
-    /// (read once, as an `If` condition further down the `Let` spine), mapped
-    /// to their boolean BIF call; `emit_if` scrutinises the call directly.
+    /// (read once, as a boolean further down the `Let` spine), mapped to
+    /// their boolean expression — a BIF call, or a fused truth `If` over such
+    /// calls (`fuse_truth_if`); `emit_if` scrutinises it directly.
     sunk: Dict(String, CExpr),
     /// Binders whose `let` was dropped by `apply_cont` because every value was
     /// atomic (a variable or literal), mapped to that value; `emit_value`
@@ -1563,9 +1565,9 @@ fn apply_cont_bool(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case cont {
     KBind([v], body, next) -> {
-      let once =
-        dict.get(state.uses, v) == Ok(1) && dict.get(state.binds, v) == Ok(1)
-      case once && if_on_spine(v, body, call_operands(bif_call)) {
+      case
+        bound_once(v, state) && if_on_spine(v, body, cvars(bif_call), state)
+      {
         True -> {
           let sunk = dict.insert(state.sunk, v, bif_call)
           emit(body, next, sc, EmitState(..state, sunk:), ctx)
@@ -1577,31 +1579,138 @@ fn apply_cont_bool(
   }
 }
 
-/// The variable operands of a BIF `call` (its atomic `CVar` args).
-fn call_operands(call: CExpr) -> List(String) {
-  case call {
-    CCall(_, _, args) ->
-      list.filter_map(args, fn(a) {
-        case a {
-          CVar(name) -> Ok(name)
-          _ -> Error(Nil)
-        }
-      })
+/// `v` is bound exactly once and read exactly once in the function.
+fn bound_once(v: String, state: EmitState) -> Bool {
+  dict.get(state.uses, v) == Ok(1) && dict.get(state.binds, v) == Ok(1)
+}
+
+/// Every variable named anywhere in `e` (a sunk truth expression: BIF calls,
+/// `case`s over them, atoms/ints and variables — no binders).
+fn cvars(e: CExpr) -> List(String) {
+  case e {
+    CVar(name) -> [name]
+    CCall(_, _, args) -> list.flat_map(args, cvars)
+    CCase(arg, clauses) ->
+      list.flat_map(clauses, fn(c) { cvars(c.body) }) |> list.append(cvars(arg))
     _ -> []
   }
 }
 
-/// `True` iff an `If` on `v` sits on the `Let` spine of `body` — as the spine's
-/// tail or as a spine `Let`'s rhs — and no spine binder above it rebinds one of
-/// `operands`.
-fn if_on_spine(v: String, body: Expr, operands: List(String)) -> Bool {
+/// `True` iff `v` is consumed as a boolean on the `Let` spine of `body` — as
+/// the condition of an `If` there (the spine's tail or a spine `Let`'s rhs), or
+/// as the value of one arm of a spine-`Let` truth `If` (`b = if c then v else
+/// 0`, an `&&`/`||` step) whose binder `b` is itself so consumed — and no spine
+/// binder above the consumer rebinds one of `operands`. Such a truth `If` is
+/// fused by `emit_if` (`fuse_truth_if`) into `b`'s own sunk boolean expression.
+fn if_on_spine(
+  v: String,
+  body: Expr,
+  operands: List(String),
+  state: EmitState,
+) -> Bool {
   case body {
     If(Var(c), _, _, _) -> c == v
     Let(_, If(Var(c), _, _, _), _) if c == v -> True
+    Let([b], If(Var(_), [ir.TI32], t, e), rest) ->
+      !list.contains(operands, b)
+      && case t == Values([Var(v)]) || e == Values([Var(v)]) {
+        True ->
+          bound_once(b, state)
+          && truth_shape(t)
+          && truth_shape(e)
+          && if_on_spine(b, rest, operands, state)
+        False -> if_on_spine(v, rest, operands, state)
+      }
     Let(xs, _, rest) ->
       !list.any(xs, list.contains(operands, _))
-      && if_on_spine(v, rest, operands)
+      && if_on_spine(v, rest, operands, state)
     _ -> False
+  }
+}
+
+/// A truth `If` arm `fuse_truth_if` can lower to a boolean expression: an
+/// i32 literal or a variable, under any number of arm-local truth tests.
+fn truth_shape(arm: Expr) -> Bool {
+  case arm {
+    Values([ConstI32(_)]) | Values([Var(_)]) -> True
+    Let([_], rhs, body) -> is_truth_test(rhs) && truth_shape(body)
+    _ -> False
+  }
+}
+
+/// A pure, non-raising rhs that `apply_cont_bool` disposes as a boolean BIF
+/// call: a term test or a number comparison.
+fn is_truth_test(rhs: Expr) -> Bool {
+  case rhs {
+    ir.TermTest(_, _) -> True
+    ir.NumTerm(op, _, _) ->
+      case op {
+        ir.NLt | ir.NLe | ir.NGt | ir.NGe | ir.NEq -> True
+        ir.NAdd | ir.NSub | ir.NMul -> False
+      }
+    _ -> False
+  }
+}
+
+/// The boolean BIF call for a truth-test rhs (`is_truth_test`), as
+/// `emit_term_test`/`emit_num_term` would build it.
+fn truth_test(rhs: Expr, state: EmitState) -> Option(CExpr) {
+  case rhs {
+    ir.TermTest(kind, arg) ->
+      Some(
+        CCall(CAtom("erlang"), CAtom(term_test_bif(kind)), [
+          emit_value(arg, state),
+        ]),
+      )
+    ir.NumTerm(op, lhs, rhs) -> {
+      let bif = fn(name) {
+        CCall(CAtom("erlang"), CAtom(name), [
+          emit_value(lhs, state),
+          emit_value(rhs, state),
+        ])
+      }
+      case op {
+        ir.NLt -> Some(bif("<"))
+        ir.NLe -> Some(bif("=<"))
+        ir.NGt -> Some(bif(">"))
+        ir.NGe -> Some(bif(">="))
+        ir.NEq -> Some(bif("=:="))
+        ir.NAdd | ir.NSub | ir.NMul -> None
+      }
+    }
+    _ -> None
+  }
+}
+
+/// The boolean expression of a truth `If` arm (`truth_shape`): arm-local
+/// tests are sunk into the arm's own scope, so the arm's value — a literal, a
+/// sunk truth binder, or any other i32 — becomes a boolean atom.
+fn truth_arm(arm: Expr, state: EmitState) -> Option(#(CExpr, EmitState)) {
+  case arm {
+    Values([ConstI32(0)]) -> Some(#(CAtom("false"), state))
+    Values([ConstI32(_)]) -> Some(#(CAtom("true"), state))
+    Values([Var(w)]) ->
+      case dict.get(state.sunk, w) {
+        Ok(call) -> Some(#(call, state))
+        Error(Nil) -> {
+          let #(wild, state2) = fresh_var(state)
+          Some(#(
+            CCase(emit_value(Var(w), state), [
+              CClause([PInt(0)], CAtom("true"), CAtom("false")),
+              CClause([PVar(wild)], CAtom("true"), CAtom("true")),
+            ]),
+            state2,
+          ))
+        }
+      }
+    Let([w], rhs, body) -> {
+      use call <- option.then(truth_test(rhs, state))
+      truth_arm(
+        body,
+        EmitState(..state, sunk: dict.insert(state.sunk, w, call)),
+      )
+    }
+    _ -> None
   }
 }
 
@@ -6371,18 +6480,84 @@ fn emit_if(
       |> result.unwrap(I32Cond(cond))
     _ -> I32Cond(cond)
   }
-  emit_if_on(
-    if_cond,
-    result,
-    then_branch,
-    else_branch,
-    cont,
-    sc,
-    sc,
-    sc,
-    state,
-    ctx,
-  )
+  case fuse_truth_if(if_cond, result, then_branch, else_branch, cont, state) {
+    Some(#(rest, next, state2)) -> emit(rest, next, sc, state2, ctx)
+    None ->
+      emit_if_on(
+        if_cond,
+        result,
+        then_branch,
+        else_branch,
+        cont,
+        sc,
+        sc,
+        sc,
+        state,
+        ctx,
+      )
+  }
+}
+
+/// An i32 truth `If` — `let b = if c then <truth arm> else <truth arm> in
+/// rest` (an `&&`/`||` step) whose binder `b` is read once, as a boolean on
+/// the spine of `rest` — is not emitted at all: its boolean expression `case
+/// c of 'true' -> T; 'false' -> E end` (arms per `truth_arm`) is sunk to
+/// that consumer under `b` and `rest` is emitted directly. No i32 round-trip
+/// and no `let`; a chain of steps nests into one boolean expression.
+fn fuse_truth_if(
+  cond: IfCond,
+  result: List(ir.ValType),
+  then_branch: Expr,
+  else_branch: Expr,
+  cont: Cont,
+  state: EmitState,
+) -> Option(#(Expr, Cont, EmitState)) {
+  case cont, result {
+    KBind([b], rest, next), [ir.TI32] -> {
+      use <- bool.guard(!bound_once(b, state), None)
+      use #(t, state2) <- option.then(truth_arm(then_branch, state))
+      // Each arm's local tests are scoped to that arm.
+      let state2 = EmitState(..state2, sunk: state.sunk)
+      use #(e, state3) <- option.then(truth_arm(else_branch, state2))
+      let #(expr, state4) = case cond {
+        BoolCond(call) -> #(
+          CCase(call, [
+            CClause([PAtom("true")], CAtom("true"), t),
+            CClause([PAtom("false")], CAtom("true"), e),
+          ]),
+          state3,
+        )
+        I32Cond(v) -> {
+          let #(wild, state4) = fresh_var(state3)
+          #(
+            CCase(emit_value(v, state), [
+              CClause([PInt(0)], CAtom("true"), e),
+              CClause([PVar(wild)], CAtom("true"), t),
+            ]),
+            state4,
+          )
+        }
+        MissCond(r) -> {
+          let #(wild, state4) = fresh_var(state3)
+          #(
+            CCase(CVar(r), [
+              CClause([PAtom("miss")], CAtom("true"), t),
+              CClause([PVar(wild)], CAtom("true"), e),
+            ]),
+            state4,
+          )
+        }
+      }
+      case if_on_spine(b, rest, cvars(expr), state) {
+        True -> {
+          let sunk = dict.insert(state.sunk, b, expr)
+          Some(#(rest, next, EmitState(..state4, sunk:)))
+        }
+        False -> None
+      }
+    }
+    _, _ -> None
+  }
 }
 
 /// What an `If` scrutinises: the IR's i32 truth value (`0` → else), a
@@ -7677,7 +7852,16 @@ fn emit_catch_clause(
 /// pattern; floats as their IEEE-754 bits per D5 — never a Core float).
 fn emit_value(v: Value, state: EmitState) -> CExpr {
   case v {
-    Var(name) -> dict.get(state.subst, name) |> result.unwrap(CVar(name))
+    Var(name) ->
+      case dict.get(state.subst, name) {
+        Ok(v) -> v
+        // A truth value sunk past a consumer that did not fuse after all:
+        // rebuild the i32 in place (pure; its operands are still in scope).
+        Error(Nil) ->
+          dict.get(state.sunk, name)
+          |> result.map(bool_to_i32)
+          |> result.unwrap(CVar(name))
+      }
     ConstI32(bits) -> CInt(bits)
     ConstI64(bits) -> CInt(bits)
     ConstF32(bits) -> CInt(bits)
