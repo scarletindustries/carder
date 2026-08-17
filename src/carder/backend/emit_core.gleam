@@ -1749,16 +1749,16 @@ fn truth_arm(arm: Expr, state: EmitState) -> Option(#(CExpr, EmitState)) {
     Values([Var(w)]) ->
       case dict.get(state.sunk, w) {
         Ok(call) -> Some(#(call, state))
-        Error(Nil) -> {
-          let #(wild, state2) = fresh_var(state)
+        // Any other i32 truth value: `W =/= 0` (a comparison BIF, so it
+        // nests into `andalso`/`orelse` chains like the sunk tests).
+        Error(Nil) ->
           Some(#(
-            CCase(emit_value(Var(w), state), [
-              CClause([PInt(0)], CAtom("true"), CAtom("false")),
-              CClause([PVar(wild)], CAtom("true"), CAtom("true")),
+            CCall(CAtom("erlang"), CAtom("=/="), [
+              emit_value(Var(w), state),
+              CInt(0),
             ]),
-            state2,
+            state,
           ))
-        }
       }
     Let([w], rhs, body) -> {
       use call <- option.then(truth_test(rhs, state))
