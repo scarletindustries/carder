@@ -177,11 +177,12 @@ type LocalFun {
 /// constructor: the already-translated RHS form, spliced in at that one read.
 /// `depth` counts the enclosing `fun`s, so a constructor is only spliced at a
 /// read in the same fun (moving an allocation into a closure body would
-/// re-run it per call). `bytes` maps each byte-string literal that occurs
-/// more than once in the function to the variable bound to it at the top of
-/// the body — every occurrence is then a variable read; `sys_core_fold`
-/// substitutes a literal-bound variable back at each read, so the compiled
-/// code is the same and the form carries the literal once.
+/// re-run it per call). `consts` maps each constant term (a byte string, or a
+/// tuple / list built only from literals) that occurs more than once in the
+/// function to the variable bound to it at the top of the body — every
+/// occurrence is then a variable read; `sys_core_fold` substitutes a
+/// literal-bound variable back at each read, so the compiled code is the same
+/// and the form carries the literal once.
 type Env {
   Env(
     ln: Int,
@@ -191,7 +192,7 @@ type Env {
     local_defs: Set(#(String, Int)),
     subst: Dict(String, Form),
     depth: Int,
-    bytes: Dict(BitArray, String),
+    consts: Dict(CExpr, String),
   )
 }
 
@@ -466,15 +467,23 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
     CFloat(v) -> Ok(#(e_float(ln, v), st))
     CAtom(name) -> Ok(#(e_atom(ln, name), st))
     CNil -> Ok(#(e_nil(ln), st))
-    CCons(head, tail) -> {
-      use #(h, st1) <- result.try(tr_expr(head, env, st))
-      use #(t, st2) <- result.try(tr_expr(tail, env, st1))
-      Ok(#(e_cons(ln, h, t), st2))
-    }
-    CTuple(elements) -> {
-      use #(es, st1) <- result.try(tr_exprs(elements, env, st))
-      Ok(#(e_tuple(ln, es), st1))
-    }
+    CCons(head, tail) ->
+      case dict.get(env.consts, expr) {
+        Ok(v) -> Ok(#(e_var(ln, v), st))
+        Error(Nil) -> {
+          use #(h, st1) <- result.try(tr_expr(head, env, st))
+          use #(t, st2) <- result.try(tr_expr(tail, env, st1))
+          Ok(#(e_cons(ln, h, t), st2))
+        }
+      }
+    CTuple(elements) ->
+      case dict.get(env.consts, expr) {
+        Ok(v) -> Ok(#(e_var(ln, v), st))
+        Error(Nil) -> {
+          use #(es, st1) <- result.try(tr_exprs(elements, env, st))
+          Ok(#(e_tuple(ln, es), st1))
+        }
+      }
     CBinary(segments) -> {
       use #(rev, st1) <- result.try(
         list.try_fold(segments, #([], st), fn(acc, seg) {
@@ -486,7 +495,7 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       Ok(#(e_bin(ln, list.reverse(rev)), st1))
     }
     CBytes(bytes) ->
-      case dict.get(env.bytes, bytes) {
+      case dict.get(env.consts, expr) {
         Ok(v) -> Ok(#(e_var(ln, v), st))
         Error(Nil) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
       }
@@ -915,28 +924,60 @@ fn count_uses(
   }
 }
 
-/// How many times each byte-string literal occurs across `expr`.
-fn count_bytes(expr: CExpr, acc: Dict(BitArray, Int)) -> Dict(BitArray, Int) {
-  let go = fn(a, e) { count_bytes(e, a) }
+/// How many times each constant term worth sharing (`is_const_term`) occurs
+/// across `expr`. A constant nested inside a larger constant counts only as
+/// part of the larger one.
+fn count_consts(expr: CExpr, acc: Dict(CExpr, Int)) -> Dict(CExpr, Int) {
+  let go = fn(a, e) { count_consts(e, a) }
+  case is_const_term(expr) {
+    True -> dict.upsert(acc, expr, fn(n) { option.unwrap(n, 0) + 1 })
+    False ->
+      case expr {
+        CVar(_)
+        | CInt(_)
+        | CFloat(_)
+        | CAtom(_)
+        | CNil
+        | CFunRef(_)
+        | CBytes(_) -> acc
+        CCons(h, t) -> go(go(acc, h), t)
+        CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, go)
+        CBinary(segs) ->
+          list.fold(segs, acc, fn(a, seg) { go(go(a, seg.value), seg.size) })
+        CFun(_, body) -> go(acc, body)
+        CLet(_, arg, body) -> go(go(acc, arg), body)
+        CLetrec(defs, body) ->
+          list.fold(defs, go(acc, body), fn(a, d) { go(a, d.value) })
+        CCase(arg, clauses) ->
+          list.fold(clauses, go(acc, arg), fn(a, cl) {
+            go(go(a, cl.guard), cl.body)
+          })
+        CApply(_, args) -> list.fold(args, acc, go)
+        CApplyExpr(op, args) -> list.fold(args, go(acc, op), go)
+        CCall(m, f, args) -> list.fold(args, go(go(acc, m), f), go)
+        CTry(arg, _, body, _, handler) -> go(go(go(acc, arg), body), handler)
+      }
+  }
+}
+
+/// A byte string, or a tuple / cons cell whose parts are all literals — a
+/// term the compiler turns into one literal, and one whose form is bigger
+/// than a variable read (an atom / integer / `[]` alone is not).
+fn is_const_term(expr: CExpr) -> Bool {
   case expr {
-    CBytes(bytes) -> dict.upsert(acc, bytes, fn(n) { option.unwrap(n, 0) + 1 })
-    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CFunRef(_) -> acc
-    CCons(h, t) -> go(go(acc, h), t)
-    CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, go)
-    CBinary(segs) ->
-      list.fold(segs, acc, fn(a, seg) { go(go(a, seg.value), seg.size) })
-    CFun(_, body) -> go(acc, body)
-    CLet(_, arg, body) -> go(go(acc, arg), body)
-    CLetrec(defs, body) ->
-      list.fold(defs, go(acc, body), fn(a, d) { go(a, d.value) })
-    CCase(arg, clauses) ->
-      list.fold(clauses, go(acc, arg), fn(a, cl) {
-        go(go(a, cl.guard), cl.body)
-      })
-    CApply(_, args) -> list.fold(args, acc, go)
-    CApplyExpr(op, args) -> list.fold(args, go(acc, op), go)
-    CCall(m, f, args) -> list.fold(args, go(go(acc, m), f), go)
-    CTry(arg, _, body, _, handler) -> go(go(go(acc, arg), body), handler)
+    CBytes(_) -> True
+    CTuple(es) -> list.all(es, is_literal)
+    CCons(h, t) -> is_literal(h) && is_literal(t)
+    _ -> False
+  }
+}
+
+fn is_literal(expr: CExpr) -> Bool {
+  case expr {
+    CInt(_) | CFloat(_) | CAtom(_) | CNil | CBytes(_) -> True
+    CTuple(es) -> list.all(es, is_literal)
+    CCons(h, t) -> is_literal(h) && is_literal(t)
+    _ -> False
   }
 }
 
@@ -1109,28 +1150,28 @@ fn tr_def(
           local_defs: local_defs,
           subst: dict.new(),
           depth: 0,
-          bytes: dict.new(),
+          consts: dict.new(),
         )
       let st = St(0)
       let #(pforms, env2, st1) = bind_params(params, env, st)
-      // Bind each byte-string literal that occurs more than once to a
-      // variable ahead of the body (see `Env.bytes`).
+      // Bind each constant term that occurs more than once to a variable
+      // ahead of the body (see `Env.consts`).
       let repeated =
-        count_bytes(body, dict.new())
+        count_consts(body, dict.new())
         |> dict.filter(fn(_, n) { n > 1 })
         |> dict.keys
-      let #(hoisted, env3, st2) =
-        list.fold(repeated, #([], env2, st1), fn(acc, bytes) {
+      use #(hoisted, env3, st2) <- result.try(
+        list.try_fold(repeated, #([], env2, st1), fn(acc, term) {
           let #(ms, env0, st0) = acc
-          let #(v, stn) = fresh(st0, "bytes")
-          let m =
-            e_match(ln, e_var(ln, v), e_bin(ln, [e_bytes_element(ln, bytes)]))
-          #(
-            [m, ..ms],
-            Env(..env0, bytes: dict.insert(env0.bytes, bytes, v)),
+          use #(tf, stt) <- result.try(tr_expr(term, env0, st0))
+          let #(v, stn) = fresh(stt, "const")
+          Ok(#(
+            [e_match(ln, e_var(ln, v), tf), ..ms],
+            Env(..env0, consts: dict.insert(env0.consts, term, v)),
             stn,
-          )
-        })
+          ))
+        }),
+      )
       use #(bodyf, _st3) <- result.try(tr_body(body, env3, st2))
       Ok(
         raw(

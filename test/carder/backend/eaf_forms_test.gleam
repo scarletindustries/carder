@@ -205,33 +205,32 @@ pub fn single_read_constructor_splices_into_its_use_test() {
 fn apply_bins(
   module: Atom,
   function: Atom,
-  args: List(Int),
-) -> #(BitArray, BitArray, BitArray)
+  args: List(BitArray),
+) -> #(BitArray, BitArray, BitArray, #(Int, BitArray), #(Int, BitArray))
 
-/// `three/0` builds `{<<"ab">>, <<"ab">>, <<"cd">>}`: the repeated literal is
-/// bound once at the top of the function and read twice; the single one
-/// stays inline.
-fn bytes_module() -> CModule {
+/// `mix/1` builds `{<<"ab">>, <<"ab">>, X, {1, <<"cd">>}, {1, <<"cd">>}}`: the
+/// repeated byte string and the repeated constant tuple are each bound once
+/// at the top of the function and read twice.
+fn consts_module() -> CModule {
   let ab = core_erlang.CBytes(<<"ab">>)
+  let cd = CTuple([CInt(1), core_erlang.CBytes(<<"cd">>)])
   CModule(
-    name: "carder@test@eaf_bytes",
-    exports: [FName("three", 0)],
+    name: "carder@test@eaf_consts",
+    exports: [FName("mix", 1)],
     attributes: [],
     defs: [
-      FunDef(
-        FName("three", 0),
-        CFun([], CTuple([ab, ab, core_erlang.CBytes(<<"cd">>)])),
-      ),
+      FunDef(FName("mix", 1), CFun(["X"], CTuple([ab, ab, CVar("X"), cd, cd]))),
     ],
   )
 }
 
-pub fn repeated_byte_string_is_bound_once_test() {
-  let assert Ok(erl) = build_beam.module_to_erl(bytes_module())
-  assert string.contains(erl, "V0 = <<\"ab\">>")
+pub fn repeated_constant_terms_are_bound_once_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(consts_module())
   assert list.length(string.split(erl, "<<\"ab\">>")) == 2
-  assert string.contains(erl, "{V0, V0, <<\"cd\">>}")
-  let assert Ok(mod) = build_beam.compile_and_load(bytes_module())
-  assert apply_bins(mod, atom.create("three"), [])
-    == #(<<"ab">>, <<"ab">>, <<"cd">>)
+  assert list.length(string.split(erl, "{1, <<\"cd\">>}")) == 2
+  assert string.contains(erl, "= <<\"ab\">>")
+  assert string.contains(erl, "= {1, <<\"cd\">>}")
+  let assert Ok(mod) = build_beam.compile_and_load(consts_module())
+  assert apply_bins(mod, atom.create("mix"), [<<"x">>])
+    == #(<<"ab">>, <<"ab">>, <<"x">>, #(1, <<"cd">>), #(1, <<"cd">>))
 }
