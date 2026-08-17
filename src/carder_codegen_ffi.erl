@@ -86,10 +86,15 @@ forms_to_erl(Forms) when is_list(Forms) ->
 %% moves get_tuple_element later on the path; it never removes work), and
 %% skipping it took the 1.72M-word raytrace forms from 11.7 s to 7.0 s (min
 %% of 2) at -0.1% .beam bytes, with the v8v7 probe's richards/deltablue/
-%% crypto/raytrace ROWs unchanged within noise (min of 3).
+%% crypto/raytrace ROWs unchanged within noise (min of 3). `no_ssa_opt_alias`
+%% IS set too: the alias analysis only feeds ssa_opt_destructive_update
+%% (in-place record/binary updates), which generated code never triggers —
+%% on the 292k-word raytrace forms it was 0.12 s of 0.76 s (13%, +28 .beam
+%% bytes) and the four v8v7 ROWs interleaved base/alias-off came out within
+%% 2.5% either way (min of 4 batches, load 15-34).
 compile_forms_guarded(Forms, Extra) ->
     Opts = [binary, return_errors, return_warnings, nowarn_unused_vars,
-            no_ssa_opt_sink | Extra],
+            no_ssa_opt_sink, no_ssa_opt_alias | Extra],
     try compile:forms(Forms, Opts) of
         {ok, Mod, Beam, _W} -> {ok, {Mod, Beam}};
         {ok, Mod, Beam}     -> {ok, {Mod, Beam}};

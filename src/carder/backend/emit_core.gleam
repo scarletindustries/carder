@@ -1122,7 +1122,12 @@ fn emit(
     CallHost(cap, name, args) ->
       emit_call_host(cap, name, args, cont, sc, state, ctx)
     Let(names, rhs, body) -> emit(rhs, KBind(names, body, cont), sc, state, ctx)
-    If(cond, result, t, e) -> emit_if(cond, result, t, e, cont, sc, state, ctx)
+    If(cond, result, t, e) ->
+      case fold_if(cond, t, e, state) {
+        Some(Arm(arm)) -> emit(arm, cont, sc, state, ctx)
+        Some(AsBool(b)) -> apply_cont(cont, [b], sc, state, ctx)
+        None -> emit_if(cond, result, t, e, cont, sc, state, ctx)
+      }
     Switch(sel, result, arms, default) ->
       emit_switch(sel, result, arms, default, cont, sc, state, ctx)
     Block(label, result, body) ->
@@ -1333,6 +1338,44 @@ fn emit(
   }
 }
 
+/// An `If` that needs no `case`: only one arm can run (`Arm`), or it merely
+/// boxes a sunk boolean as the JS `'true'`/`'false'` atoms (`AsBool`).
+type FoldedIf {
+  Arm(Expr)
+  AsBool(CExpr)
+}
+
+/// `Arm` when the condition is a literal (a constant, or a binder aliased to
+/// one by `alias_subst`); `AsBool` for `if c then 'true' else 'false'` (or the
+/// negation) on a condition `apply_cont_bool` sunk here — the boolean call
+/// itself is the value. `None` otherwise.
+fn fold_if(
+  cond: Value,
+  t: Expr,
+  e: Expr,
+  state: EmitState,
+) -> Option(FoldedIf) {
+  let sunk = case cond {
+    Var(c) -> dict.get(state.sunk, c) |> option.from_result
+    _ -> None
+  }
+  let atom = fn(name) { Values([ir.ConstAtom(name)]) }
+  case emit_value(cond, state), sunk {
+    CInt(0), _ -> Some(Arm(e))
+    CInt(_), _ -> Some(Arm(t))
+    _, Some(b) ->
+      case t == atom("true") && e == atom("false") {
+        True -> Some(AsBool(b))
+        False ->
+          case t == atom("false") && e == atom("true") {
+            True -> Some(AsBool(CCall(CAtom("erlang"), CAtom("not"), [b])))
+            False -> None
+          }
+      }
+    _, None -> None
+  }
+}
+
 /// Lower a `TermOp(op, args)` — the Phase-8 term construction/destructuring layer (unit 01, K2).
 ///
 /// Every variant is PURE and yields exactly ONE value, disposed through `cont` via `apply_cont`
@@ -1412,16 +1455,17 @@ fn emit_term_op(
         state,
         ctx,
       )
-    ir.IsEmptyList, [l] -> {
-      // `case L of [] -> 1; _ -> 0 end` — one i32 value (fresh wildcard binder for the `_` arm).
-      let #(wild, state2) = fresh_var(state)
-      let is_empty =
-        CCase(emit_value(l, state), [
-          CClause([PNil], CAtom("true"), CInt(1)),
-          CClause([PVar(wild)], CAtom("true"), CInt(0)),
-        ])
-      apply_cont(cont, [is_empty], sc, state2, ctx)
-    }
+    ir.IsEmptyList, [l] ->
+      // `L =:= []` — a boolean BIF call, so a test read once as an `If`
+      // condition fuses into that `If` (`apply_cont_bool`); otherwise the
+      // i32 truth value `case L =:= [] of 'true' -> 1; 'false' -> 0 end`.
+      apply_cont_bool(
+        cont,
+        CCall(CAtom("erlang"), CAtom("=:="), [emit_value(l, state), CNil]),
+        sc,
+        state,
+        ctx,
+      )
     // Arity mismatch — impossible for a validated module (K7); fail closed.
     _, _ -> Error(UnsupportedNode("term_op"))
   }
@@ -1487,22 +1531,19 @@ fn emit_map_op(
         state,
         ctx,
       )
-    ir.MapHas, [m, k] -> {
-      // `case maps:is_key(K, M) of 'true' -> 1; 'false' -> 0 end` — one i32 truth value.
-      // `is_key/2` always returns a boolean atom, so the two clauses are exhaustive.
-      let has =
-        CCase(
-          CCall(CAtom("maps"), CAtom("is_key"), [
-            emit_value(k, state),
-            emit_value(m, state),
-          ]),
-          [
-            CClause([PAtom("true")], CAtom("true"), CInt(1)),
-            CClause([PAtom("false")], CAtom("true"), CInt(0)),
-          ],
-        )
-      apply_cont(cont, [has], sc, state, ctx)
-    }
+    ir.MapHas, [m, k] ->
+      // `maps:is_key(K, M)` is a boolean BIF call: fused into an `If` that
+      // reads it once, else `case … of 'true' -> 1; 'false' -> 0 end`.
+      apply_cont_bool(
+        cont,
+        CCall(CAtom("maps"), CAtom("is_key"), [
+          emit_value(k, state),
+          emit_value(m, state),
+        ]),
+        sc,
+        state,
+        ctx,
+      )
     ir.MapRemove, [m, k] ->
       apply_cont(
         cont,
@@ -1543,9 +1584,25 @@ fn emit_term_test(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let bif_call =
-    CCall(CAtom("erlang"), CAtom(term_test_bif(kind)), [emit_value(arg, state)])
-  apply_cont_bool(cont, bif_call, sc, state, ctx)
+  let x = emit_value(arg, state)
+  // A literal operand (a JS constant, or a binder aliased to one) folds to its
+  // truth value — the same one the BIF would compute on that Core literal.
+  let known = case x, kind {
+    CInt(_), ir.IsInt | CInt(_), ir.IsNumber | CAtom(_), ir.IsAtom -> Some(1)
+    CInt(_), _ | CAtom(_), _ -> Some(0)
+    _, _ -> None
+  }
+  case known {
+    Some(bit) -> apply_cont(cont, [CInt(bit)], sc, state, ctx)
+    None ->
+      apply_cont_bool(
+        cont,
+        CCall(CAtom("erlang"), CAtom(term_test_bif(kind)), [x]),
+        sc,
+        state,
+        ctx,
+      )
+  }
 }
 
 /// Dispose a boolean-atom-valued BIF call `bif_call` through `cont`. When `cont`
@@ -2416,13 +2473,19 @@ fn emit_global_set(
 
 /// Bind a `#(value, InstanceState)` pair a threaded seam call returns (`t_grow`): a
 /// `case <call> of <{V, St2}> when 'true' -> <continue with V under Threading(St2)>`. Used by
-/// `memory.grow`, whose runtime returns `#(Int, InstanceState)`.
+/// `memory.grow`, whose runtime returns `#(Int, InstanceState)`, and the direct-host `Mut` ops.
+/// In a let-case leaf (`KValues`, single-value scope) the pair IS the `state_tuple` leaf, so
+/// the call is yielded as-is — no destructure and re-pair.
 fn emit_value_state_pair(
   call: CExpr,
   cont: Cont,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  use <- bool.guard(
+    strip_identity_binds(cont) == KValues && state.float == None,
+    Ok(#(call, state)),
+  )
   let #(stvar, state2) = fresh_var(state)
   use #(vvars, rest, state3) <- result.try(bind_results(
     cont,
@@ -2685,8 +2748,10 @@ fn apply_cont(
     KValues ->
       // perf6 emit_block/emit_if let-case. Under `state.float=None` (single-
       // value context — a `letrec` fun body, or emit_if let-case): yield ONE
-      // Core value (bare under NoState arity=1, else a `{st,r..}` tuple) for
-      // the enclosing `let <t> = … in case t of {..} -> cont` to destructure.
+      // Core value (bare under NoState arity=1, else a `{r..,st}` tuple —
+      // `state_tuple`, the SAME `{V, St'}` shape a threaded call returns, so a
+      // call in leaf position is the leaf; bare `st` at arity 0) for the
+      // enclosing `let <t> = … in case t of {..} -> cont` to destructure.
       // Under `state.float=Some` (perf6 letrec-floating — emit_block let-case
       // opened a multi-value scope): yield a zero-cost `<st,r..>` values-list;
       // the enclosing multi-value `let <st,r..> = …` binds it directly with
@@ -2698,7 +2763,7 @@ fn apply_cont(
         NoState, _, None -> Ok(#(CTuple(vals), state))
         Threading(cur), _, Some(_) ->
           Ok(#(value_list([CVar(cur), ..vals]), state))
-        Threading(cur), _, None -> Ok(#(CTuple([CVar(cur), ..vals]), state))
+        Threading(cur), _, None -> Ok(#(state_tuple(vals, cur), state))
       }
     KJump(target) ->
       case sc, state.float {
@@ -2706,10 +2771,11 @@ fn apply_cont(
         Threading(cur), None ->
           Ok(#(CApply(target, [CVar(cur), ..vals]), state))
         // Multi-value scope: `target` is a floated l_miss cont whose fun body
-        // was emitted under float=None → it returns a `{st,r..}` TUPLE (fun
-        // bodies are single-value). Destructure it back to a values-list so
-        // this case-leaf's arity matches the sibling `<st,v>` hit-leaves.
-        // Cold-path only (l_miss); the `let+case` cost is off the hit path.
+        // was emitted under float=None → it returns a `{r..}` / `{r..,st}`
+        // TUPLE (fun bodies are single-value; `state_tuple`). Destructure it
+        // back to a values-list so this case-leaf's arity matches the sibling
+        // `<st,v>` hit-leaves. Cold-path only (l_miss); the `let+case` cost is
+        // off the hit path.
         _, Some(#(arity, _)) -> {
           let call = case sc {
             NoState -> CApply(target, vals)
@@ -2723,14 +2789,21 @@ fn apply_cont(
             1 -> Ok(#(call, state))
             _ -> {
               let #(t, state2) = fresh_var(state)
-              let #(outs, state3) = fresh_n_vars(state2, n)
+              let #(outs, state3) = fresh_n_vars(state2, arity)
+              let #(pat, outs_all, state4) = case sc {
+                NoState -> #(PTuple(list.map(outs, PVar)), outs, state3)
+                Threading(_) -> {
+                  let #(st, state4) = fresh_var(state3)
+                  #(state_tuple_pat(outs, st), [st, ..outs], state4)
+                }
+              }
               let clause =
                 CClause(
-                  [PTuple(list.map(outs, PVar))],
+                  [pat],
                   CAtom("true"),
-                  value_list(list.map(outs, CVar)),
+                  value_list(list.map(outs_all, CVar)),
                 )
-              Ok(#(CLet([t], call, CCase(CVar(t), [clause])), state3))
+              Ok(#(CLet([t], call, CCase(CVar(t), [clause])), state4))
             }
           }
         }
@@ -2763,6 +2836,26 @@ fn apply_cont(
           }
         }
       }
+  }
+}
+
+/// The single-value leaf of a state-threading let-case: `{vals…, cur}` — the
+/// live record LAST, matching a threaded call's `{V, St'}` return so a `Mut`
+/// call in leaf position needs no re-pairing — or the bare `cur` when there
+/// are no values.
+fn state_tuple(vals: List(CExpr), cur: String) -> CExpr {
+  case vals {
+    [] -> CVar(cur)
+    _ -> CTuple(list.append(vals, [CVar(cur)]))
+  }
+}
+
+/// The pattern that destructures a `state_tuple` leaf: `{names…, st}`, or the
+/// bare `st` for no values.
+fn state_tuple_pat(names: List(String), st: String) -> CPat {
+  case names {
+    [] -> PVar(st)
+    _ -> PTuple(list.append(list.map(names, PVar), [PVar(st)]))
   }
 }
 
@@ -5017,7 +5110,9 @@ fn emit_call_direct(
 
 /// Destructure a threaded callee's `{Package, St'}` at a NON-tail site: `case <applied> of
 /// <{Pkg, St'}> -> <unpack Pkg into r values, continue under Threading(St')>`. Unpacking `Pkg`
-/// reuses the same `r∈{0,1,≥2}` logic as a pure call (`apply_cont_call`).
+/// reuses the same `r∈{0,1,≥2}` logic as a pure call (`apply_cont_call`). A single-result
+/// callee in a let-case leaf (`KValues`, single-value scope) already returns the
+/// `state_tuple` `{V, St'}` leaf, so the call is yielded as-is.
 fn emit_threaded_call_unpack(
   applied: CExpr,
   r: Int,
@@ -5025,6 +5120,10 @@ fn emit_threaded_call_unpack(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  use <- bool.guard(
+    r == 1 && strip_identity_binds(cont) == KValues && state.float == None,
+    Ok(#(applied, state)),
+  )
   let #(pkgvar, state2) = fresh_var(state)
   let #(stvar, state3) = fresh_var(state2)
   use #(rest, state4) <- result.try(apply_cont_call(
@@ -6834,23 +6933,27 @@ fn emit_let_case_wrap(
         _ -> Ok(#(CLetrec(defs, inner), state4))
       }
     }
-    False ->
-      // Bare value only under NoState arity=1 (matches apply_cont KValues).
-      // Under Threading the leaf ALWAYS built a tuple (even arity=0 →
-      // `{st}`), so always destructure — a `[single]` fast-path here would
-      // bind the 1-tuple as `st`. The intermediate `let <t> = body_c in
-      // case t of {…}` (vs `case body_c of {…}`) is measured FASTER —
-      // nesting the big body case as a discriminee regressed
+    False -> {
+      // Bare value under NoState arity=1 (matches apply_cont KValues) and
+      // under Threading arity=0 (the leaf is the bare record); otherwise the
+      // `state_tuple` `{r..,st}` leaf is destructured. The intermediate `let
+      // <t> = body_c in case t of {…}` (vs `case body_c of {…}`) is measured
+      // FASTER — nesting the big body case as a discriminee regressed
       // crypto/raytrace ~25%.
-      case sc == NoState || pure, tup_names {
-        True, [single] -> Ok(#(CLet([single], body_c, cont_c), state4))
-        _, _ -> {
+      let pat = case sc_out, pure {
+        Threading(st_out), False -> state_tuple_pat(names, st_out)
+        _, _ -> PTuple(list.map(names, PVar))
+      }
+      case pat {
+        PVar(single) | PTuple([PVar(single)]) ->
+          Ok(#(CLet([single], body_c, cont_c), state4))
+        _ -> {
           let #(t, state5) = fresh_var(state4)
-          let clause =
-            CClause([PTuple(list.map(tup_names, PVar))], CAtom("true"), cont_c)
+          let clause = CClause([pat], CAtom("true"), cont_c)
           Ok(#(CLet([t], body_c, CCase(CVar(t), [clause])), state5))
         }
       }
+    }
   }
 }
 
