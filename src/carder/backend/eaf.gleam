@@ -177,7 +177,11 @@ type LocalFun {
 /// constructor: the already-translated RHS form, spliced in at that one read.
 /// `depth` counts the enclosing `fun`s, so a constructor is only spliced at a
 /// read in the same fun (moving an allocation into a closure body would
-/// re-run it per call).
+/// re-run it per call). `bytes` maps each byte-string literal that occurs
+/// more than once in the function to the variable bound to it at the top of
+/// the body — every occurrence is then a variable read; `sys_core_fold`
+/// substitutes a literal-bound variable back at each read, so the compiled
+/// code is the same and the form carries the literal once.
 type Env {
   Env(
     ln: Int,
@@ -187,6 +191,7 @@ type Env {
     local_defs: Set(#(String, Int)),
     subst: Dict(String, Form),
     depth: Int,
+    bytes: Dict(BitArray, String),
   )
 }
 
@@ -480,7 +485,11 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       )
       Ok(#(e_bin(ln, list.reverse(rev)), st1))
     }
-    CBytes(bytes) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
+    CBytes(bytes) ->
+      case dict.get(env.bytes, bytes) {
+        Ok(v) -> Ok(#(e_var(ln, v), st))
+        Error(Nil) -> Ok(#(e_bin(ln, [e_bytes_element(ln, bytes)]), st))
+      }
     CValues(values) -> Error(BareValueList(list.length(values)))
     CFun(vars, body) -> {
       let #(params, env2, st1) =
@@ -906,6 +915,31 @@ fn count_uses(
   }
 }
 
+/// How many times each byte-string literal occurs across `expr`.
+fn count_bytes(expr: CExpr, acc: Dict(BitArray, Int)) -> Dict(BitArray, Int) {
+  let go = fn(a, e) { count_bytes(e, a) }
+  case expr {
+    CBytes(bytes) -> dict.upsert(acc, bytes, fn(n) { option.unwrap(n, 0) + 1 })
+    CVar(_) | CInt(_) | CFloat(_) | CAtom(_) | CNil | CFunRef(_) -> acc
+    CCons(h, t) -> go(go(acc, h), t)
+    CTuple(es) | CValues(es) | CPrimop(_, es) -> list.fold(es, acc, go)
+    CBinary(segs) ->
+      list.fold(segs, acc, fn(a, seg) { go(go(a, seg.value), seg.size) })
+    CFun(_, body) -> go(acc, body)
+    CLet(_, arg, body) -> go(go(acc, arg), body)
+    CLetrec(defs, body) ->
+      list.fold(defs, go(acc, body), fn(a, d) { go(a, d.value) })
+    CCase(arg, clauses) ->
+      list.fold(clauses, go(acc, arg), fn(a, cl) {
+        go(go(a, cl.guard), cl.body)
+      })
+    CApply(_, args) -> list.fold(args, acc, go)
+    CApplyExpr(op, args) -> list.fold(args, go(acc, op), go)
+    CCall(m, f, args) -> list.fold(args, go(go(acc, m), f), go)
+    CTry(arg, _, body, _, handler) -> go(go(go(acc, arg), body), handler)
+  }
+}
+
 /// Is `pat` a variable or a tuple whose leaves are all variables?
 fn binder_pat(pat: CPat) -> Bool {
   case pat {
@@ -1075,14 +1109,33 @@ fn tr_def(
           local_defs: local_defs,
           subst: dict.new(),
           depth: 0,
+          bytes: dict.new(),
         )
       let st = St(0)
       let #(pforms, env2, st1) = bind_params(params, env, st)
-      use #(bodyf, _st2) <- result.try(tr_body(body, env2, st1))
+      // Bind each byte-string literal that occurs more than once to a
+      // variable ahead of the body (see `Env.bytes`).
+      let repeated =
+        count_bytes(body, dict.new())
+        |> dict.filter(fn(_, n) { n > 1 })
+        |> dict.keys
+      let #(hoisted, env3, st2) =
+        list.fold(repeated, #([], env2, st1), fn(acc, bytes) {
+          let #(ms, env0, st0) = acc
+          let #(v, stn) = fresh(st0, "bytes")
+          let m =
+            e_match(ln, e_var(ln, v), e_bin(ln, [e_bytes_element(ln, bytes)]))
+          #(
+            [m, ..ms],
+            Env(..env0, bytes: dict.insert(env0.bytes, bytes, v)),
+            stn,
+          )
+        })
+      use #(bodyf, _st3) <- result.try(tr_body(body, env3, st2))
       Ok(
         raw(
           #(atom_of("function"), ln, atom_of(name), arity, [
-            e_clause(ln, pforms, [], bodyf),
+            e_clause(ln, pforms, [], list.append(list.reverse(hoisted), bodyf)),
           ]),
         ),
       )

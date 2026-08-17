@@ -18,6 +18,7 @@ import carder/backend/core_erlang.{
   CNil, CTuple, CVar, FName, FunDef, PTuple, PVar,
 }
 import gleam/erlang/atom.{type Atom}
+import gleam/list
 import gleam/string
 
 @external(erlang, "erlang", "apply")
@@ -198,4 +199,39 @@ pub fn single_read_constructor_splices_into_its_use_test() {
   let assert Ok(mod) = build_beam.compile_and_load(splice_module())
   assert apply_pair(mod, atom.create("pair"), [7]) == #(7, 1)
   assert apply_pair(mod, atom.create("closure"), [7]) == #(7, 1)
+}
+
+@external(erlang, "erlang", "apply")
+fn apply_bins(
+  module: Atom,
+  function: Atom,
+  args: List(Int),
+) -> #(BitArray, BitArray, BitArray)
+
+/// `three/0` builds `{<<"ab">>, <<"ab">>, <<"cd">>}`: the repeated literal is
+/// bound once at the top of the function and read twice; the single one
+/// stays inline.
+fn bytes_module() -> CModule {
+  let ab = core_erlang.CBytes(<<"ab">>)
+  CModule(
+    name: "carder@test@eaf_bytes",
+    exports: [FName("three", 0)],
+    attributes: [],
+    defs: [
+      FunDef(
+        FName("three", 0),
+        CFun([], CTuple([ab, ab, core_erlang.CBytes(<<"cd">>)])),
+      ),
+    ],
+  )
+}
+
+pub fn repeated_byte_string_is_bound_once_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(bytes_module())
+  assert string.contains(erl, "V0 = <<\"ab\">>")
+  assert list.length(string.split(erl, "<<\"ab\">>")) == 2
+  assert string.contains(erl, "{V0, V0, <<\"cd\">>}")
+  let assert Ok(mod) = build_beam.compile_and_load(bytes_module())
+  assert apply_bins(mod, atom.create("three"), [])
+    == #(<<"ab">>, <<"ab">>, <<"cd">>)
 }
