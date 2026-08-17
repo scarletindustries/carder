@@ -6862,10 +6862,21 @@ fn emit_block_join(
       // (its body is the l_join body's own tail; no CLet sits between the
       // scope open and the materialize). Not opened when already inside a
       // multi-value scope — anf.share never nests in its own body, and a
-      // nested open would need transitive floating (free-var unsafe).
+      // nested open would need transitive floating (free-var unsafe). Nor
+      // when the leaves would carry NO values (arity 0 under NoState or a
+      // state-pure Threading): an empty `<>` values-list bound by `let <> =`
+      // is not a legal single-value position; the `{}` tuple leaf + one-clause
+      // destructure of the `multi=False` wrap is.
       let outer_float = state.float
+      let leaf_width = case sc, pure {
+        Threading(_), False -> arity + 1
+        _, _ -> arity
+      }
       let open_float =
-        perf6_letrec_float && outer_float == None && float_safe_body(body)
+        perf6_letrec_float
+        && outer_float == None
+        && leaf_width > 0
+        && float_safe_body(body)
       // Not opening a scope: leaves must be tuples for the `multi=False`
       // wrap, so an inherited multi-value scope is closed for the body.
       let state2 = case open_float {
