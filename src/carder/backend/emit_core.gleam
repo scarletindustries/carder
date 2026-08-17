@@ -7039,14 +7039,16 @@ fn keeps_state(e: Expr, ctx: Ctx) -> Bool {
 }
 
 /// A `CallHost` keeps the record unless it is a direct-host op of a rebinding
-/// kind (`Mut`/`MutMiss`/`MutUnit`); `Pure`/`Read` ops and every non-direct
-/// host/stdlib/js call are state-neutral (`emit_call_host`).
+/// kind (`Mut`/`MutMiss`/`MutUnit`); `Pure`/`Read`/`ReadMiss` ops and every
+/// non-direct host/stdlib/js call are state-neutral (`emit_call_host`).
 fn host_op_keeps_state(cap: String, name: String, ctx: Ctx) -> Bool {
   case direct_host_for(ctx.binding, cap) {
     None -> True
     Some(dh) ->
       case dict.get(dh.ops, name) {
-        Ok(HostOp(kind: Pure, ..)) | Ok(HostOp(kind: Read, ..)) -> True
+        Ok(HostOp(kind: Pure, ..))
+        | Ok(HostOp(kind: Read, ..))
+        | Ok(HostOp(kind: ReadMiss, ..)) -> True
         Ok(HostOp(..)) -> False
         Error(Nil) -> False
       }

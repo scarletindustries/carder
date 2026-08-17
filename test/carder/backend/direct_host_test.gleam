@@ -215,3 +215,41 @@ pub fn readmiss_runs_like_read_neq_if_test() {
   assert !string.contains(core_rm, "'=:='")
   assert string.contains(core_rr, "'=:='")
 }
+
+/// A let-bound (non-tail) `If` whose then arm is a bare probe and whose else arm is a plain
+/// value, then a further probe on the result: neither arm rebinds the record, so the
+/// let-case is value-only.
+fn probe_in_pure_if(probe: String) -> ir.Expr {
+  ir.Let(
+    ["b"],
+    ir.NumTerm(ir.NEq, ir.Var("p0"), ir.ConstAtom("none")),
+    ir.Let(
+      ["x"],
+      ir.If(
+        ir.Var("b"),
+        [ir.TTerm],
+        ir.CallHost("cap", probe, [ir.Var("p0")]),
+        ir.Values([ir.Var("p0")]),
+      ),
+      ir.CallHost("cap", "rr", [ir.Var("x")]),
+    ),
+  )
+}
+
+fn core_of_pure_if(probe: String) -> String {
+  let m = module("rmpure_" <> probe, [fn1("f", probe_in_pure_if(probe))])
+  let assert Ok(cm) = emit_core.emit_module(m, readmiss_binding())
+  core_printer.print_module(cm)
+}
+
+/// `ReadMiss` is state-neutral like `Read`: a state-pure `If` around a `ReadMiss` probe
+/// keeps the value-only lowering (no `{St, V}` leaf tuple), exactly as under `Read`.
+pub fn readmiss_keeps_pure_if_value_only_test() {
+  let core_rm = core_of_pure_if("rm")
+  let core_rr = core_of_pure_if("rr")
+  let tuple_leaves = fn(core: String) {
+    core |> string.split("{") |> list.length
+  }
+  assert tuple_leaves(core_rr) == tuple_leaves(core_rm)
+  assert !string.contains(core_rm, "<{")
+}
