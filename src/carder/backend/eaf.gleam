@@ -57,7 +57,7 @@ import carder/backend/core_printer
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
-import gleam/option
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set.{type Set}
 
@@ -513,17 +513,20 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
         _ -> Ok(#(e_block(ln, stmts), st1))
       }
     }
-    CCase(arg, clauses) -> {
-      use #(argf, st1) <- result.try(tr_expr(arg, env, st))
-      use #(rev, st2) <- result.try(
-        list.try_fold(clauses, #([], st1), fn(acc, cl) {
-          let #(fs, st0) = acc
-          use #(f, stn) <- result.try(tr_clause(cl, env, st0))
-          Ok(#([f, ..fs], stn))
-        }),
-      )
-      Ok(#(e_case(ln, argf, list.reverse(rev)), st2))
-    }
+    // A short-circuit step over a boolean test — `case T of 'true' -> X;
+    // 'false' -> 'false'` / `'true' -> 'true'; 'false' -> Y` — is spelled
+    // `T andalso X` / `T orelse Y`. `v3_core` lowers the operator back to
+    // this very `case` (its non-boolean arm is dead: `T` is a BIF test), so
+    // the compiled code is identical; the form is ~25 words smaller.
+    CCase(arg, clauses) ->
+      case short_circuit(arg, clauses) {
+        Some(#(op, rhs)) -> {
+          use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+          use #(rhsf, st2) <- result.try(tr_expr(rhs, env, st1))
+          Ok(#(e_op2(ln, op, argf, rhsf), st2))
+        }
+        None -> tr_case(arg, clauses, env, st)
+      }
     CApply(FName(name, arity), args) -> {
       use #(argfs, st1) <- result.try(tr_exprs(args, env, st))
       case dict.get(env.funs, #(name, arity)) {
@@ -616,6 +619,75 @@ fn tr_expr(expr: CExpr, env: Env, st: St) -> Result(#(Form, St), EafError) {
       }
   }
 }
+
+/// `case Arg of Clauses end`.
+fn tr_case(
+  arg: CExpr,
+  clauses: List(CClause),
+  env: Env,
+  st: St,
+) -> Result(#(Form, St), EafError) {
+  use #(argf, st1) <- result.try(tr_expr(arg, env, st))
+  use #(rev, st2) <- result.try(
+    list.try_fold(clauses, #([], st1), fn(acc, cl) {
+      let #(fs, st0) = acc
+      use #(f, stn) <- result.try(tr_clause(cl, env, st0))
+      Ok(#([f, ..fs], stn))
+    }),
+  )
+  Ok(#(e_case(env.ln, argf, list.reverse(rev)), st2))
+}
+
+/// `Some(#(op, rhs))` when `case arg of clauses` is a short-circuit step over
+/// a boolean test — `'true' -> rhs; 'false' -> 'false'` is `arg andalso rhs`,
+/// `'true' -> 'true'; 'false' -> rhs` is `arg orelse rhs` (either clause
+/// order). `v3_core` lowers the operator back to this very `case` (its
+/// non-boolean arm is dead: `arg` is a BIF test), so the compiled code is
+/// identical; the form is ~25 words smaller.
+fn short_circuit(
+  arg: CExpr,
+  clauses: List(CClause),
+) -> Option(#(String, CExpr)) {
+  let arms = case clauses {
+    [
+      CClause([PAtom("true")], CAtom("true"), t),
+      CClause([PAtom("false")], CAtom("true"), e),
+    ] -> Some(#(t, e))
+    [
+      CClause([PAtom("false")], CAtom("true"), e),
+      CClause([PAtom("true")], CAtom("true"), t),
+    ] -> Some(#(t, e))
+    _ -> None
+  }
+  case arms, is_bool_test(arg) {
+    Some(#(t, CAtom("false"))), True -> Some(#("andalso", t))
+    Some(#(CAtom("true"), e)), True -> Some(#("orelse", e))
+    _, _ -> None
+  }
+}
+
+/// A Core expression that always yields a boolean atom: an `erlang` type-test
+/// or comparison BIF call, or a short-circuit `case` over one.
+fn is_bool_test(expr: CExpr) -> Bool {
+  case expr {
+    CCall(CAtom("erlang"), CAtom(f), [_]) -> list.contains(type_tests, f)
+    CCall(CAtom("erlang"), CAtom(f), [_, _]) -> list.contains(compare_ops, f)
+    CCase(arg, clauses) ->
+      case short_circuit(arg, clauses) {
+        Some(#(_, CAtom("true"))) | Some(#(_, CAtom("false"))) -> True
+        Some(#(_, rhs)) -> is_bool_test(rhs)
+        None -> False
+      }
+    _ -> False
+  }
+}
+
+const type_tests = [
+  "is_integer", "is_float", "is_number", "is_atom", "is_binary", "is_tuple",
+  "is_map", "is_function", "is_list", "is_boolean",
+]
+
+const compare_ops = ["<", "=<", ">", ">=", "=:=", "=/=", "==", "/="]
 
 /// One binary segment: `#<V>(Size, Unit, Type, Flags)` →
 /// `{bin_element, Anno, V, Size, [Type, {unit,Unit}, Flags…]}`.
