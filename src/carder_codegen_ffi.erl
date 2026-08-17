@@ -73,14 +73,20 @@ forms_to_erl(Forms) when is_list(Forms) ->
 %% codegen output legitimately triggers en masse (fresh pattern binders used
 %% as wildcards), keeping the warning list from growing O(module) on large
 %% guests. Speed knobs, measured on the raytrace forms: no_bool_opt /
-%% no_share_opt / no_bsm_opt / no_recv_opt / no_type_opt each land within 4%
-%% of the compile:forms baseline (their passes cost <0.5 s combined) and are
-%% NOT set; no_ssa_opt halves it but at +36% .beam with every SSA optimisation
-%% off. `no_ssa_opt_sink` IS set: with `time`, ssa_opt_sink alone was 4.5 s of
-%% beam_ssa_opt's 9.0 s (it only moves get_tuple_element later on the path;
-%% it never removes work), and skipping it took the 1.72M-word raytrace forms
-%% from 11.7 s to 7.0 s (min of 2) at -0.1% .beam bytes, with the v8v7 probe's
-%% richards/deltablue/crypto/raytrace ROWs unchanged within noise (min of 3).
+%% no_share_opt / no_bsm_opt / no_recv_opt each land within 4% of the
+%% compile:forms baseline (their passes cost <0.5 s combined) and are NOT
+%% set; no_ssa_opt halves it but at +36% .beam with every SSA optimisation
+%% off. `no_type_opt` (== no_ssa_opt_type_start/continue/finish; start+continue
+%% alone crash ssa_opt_type_finish) cuts the 294k-word raytrace forms 835 ms
+%% -> 713 ms (min of 5, load ~15) but the v8v7 raytrace ROW came out +7.7%
+%% (122,121 -> 131,484 µs, min of 3 interleaved, load 10-15; richards /
+%% deltablue / crypto within noise), so it is NOT set either — the type
+%% passes are the ones that delete guards. `no_ssa_opt_sink` IS set: with
+%% `time`, ssa_opt_sink alone was 4.5 s of beam_ssa_opt's 9.0 s (it only
+%% moves get_tuple_element later on the path; it never removes work), and
+%% skipping it took the 1.72M-word raytrace forms from 11.7 s to 7.0 s (min
+%% of 2) at -0.1% .beam bytes, with the v8v7 probe's richards/deltablue/
+%% crypto/raytrace ROWs unchanged within noise (min of 3).
 compile_forms_guarded(Forms, Extra) ->
     Opts = [binary, return_errors, return_warnings, nowarn_unused_vars,
             no_ssa_opt_sink | Extra],
