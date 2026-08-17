@@ -35,7 +35,9 @@ import carder/ir
 import carder/ir/effect
 import carder/middle/ir_opt/pass.{type Pass}
 import carder/runtime/rt_num
+import gleam/dict.{type Dict}
 import gleam/list
+import gleam/set.{type Set}
 
 /// The ordered Baseline pass list (§I fixes the order + the termination argument). This is the
 /// value `ir_opt.pipeline(Baseline)` returns; unit 04 prepends it to `Aggressive`
@@ -442,18 +444,65 @@ fn fold_conv(op: ir.ConvOp, arg: ir.Value) -> Result(ir.Expr, Nil) {
 /// - `f`: the function to rewrite.
 /// - Return: `f` with every `Values`-bound `Let` propagated and removed. Total.
 fn propagate_and_drop(f: ir.Function) -> ir.Function {
-  ir.Function(..f, body: pass.map_expr(f.body, prop_node))
+  ir.Function(..f, body: prop_expr(f.body, dict.new()))
 }
 
-/// Propagate + drop one node if it binds atomic `Values`; otherwise leave it unchanged.
-fn prop_node(e: ir.Expr) -> ir.Expr {
+/// One top-down walk carrying the accumulated substitution: a `Values`-bound `Let` (matching
+/// arity) extends `env` with its (already substituted) operands and is dropped; every other node
+/// has `env` applied to its operands. Equivalent to substituting each such `Let` bottom-up one at
+/// a time, but each `Var` is rewritten once instead of once per enclosing binding.
+fn prop_expr(e: ir.Expr, env: Dict(String, ir.Value)) -> ir.Expr {
   case e {
-    ir.Let(names, ir.Values(vs), body) ->
+    ir.Let(names, ir.Values(vs), body) -> {
+      let vs = subst_values(vs, env)
       case list.length(names) == list.length(vs) {
-        True -> subst_expr(body, list.zip(names, vs))
-        False -> e
+        True -> {
+          let env =
+            list.fold(list.zip(names, vs), env, fn(env, sub) {
+              dict.insert(env, sub.0, sub.1)
+            })
+          prop_expr(body, env)
+        }
+        False -> ir.Let(names, ir.Values(vs), prop_expr(body, env))
       }
-    _ -> e
+    }
+    ir.Let(names, rhs, body) ->
+      ir.Let(names, prop_expr(rhs, env), prop_expr(body, env))
+    ir.Block(label, result, body) ->
+      ir.Block(label, result, prop_expr(body, env))
+    ir.Loop(label, params, result, body) ->
+      ir.Loop(
+        label,
+        list.map(params, fn(p) {
+          ir.LoopParam(..p, init: subst_value(p.init, env))
+        }),
+        result,
+        prop_expr(body, env),
+      )
+    ir.If(cond, result, then_branch, else_branch) ->
+      ir.If(
+        subst_value(cond, env),
+        result,
+        prop_expr(then_branch, env),
+        prop_expr(else_branch, env),
+      )
+    ir.Switch(sel, result, arms, default) ->
+      ir.Switch(
+        subst_value(sel, env),
+        result,
+        list.map(arms, fn(a) { ir.SwitchArm(..a, body: prop_expr(a.body, env)) }),
+        prop_expr(default, env),
+      )
+    ir.Charge(cost, body) -> ir.Charge(cost, prop_expr(body, env))
+    ir.Try(result, body, handlers) ->
+      ir.Try(
+        result,
+        prop_expr(body, env),
+        list.map(handlers, fn(h) {
+          ir.CatchHandler(..h, handler: prop_expr(h.handler, env))
+        }),
+      )
+    _ -> subst_expr(e, env)
   }
 }
 
@@ -471,26 +520,71 @@ fn prop_node(e: ir.Expr) -> ir.Expr {
 /// - `f`: the function to rewrite.
 /// - Return: `f` with pure, fully-dead bindings removed. Total.
 fn dead_let(f: ir.Function) -> ir.Function {
-  ir.Function(..f, body: pass.map_expr(f.body, dead_let_node))
+  let #(body, _) = dead_let_expr(f.body)
+  ir.Function(..f, body:)
 }
 
-/// Drop one `Let` when its bound names are all dead in `body` and its `rhs` is pure.
-fn dead_let_node(e: ir.Expr) -> ir.Expr {
+/// One bottom-up walk (the same post-order as `pass.map_expr`) that carries the set of `Var`
+/// names used by the rewritten subtree, so each `Let` tests liveness against a set instead of
+/// re-collecting the vars of its whole body.
+fn dead_let_expr(e: ir.Expr) -> #(ir.Expr, Set(String)) {
   case e {
-    ir.Let(names, rhs, body) ->
-      case !any_var_occurs(names, body) && effect.is_pure(rhs) {
-        True -> body
-        False -> e
+    ir.Let(names, rhs, body) -> {
+      let #(rhs, rhs_used) = dead_let_expr(rhs)
+      let #(body, body_used) = dead_let_expr(body)
+      let dead = !list.any(names, set.contains(body_used, _))
+      case dead && effect.is_pure(rhs) {
+        True -> #(body, body_used)
+        False -> #(ir.Let(names, rhs, body), set.union(body_used, rhs_used))
       }
-    _ -> e
+    }
+    ir.Block(label, result, body) -> {
+      let #(body, used) = dead_let_expr(body)
+      #(ir.Block(label, result, body), used)
+    }
+    ir.Loop(label, params, result, body) -> {
+      let #(body, used) = dead_let_expr(body)
+      let inits = list.flat_map(params, fn(p) { value_name(p.init) })
+      #(ir.Loop(label, params, result, body), add_names(used, inits))
+    }
+    ir.If(cond, result, then_branch, else_branch) -> {
+      let #(then_branch, then_used) = dead_let_expr(then_branch)
+      let #(else_branch, else_used) = dead_let_expr(else_branch)
+      let used = add_names(set.union(then_used, else_used), value_name(cond))
+      #(ir.If(cond, result, then_branch, else_branch), used)
+    }
+    ir.Switch(selector, result, arms, default) -> {
+      let #(default, default_used) = dead_let_expr(default)
+      let #(used, arms) =
+        list.map_fold(arms, default_used, fn(acc, arm) {
+          let #(body, arm_used) = dead_let_expr(arm.body)
+          #(set.union(acc, arm_used), ir.SwitchArm(..arm, body:))
+        })
+      #(
+        ir.Switch(selector, result, arms, default),
+        add_names(used, value_name(selector)),
+      )
+    }
+    ir.Charge(cost, body) -> {
+      let #(body, used) = dead_let_expr(body)
+      #(ir.Charge(cost, body), used)
+    }
+    ir.Try(result, body, handlers) -> {
+      let #(body, body_used) = dead_let_expr(body)
+      let #(used, handlers) =
+        list.map_fold(handlers, body_used, fn(acc, h) {
+          let #(handler, h_used) = dead_let_expr(h.handler)
+          #(set.union(acc, h_used), ir.CatchHandler(..h, handler:))
+        })
+      #(ir.Try(result, body, handlers), used)
+    }
+    _ -> #(e, set.from_list(expr_vars(e)))
   }
 }
 
-/// Does any name in `names` occur (as a `Var`) anywhere in `body`? Because names are unique per
-/// function (no shadowing), any occurrence is a live use of that binding.
-fn any_var_occurs(names: List(String), body: ir.Expr) -> Bool {
-  let used = expr_vars(body)
-  list.any(names, fn(n) { list.contains(used, n) })
+/// Insert each of `names` into `used`.
+fn add_names(used: Set(String), names: List(String)) -> Set(String) {
+  list.fold(names, used, set.insert)
 }
 
 // ─────────────────────── E. dead-code / unreachable elimination ───────────────────────
@@ -804,7 +898,7 @@ fn continues_to(label: String, e: ir.Expr) -> Bool {
 
 /// Substitute each bound `Var(name)` by its mapped `Value` throughout `e`. Capture-free because
 /// names are unique per function (§C), so a substituted `Var` never clashes with an inner binder.
-fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
+fn subst_expr(e: ir.Expr, subs: Dict(String, ir.Value)) -> ir.Expr {
   case e {
     ir.Values(vs) -> ir.Values(subst_values(vs, subs))
     ir.Num(op, args) -> ir.Num(op, subst_values(args, subs))
@@ -1022,10 +1116,10 @@ fn subst_expr(e: ir.Expr, subs: List(#(String, ir.Value))) -> ir.Expr {
 
 /// Substitute one atomic `Value`: a `Var` bound in `subs` maps to its replacement; everything
 /// else (a `Const*`, or an unbound `Var`) is unchanged.
-fn subst_value(v: ir.Value, subs: List(#(String, ir.Value))) -> ir.Value {
+fn subst_value(v: ir.Value, subs: Dict(String, ir.Value)) -> ir.Value {
   case v {
     ir.Var(name) ->
-      case list.key_find(subs, name) {
+      case dict.get(subs, name) {
         Ok(replacement) -> replacement
         Error(Nil) -> v
       }
@@ -1036,7 +1130,7 @@ fn subst_value(v: ir.Value, subs: List(#(String, ir.Value))) -> ir.Value {
 /// Map `subst_value` over a list of operands.
 fn subst_values(
   vs: List(ir.Value),
-  subs: List(#(String, ir.Value)),
+  subs: Dict(String, ir.Value),
 ) -> List(ir.Value) {
   list.map(vs, fn(v) { subst_value(v, subs) })
 }

@@ -11,7 +11,7 @@
 //// `rt_num` exports.
 
 import carder/backend/core_erlang.{
-  type CExpr, CApply, CAtom, CBinary, CCall, CCase, CClause, CCons, CFun, CInt,
+  type CExpr, CApply, CAtom, CBytes, CCall, CCase, CClause, CCons, CFun, CInt,
   CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar, FName, FunDef,
   PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
@@ -19,6 +19,7 @@ import carder/backend/emit_core
 import carder/ir
 import carder/runtime/instance
 import carder/runtime/rt_num
+import gleam/bit_array
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/option
@@ -207,28 +208,18 @@ pub fn loop_is_tail_recursive_letrec_test() {
   assert entry == lname
   // The body's `continue` is a tail self-apply of the same head → constant space.
   assert applies_to(lbody, lname)
-  // The body computes the loop condition, then `case`s on it: `<0>` (false) breaks with the
-  // bare accumulator (no join point, since the exit is in tail position / KReturn). The
-  // condition is the INLINED `i64.le_u` — a raw unsigned BEAM `=<` compare reified to an i32
-  // truth value (`bool_bif_to_i32`), no `rt_num` seam. Its 1/0 internals are pinned in the
-  // numeric tests; here we only assert it IS the unsigned-`=<` shape and focus on the
+  // The body `case`s straight on the loop condition: `'false'` breaks with the bare
+  // accumulator (no join point, since the exit is in tail position / KReturn). The
+  // condition is the INLINED `i64.le_u` — a raw unsigned BEAM `=<` compare, no `rt_num`
+  // seam; `cond` is read once (by the `If`), so no `1`/`0` truth value is bound
+  // (`apply_cont_bool`). Here we only assert it IS the unsigned-`=<` shape and focus on the
   // loop/case/continue skeleton.
-  let assert CLet(
-    ["cond"],
-    CCase(
-      CCall(CAtom("erlang"), CAtom("=<"), _),
-      [
-        CClause([PAtom("true")], CAtom("true"), CInt(1)),
-        CClause([PAtom("false")], CAtom("true"), CInt(0)),
-      ],
-    ),
-    CCase(
-      CVar("cond"),
-      [
-        CClause([PInt(0)], CAtom("true"), CVar("acc")),
-        CClause([PVar(_)], CAtom("true"), _),
-      ],
-    ),
+  let assert CCase(
+    CCall(CAtom("erlang"), CAtom("=<"), _),
+    [
+      CClause([PAtom("true")], CAtom("true"), _),
+      CClause([PAtom("false")], CAtom("true"), CVar("acc")),
+    ],
   ) = lbody
 }
 
@@ -344,7 +335,7 @@ pub fn call_host_import_is_deny_all_test() {
     CCall(
       CAtom(host),
       CAtom("call_host"),
-      [CBinary(_), CBinary(_), CCons(CVar("p0"), CNil)],
+      [CBytes(_), CBytes(_), CCons(CVar("p0"), CNil)],
     ),
     CVar("r"),
   ) = body_of(module_with(host_import_fn()), "useimport")
@@ -697,7 +688,7 @@ pub fn mem_store_is_ordered_effect_test() {
 /// takes a `String`/binary).
 pub fn global_get_is_binary_name_call_test() {
   let b = binding()
-  let assert CCall(CAtom(state), CAtom("global_get"), [CBinary(_)]) =
+  let assert CCall(CAtom(state), CAtom("global_get"), [CBytes(_)]) =
     body_of(op_module("f", [], [ir.TI32], ir.GlobalGet("g0")), "f")
   assert state == b.state_module
 }
@@ -708,7 +699,7 @@ pub fn global_set_is_ordered_effect_test() {
   let b = binding()
   let assert CLet(
     [_g],
-    CCall(CAtom(state), CAtom("global_set"), [CBinary(_), CVar("v")]),
+    CCall(CAtom(state), CAtom("global_set"), [CBytes(_), CVar("v")]),
     CAtom("ok"),
   ) =
     body_of(
@@ -972,7 +963,7 @@ pub fn instantiate_entry_golden_test() {
   let assert CCall(CAtom(_), CAtom("fresh"), [CInt(1), _, CInt(65_536)]) =
     mem_fresh
   let assert CCall(CAtom(_), CAtom("new"), [CInt(4), _]) = table_new
-  let assert CCons(CTuple([CBinary(_), CInt(42)]), CNil) = globals
+  let assert CCons(CTuple([CBytes(_), CInt(42)]), CNil) = globals
   // Step 2: element segment BEFORE data segment, each a trap `case` over its seam call.
   let assert CLet([_], elem_rhs, rest2) = rest1
   assert contains_call(elem_rhs, b.table_module, "init_elem")
@@ -1274,7 +1265,7 @@ pub fn threaded_global_get_reads_without_rebind_test() {
   let assert FunDef(FName("get", 1), CFun([st], body)) =
     threaded_def(st_module(get), "get")
   let assert CTuple([
-    CCall(CAtom(state), CAtom("t_global_get"), [CVar(st_arg), CBinary(_)]),
+    CCall(CAtom(state), CAtom("t_global_get"), [CVar(st_arg), CBytes(_)]),
     CVar(ret),
   ]) = body
   assert state == b.state_module
@@ -1299,11 +1290,7 @@ pub fn threaded_global_set_rebinds_record_test() {
   // used to wrap it (from the empty-result `Values([])`) is now elided at emit time.
   let assert CLet(
     [newst],
-    CCall(
-      CAtom(_),
-      CAtom("t_global_set"),
-      [CVar(st_arg), CBinary(_), CVar("v")],
-    ),
+    CCall(CAtom(_), CAtom("t_global_set"), [CVar(st_arg), CBytes(_), CVar("v")]),
     CTuple([CAtom("ok"), CVar(ret)]),
   ) = body
   assert st_arg == st
@@ -1871,8 +1858,8 @@ pub fn mem_init_drop_gate_test() {
   let assert CCase(
     CCall(CAtom(_), CAtom("data_dropped"), [CInt(0)]),
     [
-      CClause([PAtom("true")], CAtom("true"), CBinary([])),
-      CClause([PVar(_)], CAtom("true"), CBinary([_, _, _, _])),
+      CClause([PAtom("true")], CAtom("true"), CBytes(<<>>)),
+      CClause([PVar(_)], CAtom("true"), CBytes(<<_, _, _, _>>)),
     ],
   ) = gate
   // …then the gated payload feeds `rt_mem:init(0, Seg, …)`.
@@ -2125,8 +2112,8 @@ pub fn const_v128_is_binary_literal_test() {
         ir.ConstV128(<<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16>>),
       ]),
     ))
-  let assert CBinary(segs) = body_of_b(m, "f", binding())
-  assert list.length(segs) == 16
+  let assert CBytes(bytes) = body_of_b(m, "f", binding())
+  assert bit_array.byte_size(bytes) == 16
 }
 
 /// `SimdStore` (`v128.store`) → an EAGER trapping `store_bytes(Addr, V, Off)` zero-effect (the 16

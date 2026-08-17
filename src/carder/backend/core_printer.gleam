@@ -32,9 +32,9 @@
 
 import carder/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
-  type FunDef, CApply, CApplyExpr, CAtom, CBinary, CCall, CCase, CCons, CFloat,
-  CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple, CValues, CVar,
-  PAtom, PCons, PInt, PNil, PTuple, PVar,
+  type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBytes, CCall, CCase, CCons,
+  CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
+  CValues, CVar, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import gleam/bit_array
 import gleam/float
@@ -184,6 +184,12 @@ fn print_expr(e: CExpr, ind: String) -> StringTree {
       string_tree.concat([
         st("#{"),
         list.map(segments, print_bitseg(_, ind)) |> string_tree.join(", "),
+        st("}#"),
+      ])
+    CBytes(bytes) ->
+      string_tree.concat([
+        st("#{"),
+        print_bytes(bytes, []) |> string_tree.join(", "),
         st("}#"),
       ])
     CFun(vars, body) -> print_fun(vars, body, ind)
@@ -412,6 +418,19 @@ fn print_bitseg(seg: CBitSeg, ind: String) -> StringTree {
     list.map(seg.flags, print_atom) |> string_tree.join(","),
     st("])"),
   ])
+}
+
+/// Print a byte-string literal as one `#<B>(8,1,'integer',['unsigned','big'])`
+/// segment per byte (accumulated in reverse, then restored).
+fn print_bytes(bytes: BitArray, acc: List(StringTree)) -> List(StringTree) {
+  case bytes {
+    <<b:size(8), rest:bits>> ->
+      print_bytes(rest, [
+        st("#<" <> int.to_string(b) <> ">(8,1,'integer',['unsigned','big'])"),
+        ..acc
+      ])
+    _ -> list.reverse(acc)
+  }
 }
 
 // ─────────────────────────────── atom printer ───────────────────────────────
