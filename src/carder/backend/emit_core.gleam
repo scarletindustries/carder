@@ -102,7 +102,7 @@ import carder/ir.{
 import carder/runtime/instance.{
   type Binding, type DirectHost, type HostPolicy, type MemTier, Atomics,
   HostDenyAll, HostOp, HostOpen, HostWhitelist, MeterFuel, MeterOff, Mut,
-  MutMiss, MutUnit, Nif, Paged, Pure, Read, Threaded,
+  MutMiss, MutUnit, Nif, Paged, Pure, Read, ReadMiss, Threaded,
 }
 import carder/runtime/profiles
 import gleam/bit_array
@@ -204,10 +204,15 @@ pub type EmitError {
   /// `direct_host.ops`. FAIL-CLOSED: no call is emitted (the table is the caller's build-time
   /// `Binding` value, so an unknown op cannot reach an arbitrary MFA). Never a panic.
   UnknownDirectOp(capability: String, op: String)
-  /// A direct-host `CallHost` whose `OpKind` needs `Threading(cur)` (Read/Mut/MutMiss/MutUnit)
+  /// A direct-host `CallHost` whose `OpKind` needs `Threading(cur)` (every kind but `Pure`)
   /// but reached a `NoState` context. FAIL-CLOSED — `direct_host` makes every function
   /// state-reaching, so this is a backend defence, never a panic.
   DirectOpRequiresThreaded(op: String)
+  /// A `KValuesPure`/`KJumpPure` leaf reached under a channel other than the
+  /// one it was proved pure for (`keeps_state` was too optimistic). Internal:
+  /// the enclosing If/Block/Switch catches it and re-emits under the plain
+  /// state-threading twin, so it never escapes `emit_function`.
+  StateNotPure(expected: String)
 }
 
 // ─────────────────────────────── internal state ───────────────────────────────
@@ -268,10 +273,18 @@ type Ctx {
 ///   NoState only. Trivial; inlined.
 /// - `KBind(names, body, next)`: bind the values to `names`, then emit `body` under
 ///   `next`.
+/// - `KJumpPure(target, st)` / `KValuesPure(st)`: the state-pure twins of
+///   `KJump`/`KValues` under `Threading(st)`. The enclosing If/Block/Switch
+///   proved (`keeps_state`) that no arm rebinds the record, so the leaf yields
+///   the values ALONE — no leading state slot — and the join / let-case keeps
+///   the incoming `st`. A leaf reached under any other channel is
+///   `StateNotPure`; the enclosing construct then re-emits under the plain twin.
 type Cont {
   KReturn
   KJump(target: FName)
   KValues
+  KJumpPure(target: FName, st: String)
+  KValuesPure(st: String)
   KBind(names: List(String), body: Expr, next: Cont)
   /// The continuation of a `Try` body. The body is a nullary fun applied
   /// under the Core `try`, so it must not transfer control past the try —
@@ -342,6 +355,14 @@ type EmitState {
     uses: Dict(String, Int),
     /// How many times each IR variable is BOUND in the function being emitted.
     binds: Dict(String, Int),
+    /// Truth-value binders whose i32 `let` was dropped by `apply_cont_bool`
+    /// (read once, as an `If` condition further down the `Let` spine), mapped
+    /// to their boolean BIF call; `emit_if` scrutinises the call directly.
+    sunk: Dict(String, CExpr),
+    /// Binders whose `let` was dropped by `apply_cont` because every value was
+    /// atomic (a variable or literal), mapped to that value; `emit_value`
+    /// substitutes it at every read.
+    subst: Dict(String, CExpr),
   )
 }
 
@@ -738,6 +759,8 @@ fn emit_function(
       try_outer: None,
       uses: uses,
       binds: binds,
+      sunk: dict.new(),
+      subst: dict.new(),
     )
   case is_threaded(ctx) && set.contains(ctx.fn_state_reaching, f.name) {
     True -> {
@@ -1087,7 +1110,8 @@ fn emit(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case expr {
-    Values(vs) -> apply_cont(cont, list.map(vs, emit_value), sc, state, ctx)
+    Values(vs) ->
+      apply_cont(cont, list.map(vs, emit_value(_, state)), sc, state, ctx)
     Return(vs) -> emit_return(vs, sc, state)
     Num(op, args) -> emit_num(op, args, cont, sc, state, ctx)
     Convert(op, arg) -> emit_convert(op, arg, cont, sc, state, ctx)
@@ -1333,11 +1357,22 @@ fn emit_term_op(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case op, args {
     ir.MakeTuple, _ ->
-      apply_cont(cont, [CTuple(list.map(args, emit_value))], sc, state, ctx)
+      apply_cont(
+        cont,
+        [CTuple(list.map(args, emit_value(_, state)))],
+        sc,
+        state,
+        ctx,
+      )
     ir.TupleGet(i), [t] ->
       apply_cont(
         cont,
-        [CCall(CAtom("erlang"), CAtom("element"), [CInt(i + 1), emit_value(t)])],
+        [
+          CCall(CAtom("erlang"), CAtom("element"), [
+            CInt(i + 1),
+            emit_value(t, state),
+          ]),
+        ],
         sc,
         state,
         ctx,
@@ -1345,18 +1380,24 @@ fn emit_term_op(
     ir.TupleSize, [t] ->
       apply_cont(
         cont,
-        [CCall(CAtom("erlang"), CAtom("tuple_size"), [emit_value(t)])],
+        [CCall(CAtom("erlang"), CAtom("tuple_size"), [emit_value(t, state)])],
         sc,
         state,
         ctx,
       )
     ir.MakeCons, [h, t] ->
-      apply_cont(cont, [CCons(emit_value(h), emit_value(t))], sc, state, ctx)
+      apply_cont(
+        cont,
+        [CCons(emit_value(h, state), emit_value(t, state))],
+        sc,
+        state,
+        ctx,
+      )
     ir.MakeNil, [] -> apply_cont(cont, [CNil], sc, state, ctx)
     ir.ListHead, [l] ->
       apply_cont(
         cont,
-        [CCall(CAtom("erlang"), CAtom("hd"), [emit_value(l)])],
+        [CCall(CAtom("erlang"), CAtom("hd"), [emit_value(l, state)])],
         sc,
         state,
         ctx,
@@ -1364,7 +1405,7 @@ fn emit_term_op(
     ir.ListTail, [l] ->
       apply_cont(
         cont,
-        [CCall(CAtom("erlang"), CAtom("tl"), [emit_value(l)])],
+        [CCall(CAtom("erlang"), CAtom("tl"), [emit_value(l, state)])],
         sc,
         state,
         ctx,
@@ -1373,7 +1414,7 @@ fn emit_term_op(
       // `case L of [] -> 1; _ -> 0 end` — one i32 value (fresh wildcard binder for the `_` arm).
       let #(wild, state2) = fresh_var(state)
       let is_empty =
-        CCase(emit_value(l), [
+        CCase(emit_value(l, state), [
           CClause([PNil], CAtom("true"), CInt(1)),
           CClause([PVar(wild)], CAtom("true"), CInt(0)),
         ])
@@ -1421,9 +1462,9 @@ fn emit_map_op(
         cont,
         [
           CCall(CAtom("maps"), CAtom("get"), [
-            emit_value(k),
-            emit_value(m),
-            emit_value(default),
+            emit_value(k, state),
+            emit_value(m, state),
+            emit_value(default, state),
           ]),
         ],
         sc,
@@ -1435,9 +1476,9 @@ fn emit_map_op(
         cont,
         [
           CCall(CAtom("maps"), CAtom("put"), [
-            emit_value(k),
-            emit_value(v),
-            emit_value(m),
+            emit_value(k, state),
+            emit_value(v, state),
+            emit_value(m, state),
           ]),
         ],
         sc,
@@ -1449,7 +1490,10 @@ fn emit_map_op(
       // `is_key/2` always returns a boolean atom, so the two clauses are exhaustive.
       let has =
         CCase(
-          CCall(CAtom("maps"), CAtom("is_key"), [emit_value(k), emit_value(m)]),
+          CCall(CAtom("maps"), CAtom("is_key"), [
+            emit_value(k, state),
+            emit_value(m, state),
+          ]),
           [
             CClause([PAtom("true")], CAtom("true"), CInt(1)),
             CClause([PAtom("false")], CAtom("true"), CInt(0)),
@@ -1460,7 +1504,12 @@ fn emit_map_op(
     ir.MapRemove, [m, k] ->
       apply_cont(
         cont,
-        [CCall(CAtom("maps"), CAtom("remove"), [emit_value(k), emit_value(m)])],
+        [
+          CCall(CAtom("maps"), CAtom("remove"), [
+            emit_value(k, state),
+            emit_value(m, state),
+          ]),
+        ],
         sc,
         state,
         ctx,
@@ -1468,7 +1517,7 @@ fn emit_map_op(
     ir.MapSize, [m] ->
       apply_cont(
         cont,
-        [CCall(CAtom("maps"), CAtom("size"), [emit_value(m)])],
+        [CCall(CAtom("maps"), CAtom("size"), [emit_value(m, state)])],
         sc,
         state,
         ctx,
@@ -1493,15 +1542,18 @@ fn emit_term_test(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let bif_call =
-    CCall(CAtom("erlang"), CAtom(term_test_bif(kind)), [emit_value(arg)])
+    CCall(CAtom("erlang"), CAtom(term_test_bif(kind)), [emit_value(arg, state)])
   apply_cont_bool(cont, bif_call, sc, state, ctx)
 }
 
 /// Dispose a boolean-atom-valued BIF call `bif_call` through `cont`. When `cont`
-/// binds it to a name that is read ONCE, as the condition of an immediately
-/// following `If`, the `If` is emitted straight on the boolean (`case bif_call
-/// of 'true' -> then; 'false' -> else`) — no `1`/`0` round-trip. Otherwise the
-/// i32 truth value (`bool_to_i32`) is bound as usual.
+/// binds it to a name that is bound once and read ONCE, as the condition of an
+/// `If` on the `Let` spine of the body, the i32 binder is dropped and the call
+/// is sunk to that `If` (`state.sunk`), which `emit_if` then emits straight on
+/// the boolean (`case bif_call of 'true' -> then; 'false' -> else`) — no `1`/`0`
+/// round-trip. The BIF is pure and its operands are atomic, so it may move past
+/// the intervening `Let`s as long as none rebinds an operand. Otherwise the i32
+/// truth value (`bool_to_i32`) is bound as usual.
 fn apply_cont_bool(
   cont: Cont,
   bif_call: CExpr,
@@ -1509,14 +1561,47 @@ fn apply_cont_bool(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let fused = case cont {
-    KBind([v], body, next) -> fused_if(v, body, next, state)
-    _ -> None
+  case cont {
+    KBind([v], body, next) -> {
+      let once =
+        dict.get(state.uses, v) == Ok(1) && dict.get(state.binds, v) == Ok(1)
+      case once && if_on_spine(v, body, call_operands(bif_call)) {
+        True -> {
+          let sunk = dict.insert(state.sunk, v, bif_call)
+          emit(body, next, sc, EmitState(..state, sunk:), ctx)
+        }
+        False -> apply_cont(cont, [bool_to_i32(bif_call)], sc, state, ctx)
+      }
+    }
+    _ -> apply_cont(cont, [bool_to_i32(bif_call)], sc, state, ctx)
   }
-  case fused {
-    Some(FusedIf(result, t, e, next)) ->
-      emit_if_on(BoolCond(bif_call), result, t, e, next, sc, sc, sc, state, ctx)
-    None -> apply_cont(cont, [bool_to_i32(bif_call)], sc, state, ctx)
+}
+
+/// The variable operands of a BIF `call` (its atomic `CVar` args).
+fn call_operands(call: CExpr) -> List(String) {
+  case call {
+    CCall(_, _, args) ->
+      list.filter_map(args, fn(a) {
+        case a {
+          CVar(name) -> Ok(name)
+          _ -> Error(Nil)
+        }
+      })
+    _ -> []
+  }
+}
+
+/// `True` iff an `If` on `v` sits on the `Let` spine of `body` — as the spine's
+/// tail or as a spine `Let`'s rhs — and no spine binder above it rebinds one of
+/// `operands`.
+fn if_on_spine(v: String, body: Expr, operands: List(String)) -> Bool {
+  case body {
+    If(Var(c), _, _, _) -> c == v
+    Let(_, If(Var(c), _, _, _), _) if c == v -> True
+    Let(xs, _, rest) ->
+      !list.any(xs, list.contains(operands, _))
+      && if_on_spine(v, rest, operands)
+    _ -> False
   }
 }
 
@@ -1587,7 +1672,7 @@ fn emit_term_tag(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  apply_cont(cont, [term_tag_case(emit_value(arg))], sc, state, ctx)
+  apply_cont(cont, [term_tag_case(emit_value(arg, state))], sc, state, ctx)
 }
 
 /// Build the `TermTag` nested `case` over the atomic term `x`: for each `#(is_BIF, code)` (in the
@@ -1633,8 +1718,8 @@ fn emit_num_term(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let a = emit_value(lhs)
-  let b = emit_value(rhs)
+  let a = emit_value(lhs, state)
+  let b = emit_value(rhs, state)
   let bif = fn(name) { CCall(CAtom("erlang"), CAtom(name), [a, b]) }
   case op {
     // arithmetic → a number term (a bare BIF call)
@@ -1695,7 +1780,7 @@ fn emit_make_closure(
                 CApply(
                   FName(fn_name, fn_params),
                   list.append(
-                    list.map(captures, emit_value),
+                    list.map(captures, emit_value(_, state)),
                     list.map(param_names, CVar),
                   ),
                 )
@@ -1726,7 +1811,7 @@ fn emit_make_closure(
                     CApply(FName(fn_name, list.length(captures) + arity + 1), [
                       CVar(st_param),
                       ..list.append(
-                        list.map(captures, emit_value),
+                        list.map(captures, emit_value(_, state)),
                         list.map(param_names, CVar),
                       )
                     ])
@@ -1766,14 +1851,14 @@ fn emit_call_closure(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let cargs = list.map(args, emit_value)
+  let cargs = list.map(args, emit_value(_, state))
   case is_direct(ctx.binding), sc {
     False, _ | True, NoState -> {
-      let applied = CApplyExpr(emit_value(callee), cargs)
+      let applied = CApplyExpr(emit_value(callee, state), cargs)
       apply_cont_call(cont, applied, 1, sc, state, ctx)
     }
     True, Threading(cur) -> {
-      let applied = CApplyExpr(emit_value(callee), [CVar(cur), ..cargs])
+      let applied = CApplyExpr(emit_value(callee, state), [CVar(cur), ..cargs])
       case cont {
         KReturn -> Ok(#(applied, state))
         _ -> emit_threaded_call_unpack(applied, 1, cont, state, ctx)
@@ -1790,7 +1875,7 @@ fn emit_return(
   sc: StateChan,
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let pkg = function_return(list.map(vs, emit_value))
+  let pkg = function_return(list.map(vs, emit_value(_, state)))
   case state.try_outer {
     Some(_) -> Ok(#(exit_record("$2c_ret", [pkg], sc), state))
     None ->
@@ -1841,11 +1926,12 @@ fn emit_mem_grow(
   case sc {
     NoState -> {
       let call = case mem {
-        0 -> seam_call(ctx.binding.mem_module, "grow", [emit_value(delta)])
+        0 ->
+          seam_call(ctx.binding.mem_module, "grow", [emit_value(delta, state)])
         _ ->
           seam_call(ctx.binding.mem_module, "grow_at", [
             CInt(mem),
-            emit_value(delta),
+            emit_value(delta, state),
           ])
       }
       apply_cont(cont, [call], sc, state, ctx)
@@ -1855,13 +1941,13 @@ fn emit_mem_grow(
         0 ->
           seam_call(ctx.binding.mem_module, "t_grow", [
             CVar(cur),
-            emit_value(delta),
+            emit_value(delta, state),
           ])
         _ ->
           seam_call(ctx.binding.mem_module, "t_grow_at", [
             CVar(cur),
             CInt(mem),
-            emit_value(delta),
+            emit_value(delta, state),
           ])
       }
       emit_value_state_pair(call, cont, state, ctx)
@@ -1896,7 +1982,7 @@ fn emit_mem_load(
     CInt(op.bytes),
     bool_atom(op.signed),
     CInt(result_width(result)),
-    emit_value(addr),
+    emit_value(addr, state),
     CInt(offset),
   ]
   case sc {
@@ -1962,8 +2048,8 @@ fn emit_mem_store(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let tail = [
     CInt(op.bytes),
-    emit_value(addr),
-    emit_value(value),
+    emit_value(addr, state),
+    emit_value(value, state),
     CInt(offset),
   ]
   case sc {
@@ -2026,7 +2112,7 @@ fn emit_mem_load_unchecked(
         CInt(op.bytes),
         bool_atom(op.signed),
         CInt(result_width(result)),
-        emit_value(addr),
+        emit_value(addr, state),
         CInt(offset),
       ]
       let call = case sc {
@@ -2063,8 +2149,8 @@ fn emit_mem_store_unchecked(
     True -> {
       let tail = [
         CInt(op.bytes),
-        emit_value(addr),
-        emit_value(value),
+        emit_value(addr, state),
+        emit_value(value, state),
         CInt(offset),
       ]
       case sc {
@@ -2195,7 +2281,7 @@ fn emit_global_set(
       let effect =
         seam_call(ctx.binding.state_module, cell_fn, [
           core_binary_string(name),
-          emit_value(value),
+          emit_value(value, state),
         ])
       emit_zero_effect(effect, cont, sc, state, ctx)
     }
@@ -2204,7 +2290,7 @@ fn emit_global_set(
         seam_call(ctx.binding.state_module, threaded_fn, [
           CVar(cur),
           core_binary_string(name),
-          emit_value(value),
+          emit_value(value, state),
         ])
       let #(newst, state2) = fresh_var(state)
       use #(rest, state3) <- result.try(apply_cont(
@@ -2252,7 +2338,8 @@ fn emit_value_state_pair(
 /// §9.5): fresh `St2 = <call>`, then continue with ZERO values under `Threading(St2)`. Distinct
 /// from `emit_threaded_record_effect` — no `Result` unwrap (the JS runtime never `{error,_}`s).
 /// arc's `anf.host_unit` wraps every MutUnit CallHost in `Let([r], _, body)` (r discarded), so
-/// a `KBind([_], …)` cont is fed one dummy `undefined` to satisfy the arity check.
+/// a `KBind([_], …)` cont is fed one dummy `undefined` to satisfy the arity check — unless
+/// `r` is never read, in which case the `let r = 'undefined'` is skipped entirely.
 fn emit_state_rebind(
   call: CExpr,
   cont: Cont,
@@ -2260,18 +2347,64 @@ fn emit_state_rebind(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let #(st2, state2) = fresh_var(state)
-  let vals = case cont {
-    KBind([_], _, _) -> [CAtom("undefined")]
-    _ -> []
-  }
-  use #(rest, state3) <- result.try(apply_cont(
-    cont,
-    vals,
-    Threading(st2),
-    state2,
-    ctx,
-  ))
+  let unread = fn(r) { dict.get(state.uses, r) |> result.unwrap(0) == 0 }
+  use #(rest, state3) <- result.try(case cont {
+    KBind([r], body, next) ->
+      case unread(r) {
+        True -> emit(body, next, Threading(st2), state2, ctx)
+        False ->
+          apply_cont(cont, [CAtom("undefined")], Threading(st2), state2, ctx)
+      }
+    _ -> apply_cont(cont, [], Threading(st2), state2, ctx)
+  })
   Ok(#(CLet([st2], call, rest), state3))
+}
+
+/// Dispose a `ReadMiss` call that returns bare `V | miss` (`sc` unchanged either
+/// way). When the IR binds the result `r` (bound once) and the very next node is
+/// `Let([b], NumTerm(NEq, Var(r), ConstAtom("miss")), …)` with `b` read once as
+/// an `If` condition, the probe and the test lower to ONE `let R = <call> in
+/// case R of 'miss' -> then; _ -> else` — no `=:=` BIF, no i32 round-trip. Any
+/// other cont takes the plain `Read` shape (bare value through `apply_cont_call`).
+fn emit_read_or_miss(
+  call: CExpr,
+  cur: String,
+  cont: Cont,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  let fused = case cont {
+    KBind([r], Let([b], ir.NumTerm(ir.NEq, lhs, rhs), body), next)
+      if lhs == Var(r)
+      && rhs == ir.ConstAtom("miss")
+      || rhs == Var(r)
+      && lhs == ir.ConstAtom("miss")
+    ->
+      case dict.get(state.binds, r) == Ok(1) {
+        True -> option.map(fused_if(b, body, next, state), fn(f) { #(r, f) })
+        False -> None
+      }
+    _ -> None
+  }
+  let sc = Threading(cur)
+  case fused {
+    Some(#(r, FusedIf(result, t, e, next))) -> {
+      use #(rest, state2) <- result.try(emit_if_on(
+        MissCond(r),
+        result,
+        t,
+        e,
+        next,
+        sc,
+        sc,
+        sc,
+        state,
+        ctx,
+      ))
+      Ok(#(CLet([r], call, rest), state2))
+    }
+    None -> apply_cont_call(cont, call, 1, sc, state, ctx)
+  }
 }
 
 /// Rebind the threaded `InstanceState` from a `MutMiss` call that returns
@@ -2424,6 +2557,22 @@ fn apply_cont(
     KTryFall -> Ok(#(exit_record("$2c_fall", vals, sc), state))
     KTryReturn ->
       Ok(#(exit_record("$2c_ret", [function_return(vals)], sc), state))
+    // State-pure leaves: the record is provably still `st`, so yield exactly
+    // what the NoState twin would (values only, no state slot).
+    KValuesPure(st) ->
+      case sc {
+        Threading(cur) if cur == st ->
+          apply_cont(KValues, vals, NoState, state, ctx)
+        NoState -> apply_cont(KValues, vals, NoState, state, ctx)
+        Threading(_) -> Error(StateNotPure(st))
+      }
+    KJumpPure(target, st) ->
+      case sc {
+        Threading(cur) if cur == st ->
+          apply_cont(KJump(target), vals, NoState, state, ctx)
+        NoState -> apply_cont(KJump(target), vals, NoState, state, ctx)
+        Threading(_) -> Error(StateNotPure(st))
+      }
     KValues ->
       // perf6 emit_block/emit_if let-case. Under `state.float=None` (single-
       // value context — a `letrec` fun body, or emit_if let-case): yield ONE
@@ -2481,20 +2630,84 @@ fn apply_cont(
       case list.length(names) == list.length(vals) {
         False -> Error(ArityMismatch(list.length(names), list.length(vals)))
         True -> {
-          use #(body_c, state2) <- result.try(emit(body, next, sc, state, ctx))
-          case names {
-            // A zero-value bind is `let <> = <> in body`: the RHS `value_list([])` is the
-            // empty value list `<>` — a pure literal with no side effects — so the `let` is a
-            // vacuous no-op. Emit `body` directly. On a large guest (e.g. the TeaVM gateway)
-            // this drops ~10k such lets (~10% of the emitted Core text), shrinking the
-            // emit/scan/parse cost and wall-time. It does NOT change the resulting `.beam`
-            // (`sys_core_fold` inside `compile:forms` already elides these), so the
-            // compile:forms peak is unchanged; this is a text/transient/time win only.
-            [] -> Ok(#(body_c, state2))
-            _ -> Ok(#(CLet(names, value_list(vals), body_c), state2))
+          case alias_subst(names, vals, state) {
+            Some(subst) -> {
+              use #(body_c, state2) <- result.try(emit(
+                body,
+                next,
+                sc,
+                EmitState(..state, subst:),
+                ctx,
+              ))
+              Ok(#(body_c, EmitState(..state2, subst: state.subst)))
+            }
+            None -> {
+              use #(body_c, state2) <- result.try(emit(
+                body,
+                next,
+                sc,
+                state,
+                ctx,
+              ))
+              bind_values(names, vals, body_c, state2)
+            }
           }
         }
       }
+  }
+}
+
+/// `let names = vals in body`, or `body` alone for a zero-value bind.
+fn bind_values(
+  names: List(String),
+  vals: List(CExpr),
+  body_c: CExpr,
+  state2: EmitState,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  case names {
+    // A zero-value bind is `let <> = <> in body`: the RHS `value_list([])` is the
+    // empty value list `<>` — a pure literal with no side effects — so the `let` is a
+    // vacuous no-op. Emit `body` directly. On a large guest (e.g. the TeaVM gateway)
+    // this drops ~10k such lets (~10% of the emitted Core text), shrinking the
+    // emit/scan/parse cost and wall-time. It does NOT change the resulting `.beam`
+    // (`sys_core_fold` inside `compile:forms` already elides these), so the
+    // compile:forms peak is unchanged; this is a text/transient/time win only.
+    [] -> Ok(#(body_c, state2))
+    _ -> Ok(#(CLet(names, value_list(vals), body_c), state2))
+  }
+}
+
+/// `state.subst` extended with `names -> vals` when the `let` can be dropped:
+/// every value is a variable or literal, every name is bound exactly once in
+/// the function, and no aliased variable is rebound anywhere in it (so the
+/// alias stays valid throughout the binder's scope). `None` otherwise.
+fn alias_subst(
+  names: List(String),
+  vals: List(CExpr),
+  state: EmitState,
+) -> Option(Dict(String, CExpr)) {
+  let bound_once = fn(name) { dict.get(state.binds, name) == Ok(1) }
+  let stable = fn(val) {
+    case val {
+      CVar(name) ->
+        case dict.get(state.binds, name) {
+          Ok(n) -> n <= 1
+          Error(Nil) -> True
+        }
+      CInt(_) | CAtom(_) -> True
+      _ -> False
+    }
+  }
+  let distinct = set.size(set.from_list(names)) == list.length(names)
+  case distinct && list.all(names, bound_once) && list.all(vals, stable) {
+    True ->
+      Some(
+        list.zip(names, vals)
+        |> list.fold(state.subst, fn(acc, pair) {
+          dict.insert(acc, pair.0, pair.1)
+        }),
+      )
+    False -> None
   }
 }
 
@@ -2745,7 +2958,21 @@ fn materialize(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
-  materialize_if(cont, arity, sc, state, ctx, force_inline: False)
+  materialize_if(cont, arity, sc, state, ctx, force_inline: False, pure: False)
+}
+
+/// `materialize` for a construct whose every exit provably keeps the incoming
+/// record (`keeps_state`): under `Threading(cur)` the join is NOT widened —
+/// `'J'/arity = fun(names…) -> <body under Threading(cur)>` — and the exits
+/// jump through `KJumpPure(J, cur)` with the values alone.
+fn materialize_pure(
+  cont: Cont,
+  arity: Int,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
+  materialize_if(cont, arity, sc, state, ctx, force_inline: False, pure: True)
 }
 
 /// `materialize` with an override: `force_inline: True` skips the letrec even
@@ -2759,11 +2986,14 @@ fn materialize_if(
   state: EmitState,
   ctx: Ctx,
   force_inline force_inline: Bool,
+  pure pure: Bool,
 ) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
   case strip_identity_binds(cont) {
     KReturn -> Ok(#(None, KReturn, state))
     KJump(t) -> Ok(#(None, KJump(t), state))
     KValues -> Ok(#(None, KValues, state))
+    KJumpPure(t, st) -> Ok(#(None, KJumpPure(t, st), state))
+    KValuesPure(st) -> Ok(#(None, KValuesPure(st), state))
     KTryFall -> Ok(#(None, KTryFall, state))
     KTryReturn -> Ok(#(None, KTryReturn, state))
     KBind(names, body, next) as kb ->
@@ -2793,8 +3023,8 @@ fn materialize_if(
           {
             True -> Ok(#(None, kb, state))
             False ->
-              case sc {
-                NoState -> {
+              case sc, pure {
+                NoState, _ -> {
                   let #(jname, state2) = fresh_fn(state)
                   let fname = FName(jname, arity)
                   let outer_float = state2.float
@@ -2807,11 +3037,30 @@ fn materialize_if(
                   ))
                   float_or_wrap(
                     FunDef(fname, CFun(names, jbody)),
-                    fname,
+                    KJump(fname),
                     EmitState(..state3, float: outer_float),
                   )
                 }
-                Threading(_) -> {
+                // State-pure join: no widened state slot — the body runs under
+                // the SAME `cur` every exit still holds (a free var of the fun).
+                Threading(cur), True -> {
+                  let #(jname, state2) = fresh_fn(state)
+                  let fname = FName(jname, arity)
+                  let outer_float = state2.float
+                  use #(jbody, state3) <- result.try(emit(
+                    body,
+                    next,
+                    sc,
+                    EmitState(..state2, float: None),
+                    ctx,
+                  ))
+                  float_or_wrap(
+                    FunDef(fname, CFun(names, jbody)),
+                    KJumpPure(fname, cur),
+                    EmitState(..state3, float: outer_float),
+                  )
+                }
+                Threading(_), False -> {
                   let #(jname, state2) = fresh_fn(state)
                   let #(st_join, state3) = fresh_var(state2)
                   let fname = FName(jname, arity + 1)
@@ -2829,7 +3078,7 @@ fn materialize_if(
                   ))
                   float_or_wrap(
                     FunDef(fname, CFun([st_join, ..names], jbody)),
-                    fname,
+                    KJump(fname),
                     EmitState(..state4, float: outer_float),
                   )
                 }
@@ -3233,17 +3482,13 @@ fn band_lit(x: CExpr, mask: Int) -> CExpr {
 /// Otherwise fall through to the normal in-place `Some(def)` wrap.
 fn float_or_wrap(
   def: FunDef,
-  fname: FName,
+  jump: Cont,
   state: EmitState,
 ) -> Result(#(Option(FunDef), Cont, EmitState), EmitError) {
   case state.float {
     Some(#(ar, defs)) ->
-      Ok(#(
-        None,
-        KJump(fname),
-        EmitState(..state, float: Some(#(ar, [def, ..defs]))),
-      ))
-    None -> Ok(#(Some(def), KJump(fname), state))
+      Ok(#(None, jump, EmitState(..state, float: Some(#(ar, [def, ..defs])))))
+    None -> Ok(#(Some(def), jump, state))
   }
 }
 
@@ -3336,7 +3581,7 @@ fn emit_num(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let cargs = list.map(args, emit_value)
+  let cargs = list.map(args, emit_value(_, state))
   case
     ctx.binding.num_module == "carder@runtime@rt_num",
     inline_num_op(op, cargs)
@@ -3497,13 +3742,13 @@ fn emit_convert(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case is_boxing_conv(op) {
     // Term↔numeric boxing bridge (K5/D5): identity on the carried bit pattern.
-    True -> apply_cont(cont, [emit_value(arg)], sc, state, ctx)
+    True -> apply_cont(cont, [emit_value(arg, state)], sc, state, ctx)
     False ->
       case conv_op_name(op) {
         Error(node) -> Error(UnsupportedNode(node))
         Ok(fn_name) -> {
           let call =
-            seam_call(ctx.binding.num_module, fn_name, [emit_value(arg)])
+            seam_call(ctx.binding.num_module, fn_name, [emit_value(arg, state)])
           case is_trapping_conv(op) {
             True -> emit_trapping_result(call, cont, sc, state, ctx)
             False -> apply_cont(cont, [call], sc, state, ctx)
@@ -3552,7 +3797,8 @@ fn emit_simd(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let call = seam_call(simd_module, simd_op_name(op), simd_call_args(op, args))
+  let call =
+    seam_call(simd_module, simd_op_name(op), simd_call_args(op, args, state))
   apply_cont(cont, [call], sc, state, ctx)
 }
 
@@ -3583,7 +3829,8 @@ fn emit_gc(
     ir.GcArrayInitElem(e) ->
       emit_gc_array_init_elem(e, args, cont, sc, state, ctx)
     _ -> {
-      let call = seam_call(gc_module, gc_op_name(op), gc_call_args(op, args))
+      let call =
+        seam_call(gc_module, gc_op_name(op), gc_call_args(op, args, state))
       case gc_is_void(op) {
         // struct.set / array.set / fill / copy push no value — sequence the call
         // and continue with zero results.
@@ -3611,12 +3858,12 @@ fn emit_gc_call_ref(
     [f, ..ps] -> #(f, ps)
     [] -> #(ir.ConstI32(0), [])
   }
-  let params_c = core_list(list.map(params, emit_value))
+  let params_c = core_list(list.map(params, emit_value(_, state)))
   case sc {
     NoState -> {
       let call =
         seam_call(gc_module, "call_ref", [
-          emit_value(funcref),
+          emit_value(funcref, state),
           params_c,
           CInt(rc),
         ])
@@ -3635,7 +3882,7 @@ fn emit_gc_call_ref(
       let call =
         seam_call(gc_module, "t_call_ref", [
           CVar(cur),
-          emit_value(funcref),
+          emit_value(funcref, state),
           params_c,
           CInt(rc),
         ])
@@ -3701,8 +3948,8 @@ fn emit_gc_array_new_data(
     seam_call(gc_module, "array_new_data", [
       CInt(type_idx),
       CVar(segvar),
-      emit_value(offset),
-      emit_value(count),
+      emit_value(offset, state),
+      emit_value(count, state),
       CInt(width),
     ])
   use #(rest, state4) <- result.try(apply_cont(cont, [call], sc, state3, ctx))
@@ -3738,11 +3985,11 @@ fn emit_gc_array_init_data(
   let #(segvar, state3) = fresh_var(state2)
   let call =
     seam_call(gc_module, "array_init_data", [
-      emit_value(arrayref),
-      emit_value(dst),
+      emit_value(arrayref, state),
+      emit_value(dst, state),
       CVar(segvar),
-      emit_value(src),
-      emit_value(count),
+      emit_value(src, state),
+      emit_value(count, state),
       CInt(width),
     ])
   use #(rest, state4) <- result.try(emit_zero_effect(
@@ -3797,8 +4044,8 @@ fn emit_gc_array_new_elem(
     seam_call(gc_module, "array_new_elem", [
       CInt(type_idx),
       CVar(segvar),
-      emit_value(offset),
-      emit_value(count),
+      emit_value(offset, state),
+      emit_value(count, state),
     ])
   use #(rest, state5) <- result.try(apply_cont(cont, [call], sc, state4, ctx))
   Ok(#(CLet([segvar], gated, rest), state5))
@@ -3842,11 +4089,11 @@ fn emit_gc_array_init_elem(
   let #(segvar, state4) = fresh_var(state3)
   let call =
     seam_call(gc_module, "array_init_elem", [
-      emit_value(arrayref),
-      emit_value(dst),
+      emit_value(arrayref, state),
+      emit_value(dst, state),
       CVar(segvar),
-      emit_value(src),
-      emit_value(count),
+      emit_value(src, state),
+      emit_value(count, state),
     ])
   use #(rest, state5) <- result.try(emit_zero_effect(
     call,
@@ -3913,8 +4160,12 @@ fn gc_op_name(op: ir.GcOp) -> String {
 /// with the op's compile-time immediates spliced in — the type index / field
 /// index / packed width+signedness / RTTI matcher the runtime needs. Field lists
 /// (`struct.new`, `array.new_fixed`) are passed as a single Core list.
-fn gc_call_args(op: ir.GcOp, args: List(Value)) -> List(CExpr) {
-  let ev = list.map(args, emit_value)
+fn gc_call_args(
+  op: ir.GcOp,
+  args: List(Value),
+  state: EmitState,
+) -> List(CExpr) {
+  let ev = list.map(args, emit_value(_, state))
   case op {
     ir.GcStructNew(t) -> [CInt(t), core_list(ev)]
     ir.GcStructGet(f, ir.ReadPlain) -> list.append(ev, [CInt(f)])
@@ -3996,21 +4247,25 @@ fn cbool(b: Bool) -> CExpr {
 /// - `SReplaceLane(_, l)` — the head is `<shape>_replace_lane(a, lane, x)` (lane is the MIDDLE arg,
 ///   per the frozen rt_simd signature — NOT last as the stale unit doc §B.1 sketched); `args ==
 ///   [vec, x]`, so splice: `[vec, l, x]`.
-/// - every other op — its operands only (`list.map(args, emit_value)`).
-fn simd_call_args(op: ir.SimdOp, args: List(Value)) -> List(CExpr) {
+/// - every other op — its operands only (`list.map(args, emit_value(_, state))`).
+fn simd_call_args(
+  op: ir.SimdOp,
+  args: List(Value),
+  state: EmitState,
+) -> List(CExpr) {
   case op {
     ir.SExtractLane(_, lane)
     | ir.SExtractLaneS(_, lane)
     | ir.SExtractLaneU(_, lane) ->
-      list.append(list.map(args, emit_value), [CInt(lane)])
+      list.append(list.map(args, emit_value(_, state)), [CInt(lane)])
     ir.SReplaceLane(_, lane) ->
       case args {
-        [vec, x] -> [emit_value(vec), CInt(lane), emit_value(x)]
+        [vec, x] -> [emit_value(vec, state), CInt(lane), emit_value(x, state)]
         // Validation guarantees replace-lane has exactly [vec, scalar]; any other shape is an
         // internal invariant, defaulted to the operands verbatim (never reached).
-        _ -> list.map(args, emit_value)
+        _ -> list.map(args, emit_value(_, state))
       }
-    _ -> list.map(args, emit_value)
+    _ -> list.map(args, emit_value(_, state))
   }
 }
 
@@ -4029,8 +4284,8 @@ fn emit_simd_shuffle(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let call =
     seam_call(simd_module, "i8x16_shuffle", [
-      emit_value(a),
-      emit_value(b),
+      emit_value(a, state),
+      emit_value(b, state),
       core_list(list.map(lanes, CInt)),
     ])
   apply_cont(cont, [call], sc, state, ctx)
@@ -4238,7 +4493,8 @@ fn emit_simd_load(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case kind {
     ir.LoadV128 -> {
-      let call = simd_load_bytes_call(mem, addr, offset, 16, sc, ctx)
+      let call =
+        simd_load_bytes_call(mem, emit_value(addr, state), offset, 16, sc, ctx)
       emit_simd_trapping_value(call, fn(x) { x }, cont, sc, state, ctx)
     }
     ir.LoadSplat(bits) -> {
@@ -4248,7 +4504,7 @@ fn emit_simd_load(
           bits / 8,
           False,
           scalar_result_width(bits),
-          addr,
+          emit_value(addr, state),
           offset,
           sc,
           ctx,
@@ -4263,7 +4519,8 @@ fn emit_simd_load(
       )
     }
     ir.LoadExtend(source_bits, signed) -> {
-      let call = simd_load_bytes_call(mem, addr, offset, 8, sc, ctx)
+      let call =
+        simd_load_bytes_call(mem, emit_value(addr, state), offset, 8, sc, ctx)
       emit_simd_trapping_value(
         call,
         fn(x) {
@@ -4280,7 +4537,15 @@ fn emit_simd_load(
       )
     }
     ir.LoadZero(bits) -> {
-      let call = simd_load_bytes_call(mem, addr, offset, bits / 8, sc, ctx)
+      let call =
+        simd_load_bytes_call(
+          mem,
+          emit_value(addr, state),
+          offset,
+          bits / 8,
+          sc,
+          ctx,
+        )
       emit_simd_trapping_value(
         call,
         fn(x) { seam_call(simd_module, "v128_load_zero", [x, CInt(bits)]) },
@@ -4309,7 +4574,14 @@ fn emit_simd_store(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let call =
-    simd_store_bytes_call(mem, addr, emit_value(value), offset, sc, ctx)
+    simd_store_bytes_call(
+      mem,
+      emit_value(addr, state),
+      emit_value(value, state),
+      offset,
+      sc,
+      ctx,
+    )
   case sc {
     NoState -> {
       let #(effect, state2) = trapping_effect(call, ctx, state)
@@ -4341,7 +4613,7 @@ fn emit_simd_load_lane(
       width / 8,
       False,
       scalar_result_width(width),
-      addr,
+      emit_value(addr, state),
       offset,
       sc,
       ctx,
@@ -4350,7 +4622,7 @@ fn emit_simd_load_lane(
     call,
     fn(x) {
       seam_call(simd_module, "v128_replace_lane_bits", [
-        emit_value(vec),
+        emit_value(vec, state),
         CInt(lane),
         CInt(width),
         x,
@@ -4382,12 +4654,20 @@ fn emit_simd_store_lane(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let extracted =
     seam_call(simd_module, "v128_extract_lane_bits", [
-      emit_value(vec),
+      emit_value(vec, state),
       CInt(lane),
       CInt(width),
     ])
   let call =
-    simd_scalar_store_call(mem, width / 8, addr, extracted, offset, sc, ctx)
+    simd_scalar_store_call(
+      mem,
+      width / 8,
+      emit_value(addr, state),
+      extracted,
+      offset,
+      sc,
+      ctx,
+    )
   case sc {
     NoState -> {
       let #(effect, state2) = trapping_effect(call, ctx, state)
@@ -4438,13 +4718,13 @@ fn emit_simd_trapping_value(
 /// raw bignum address, `offset` a bignum `CInt`; `rt_mem` reads the width from the handle (§D).
 fn simd_load_bytes_call(
   mem: Int,
-  addr: Value,
+  addr: CExpr,
   offset: Int,
   n: Int,
   sc: StateChan,
   ctx: Ctx,
 ) -> CExpr {
-  let tail = [emit_value(addr), CInt(offset), CInt(n)]
+  let tail = [addr, CInt(offset), CInt(n)]
   case mem, sc {
     0, NoState -> seam_call(ctx.binding.mem_module, "load_bytes", tail)
     0, Threading(cur) ->
@@ -4465,13 +4745,13 @@ fn simd_load_bytes_call(
 /// Bytes, Off)`. Index 0 → the un-indexed head; ≥1 → the `_at` head with a leading memidx.
 fn simd_store_bytes_call(
   mem: Int,
-  addr: Value,
+  addr: CExpr,
   bytes: CExpr,
   offset: Int,
   sc: StateChan,
   ctx: Ctx,
 ) -> CExpr {
-  let tail = [emit_value(addr), bytes, CInt(offset)]
+  let tail = [addr, bytes, CInt(offset)]
   case mem, sc {
     0, NoState -> seam_call(ctx.binding.mem_module, "store_bytes", tail)
     0, Threading(cur) ->
@@ -4495,7 +4775,7 @@ fn simd_scalar_load_call(
   bytes: Int,
   signed: Bool,
   result_bits: Int,
-  addr: Value,
+  addr: CExpr,
   offset: Int,
   sc: StateChan,
   ctx: Ctx,
@@ -4504,7 +4784,7 @@ fn simd_scalar_load_call(
     CInt(bytes),
     bool_atom(signed),
     CInt(result_bits),
-    emit_value(addr),
+    addr,
     CInt(offset),
   ]
   case mem, sc {
@@ -4529,13 +4809,13 @@ fn simd_scalar_load_call(
 fn simd_scalar_store_call(
   mem: Int,
   bytes: Int,
-  addr: Value,
+  addr: CExpr,
   value_expr: CExpr,
   offset: Int,
   sc: StateChan,
   ctx: Ctx,
 ) -> CExpr {
-  let tail = [CInt(bytes), emit_value(addr), value_expr, CInt(offset)]
+  let tail = [CInt(bytes), addr, value_expr, CInt(offset)]
   case mem, sc {
     0, NoState -> seam_call(ctx.binding.mem_module, "store", tail)
     0, Threading(cur) ->
@@ -4597,7 +4877,7 @@ fn emit_call_direct(
     Error(_) -> Error(UnknownFunction(fn_name))
     Ok(arity) -> {
       let r = result.unwrap(dict.get(ctx.fn_results, fn_name), 1)
-      let cargs = list.map(args, emit_value)
+      let cargs = list.map(args, emit_value(_, state))
       let callee_threaded =
         is_threaded(ctx) && set.contains(ctx.fn_state_reaching, fn_name)
       case sc, callee_threaded {
@@ -4688,7 +4968,7 @@ fn emit_call_host(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let cargs = list.map(args, emit_value)
+  let cargs = list.map(args, emit_value(_, state))
   case direct_host_for(ctx.binding, capability) {
     Some(dh) -> emit_call_direct_host(dh, name, cargs, cont, sc, state, ctx)
     None ->
@@ -4765,8 +5045,10 @@ fn direct_host_for(binding: Binding, capability: String) -> Option(DirectHost) {
 
 /// Lower a direct-host `CallHost`: look `name` up in `dh.ops` and emit `call 'M':'F'(…)` under
 /// the op's `OpKind` convention — `Pure`: `M:F(args)`, one value, `sc` unchanged; `Read`:
-/// `M:F(St, args)`, bare value, `sc` unchanged; `Mut`: `{V, St'}`, rebinds; `MutMiss`:
-/// bare `St' | miss`, rebinds unless atom; `MutUnit`: bare `St'`, rebinds, zero values.
+/// `M:F(St, args)`, bare value, `sc` unchanged; `ReadMiss`: bare `V | miss`, `sc` unchanged,
+/// fused with an immediate `=:= miss` test into one `case` (`emit_read_or_miss`); `Mut`:
+/// `{V, St'}`, rebinds; `MutMiss`: bare `St' | miss`, rebinds unless atom; `MutUnit`: bare
+/// `St'`, rebinds, zero values.
 /// `Error(UnknownDirectOp)` for an op not in the table; `Error(DirectOpRequiresThreaded)` if a
 /// state-taking kind meets `NoState` (unreachable: `direct_host` threads every function).
 fn emit_call_direct_host(
@@ -4786,6 +5068,8 @@ fn emit_call_direct_host(
         Pure, _ -> apply_cont_call(cont, call(cargs), 1, sc, state, ctx)
         Read, Threading(cur) ->
           apply_cont_call(cont, call([CVar(cur), ..cargs]), 1, sc, state, ctx)
+        ReadMiss, Threading(cur) ->
+          emit_read_or_miss(call([CVar(cur), ..cargs]), cur, cont, state, ctx)
         Mut, Threading(cur) ->
           emit_value_state_pair(call([CVar(cur), ..cargs]), cont, state, ctx)
         MutMiss, Threading(cur) ->
@@ -4912,16 +5196,16 @@ fn emit_call_indirect(
       let call = case idx {
         0 ->
           seam_call(ctx.binding.table_module, "call_indirect", [
-            emit_value(index),
+            emit_value(index, state),
             func_type_term(ty),
-            core_list(list.map(args, emit_value)),
+            core_list(list.map(args, emit_value(_, state))),
           ])
         _ ->
           seam_call(ctx.binding.table_module, "call_indirect_at", [
             CInt(idx),
-            emit_value(index),
+            emit_value(index, state),
             func_type_term(ty),
-            core_list(list.map(args, emit_value)),
+            core_list(list.map(args, emit_value(_, state))),
           ])
       }
       // Bind one var to the unwrapped result LIST (or raise on `{error,R}`), then unpack it.
@@ -4960,17 +5244,17 @@ fn emit_call_indirect(
         0 ->
           seam_call(ctx.binding.table_module, "t_call_indirect", [
             CVar(cur),
-            emit_value(index),
+            emit_value(index, state),
             func_type_term(ty),
-            core_list(list.map(args, emit_value)),
+            core_list(list.map(args, emit_value(_, state))),
           ])
         _ ->
           seam_call(ctx.binding.table_module, "t_call_indirect_at", [
             CVar(cur),
             CInt(idx),
-            emit_value(index),
+            emit_value(index, state),
             func_type_term(ty),
-            core_list(list.map(args, emit_value)),
+            core_list(list.map(args, emit_value(_, state))),
           ])
       }
       let #(pvar, state2) = fresh_var(state)
@@ -5076,7 +5360,7 @@ fn emit_call_import(
   let applied =
     seam_call(link_module, "call_import", [
       CVar(cvar),
-      core_list(list.map(args, emit_value)),
+      core_list(list.map(args, emit_value(_, state))),
     ])
   let #(lvar, state3) = fresh_var(state2)
   use #(rest, state4) <- result.try(unpack_result_list(
@@ -5142,7 +5426,7 @@ fn emit_return_call_indirect(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let idx = table_idx(ctx, table)
   let tag = func_type_term(ty)
-  let cargs = core_list(list.map(args, emit_value))
+  let cargs = core_list(list.map(args, emit_value(_, state)))
   let #(tvar, state2) = fresh_var(state)
   let #(evar, state3) = fresh_var(state2)
   // Select the head + tail-apply per state channel. Under `Threading` the read-only `cur` flows
@@ -5152,13 +5436,13 @@ fn emit_return_call_indirect(
       let lookup = case idx {
         0 ->
           seam_call(ctx.binding.table_module, "call_indirect_lookup", [
-            emit_value(index),
+            emit_value(index, state),
             tag,
           ])
         _ ->
           seam_call(ctx.binding.table_module, "call_indirect_lookup_at", [
             CInt(idx),
-            emit_value(index),
+            emit_value(index, state),
             tag,
           ])
       }
@@ -5169,14 +5453,14 @@ fn emit_return_call_indirect(
         0 ->
           seam_call(ctx.binding.table_module, "t_call_indirect_lookup", [
             CVar(cur),
-            emit_value(index),
+            emit_value(index, state),
             tag,
           ])
         _ ->
           seam_call(ctx.binding.table_module, "t_call_indirect_lookup_at", [
             CVar(cur),
             CInt(idx),
-            emit_value(index),
+            emit_value(index, state),
             tag,
           ])
       }
@@ -5210,13 +5494,14 @@ fn emit_return_call_ref(
   state: EmitState,
   _ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let cargs = core_list(list.map(args, emit_value))
+  let cargs = core_list(list.map(args, emit_value(_, state)))
   let call = case sc {
-    NoState -> seam_call(gc_module, "apply_ref", [emit_value(funcref), cargs])
+    NoState ->
+      seam_call(gc_module, "apply_ref", [emit_value(funcref, state), cargs])
     Threading(cur) ->
       seam_call(gc_module, "t_apply_ref", [
         CVar(cur),
-        emit_value(funcref),
+        emit_value(funcref, state),
         cargs,
       ])
   }
@@ -5426,7 +5711,7 @@ fn emit_ref_is_null(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let call = seam_call(ref_module, "is_null", [emit_value(arg)])
+  let call = seam_call(ref_module, "is_null", [emit_value(arg, state)])
   let #(wild, state2) = fresh_var(state)
   let i32 =
     CCase(call, [
@@ -5460,12 +5745,15 @@ fn emit_table_get(
   let idx = table_idx(ctx, table)
   let call = case sc {
     NoState ->
-      seam_call(ctx.binding.table_module, "get", [CInt(idx), emit_value(index)])
+      seam_call(ctx.binding.table_module, "get", [
+        CInt(idx),
+        emit_value(index, state),
+      ])
     Threading(cur) ->
       seam_call(ctx.binding.table_module, "t_get", [
         CVar(cur),
         CInt(idx),
-        emit_value(index),
+        emit_value(index, state),
       ])
   }
   emit_trapping_result(call, cont, sc, state, ctx)
@@ -5489,8 +5777,8 @@ fn emit_table_set(
       let call =
         seam_call(ctx.binding.table_module, "set", [
           CInt(idx),
-          emit_value(index),
-          emit_value(value),
+          emit_value(index, state),
+          emit_value(value, state),
         ])
       let #(effect, state2) = trapping_effect(call, ctx, state)
       emit_zero_effect(effect, cont, sc, state2, ctx)
@@ -5500,8 +5788,8 @@ fn emit_table_set(
         seam_call(ctx.binding.table_module, "t_set", [
           CVar(cur),
           CInt(idx),
-          emit_value(index),
-          emit_value(value),
+          emit_value(index, state),
+          emit_value(value, state),
         ])
       emit_threaded_record_effect(call, cont, state, ctx)
     }
@@ -5547,8 +5835,8 @@ fn emit_table_grow(
         [
           seam_call(ctx.binding.table_module, "grow", [
             CInt(idx),
-            emit_value(delta),
-            emit_value(init),
+            emit_value(delta, state),
+            emit_value(init, state),
           ]),
         ],
         sc,
@@ -5560,8 +5848,8 @@ fn emit_table_grow(
         seam_call(ctx.binding.table_module, "t_grow", [
           CVar(cur),
           CInt(idx),
-          emit_value(delta),
-          emit_value(init),
+          emit_value(delta, state),
+          emit_value(init, state),
         ])
       emit_value_state_pair(call, cont, state, ctx)
     }
@@ -5587,9 +5875,9 @@ fn emit_table_fill(
       let call =
         seam_call(ctx.binding.table_module, "fill", [
           CInt(idx),
-          emit_value(offset),
-          emit_value(value),
-          emit_value(count),
+          emit_value(offset, state),
+          emit_value(value, state),
+          emit_value(count, state),
         ])
       let #(effect, state2) = trapping_effect(call, ctx, state)
       emit_zero_effect(effect, cont, sc, state2, ctx)
@@ -5599,9 +5887,9 @@ fn emit_table_fill(
         seam_call(ctx.binding.table_module, "t_fill", [
           CVar(cur),
           CInt(idx),
-          emit_value(offset),
-          emit_value(value),
-          emit_value(count),
+          emit_value(offset, state),
+          emit_value(value, state),
+          emit_value(count, state),
         ])
       emit_threaded_record_effect(call, cont, state, ctx)
     }
@@ -5651,9 +5939,9 @@ fn emit_table_init(
         seam_call(ctx.binding.table_module, "table_init", [
           CInt(idx),
           CVar(segvar),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       let #(effect, state5) = trapping_effect(call, ctx, state4)
       use #(rest, state6) <- result.try(emit_zero_effect(
@@ -5671,9 +5959,9 @@ fn emit_table_init(
           CVar(cur),
           CInt(idx),
           CVar(segvar),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       use #(rest, state5) <- result.try(emit_threaded_record_effect(
         call,
@@ -5708,9 +5996,9 @@ fn emit_table_copy(
         seam_call(ctx.binding.table_module, "table_copy", [
           CInt(didx),
           CInt(sidx),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       let #(effect, state2) = trapping_effect(call, ctx, state)
       emit_zero_effect(effect, cont, sc, state2, ctx)
@@ -5721,9 +6009,9 @@ fn emit_table_copy(
           CVar(cur),
           CInt(didx),
           CInt(sidx),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       emit_threaded_record_effect(call, cont, state, ctx)
     }
@@ -5766,9 +6054,9 @@ fn emit_mem_fill(
       let call =
         seam_call(ctx.binding.mem_module, "fill", [
           CInt(mem),
-          emit_value(dest),
-          emit_value(value),
-          emit_value(count),
+          emit_value(dest, state),
+          emit_value(value, state),
+          emit_value(count, state),
         ])
       let #(effect, state2) = trapping_effect(call, ctx, state)
       emit_zero_effect(effect, cont, sc, state2, ctx)
@@ -5778,9 +6066,9 @@ fn emit_mem_fill(
         seam_call(ctx.binding.mem_module, "t_fill", [
           CVar(cur),
           CInt(mem),
-          emit_value(dest),
-          emit_value(value),
-          emit_value(count),
+          emit_value(dest, state),
+          emit_value(value, state),
+          emit_value(count, state),
         ])
       emit_threaded_record_effect(call, cont, state, ctx)
     }
@@ -5807,9 +6095,9 @@ fn emit_mem_copy(
         seam_call(ctx.binding.mem_module, "copy", [
           CInt(dst_mem),
           CInt(src_mem),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       let #(effect, state2) = trapping_effect(call, ctx, state)
       emit_zero_effect(effect, cont, sc, state2, ctx)
@@ -5820,9 +6108,9 @@ fn emit_mem_copy(
           CVar(cur),
           CInt(dst_mem),
           CInt(src_mem),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       emit_threaded_record_effect(call, cont, state, ctx)
     }
@@ -5866,9 +6154,9 @@ fn emit_mem_init(
         seam_call(ctx.binding.mem_module, "init", [
           CInt(mem),
           CVar(segvar),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       let #(effect, state4) = trapping_effect(call, ctx, state3)
       use #(rest, state5) <- result.try(emit_zero_effect(
@@ -5886,9 +6174,9 @@ fn emit_mem_init(
           CVar(cur),
           CInt(mem),
           CVar(segvar),
-          emit_value(dst),
-          emit_value(src),
-          emit_value(count),
+          emit_value(dst, state),
+          emit_value(src, state),
+          emit_value(count, state),
         ])
       use #(rest, state4) <- result.try(emit_threaded_record_effect(
         call,
@@ -6071,8 +6359,16 @@ fn emit_if(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
+  // A truth value sunk here by `apply_cont_bool`: scrutinise its BIF call.
+  let if_cond = case cond {
+    Var(v) ->
+      dict.get(state.sunk, v)
+      |> result.map(BoolCond)
+      |> result.unwrap(I32Cond(cond))
+    _ -> I32Cond(cond)
+  }
   emit_if_on(
-    I32Cond(cond),
+    if_cond,
     result,
     then_branch,
     else_branch,
@@ -6085,11 +6381,13 @@ fn emit_if(
   )
 }
 
-/// What an `If` scrutinises: the IR's i32 truth value (`0` → else), or a
-/// boolean-atom BIF call fused in by `apply_cont_bool` (`'false'` → else).
+/// What an `If` scrutinises: the IR's i32 truth value (`0` → else), a
+/// boolean-atom BIF call fused in by `apply_cont_bool` (`'false'` → else), or
+/// a `ReadMiss` result fused in by `emit_read_or_miss` (`'miss'` → then).
 type IfCond {
   I32Cond(Value)
   BoolCond(CExpr)
+  MissCond(String)
 }
 
 /// `sc` is the channel the join/`cont` runs under; `then_sc`/`else_sc` are the
@@ -6107,6 +6405,55 @@ fn emit_if_on(
   else_sc: StateChan,
   state: EmitState,
   ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  // Item 1: when neither arm can rebind the record, the join / let-case keeps
+  // the incoming `St` and the leaves yield the value alone. Proved
+  // syntactically (`keeps_state`); if a leaf still lands under another
+  // channel, fall back to the state-threading lowering.
+  let pure =
+    is_direct(ctx.binding)
+    && sc != NoState
+    && then_sc == sc
+    && else_sc == sc
+    && keeps_state(then_branch, ctx)
+    && keeps_state(else_branch, ctx)
+  let go = fn(pure: Bool) {
+    emit_if_join(
+      cond,
+      result,
+      then_branch,
+      else_branch,
+      cont,
+      sc,
+      then_sc,
+      else_sc,
+      state,
+      ctx,
+      pure,
+    )
+  }
+  case pure {
+    True ->
+      case go(True) {
+        Error(StateNotPure(_)) -> go(False)
+        other -> other
+      }
+    False -> go(False)
+  }
+}
+
+fn emit_if_join(
+  cond: IfCond,
+  result: List(ir.ValType),
+  then_branch: Expr,
+  else_branch: Expr,
+  cont: Cont,
+  sc: StateChan,
+  then_sc: StateChan,
+  else_sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+  pure: Bool,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   // perf5 richards-gate: when one arm is a bottom transfer (Break/Continue/
   // Return/Trap/Throw/Unreachable), `cont` is reachable from ONE arm only —
@@ -6158,8 +6505,12 @@ fn emit_if_on(
               && all_breaks_local(then_branch, "", [], [])
               && all_breaks_local(else_branch, "", [], [])
             {
-              True -> Ok(#(None, KValues, state))
-              False -> materialize(cont, arity, sc, state, ctx)
+              True -> Ok(#(None, leaf_cont(sc, pure), state))
+              False ->
+                case pure {
+                  True -> materialize_pure(cont, arity, sc, state, ctx)
+                  False -> materialize(cont, arity, sc, state, ctx)
+                }
             }
         }
     },
@@ -6167,7 +6518,7 @@ fn emit_if_on(
   // Under the let-case tail the arms' `KValues` leaves must be tuples
   // (`multi=False` below), so an inherited multi-value scope is closed for
   // the arms and restored after.
-  let let_case = jcont == KValues && block_can_let_case(cont, arity)
+  let let_case = jcont == leaf_cont(sc, pure) && block_can_let_case(cont, arity)
   let outer_float = state2.float
   let state2 = case let_case {
     True -> EmitState(..state2, float: None)
@@ -6195,7 +6546,7 @@ fn emit_if_on(
     I32Cond(v) -> {
       let #(wild, state5) = fresh_var(state4)
       #(
-        CCase(emit_value(v), [
+        CCase(emit_value(v, state), [
           CClause([PInt(0)], CAtom("true"), else_c),
           CClause([PVar(wild)], CAtom("true"), then_c),
         ]),
@@ -6209,6 +6560,16 @@ fn emit_if_on(
       ]),
       state4,
     )
+    MissCond(r) -> {
+      let #(wild, state5) = fresh_var(state4)
+      #(
+        CCase(CVar(r), [
+          CClause([PAtom("miss")], CAtom("true"), then_c),
+          CClause([PVar(wild)], CAtom("true"), else_c),
+        ]),
+        state5,
+      )
+    }
   }
   // perf6 let-case tail: KValues chosen HERE (block_can_let_case ⇒ cont was a
   // KBind, not an inherited KValues from an outer let-case) → wrap; else the
@@ -6218,8 +6579,27 @@ fn emit_if_on(
   // richards' hot pattern is anf.share (Block), not bind_if.
   case let_case {
     True ->
-      emit_let_case_wrap(case_expr, arity, [], False, cont, sc, state5, ctx)
+      emit_let_case_wrap(
+        case_expr,
+        arity,
+        [],
+        False,
+        pure,
+        cont,
+        sc,
+        state5,
+        ctx,
+      )
     False -> Ok(#(wrap_join(maybe_def, case_expr), state5))
+  }
+}
+
+/// The let-case leaf cont for `sc`: `KValuesPure(cur)` when the construct is
+/// state-pure under `Threading(cur)`, else the plain `KValues`.
+fn leaf_cont(sc: StateChan, pure: Bool) -> Cont {
+  case sc, pure {
+    Threading(cur), True -> KValuesPure(cur)
+    _, _ -> KValues
   }
 }
 
@@ -6236,17 +6616,20 @@ fn emit_let_case_wrap(
   arity: Int,
   defs: List(FunDef),
   multi: Bool,
+  pure: Bool,
   cont: Cont,
   sc: StateChan,
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(state2, sc_out) = case sc {
-    NoState -> #(state, sc)
-    Threading(_) -> {
+  // `pure` (item 1): the leaves carry no state slot and `cont` keeps the
+  // incoming record — the shape is exactly the NoState one.
+  let #(state2, sc_out) = case sc, pure {
+    Threading(_), False -> {
       let #(st_out, s) = fresh_var(state)
       #(s, Threading(st_out))
     }
+    _, _ -> #(state, sc)
   }
   use #(names, cont_c, state4) <- result.try(bind_results(
     cont,
@@ -6255,9 +6638,9 @@ fn emit_let_case_wrap(
     state2,
     ctx,
   ))
-  let tup_names = case sc_out {
-    NoState -> names
-    Threading(st_out) -> [st_out, ..names]
+  let tup_names = case sc_out, pure {
+    Threading(st_out), False -> [st_out, ..names]
+    _, _ -> names
   }
   case multi {
     True -> {
@@ -6280,8 +6663,8 @@ fn emit_let_case_wrap(
       // case t of {…}` (vs `case body_c of {…}`) is measured FASTER —
       // nesting the big body case as a discriminee regressed
       // crypto/raytrace ~25%.
-      case sc, tup_names {
-        NoState, [single] -> Ok(#(CLet([single], body_c, cont_c), state4))
+      case sc == NoState || pure, tup_names {
+        True, [single] -> Ok(#(CLet([single], body_c, cont_c), state4))
         _, _ -> {
           let #(t, state5) = fresh_var(state4)
           let clause =
@@ -6332,13 +6715,50 @@ fn emit_switch(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  use #(maybe_def, jcont, state2) <- result.try(materialize(
-    cont,
-    list.length(result),
-    sc,
-    state,
-    ctx,
-  ))
+  // Item 1: a state-pure switch keeps the incoming record at its join.
+  let pure =
+    is_direct(ctx.binding)
+    && sc != NoState
+    && keeps_state(default, ctx)
+    && list.all(arms, fn(a: SwitchArm) { keeps_state(a.body, ctx) })
+  let go = fn(pure: Bool) {
+    emit_switch_join(
+      selector,
+      result,
+      arms,
+      default,
+      cont,
+      sc,
+      state,
+      ctx,
+      pure,
+    )
+  }
+  case pure {
+    True ->
+      case go(True) {
+        Error(StateNotPure(_)) -> go(False)
+        other -> other
+      }
+    False -> go(False)
+  }
+}
+
+fn emit_switch_join(
+  selector: Value,
+  result: List(ir.ValType),
+  arms: List(SwitchArm),
+  default: Expr,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+  pure: Bool,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  use #(maybe_def, jcont, state2) <- result.try(case pure {
+    True -> materialize_pure(cont, list.length(result), sc, state, ctx)
+    False -> materialize(cont, list.length(result), sc, state, ctx)
+  })
   use #(arm_clauses, state3) <- result.try(
     emit_switch_arms(arms, jcont, sc, state2, ctx, []),
   )
@@ -6346,7 +6766,10 @@ fn emit_switch(
   let #(wild, state5) = fresh_var(state4)
   let clauses =
     list.append(arm_clauses, [CClause([PVar(wild)], CAtom("true"), default_c)])
-  Ok(#(wrap_join(maybe_def, CCase(emit_value(selector), clauses)), state5))
+  Ok(#(
+    wrap_join(maybe_def, CCase(emit_value(selector, state), clauses)),
+    state5,
+  ))
 }
 
 /// Emit the `Switch` arm clauses, threading state (accumulator in reverse).
@@ -6381,6 +6804,32 @@ fn emit_block(
   sc: StateChan,
   state: EmitState,
   ctx: Ctx,
+) -> Result(#(CExpr, EmitState), EmitError) {
+  // Item 1: a state-pure block keeps the incoming record past its exit —
+  // let-case leaves / the join carry the values alone (see `emit_if_on`).
+  let pure = is_direct(ctx.binding) && sc != NoState && keeps_state(body, ctx)
+  let go = fn(pure: Bool) {
+    emit_block_join(label, result, body, cont, sc, state, ctx, pure)
+  }
+  case pure {
+    True ->
+      case go(True) {
+        Error(StateNotPure(_)) -> go(False)
+        other -> other
+      }
+    False -> go(False)
+  }
+}
+
+fn emit_block_join(
+  label: String,
+  result: List(ir.ValType),
+  body: Expr,
+  cont: Cont,
+  sc: StateChan,
+  state: EmitState,
+  ctx: Ctx,
+  pure: Bool,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let arity = list.length(result)
   // perf6 richards-gate: LET-CASE lowering. When every non-local exit in
@@ -6419,8 +6868,9 @@ fn emit_block(
         True -> EmitState(..state, float: Some(#(arity, [])))
         False -> EmitState(..state, float: None)
       }
-      let state3 = push_label(state2, LabelEntry(label, KValues, None))
-      use #(body_c, state4) <- result.try(emit(body, KValues, sc, state3, ctx))
+      let leaf = leaf_cont(sc, pure)
+      let state3 = push_label(state2, LabelEntry(label, leaf, None))
+      use #(body_c, state4) <- result.try(emit(body, leaf, sc, state3, ctx))
       let state5 = restore_labels(state4, state.labels)
       let #(defs, state6) = case open_float, state5.float {
         True, Some(#(_, ds)) -> #(
@@ -6429,16 +6879,23 @@ fn emit_block(
         )
         _, _ -> #([], EmitState(..state5, float: outer_float))
       }
-      emit_let_case_wrap(body_c, arity, defs, open_float, cont, sc, state6, ctx)
+      emit_let_case_wrap(
+        body_c,
+        arity,
+        defs,
+        open_float,
+        pure,
+        cont,
+        sc,
+        state6,
+        ctx,
+      )
     }
     False -> {
-      use #(maybe_def, exit_cont, state2) <- result.try(materialize(
-        cont,
-        arity,
-        sc,
-        state,
-        ctx,
-      ))
+      use #(maybe_def, exit_cont, state2) <- result.try(case pure {
+        True -> materialize_pure(cont, arity, sc, state, ctx)
+        False -> materialize(cont, arity, sc, state, ctx)
+      })
       let state3 = push_label(state2, LabelEntry(label, exit_cont, None))
       use #(body_c, state4) <- result.try(emit(body, exit_cont, sc, state3, ctx))
       let state5 = restore_labels(state4, state2.labels)
@@ -6524,10 +6981,71 @@ fn kvalues_labels(labels: List(LabelEntry)) -> List(String) {
     True ->
       list.filter_map(labels, fn(e) {
         case e.break_cont {
-          KValues -> Ok(e.label)
+          KValues | KValuesPure(_) -> Ok(e.label)
           _ -> Error(Nil)
         }
       })
+  }
+}
+
+/// Item 1: True iff lowering `e` under `Threading(cur)` can never REBIND the
+/// record — every leaf that reaches the enclosing construct's cont still runs
+/// under the same `cur`, so that construct may keep the incoming record and
+/// yield its values alone (`KValuesPure`/`KJumpPure`). Conservative: only
+/// nodes whose lowering is known state-neutral pass; every mutator (`Mut*`
+/// direct-host ops, stores, threaded calls, closures, loops, try, gc) fails.
+/// Bottom transfers never reach the cont, so they pass.
+fn keeps_state(e: Expr, ctx: Ctx) -> Bool {
+  case e {
+    Values(_)
+    | Num(..)
+    | Convert(..)
+    | TermOp(..)
+    | ir.TermTest(..)
+    | ir.TermTag(..)
+    | ir.NumTerm(..)
+    | MapOp(..)
+    | MakeClosure(..)
+    | ir.RefFunc(..)
+    | ir.RefFuncImport(..)
+    | ir.RefIsNull(..)
+    | ir.Simd(..)
+    | ir.SimdShuffle(..)
+    | Trap(..)
+    | ir.Throw(..)
+    | ir.ThrowRef(..)
+    | Return(..)
+    | ir.ReturnCall(..)
+    | ir.ReturnCallIndirect(..)
+    | ir.ReturnCallRef(..)
+    | ir.ReturnCallImport(..)
+    | Break(..)
+    | Continue(..) -> True
+    CallHost(cap, name, _) -> host_op_keeps_state(cap, name, ctx)
+    CallDirect(name, _) -> !set.contains(ctx.fn_state_reaching, name)
+    Let(_, rhs, body) -> keeps_state(rhs, ctx) && keeps_state(body, ctx)
+    If(_, _, t, f) -> keeps_state(t, ctx) && keeps_state(f, ctx)
+    Block(_, _, body) -> keeps_state(body, ctx)
+    Switch(_, _, arms, d) ->
+      keeps_state(d, ctx)
+      && list.all(arms, fn(a: SwitchArm) { keeps_state(a.body, ctx) })
+    Charge(_, body) -> keeps_state(body, ctx)
+    _ -> False
+  }
+}
+
+/// A `CallHost` keeps the record unless it is a direct-host op of a rebinding
+/// kind (`Mut`/`MutMiss`/`MutUnit`); `Pure`/`Read` ops and every non-direct
+/// host/stdlib/js call are state-neutral (`emit_call_host`).
+fn host_op_keeps_state(cap: String, name: String, ctx: Ctx) -> Bool {
+  case direct_host_for(ctx.binding, cap) {
+    None -> True
+    Some(dh) ->
+      case dict.get(dh.ops, name) {
+        Ok(HostOp(kind: Pure, ..)) | Ok(HostOp(kind: Read, ..)) -> True
+        Ok(HostOp(..)) -> False
+        Error(Nil) -> False
+      }
   }
 }
 
@@ -6659,7 +7177,7 @@ fn emit_loop(
       ))
       let state6 = restore_labels(state5, state3.labels)
       let param_names = list.map(params, fn(p) { p.name })
-      let inits = list.map(params, fn(p) { emit_value(p.init) })
+      let inits = list.map(params, fn(p) { emit_value(p.init, state) })
       let loop_def = FunDef(lfname, CFun(param_names, body_c))
       let loop_expr = CLetrec([loop_def], CApply(lfname, inits))
       Ok(#(wrap_join(maybe_def, loop_expr), state6))
@@ -6678,7 +7196,10 @@ fn emit_loop(
       ))
       let state6 = restore_labels(state5, state3b.labels)
       let param_names = [st_loop, ..list.map(params, fn(p) { p.name })]
-      let inits = [CVar(cur), ..list.map(params, fn(p) { emit_value(p.init) })]
+      let inits = [
+        CVar(cur),
+        ..list.map(params, fn(p) { emit_value(p.init, state) })
+      ]
       let loop_def = FunDef(lfname, CFun(param_names, body_c))
       let loop_expr = CLetrec([loop_def], CApply(lfname, inits))
       Ok(#(wrap_join(maybe_def, loop_expr), state6))
@@ -6697,7 +7218,7 @@ fn emit_break(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use entry <- result.try(find_label(state, label))
-  let vals = list.map(vs, emit_value)
+  let vals = list.map(vs, emit_value(_, state))
   case label_outside_try(state, label) {
     True -> Ok(#(exit_record("$2c_brk", [CAtom(label), ..vals], sc), state))
     False -> apply_cont(entry.break_cont, vals, sc, state, ctx)
@@ -6715,7 +7236,7 @@ fn emit_continue(
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use entry <- result.try(find_label(state, label))
-  let vals = list.map(vs, emit_value)
+  let vals = list.map(vs, emit_value(_, state))
   case entry.continue_target, label_outside_try(state, label) {
     Some(_), True ->
       Ok(#(exit_record("$2c_cont", [CAtom(label), ..vals], sc), state))
@@ -6774,7 +7295,7 @@ fn emit_throw(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   use tag_id <- result.try(resolve_tag(ctx, tag))
-  let cargs = list.map(args, emit_value)
+  let cargs = list.map(args, emit_value(_, state))
   let payload = case sc, is_direct(ctx.binding) {
     Threading(cur), True -> core_list([CVar(cur), ..cargs])
     _, _ -> core_list(cargs)
@@ -6790,7 +7311,7 @@ fn emit_throw_ref(
   exnref: Value,
   state: EmitState,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  Ok(#(seam_call(exn_module, "throw_ref", [emit_value(exnref)]), state))
+  Ok(#(seam_call(exn_module, "throw_ref", [emit_value(exnref, state)]), state))
 }
 
 /// Lower `Try(result, body, handlers)` to a BEAM-native `try … catch` (the `CTry` node, J1/§C).
@@ -7134,11 +7655,12 @@ fn emit_catch_clause(
 // ─────────────────────────────── values ───────────────────────────────
 
 /// Lower an atomic IR `Value` to a Core expression. Variables become `CVar` (raw name —
-/// the printer legalizes). Every constant is its RAW BIT PATTERN as a `CInt` (integers as
-/// the unsigned bit pattern; floats as their IEEE-754 bits per D5 — never a Core float).
-fn emit_value(v: Value) -> CExpr {
+/// the printer legalizes) unless `state.subst` maps them to the atomic value they alias.
+/// Every constant is its RAW BIT PATTERN as a `CInt` (integers as the unsigned bit
+/// pattern; floats as their IEEE-754 bits per D5 — never a Core float).
+fn emit_value(v: Value, state: EmitState) -> CExpr {
   case v {
-    Var(name) -> CVar(name)
+    Var(name) -> dict.get(state.subst, name) |> result.unwrap(CVar(name))
     ConstI32(bits) -> CInt(bits)
     ConstI64(bits) -> CInt(bits)
     ConstF32(bits) -> CInt(bits)
@@ -7481,6 +8003,8 @@ fn emit_instantiate_full(
       try_outer: None,
       uses: dict.new(),
       binds: dict.new(),
+      sunk: dict.new(),
+      subst: dict.new(),
     )
   let n_imports = count_import_slots(module)
   // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
@@ -7954,6 +8478,8 @@ fn emit_instantiate_cell(
       try_outer: None,
       uses: dict.new(),
       binds: dict.new(),
+      sunk: dict.new(),
+      subst: dict.new(),
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   let seed_effect = seam_call(ctx.binding.state_module, "seed", [decl_term])
@@ -8012,6 +8538,8 @@ fn emit_instantiate_threaded(
       try_outer: None,
       uses: dict.new(),
       binds: dict.new(),
+      sunk: dict.new(),
+      subst: dict.new(),
     )
   use #(decl_term, state1) <- result.try(state_decl_term(module, ctx, state0))
   // (0) The unchanged metering/host seed discards.
@@ -8899,15 +9427,16 @@ fn collect_vars(f: Function) -> Set(String) {
 }
 
 /// Per variable of `f`'s body: how many times it is READ (a `Var` operand) and
-/// how many times it is BOUND (`Let`/loop/handler binder). Params/locals are
-/// not binders here, so a name absent from `binds` is not a body binder.
+/// how many times it is BOUND (a param, or a `Let`/loop/handler binder).
+/// Locals are not binders here.
 fn var_counts(f: Function) -> #(Dict(String, Int), Dict(String, Int)) {
   let bump = fn(d, name) {
     dict.upsert(d, name, fn(n) { option.unwrap(n, 0) + 1 })
   }
+  let binds0 = list.fold(f.params, dict.new(), fn(d, l) { bump(d, l.name) })
   walk_vars(
     f.body,
-    #(dict.new(), dict.new()),
+    #(dict.new(), binds0),
     fn(acc, name) { #(acc.0, bump(acc.1, name)) },
     fn(acc, name) { #(bump(acc.0, name), acc.1) },
   )
