@@ -17,6 +17,7 @@ import carder/backend/core_erlang.{
   type CModule, CAtom, CCall, CCase, CClause, CCons, CFun, CInt, CLet, CModule,
   CNil, CTuple, CVar, FName, FunDef, PTuple, PVar,
 }
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom.{type Atom}
 import gleam/list
 import gleam/string
@@ -234,3 +235,74 @@ pub fn repeated_constant_terms_are_bound_once_test() {
   assert apply_bins(mod, atom.create("mix"), [<<"x">>])
     == #(<<"ab">>, <<"ab">>, <<"x">>, #(1, <<"cd">>), #(1, <<"cd">>))
 }
+
+/// `both/2`: `case is_integer(X) of 'true' -> is_integer(Y); 'false' ->
+/// 'false'` under a further `case … of 'true' -> 1; 'false' -> 0`; `either/2`
+/// the `orelse` twin; `keep/1` a two-clause `case` whose scrutinee is not a
+/// test (a plain variable) — it must stay a `case`.
+fn short_circuit_module() -> CModule {
+  let bool_case = fn(scrutinee, t, e) {
+    CCase(scrutinee, [
+      CClause([core_erlang.PAtom("true")], CAtom("true"), t),
+      CClause([core_erlang.PAtom("false")], CAtom("true"), e),
+    ])
+  }
+  let to_i32 = fn(b) { bool_case(b, CInt(1), CInt(0)) }
+  let is_int = fn(v) { erlang("is_integer", [CVar(v)]) }
+  CModule(
+    name: "carder@test@eaf_short_circuit",
+    exports: [FName("both", 2), FName("either", 2), FName("keep", 1)],
+    attributes: [],
+    defs: [
+      FunDef(
+        FName("both", 2),
+        CFun(
+          ["X", "Y"],
+          to_i32(bool_case(is_int("X"), is_int("Y"), CAtom("false"))),
+        ),
+      ),
+      FunDef(
+        FName("either", 2),
+        CFun(
+          ["X", "Y"],
+          to_i32(bool_case(is_int("X"), CAtom("true"), is_int("Y"))),
+        ),
+      ),
+      FunDef(
+        FName("keep", 1),
+        CFun(["X"], to_i32(bool_case(CVar("X"), CAtom("true"), CAtom("false")))),
+      ),
+    ],
+  )
+}
+
+pub fn short_circuit_case_spells_as_operator_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(short_circuit_module())
+  // erl_pp wraps long operator expressions, so compare with whitespace squeezed.
+  let flat =
+    string.split(erl, "\n") |> list.map(string.trim) |> string.join(" ")
+  let assert Ok(#(both_src, rest)) = string.split_once(flat, "either(")
+  let assert Ok(#(either_src, keep_src)) = string.split_once(rest, "keep(")
+  assert string.contains(both_src, "is_integer(V0) andalso is_integer(V1)")
+  assert string.contains(either_src, "is_integer(V0) orelse is_integer(V1)")
+  assert !string.contains(keep_src, "andalso")
+  assert !string.contains(keep_src, "orelse")
+  let assert Ok(mod) = build_beam.compile_and_load(short_circuit_module())
+  let both = atom.create("both")
+  let either = atom.create("either")
+  assert apply_int(mod, both, [1, 2]) == 1
+  assert apply_int(mod, both, [1, 0]) == 1
+  let a = to_dynamic(atom.create("a"))
+  let one = to_dynamic(1)
+  assert apply_any_int(mod, both, [one, a]) == 0
+  assert apply_any_int(mod, both, [a, one]) == 0
+  assert apply_any_int(mod, either, [a, one]) == 1
+  assert apply_any_int(mod, either, [a, a]) == 0
+  assert apply_int(mod, either, [1, 2]) == 1
+}
+
+@external(erlang, "erlang", "apply")
+fn apply_any_int(module: Atom, function: Atom, args: List(Dynamic)) -> Int
+
+@external(erlang, "gleam_stdlib", "identity")
+fn to_dynamic(x: a) -> Dynamic
