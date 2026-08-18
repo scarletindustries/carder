@@ -54,6 +54,7 @@ import carder/backend/core_erlang.{
   CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
 }
 import carder/backend/core_printer
+import carder/backend/eaf_simplify
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -1370,8 +1371,9 @@ fn tr_def(
 ) -> Result(Form, EafError) {
   let FunDef(FName(name, arity), value) = def
   case value {
-    CFun(params, body) -> {
+    CFun(params, body0) -> {
       let ln = idx + 1
+      let body = eaf_simplify.simplify(body0, count_uses(body0, 0, dict.new()))
       let env =
         Env(
           ln: ln,

@@ -81,7 +81,8 @@ fn const_fold_module(module: ir.Module) -> ir.Module {
   )
 }
 
-/// Fold a single node if it is a constant `Num`/`Convert`; otherwise return it unchanged.
+/// Fold a single node if it is a constant `Num`/`Convert`/`TermTest`; otherwise return it
+/// unchanged.
 fn fold_node(e: ir.Expr) -> ir.Expr {
   case e {
     ir.Num(op, args) ->
@@ -94,7 +95,37 @@ fn fold_node(e: ir.Expr) -> ir.Expr {
         Ok(folded) -> folded
         Error(Nil) -> e
       }
+    ir.TermTest(kind, arg) ->
+      case fold_term_test(kind, arg) {
+        Ok(folded) -> folded
+        Error(Nil) -> e
+      }
     _ -> e
+  }
+}
+
+/// Fold a term-shape test on a literal. The shape of every `Const*` term is fixed by
+/// `emit_core.emit_value`: the four numeric constants are BEAM integers (floats travel as their
+/// raw bits), `ConstAtom` an atom, `ConstBinary`/`ConstV128` a binary, `ConstNull` a tuple. So
+/// `is_integer(<<"hi">>)` is `0` at compile time and the guard arm it fed becomes unreachable
+/// (const-`if` then drops it). `Error(Nil)` for a `Var` operand.
+fn fold_term_test(kind: ir.TermKind, arg: ir.Value) -> Result(ir.Expr, Nil) {
+  let truth = fn(b: Bool) {
+    case b {
+      True -> ok_val(ir.ConstI32(1))
+      False -> ok_val(ir.ConstI32(0))
+    }
+  }
+  case arg {
+    ir.Var(_) -> Error(Nil)
+    ir.ConstI32(_) | ir.ConstI64(_) | ir.ConstF32(_) | ir.ConstF64(_) ->
+      truth(case kind {
+        ir.IsInt | ir.IsNumber -> True
+        _ -> False
+      })
+    ir.ConstAtom(_) -> truth(kind == ir.IsAtom)
+    ir.ConstBinary(_) | ir.ConstV128(_) -> truth(kind == ir.IsBinary)
+    ir.ConstNull(_) -> truth(kind == ir.IsTuple)
   }
 }
 
