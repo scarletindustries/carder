@@ -235,7 +235,7 @@ fn readable_base(raw_name: String) -> String {
     "_" <> rest -> rest
     other -> other
   }
-  let named = strip_counters(trimmed)
+  let named = strip_counters(erlang_var_chars(trimmed))
   case named {
     // emit_core's wildcard binder: bound and never read, so `_W` keeps the
     // Erlang compiler quiet about it.
@@ -249,6 +249,33 @@ fn readable_base(raw_name: String) -> String {
           }
         Error(Nil) -> "V"
       }
+  }
+}
+
+/// Erlang variables allow only `[A-Za-z0-9_@]`; JS identifiers can also
+/// carry `$` (and any Unicode letter). Anything else becomes `_`.
+fn erlang_var_chars(s: String) -> String {
+  string.to_graphemes(s)
+  |> list.map(fn(g) {
+    case g {
+      "_" | "@" -> g
+      _ ->
+        case is_digit(g) || is_ascii_letter(g) {
+          True -> g
+          False -> "_"
+        }
+    }
+  })
+  |> string.concat
+}
+
+fn is_ascii_letter(g: String) -> Bool {
+  case string.to_utf_codepoints(g) {
+    [cp] -> {
+      let c = string.utf_codepoint_to_int(cp)
+      { c >= 65 && c <= 90 } || { c >= 97 && c <= 122 }
+    }
+    _ -> False
   }
 }
 
