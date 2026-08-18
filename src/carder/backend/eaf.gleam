@@ -197,27 +197,40 @@ type Env {
   )
 }
 
-/// Names minted so far in the current top-level function: readable base
-/// name → how many times it has been used. Erlang variables are function
-/// scoped, so each function starts empty.
+/// Names minted so far in the current top-level function: every Erlang
+/// variable handed out, plus the next suffix to try per readable base.
+/// Erlang variables are function scoped, so each function starts empty.
 type St {
-  St(used: Dict(String, Int))
+  St(taken: Set(String), next: Dict(String, Int))
 }
 
 /// Mint an Erlang variable for the Core variable `raw_name`, keeping the
 /// name readable: the Core printer's `V` prefix and byte escapes are undone
 /// (`V_5fp0` → `_p0`), a leading underscore is dropped, the first letter is
 /// capitalised, and a second binding of the same base in one function gets a
-/// numeric suffix (`T`, `T2`, `T3`). The set of distinct names is bounded by
-/// the distinct source names, so the atom cost of `compile:forms` stays flat.
+/// numeric suffix (`T`, `T2`, `T3`). A candidate that coincides with a name
+/// already handed out for a different base (`r` → `R2` when `r2` → `R2` was
+/// used) is skipped. The set of distinct names is bounded by the distinct
+/// source names, so the atom cost of `compile:forms` stays flat.
 fn fresh(st: St, raw_name: String) -> #(String, St) {
   let base = readable_base(raw_name)
-  case dict.get(st.used, base) {
-    Ok(n) -> #(
-      base <> int.to_string(n + 1),
-      St(used: dict.insert(st.used, base, n + 1)),
+  case set.contains(st.taken, base) {
+    False -> #(base, St(..st, taken: set.insert(st.taken, base)))
+    True -> next_free(st, base, dict.get(st.next, base) |> result.unwrap(2))
+  }
+}
+
+fn next_free(st: St, base: String, n: Int) -> #(String, St) {
+  let cand = base <> int.to_string(n)
+  case set.contains(st.taken, cand) {
+    True -> next_free(st, base, n + 1)
+    False -> #(
+      cand,
+      St(
+        taken: set.insert(st.taken, cand),
+        next: dict.insert(st.next, base, n + 1),
+      ),
     )
-    Error(Nil) -> #(base, St(used: dict.insert(st.used, base, 1)))
   }
 }
 
@@ -1355,7 +1368,7 @@ fn tr_def(
           depth: 0,
           consts: dict.new(),
         )
-      let st = St(used: dict.new())
+      let st = St(taken: set.new(), next: dict.new())
       let #(pforms, env2, st1) = bind_params(params, env, st)
       // Bind each constant term that occurs more than once to a variable
       // ahead of the body (see `Env.consts`).
