@@ -110,13 +110,7 @@ pub const threaded_paged = Combo(
 )
 
 /// The tier-O O(1) node-safe point under the `Cell` calling convention.
-pub const cell_atomics = Combo(
-  "cell×atomics",
-  Cell,
-  Atomics,
-  TableAtomics,
-  Safe,
-)
+pub const cell_atomics = Combo("cell×atomics", Cell, Atomics, TableAtomics, Safe)
 
 /// The tier-O O(1) point under the `Threaded` calling convention — the combination most likely
 /// to surface a threading bug (the mutable backend returns the same mutated ref under both
