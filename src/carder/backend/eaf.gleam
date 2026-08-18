@@ -235,14 +235,7 @@ fn readable_base(raw_name: String) -> String {
     "_" <> rest -> rest
     other -> other
   }
-  let named = case string.split(trimmed, "_") {
-    [hint, digits] if hint != "" ->
-      case int.parse(digits) {
-        Ok(_) -> hint
-        Error(Nil) -> trimmed
-      }
-    _ -> trimmed
-  }
+  let named = strip_counters(trimmed)
   case named {
     // emit_core's wildcard binder: bound and never read, so `_W` keeps the
     // Erlang compiler quiet about it.
@@ -256,6 +249,26 @@ fn readable_base(raw_name: String) -> String {
           }
         Error(Nil) -> "V"
       }
+  }
+}
+
+/// Drop every trailing `_<digits>` group (`t_12` → `t`, `y__2_17` → `y`):
+/// counters that only kept the Core name unique. A name that is nothing but
+/// digits after the strip keeps them (`_2` → `2` → `V2`).
+fn strip_counters(s: String) -> String {
+  case string.split(s, "_") |> list.reverse {
+    [last, ..rest] if rest != [] ->
+      case int.parse(last), last == "" {
+        Ok(_), _ | _, True -> {
+          let stem = list.reverse(rest) |> string.join("_")
+          case stem {
+            "" -> s
+            _ -> strip_counters(stem)
+          }
+        }
+        Error(Nil), False -> s
+      }
+    _ -> s
   }
 }
 
