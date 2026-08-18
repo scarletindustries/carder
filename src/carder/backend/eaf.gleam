@@ -243,13 +243,19 @@ fn readable_base(raw_name: String) -> String {
       }
     _ -> trimmed
   }
-  case string.pop_grapheme(named) {
-    Ok(#(first, rest)) ->
-      case is_digit(first) {
-        True -> "V" <> named
-        False -> string.uppercase(first) <> rest
+  case named {
+    // emit_core's wildcard binder: bound and never read, so `_W` keeps the
+    // Erlang compiler quiet about it.
+    "w" -> "_W"
+    _ ->
+      case string.pop_grapheme(named) {
+        Ok(#(first, rest)) ->
+          case is_digit(first) {
+            True -> "V" <> named
+            False -> string.uppercase(first) <> rest
+          }
+        Error(Nil) -> "V"
       }
-    Error(Nil) -> "V"
   }
 }
 
