@@ -363,3 +363,21 @@ pub fn underscore_name_is_readable_test() {
   let assert Ok(mod) = build_beam.compile_and_load(underscore_module())
   assert apply_int(mod, atom.create("id"), [7]) == 7
 }
+
+/// A name that starts with `V` keeps it: the printer never sees
+/// `legalize_var` output, so the `V` is the name's own.
+fn leading_v_module() -> CModule {
+  CModule(
+    name: "carder@test@eaf_leading_v",
+    exports: [FName("id", 1)],
+    attributes: [],
+    defs: [
+      FunDef(FName("id", 1), CFun(["valid_name"], CVar("valid_name"))),
+    ],
+  )
+}
+
+pub fn leading_v_is_kept_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(leading_v_module())
+  assert string.contains(erl, "id(Valid_name) ->")
+}
