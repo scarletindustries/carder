@@ -60,6 +60,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set.{type Set}
+import gleam/string
 
 /// An opaque Erlang Abstract Format term — a form, expression, pattern, or
 /// annotation node exactly as `compile:forms/2` / `erl_lint` consume it
@@ -196,23 +197,107 @@ type Env {
   )
 }
 
-/// The fresh-name counter, threaded through the whole translation of one
-/// top-level function (each function restarts at 0 — Erlang variables are
-/// function-scoped, so cross-function uniqueness is not needed).
+/// Names minted so far in the current top-level function: readable base
+/// name → how many times it has been used. Erlang variables are function
+/// scoped, so each function starts empty.
 type St {
-  St(counter: Int)
+  St(used: Dict(String, Int))
 }
 
-/// Mint a fresh (within the current function) Erlang variable name: `V` plus
-/// the counter. The raw Core name is deliberately NOT part of it — every
-/// distinct variable atom is interned permanently by `compile:forms`, and
-/// origin-tagged names (`Vg3010@7`) are unique per module, so a large guest
-/// interned tens of thousands of atoms. Counter-only names repeat across
-/// functions and modules, so the whole atom cost is one atom per counter
-/// value ever reached. `_raw_name` stays in the signature so a debug build
-/// can switch the naming back without touching the call sites.
-fn fresh(st: St, _raw_name: String) -> #(String, St) {
-  #("V" <> int.to_string(st.counter), St(st.counter + 1))
+/// Mint an Erlang variable for the Core variable `raw_name`, keeping the
+/// name readable: the Core printer's `V` prefix and byte escapes are undone
+/// (`V_5fp0` → `_p0`), a leading underscore is dropped, the first letter is
+/// capitalised, and a second binding of the same base in one function gets a
+/// numeric suffix (`T`, `T2`, `T3`). The set of distinct names is bounded by
+/// the distinct source names, so the atom cost of `compile:forms` stays flat.
+fn fresh(st: St, raw_name: String) -> #(String, St) {
+  let base = readable_base(raw_name)
+  case dict.get(st.used, base) {
+    Ok(n) -> #(
+      base <> int.to_string(n + 1),
+      St(used: dict.insert(st.used, base, n + 1)),
+    )
+    Error(Nil) -> #(base, St(used: dict.insert(st.used, base, 1)))
+  }
+}
+
+/// `readable_base("V_5fp0") == "P0"`, `readable_base("st_12") == "St"`,
+/// `readable_base("letrec") == "Letrec"`. emit_core mints `<hint>_<n>` (the
+/// counter only keeps the Core name unique), so the counter is dropped and
+/// the per-function suffix in `fresh` disambiguates instead. Total: an input
+/// with no usable character yields `"V"`.
+fn readable_base(raw_name: String) -> String {
+  let unescaped = case raw_name {
+    "V" <> rest -> unescape_var(rest, "")
+    other -> other
+  }
+  let trimmed = case unescaped {
+    "_" <> rest -> rest
+    other -> other
+  }
+  let named = case string.split(trimmed, "_") {
+    [hint, digits] if hint != "" ->
+      case int.parse(digits) {
+        Ok(_) -> hint
+        Error(Nil) -> trimmed
+      }
+    _ -> trimmed
+  }
+  case string.pop_grapheme(named) {
+    Ok(#(first, rest)) ->
+      case is_digit(first) {
+        True -> "V" <> named
+        False -> string.uppercase(first) <> rest
+      }
+    Error(Nil) -> "V"
+  }
+}
+
+fn is_digit(g: String) -> Bool {
+  case g {
+    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" -> True
+    _ -> False
+  }
+}
+
+/// Undo `core_printer.legalize_var`'s byte escapes: `_xx` (two lowercase hex
+/// digits) → the byte; anything else passes through. Non-alphanumeric bytes
+/// other than `_` are dropped, since Erlang variables allow only
+/// `[A-Za-z0-9_@]`.
+fn unescape_var(s: String, acc: String) -> String {
+  case s {
+    "" -> acc
+    "_" <> rest ->
+      case string.slice(rest, 0, 2) {
+        hex ->
+          case string.length(hex) == 2 && is_hex(hex) {
+            True -> {
+              let assert Ok(byte) = int.base_parse(hex, 16)
+              let ch = case byte == 0x5f {
+                True -> "_"
+                False -> ""
+              }
+              unescape_var(string.drop_start(rest, 2), acc <> ch)
+            }
+            False -> unescape_var(rest, acc <> "_")
+          }
+      }
+    _ -> {
+      let assert Ok(#(g, rest)) = string.pop_grapheme(s)
+      unescape_var(rest, acc <> g)
+    }
+  }
+}
+
+fn is_hex(s: String) -> Bool {
+  string.to_graphemes(s)
+  |> list.all(fn(g) {
+    case g {
+      "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" -> True
+      "a" | "b" | "c" | "d" | "e" | "f" -> True
+      _ -> False
+    }
+  })
 }
 
 /// Bind `raw_name` to a fresh Erlang variable: mint the name and extend the
@@ -1224,7 +1309,7 @@ fn tr_def(
           depth: 0,
           consts: dict.new(),
         )
-      let st = St(0)
+      let st = St(used: dict.new())
       let #(pforms, env2, st1) = bind_params(params, env, st)
       // Bind each constant term that occurs more than once to a variable
       // ahead of the body (see `Env.consts`).
