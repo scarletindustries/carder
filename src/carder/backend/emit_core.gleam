@@ -390,12 +390,15 @@ fn exit_record(tag: String, vs: List(CExpr), sc: StateChan) -> CExpr {
 }
 
 /// A fresh Core-variable raw name guaranteed distinct from every name already reserved
-/// in this function. Returns the name and the advanced state.
-fn fresh_var(s: EmitState) -> #(String, EmitState) {
-  let cand = "g" <> int.to_string(s.counter)
+/// in this function. `hint` says what the variable holds (`"st"` for the threaded state,
+/// `"t"` for a temporary, `"_"` for a wildcard, ...); the counter keeps it unique and the
+/// Erlang printer turns `st12` into a readable per-function `St`, `St2`, .... Returns the
+/// name and the advanced state.
+fn fresh_var(s: EmitState, hint: String) -> #(String, EmitState) {
+  let cand = hint <> "_" <> int.to_string(s.counter)
   let s2 = EmitState(..s, counter: s.counter + 1)
   case set.contains(s.vars, cand) {
-    True -> fresh_var(s2)
+    True -> fresh_var(s2, hint)
     False -> #(cand, EmitState(..s2, vars: set.insert(s2.vars, cand)))
   }
 }
@@ -403,7 +406,7 @@ fn fresh_var(s: EmitState) -> #(String, EmitState) {
 /// A fresh `letrec` function atom guaranteed distinct from every module function name and
 /// previously-generated join-point/loop atom. Returns the name and the advanced state.
 fn fresh_fn(s: EmitState) -> #(String, EmitState) {
-  let cand = "j" <> int.to_string(s.counter)
+  let cand = "j_" <> int.to_string(s.counter)
   let s2 = EmitState(..s, counter: s.counter + 1)
   case set.contains(s.fns, cand) {
     True -> fresh_fn(s2)
@@ -766,7 +769,7 @@ fn emit_function(
     )
   case is_threaded(ctx) && set.contains(ctx.fn_state_reaching, f.name) {
     True -> {
-      let #(st0, state1) = fresh_var(state0)
+      let #(st0, state1) = fresh_var(state0, "st")
       use #(body, _state) <- result.try(emit(
         f.body,
         KReturn,
@@ -1414,7 +1417,7 @@ fn emit_term_op(
       )
     ir.IsEmptyList, [l] -> {
       // `case L of [] -> 1; _ -> 0 end` — one i32 value (fresh wildcard binder for the `_` arm).
-      let #(wild, state2) = fresh_var(state)
+      let #(wild, state2) = fresh_var(state, "w")
       let is_empty =
         CCase(emit_value(l, state), [
           CClause([PNil], CAtom("true"), CInt(1)),
@@ -1693,7 +1696,7 @@ fn truth_arm(arm: Expr, state: EmitState) -> Option(#(CExpr, EmitState)) {
       case dict.get(state.sunk, w) {
         Ok(call) -> Some(#(call, state))
         Error(Nil) -> {
-          let #(wild, state2) = fresh_var(state)
+          let #(wild, state2) = fresh_var(state, "w")
           Some(#(
             CCase(emit_value(Var(w), state), [
               CClause([PInt(0)], CAtom("true"), CAtom("false")),
@@ -1914,7 +1917,7 @@ fn emit_make_closure(
                     ctx,
                   )
                 _ -> {
-                  let #(st_param, s1) = fresh_var(state)
+                  let #(st_param, s1) = fresh_var(state, "st")
                   let #(param_names, s2) = fresh_n_vars(s1, arity)
                   let body =
                     CApply(FName(fn_name, list.length(captures) + arity + 1), [
@@ -2274,7 +2277,7 @@ fn emit_mem_store_unchecked(
               CVar(cur),
               ..tail
             ])
-          let #(newst, state2) = fresh_var(state)
+          let #(newst, state2) = fresh_var(state, "st")
           use #(rest, state3) <- result.try(apply_cont(
             cont,
             [],
@@ -2401,7 +2404,7 @@ fn emit_global_set(
           core_binary_string(name),
           emit_value(value, state),
         ])
-      let #(newst, state2) = fresh_var(state)
+      let #(newst, state2) = fresh_var(state, "st")
       use #(rest, state3) <- result.try(apply_cont(
         cont,
         [],
@@ -2423,7 +2426,7 @@ fn emit_value_state_pair(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(stvar, state2) = fresh_var(state)
+  let #(stvar, state2) = fresh_var(state, "st")
   use #(vvars, rest, state3) <- result.try(bind_results(
     cont,
     1,
@@ -2455,7 +2458,7 @@ fn emit_state_rebind(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(st2, state2) = fresh_var(state)
+  let #(st2, state2) = fresh_var(state, "st")
   let unread = fn(r) { dict.get(state.uses, r) |> result.unwrap(0) == 0 }
   use #(rest, state3) <- result.try(case cont {
     KBind([r], body, next) ->
@@ -2560,7 +2563,7 @@ fn emit_state_rebind_or_miss(
       Ok(#(CLet([r], call, rest), state2))
     }
     None -> {
-      let #(st2, state2) = fresh_var(state)
+      let #(st2, state2) = fresh_var(state, "st")
       use #(rvars, rest, state3) <- result.try(bind_results(
         cont,
         1,
@@ -2599,7 +2602,7 @@ fn emit_threaded_record_effect(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(newst, state2) = fresh_var(state)
+  let #(newst, state2) = fresh_var(state, "st")
   let #(reduced, state3) = record_result_case(call, ctx, state2)
   use #(rest, state4) <- result.try(apply_cont(
     cont,
@@ -2620,8 +2623,8 @@ fn record_result_case(
   ctx: Ctx,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
-  let #(svar, state2) = fresh_var(state)
-  let #(evar, state3) = fresh_var(state2)
+  let #(svar, state2) = fresh_var(state, "s")
+  let #(evar, state3) = fresh_var(state2, "e")
   let reduced =
     CCase(call, [
       CClause([PTuple([PAtom("ok"), PVar(svar)])], CAtom("true"), CVar(svar)),
@@ -2722,7 +2725,7 @@ fn apply_cont(
           case n {
             1 -> Ok(#(call, state))
             _ -> {
-              let #(t, state2) = fresh_var(state)
+              let #(t, state2) = fresh_var(state, "t")
               let #(outs, state3) = fresh_n_vars(state2, n)
               let clause =
                 CClause(
@@ -2874,7 +2877,7 @@ fn apply_cont_call_unpack(
 ) -> Result(#(CExpr, EmitState), EmitError) {
   case r {
     0 -> {
-      let #(g, state2) = fresh_var(state)
+      let #(g, state2) = fresh_var(state, "t")
       use #(rest, state3) <- result.try(apply_cont(cont, [], sc, state2, ctx))
       Ok(#(CLet([g], produced, rest), state3))
     }
@@ -2934,7 +2937,7 @@ fn fresh_n_vars(state: EmitState, n: Int) -> #(List(String), EmitState) {
   case n <= 0 {
     True -> #([], state)
     False -> {
-      let #(name, state2) = fresh_var(state)
+      let #(name, state2) = fresh_var(state, "v")
       let #(rest, state3) = fresh_n_vars(state2, n - 1)
       #([name, ..rest], state3)
     }
@@ -3175,7 +3178,7 @@ fn materialize_if(
                 }
                 Threading(_), _, _ -> {
                   let #(jname, state2) = fresh_fn(state)
-                  let #(st_join, state3) = fresh_var(state2)
+                  let #(st_join, state3) = fresh_var(state2, "st")
                   let fname = FName(jname, arity + 1)
                   // Fun body is single-value: emit under float=None so its
                   // KValues leaves yield a `{st,r..}` tuple. Any float sink
@@ -3742,9 +3745,9 @@ fn emit_trapping_result(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(xvar, state2) = fresh_var(state)
-  let #(evar, state3) = fresh_var(state2)
-  let #(rvar, state4) = fresh_var(state3)
+  let #(xvar, state2) = fresh_var(state, "x")
+  let #(evar, state3) = fresh_var(state2, "e")
+  let #(rvar, state4) = fresh_var(state3, "r")
   let result_case =
     CCase(produced, [
       CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), CVar(xvar)),
@@ -3773,8 +3776,8 @@ fn trapping_effect(
   ctx: Ctx,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
-  let #(wild, state2) = fresh_var(state)
-  let #(evar, state3) = fresh_var(state2)
+  let #(wild, state2) = fresh_var(state, "w")
+  let #(evar, state3) = fresh_var(state2, "e")
   let reduced =
     CCase(call, [
       CClause([PTuple([PAtom("ok"), PVar(wild)])], CAtom("true"), CAtom("ok")),
@@ -3798,7 +3801,7 @@ fn emit_zero_effect(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(g, state2) = fresh_var(state)
+  let #(g, state2) = fresh_var(state, "t")
   use #(rest, state3) <- result.try(apply_cont(cont, [], sc, state2, ctx))
   Ok(#(CLet([g], effect, rest), state3))
 }
@@ -3980,7 +3983,7 @@ fn emit_gc_call_ref(
           params_c,
           CInt(rc),
         ])
-      let #(lvar, state2) = fresh_var(state)
+      let #(lvar, state2) = fresh_var(state, "l")
       use #(rest, state3) <- result.try(unpack_result_list(
         lvar,
         rc,
@@ -3999,9 +4002,9 @@ fn emit_gc_call_ref(
           params_c,
           CInt(rc),
         ])
-      let #(pair, state2) = fresh_var(state)
-      let #(rsvar, state3) = fresh_var(state2)
-      let #(stvar, state4) = fresh_var(state3)
+      let #(pair, state2) = fresh_var(state, "pair")
+      let #(rsvar, state3) = fresh_var(state2, "rs")
+      let #(stvar, state4) = fresh_var(state3, "st")
       use #(rest, state5) <- result.try(unpack_result_list(
         rsvar,
         rc,
@@ -4056,7 +4059,7 @@ fn emit_gc_array_new_data(
       state,
       ctx,
     )
-  let #(segvar, state3) = fresh_var(state2)
+  let #(segvar, state3) = fresh_var(state2, "seg")
   let call =
     seam_call(gc_module, "array_new_data", [
       CInt(type_idx),
@@ -4095,7 +4098,7 @@ fn emit_gc_array_init_data(
       state,
       ctx,
     )
-  let #(segvar, state3) = fresh_var(state2)
+  let #(segvar, state3) = fresh_var(state2, "seg")
   let call =
     seam_call(gc_module, "array_init_data", [
       emit_value(arrayref, state),
@@ -4152,7 +4155,7 @@ fn emit_gc_array_new_elem(
       state2,
       ctx,
     )
-  let #(segvar, state4) = fresh_var(state3)
+  let #(segvar, state4) = fresh_var(state3, "seg")
   let call =
     seam_call(gc_module, "array_new_elem", [
       CInt(type_idx),
@@ -4199,7 +4202,7 @@ fn emit_gc_array_init_elem(
       state2,
       ctx,
     )
-  let #(segvar, state4) = fresh_var(state3)
+  let #(segvar, state4) = fresh_var(state3, "seg")
   let call =
     seam_call(gc_module, "array_init_elem", [
       emit_value(arrayref, state),
@@ -4803,9 +4806,9 @@ fn emit_simd_trapping_value(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(xvar, state2) = fresh_var(state)
-  let #(evar, state3) = fresh_var(state2)
-  let #(rvar, state4) = fresh_var(state3)
+  let #(xvar, state2) = fresh_var(state, "x")
+  let #(evar, state3) = fresh_var(state2, "e")
+  let #(rvar, state4) = fresh_var(state3, "r")
   let result_case =
     CCase(produced, [
       CClause([PTuple([PAtom("ok"), PVar(xvar)])], CAtom("true"), CVar(xvar)),
@@ -5025,8 +5028,8 @@ fn emit_threaded_call_unpack(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(pkgvar, state2) = fresh_var(state)
-  let #(stvar, state3) = fresh_var(state2)
+  let #(pkgvar, state2) = fresh_var(state, "pkg")
+  let #(stvar, state3) = fresh_var(state2, "st")
   use #(rest, state4) <- result.try(apply_cont_call(
     cont,
     CVar(pkgvar),
@@ -5322,9 +5325,9 @@ fn emit_call_indirect(
           ])
       }
       // Bind one var to the unwrapped result LIST (or raise on `{error,R}`), then unpack it.
-      let #(xvar, state2) = fresh_var(state)
-      let #(evar, state3) = fresh_var(state2)
-      let #(lvar, state4) = fresh_var(state3)
+      let #(xvar, state2) = fresh_var(state, "x")
+      let #(evar, state3) = fresh_var(state2, "e")
+      let #(lvar, state4) = fresh_var(state3, "l")
       let result_case =
         CCase(call, [
           CClause(
@@ -5370,9 +5373,9 @@ fn emit_call_indirect(
             core_list(list.map(args, emit_value(_, state))),
           ])
       }
-      let #(pvar, state2) = fresh_var(state)
-      let #(evar, state3) = fresh_var(state2)
-      let #(pbound, state4) = fresh_var(state3)
+      let #(pvar, state2) = fresh_var(state, "p")
+      let #(evar, state3) = fresh_var(state2, "e")
+      let #(pbound, state4) = fresh_var(state3, "p")
       let result_case =
         CCase(call, [
           CClause(
@@ -5387,8 +5390,8 @@ fn emit_call_indirect(
           ),
         ])
       // Destructure `pbound = {Rs, St2}`, then unpack `Rs` under `Threading(St2)`.
-      let #(rsvar, state5) = fresh_var(state4)
-      let #(stvar, state6) = fresh_var(state5)
+      let #(rsvar, state5) = fresh_var(state4, "rs")
+      let #(stvar, state6) = fresh_var(state5, "st")
       use #(rest, state7) <- result.try(unpack_result_list(
         rsvar,
         r,
@@ -5469,13 +5472,13 @@ fn emit_call_import(
         CInt(slot),
       ])
   }
-  let #(cvar, state2) = fresh_var(state)
+  let #(cvar, state2) = fresh_var(state, "c")
   let applied =
     seam_call(link_module, "call_import", [
       CVar(cvar),
       core_list(list.map(args, emit_value(_, state))),
     ])
-  let #(lvar, state3) = fresh_var(state2)
+  let #(lvar, state3) = fresh_var(state2, "l")
   use #(rest, state4) <- result.try(unpack_result_list(
     lvar,
     r,
@@ -5540,8 +5543,8 @@ fn emit_return_call_indirect(
   let idx = table_idx(ctx, table)
   let tag = func_type_term(ty)
   let cargs = core_list(list.map(args, emit_value(_, state)))
-  let #(tvar, state2) = fresh_var(state)
-  let #(evar, state3) = fresh_var(state2)
+  let #(tvar, state2) = fresh_var(state, "t")
+  let #(evar, state3) = fresh_var(state2, "e")
   // Select the head + tail-apply per state channel. Under `Threading` the read-only `cur` flows
   // into both the lookup and the 2-ary target apply (which returns `{Package, St'}`).
   let #(lookup, tail_apply) = case sc {
@@ -5752,7 +5755,7 @@ fn imported_funcref_cell_closure(
   ctx: Ctx,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
-  let #(argsvar, state1) = fresh_var(state)
+  let #(argsvar, state1) = fresh_var(state, "args")
   let #(resnames, state2) = fresh_n_vars(state1, list.length(ty.results))
   let call =
     seam_call(link_module, "call_import", [
@@ -5790,8 +5793,8 @@ fn imported_funcref_threaded_closure(
   ctx: Ctx,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
-  let #(stvar, state1) = fresh_var(state)
-  let #(argsvar, state2) = fresh_var(state1)
+  let #(stvar, state1) = fresh_var(state, "st")
+  let #(argsvar, state2) = fresh_var(state1, "args")
   let #(resnames, state3) = fresh_n_vars(state2, list.length(ty.results))
   let call =
     seam_call(link_module, "call_import", [
@@ -5825,7 +5828,7 @@ fn emit_ref_is_null(
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
   let call = seam_call(ref_module, "is_null", [emit_value(arg, state)])
-  let #(wild, state2) = fresh_var(state)
+  let #(wild, state2) = fresh_var(state, "w")
   let i32 =
     CCase(call, [
       CClause([PAtom("true")], CAtom("true"), CInt(1)),
@@ -6045,7 +6048,7 @@ fn emit_table_init(
   ))
   let #(gated, state3) =
     drop_gate(seg, "elem_dropped", CNil, core_list(entries), sc, state2, ctx)
-  let #(segvar, state4) = fresh_var(state3)
+  let #(segvar, state4) = fresh_var(state3, "seg")
   case sc {
     NoState -> {
       let call =
@@ -6260,7 +6263,7 @@ fn emit_mem_init(
       state,
       ctx,
     )
-  let #(segvar, state3) = fresh_var(state2)
+  let #(segvar, state3) = fresh_var(state2, "seg")
   case sc {
     NoState -> {
       let call =
@@ -6339,7 +6342,7 @@ fn emit_drop(
           CVar(cur),
           CInt(seg),
         ])
-      let #(newst, state2) = fresh_var(state)
+      let #(newst, state2) = fresh_var(state, "st")
       use #(rest, state3) <- result.try(apply_cont(
         cont,
         [],
@@ -6374,7 +6377,7 @@ fn drop_gate(
         CInt(seg),
       ])
   }
-  let #(wild, state2) = fresh_var(state)
+  let #(wild, state2) = fresh_var(state, "w")
   let gate =
     CCase(check, [
       CClause([PAtom("true")], CAtom("true"), empty),
@@ -6528,7 +6531,7 @@ fn fuse_truth_if(
           state3,
         )
         I32Cond(v) -> {
-          let #(wild, state4) = fresh_var(state3)
+          let #(wild, state4) = fresh_var(state3, "w")
           #(
             CCase(emit_value(v, state), [
               CClause([PInt(0)], CAtom("true"), e),
@@ -6538,7 +6541,7 @@ fn fuse_truth_if(
           )
         }
         MissCond(r) -> {
-          let #(wild, state4) = fresh_var(state3)
+          let #(wild, state4) = fresh_var(state3, "w")
           #(
             CCase(CVar(r), [
               CClause([PAtom("miss")], CAtom("true"), t),
@@ -6723,7 +6726,7 @@ fn emit_if_join(
   }
   let #(case_expr, state5) = case cond {
     I32Cond(v) -> {
-      let #(wild, state5) = fresh_var(state4)
+      let #(wild, state5) = fresh_var(state4, "w")
       #(
         CCase(emit_value(v, state), [
           CClause([PInt(0)], CAtom("true"), else_c),
@@ -6740,7 +6743,7 @@ fn emit_if_join(
       state4,
     )
     MissCond(r) -> {
-      let #(wild, state5) = fresh_var(state4)
+      let #(wild, state5) = fresh_var(state4, "w")
       #(
         CCase(CVar(r), [
           CClause([PAtom("miss")], CAtom("true"), then_c),
@@ -6805,7 +6808,7 @@ fn emit_let_case_wrap(
   // incoming record — the shape is exactly the NoState one.
   let #(state2, sc_out) = case sc, pure {
     Threading(_), False -> {
-      let #(st_out, s) = fresh_var(state)
+      let #(st_out, s) = fresh_var(state, "st")
       #(s, Threading(st_out))
     }
     _, _ -> #(state, sc)
@@ -6845,7 +6848,7 @@ fn emit_let_case_wrap(
       case sc == NoState || pure, tup_names {
         True, [single] -> Ok(#(CLet([single], body_c, cont_c), state4))
         _, _ -> {
-          let #(t, state5) = fresh_var(state4)
+          let #(t, state5) = fresh_var(state4, "t")
           let clause =
             CClause([PTuple(list.map(tup_names, PVar))], CAtom("true"), cont_c)
           Ok(#(CLet([t], body_c, CCase(CVar(t), [clause])), state5))
@@ -6951,7 +6954,7 @@ fn emit_switch_join(
     emit_switch_arms(arms, jcont, sc, state2, ctx, []),
   )
   use #(default_c, state4) <- result.try(emit(default, jcont, sc, state3, ctx))
-  let #(wild, state5) = fresh_var(state4)
+  let #(wild, state5) = fresh_var(state4, "w")
   let clauses =
     list.append(arm_clauses, [CClause([PVar(wild)], CAtom("true"), default_c)])
   Ok(#(
@@ -7384,7 +7387,7 @@ fn emit_loop(
       Ok(#(wrap_join(maybe_def, loop_expr), state6))
     }
     Threading(cur) -> {
-      let #(st_loop, state3b) = fresh_var(state3)
+      let #(st_loop, state3b) = fresh_var(state3, "st")
       let lfname = FName(lname, arity + 1)
       let state4 =
         push_label(state3b, LabelEntry(label, exit_cont, Some(lfname)))
@@ -7468,7 +7471,7 @@ fn emit_charge(
     Charge(cost2, inner) ->
       emit_charge(cost + cost2, inner, cont, sc, state, ctx)
     _ -> {
-      let #(wild, state2) = fresh_var(state)
+      let #(wild, state2) = fresh_var(state, "w")
       use #(body_c, state3) <- result.try(emit(body, cont, sc, state2, ctx))
       let charge_call =
         CCall(CAtom(ctx.binding.meter_module), CAtom("charge"), [CInt(cost)])
@@ -7562,10 +7565,10 @@ fn emit_try(
   let body_fn = FName(bname, 0)
   let body_def = FunDef(body_fn, CFun([], body_c))
   // The single transparent success binder (§C.1) + the three exception pattern variables.
-  let #(vv, s3) = fresh_var(s2b)
-  let #(cvar, s4) = fresh_var(s3)
-  let #(rvar, s5) = fresh_var(s4)
-  let #(svar, s6) = fresh_var(s5)
+  let #(vv, s3) = fresh_var(s2b, "v")
+  let #(cvar, s4) = fresh_var(s3, "c")
+  let #(rvar, s5) = fresh_var(s4, "r")
+  let #(svar, s6) = fresh_var(s5, "s")
   use #(handler_c, s7) <- result.try(try_dispatch(
     handlers,
     cvar,
@@ -7609,8 +7612,8 @@ fn exit_dispatch(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(rec, state) = fresh_var(state)
-  let #(st, state) = fresh_var(state)
+  let #(rec, state) = fresh_var(state, "rec")
+  let #(st, state) = fresh_var(state, "st")
   let #(inner_sc, wrap) = case sc {
     NoState -> #(NoState, fn(e: CExpr) { CLet([rec], CVar(rvar), e) })
     Threading(_) -> #(Threading(st), fn(e: CExpr) {
@@ -7627,7 +7630,7 @@ fn exit_dispatch(
     state,
     ctx,
   ))
-  let #(pkg, state) = fresh_var(state)
+  let #(pkg, state) = fresh_var(state, "pkg")
   use #(ret_c, state) <- result.try(case state.try_outer {
     Some(_) -> Ok(#(exit_record("$2c_ret", [CVar(pkg)], inner_sc), state))
     None ->
@@ -7666,7 +7669,7 @@ fn fresh_vars(state: EmitState, n: Int) -> #(List(String), EmitState) {
   let #(names, state) =
     list.fold(list.repeat(Nil, n), #([], state), fn(acc, _) {
       let #(names, state) = acc
-      let #(v, state) = fresh_var(state)
+      let #(v, state) = fresh_var(state, "v")
       #([v, ..names], state)
     })
   #(list.reverse(names), state)
@@ -7730,7 +7733,7 @@ fn try_dispatch(
   state: EmitState,
   ctx: Ctx,
 ) -> Result(#(CExpr, EmitState), EmitError) {
-  let #(stk_var, state1) = fresh_var(state)
+  let #(stk_var, state1) = fresh_var(state, "stk")
   let reraise =
     CLet(
       [stk_var],
@@ -7784,7 +7787,7 @@ fn emit_catch_clause(
     ir.OnTag(tag) ->
       case is_direct(ctx.binding), sc {
         True, Threading(_) -> {
-          let #(st_caught, state_a) = fresh_var(state)
+          let #(st_caught, state_a) = fresh_var(state, "st")
           use #(hbody0, state_b) <- result.try(emit(
             hexpr,
             exit_cont,
@@ -7796,7 +7799,7 @@ fn emit_catch_clause(
           use tag_id <- result.try(resolve_tag(ctx, tag))
           let match =
             seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
-          let #(wild, state_c) = fresh_var(state_b)
+          let #(wild, state_c) = fresh_var(state_b, "w")
           Ok(#(
             CCase(match, [
               CClause(
@@ -7821,7 +7824,7 @@ fn emit_catch_clause(
           use tag_id <- result.try(resolve_tag(ctx, tag))
           let match =
             seam_call(exn_module, "match_tag", [CVar(rvar), CInt(tag_id)])
-          let #(wild, state2) = fresh_var(state1)
+          let #(wild, state2) = fresh_var(state1, "w")
           Ok(#(
             CCase(match, [
               CClause(
@@ -8220,7 +8223,7 @@ fn emit_instantiate_full(
   // The positional `Imports` parameter (only present at arity 1) + one destructuring var per
   // import SLOT (`Imp<p>`) — state imports first, then the function-import dispatch closures (S5).
   // Gensym'd, so they never collide with each other or the seeds.
-  let #(imports_param, state1) = fresh_var(state0)
+  let #(imports_param, state1) = fresh_var(state0, "imports")
   let #(imp_vars, state2) = fresh_n_vars(state1, n_imports)
   use #(decl_term, deferred_global_sets, state3) <- result.try(full_decl_term(
     module,
@@ -8348,7 +8351,7 @@ fn full_threaded_body(
   let seed_effects =
     list.flatten([seed_fuel_effect(ctx), seed_policy_effect(ctx)])
   let #(seed_wraps, state2) = discard_wrappers(seed_effects, state)
-  let #(st0, state3) = fresh_var(state2)
+  let #(st0, state3) = fresh_var(state2, "st")
   let fresh_wrap = fn(rest) {
     CLet(
       [st0],
@@ -8362,7 +8365,7 @@ fn full_threaded_body(
   let #(cur_seeded, fi_wraps, state3b) = case func_import_vars {
     [] -> #(st0, [], state3)
     _ -> {
-      let #(st0b, s) = fresh_var(state3)
+      let #(st0b, s) = fresh_var(state3, "st")
       let wrap = fn(rest) {
         CLet(
           [st0b],
@@ -8757,7 +8760,7 @@ fn emit_instantiate_threaded(
     list.flatten([seed_fuel_effect(ctx), seed_policy_effect(ctx)])
   let #(seed_wraps, state2) = discard_wrappers(seed_effects, state1)
   // (1) St0 = fresh(Decl).
-  let #(st0, state3) = fresh_var(state2)
+  let #(st0, state3) = fresh_var(state2, "st")
   let fresh_wrap = fn(rest) {
     CLet([st0], seam_call(ctx.binding.state_module, "fresh", [decl_term]), rest)
   }
@@ -8796,7 +8799,7 @@ fn discard_wrappers(
 ) -> #(List(fn(CExpr) -> CExpr), EmitState) {
   list.fold(effects, #([], state), fn(acc, effect) {
     let #(wraps, st) = acc
-    let #(g, st2) = fresh_var(st)
+    let #(g, st2) = fresh_var(st, "t")
     let wrap = fn(rest) { CLet([g], effect, rest) }
     #(list.append(wraps, [wrap]), st2)
   })
@@ -8856,7 +8859,7 @@ fn threaded_elem_wrappers(
           }
         })
         let #(reduced, st3) = record_result_case(call, ctx, st2)
-        let #(newvar, st4) = fresh_var(st3)
+        let #(newvar, st4) = fresh_var(st3, "v")
         let wrap = fn(rest) { CLet([newvar], reduced, rest) }
         Ok(#(list.append(wraps, [wrap]), newvar, st4))
       }
@@ -8895,7 +8898,7 @@ fn threaded_data_wrappers(
             ])
         }
         let #(reduced, st2) = record_result_case(call, ctx, st)
-        let #(newvar, st3) = fresh_var(st2)
+        let #(newvar, st3) = fresh_var(st2, "v")
         let wrap = fn(rest) { CLet([newvar], reduced, rest) }
         Ok(#(list.append(wraps, [wrap]), newvar, st3))
       }
@@ -8924,8 +8927,8 @@ fn threaded_start_wrapper(
           case set.contains(ctx.fn_state_reaching, name) {
             True -> {
               let applied = CApply(FName(name, arity + 1), [CVar(cur)])
-              let #(wildvar, state2) = fresh_var(state)
-              let #(newvar, state3) = fresh_var(state2)
+              let #(wildvar, state2) = fresh_var(state, "w")
+              let #(newvar, state3) = fresh_var(state2, "v")
               let wrap = fn(rest) {
                 CCase(applied, [
                   CClause(
@@ -8939,7 +8942,7 @@ fn threaded_start_wrapper(
             }
             False -> {
               let applied = CApply(FName(name, arity), [])
-              let #(wildvar, state2) = fresh_var(state)
+              let #(wildvar, state2) = fresh_var(state, "w")
               let wrap = fn(rest) { CLet([wildvar], applied, rest) }
               Ok(#([wrap], cur, state2))
             }
@@ -9000,8 +9003,8 @@ fn threaded_element_closure(
   reaching: Bool,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
-  let #(stvar, state1) = fresh_var(state)
-  let #(argsvar, state2) = fresh_var(state1)
+  let #(stvar, state1) = fresh_var(state, "st")
+  let #(argsvar, state2) = fresh_var(state1, "args")
   let #(argnames, state3) = fresh_n_vars(state2, arity)
   case reaching {
     False -> {
@@ -9097,7 +9100,7 @@ fn chain_effects(
   case effects {
     [] -> #(CAtom("ok"), state)
     [e, ..rest] -> {
-      let #(g, state2) = fresh_var(state)
+      let #(g, state2) = fresh_var(state, "t")
       let #(tail, state3) = chain_effects(rest, state2)
       #(CLet([g], e, tail), state3)
     }
@@ -9298,7 +9301,7 @@ fn element_closure(
   arity: Int,
   state: EmitState,
 ) -> #(CExpr, EmitState) {
-  let #(argsvar, state1) = fresh_var(state)
+  let #(argsvar, state1) = fresh_var(state, "args")
   let #(argnames, state2) = fresh_n_vars(state1, arity)
   let applied = CApply(FName(fname, arity), list.map(argnames, CVar))
   let body = case arity {

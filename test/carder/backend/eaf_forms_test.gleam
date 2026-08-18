@@ -69,7 +69,7 @@ fn bif_module() -> CModule {
 pub fn erlang_operators_and_bifs_spell_as_source_test() {
   let assert Ok(erl) = build_beam.module_to_erl(bif_module())
   assert string.contains(erl, " + ")
-  assert string.contains(erl, "-V0")
+  assert string.contains(erl, "-X")
   let assert Ok(mod) = build_beam.compile_and_load(bif_module())
   assert apply_int(mod, atom.create("add"), [40, 2]) == 42
   assert apply_int(mod, atom.create("is_int"), [7]) == 1
@@ -135,11 +135,11 @@ pub fn single_use_temporary_folds_into_match_test() {
   let assert Ok(erl) = build_beam.module_to_erl(temp_module())
   let assert Ok(#(swap_src, keep_src)) = string.split_once(erl, "keep(")
   // `swap`: one match binding the pair straight from the call — no
-  // `V1 = element(...)` temporary, no `case`.
+  // `G = element(...)` temporary, no `case`.
   assert !string.contains(swap_src, "case")
-  assert !string.contains(swap_src, "= V1")
+  assert !string.contains(swap_src, "G =")
   // `keep`: the temporary is read again, so it stays bound.
-  assert string.contains(keep_src, "= V1")
+  assert string.contains(keep_src, "G =")
   let assert Ok(mod) = build_beam.compile_and_load(temp_module())
   assert apply_pair(mod, atom.create("swap"), [#(1, 2)]) == #(2, 1)
   assert apply_triple(mod, atom.create("keep"), [#(1, 2)]) == #(2, 1, #(1, 2))
@@ -190,13 +190,13 @@ pub fn single_read_constructor_splices_into_its_use_test() {
   let assert Ok(erl) = build_beam.module_to_erl(splice_module())
   let assert Ok(#(pair_src, rest)) = string.split_once(erl, "twice(")
   let assert Ok(#(twice_src, closure_src)) = string.split_once(rest, "closure(")
-  // `pair`: no match at all — `element(1, {{V0, 1}})`.
+  // `pair`: no match at all — `element(1, {{X, 1}})`.
   assert !string.contains(pair_src, " = ")
-  assert string.contains(pair_src, "{{V0, 1}}")
+  assert string.contains(pair_src, "{{X, 1}}")
   // `twice`: read twice → bound once, referenced twice.
-  assert string.contains(twice_src, "V1 = {V0, 1}")
+  assert string.contains(twice_src, "T = {X, 1}")
   // `closure`: the tuple is built outside the fun, not inside it.
-  assert string.contains(closure_src, "V1 = {V0, 1}")
+  assert string.contains(closure_src, "T = {X, 1}")
   let assert Ok(mod) = build_beam.compile_and_load(splice_module())
   assert apply_pair(mod, atom.create("pair"), [7]) == #(7, 1)
   assert apply_pair(mod, atom.create("closure"), [7]) == #(7, 1)
@@ -283,8 +283,8 @@ pub fn short_circuit_case_spells_as_operator_test() {
     string.split(erl, "\n") |> list.map(string.trim) |> string.join(" ")
   let assert Ok(#(both_src, rest)) = string.split_once(flat, "either(")
   let assert Ok(#(either_src, keep_src)) = string.split_once(rest, "keep(")
-  assert string.contains(both_src, "is_integer(V0) andalso is_integer(V1)")
-  assert string.contains(either_src, "is_integer(V0) orelse is_integer(V1)")
+  assert string.contains(both_src, "is_integer(X) andalso is_integer(Y)")
+  assert string.contains(either_src, "is_integer(X) orelse is_integer(Y)")
   assert !string.contains(keep_src, "andalso")
   assert !string.contains(keep_src, "orelse")
   let assert Ok(mod) = build_beam.compile_and_load(short_circuit_module())
@@ -306,3 +306,60 @@ fn apply_any_int(module: Atom, function: Atom, args: List(Dynamic)) -> Int
 
 @external(erlang, "gleam_stdlib", "identity")
 fn to_dynamic(x: a) -> Dynamic
+
+/// `names/2`: Core variables `r`, `r_150` and `r2` in one function. `r`
+/// and `r_150` share the readable base `R`, so one of them becomes `R2` —
+/// which must not also be handed to `r2`.
+fn names_module() -> CModule {
+  CModule(
+    name: "carder@test@eaf_names",
+    exports: [FName("names", 2)],
+    attributes: [],
+    defs: [
+      FunDef(
+        FName("names", 2),
+        CFun(
+          ["r", "r2"],
+          CLet(
+            ["r_150"],
+            erlang("+", [CVar("r"), CInt(1)]),
+            CTuple([CVar("r"), CVar("r_150"), CVar("r2")]),
+          ),
+        ),
+      ),
+    ],
+  )
+}
+
+pub fn readable_names_never_collide_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(names_module())
+  assert string.contains(erl, "names(R, R2)")
+  assert string.contains(erl, "R3 = R + 1")
+  let assert Ok(mod) = build_beam.compile_and_load(names_module())
+  assert apply_triple_int(mod, atom.create("names"), [1, 5]) == #(1, 2, 5)
+}
+
+@external(erlang, "erlang", "apply")
+fn apply_triple_int(
+  module: Atom,
+  function: Atom,
+  args: List(Int),
+) -> #(Int, Int, Int)
+
+/// A Core variable whose readable form would be nothing but underscores
+/// (a JS binding named `_`) must not become Erlang's anonymous `_`.
+fn underscore_module() -> CModule {
+  CModule(
+    name: "carder@test@eaf_underscore",
+    exports: [FName("id", 1)],
+    attributes: [],
+    defs: [FunDef(FName("id", 1), CFun(["_"], CVar("_")))],
+  )
+}
+
+pub fn underscore_name_is_readable_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(underscore_module())
+  assert string.contains(erl, "id(V) ->")
+  let assert Ok(mod) = build_beam.compile_and_load(underscore_module())
+  assert apply_int(mod, atom.create("id"), [7]) == 7
+}
