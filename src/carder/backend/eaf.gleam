@@ -235,17 +235,15 @@ fn next_free(st: St, base: String, n: Int) -> #(String, St) {
   }
 }
 
-/// `readable_base("V_5fp0") == "P0"`, `readable_base("st_12") == "St"`,
+/// `readable_base("_p0") == "P0"`, `readable_base("st_12") == "St"`,
 /// `readable_base("letrec") == "Letrec"`. emit_core mints `<hint>_<n>` (the
 /// counter only keeps the Core name unique), so the counter is dropped and
 /// the per-function suffix in `fresh` disambiguates instead. Total: an input
 /// with no usable character yields `"V"`.
 fn readable_base(raw_name: String) -> String {
-  let unescaped = case raw_name {
-    "V" <> rest -> unescape_var(rest, "")
-    other -> other
-  }
-  let trimmed = case unescaped {
+  // Names arrive raw from the Core-shaped module (never through the Core
+  // printer's `legalize_var`), so a leading `V` is part of the name.
+  let trimmed = case raw_name {
     "_" <> rest -> rest
     other -> other
   }
@@ -322,46 +320,6 @@ fn is_digit(g: String) -> Bool {
     "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" -> True
     _ -> False
   }
-}
-
-/// Undo `core_printer.legalize_var`'s byte escapes: `_xx` (two lowercase hex
-/// digits) → the byte; anything else passes through. Non-alphanumeric bytes
-/// other than `_` are dropped, since Erlang variables allow only
-/// `[A-Za-z0-9_@]`.
-fn unescape_var(s: String, acc: String) -> String {
-  case s {
-    "" -> acc
-    "_" <> rest ->
-      case string.slice(rest, 0, 2) {
-        hex ->
-          case string.length(hex) == 2 && is_hex(hex) {
-            True -> {
-              let assert Ok(byte) = int.base_parse(hex, 16)
-              let ch = case byte == 0x5f {
-                True -> "_"
-                False -> ""
-              }
-              unescape_var(string.drop_start(rest, 2), acc <> ch)
-            }
-            False -> unescape_var(rest, acc <> "_")
-          }
-      }
-    _ -> {
-      let assert Ok(#(g, rest)) = string.pop_grapheme(s)
-      unescape_var(rest, acc <> g)
-    }
-  }
-}
-
-fn is_hex(s: String) -> Bool {
-  string.to_graphemes(s)
-  |> list.all(fn(g) {
-    case g {
-      "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" -> True
-      "a" | "b" | "c" | "d" | "e" | "f" -> True
-      _ -> False
-    }
-  })
 }
 
 /// Bind `raw_name` to a fresh Erlang variable: mint the name and extend the
