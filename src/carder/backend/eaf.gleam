@@ -249,10 +249,14 @@ fn readable_base(raw_name: String) -> String {
     other -> other
   }
   let named = strip_counters(erlang_var_chars(trimmed))
+  let all_underscores = string.replace(named, "_", "") == ""
   case named {
     // emit_core's wildcard binder: bound and never read, so `_W` keeps the
     // Erlang compiler quiet about it.
     "w" -> "_W"
+    // Nothing usable left (a JS name like `_` or `#_`): a bare `_` would be
+    // Erlang's anonymous variable, which cannot be read back.
+    _ if all_underscores -> "V"
     _ ->
       case string.pop_grapheme(named) {
         Ok(#(first, rest)) ->

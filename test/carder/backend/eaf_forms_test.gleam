@@ -345,3 +345,21 @@ fn apply_triple_int(
   function: Atom,
   args: List(Int),
 ) -> #(Int, Int, Int)
+
+/// A Core variable whose readable form would be nothing but underscores
+/// (a JS binding named `_`) must not become Erlang's anonymous `_`.
+fn underscore_module() -> CModule {
+  CModule(
+    name: "carder@test@eaf_underscore",
+    exports: [FName("id", 1)],
+    attributes: [],
+    defs: [FunDef(FName("id", 1), CFun(["_"], CVar("_")))],
+  )
+}
+
+pub fn underscore_name_is_readable_test() {
+  let assert Ok(erl) = build_beam.module_to_erl(underscore_module())
+  assert string.contains(erl, "id(V) ->")
+  let assert Ok(mod) = build_beam.compile_and_load(underscore_module())
+  assert apply_int(mod, atom.create("id"), [7]) == 7
+}
