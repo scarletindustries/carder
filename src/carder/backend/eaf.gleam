@@ -996,13 +996,24 @@ fn count_uses(
   }
 }
 
-/// How many times each constant term worth sharing (`is_const_term`) occurs
-/// across `expr`. A constant nested inside a larger constant counts only as
-/// part of the larger one.
-fn count_consts(expr: CExpr, acc: Dict(CExpr, Int)) -> Dict(CExpr, Int) {
+/// Each constant term worth sharing (`is_const_term`) with how many times it
+/// occurs across `expr`, keyed by first occurrence (0-based) so callers can
+/// hoist in source order rather than map order, which is not stable. A
+/// constant nested inside a larger constant counts only as part of the
+/// larger one.
+fn count_consts(
+  expr: CExpr,
+  acc: Dict(CExpr, #(Int, Int)),
+) -> Dict(CExpr, #(Int, Int)) {
   let go = fn(a, e) { count_consts(e, a) }
   case is_const_term(expr) {
-    True -> dict.upsert(acc, expr, fn(n) { option.unwrap(n, 0) + 1 })
+    True ->
+      dict.upsert(acc, expr, fn(seen) {
+        case seen {
+          option.Some(#(first, n)) -> #(first, n + 1)
+          option.None -> #(dict.size(acc), 1)
+        }
+      })
     False ->
       case expr {
         CVar(_)
@@ -1230,8 +1241,10 @@ fn tr_def(
       // ahead of the body (see `Env.consts`).
       let repeated =
         count_consts(body, dict.new())
-        |> dict.filter(fn(_, n) { n > 1 })
-        |> dict.keys
+        |> dict.to_list
+        |> list.filter(fn(kv) { kv.1.1 > 1 })
+        |> list.sort(fn(a, b) { int.compare(a.1.0, b.1.0) })
+        |> list.map(fn(kv) { kv.0 })
       use #(hoisted, env3, st2) <- result.try(
         list.try_fold(repeated, #([], env2, st1), fn(acc, term) {
           let #(ms, env0, st0) = acc
