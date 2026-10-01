@@ -34,7 +34,7 @@ import carder/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FName,
   type FunDef, CApply, CApplyExpr, CAtom, CBinary, CBytes, CCall, CCase, CCons,
   CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
-  CValues, CVar, PAtom, PCons, PInt, PNil, PTuple, PVar,
+  CValues, CVar, PAtom, PBytes, PCons, PInt, PNil, PTuple, PVar,
 }
 import gleam/bit_array
 import gleam/float
@@ -385,6 +385,12 @@ fn print_pat(p: CPat) -> StringTree {
     PInt(value) -> st(int.to_string(value))
     PAtom(name) -> print_atom(name)
     PNil -> st("[]")
+    PBytes(bytes) ->
+      string_tree.concat([
+        st("#{"),
+        print_bytes(bytes, []) |> string_tree.join(", "),
+        st("}#"),
+      ])
     PCons(head, tail) ->
       string_tree.concat([
         st("["),

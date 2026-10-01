@@ -51,7 +51,7 @@ import carder/backend/core_erlang.{
   type CBitSeg, type CClause, type CExpr, type CModule, type CPat, type FunDef,
   CApply, CApplyExpr, CAtom, CBinary, CBitSeg, CBytes, CCall, CCase, CClause,
   CCons, CFloat, CFun, CFunRef, CInt, CLet, CLetrec, CNil, CPrimop, CTry, CTuple,
-  CValues, CVar, FName, FunDef, PAtom, PCons, PInt, PNil, PTuple, PVar,
+  CValues, CVar, FName, FunDef, PAtom, PBytes, PCons, PInt, PNil, PTuple, PVar,
 }
 import carder/backend/core_printer
 import carder/backend/eaf_simplify
@@ -866,6 +866,7 @@ fn tr_pat(pat: CPat, env: Env, st: St) -> #(Form, Env, St) {
     PInt(v) -> #(e_int(ln, v), env, st)
     PAtom(name) -> #(e_atom(ln, name), env, st)
     PNil -> #(e_nil(ln), env, st)
+    PBytes(bytes) -> #(e_bin(ln, [e_bytes_element(ln, bytes)]), env, st)
     PCons(head, tail) -> {
       let #(hf, env1, st1) = tr_pat(head, env, st)
       let #(tf, env2, st2) = tr_pat(tail, env1, st1)
@@ -1176,7 +1177,7 @@ fn binder_pat(pat: CPat) -> Bool {
   case pat {
     PVar(_) -> True
     PTuple(elements) -> list.all(elements, binder_pat)
-    PInt(_) | PAtom(_) | PNil | PCons(_, _) -> False
+    PInt(_) | PAtom(_) | PNil | PBytes(_) | PCons(_, _) -> False
   }
 }
 

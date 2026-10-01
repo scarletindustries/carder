@@ -232,6 +232,8 @@ pub type CPat {
   PCons(head: CPat, tail: CPat)
   /// The empty-list pattern `[]`.
   PNil
+  /// A byte-string literal pattern, matching exactly the binary `bytes`.
+  PBytes(bytes: BitArray)
 }
 
 /// A binary segment (lock-now placeholder; the Phase-1 integer corpus does not
