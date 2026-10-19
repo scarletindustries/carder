@@ -169,3 +169,59 @@ pub fn pure_arity0_block_hit_and_miss_test() {
   assert run("s0", share0(), 5) == 5
   assert run("s0", share0(), 0) == 0
 }
+
+/// Arity-0 nested blocks whose arms run a `Mut` kernel, then break out: a switch
+/// with a body per case. A taken arm jumps to a floated cont that hands back only
+/// the record, which must rejoin its siblings as the bare record.
+fn arms0() -> ir.Expr {
+  let is = fn(n: Int, name: String, yes: ir.Expr, no: ir.Expr) {
+    ir.Let(
+      [name],
+      ir.NumTerm(ir.NEq, ir.Var("p0"), ir.ConstI32(n)),
+      ir.If(ir.Var(name), [], yes, no),
+    )
+  }
+  let arm = fn(name: String) {
+    ir.Let(
+      [name],
+      ir.CallHost("cap", "slow", [ir.Var("p0")]),
+      ir.Break("l_out", []),
+    )
+  }
+  let dispatch =
+    is(
+      1,
+      "is1",
+      ir.Break("l_one", []),
+      is(2, "is2", ir.Break("l_two", []), ir.Break("l_out", [])),
+    )
+  ir.Let(
+    [],
+    ir.Block(
+      "l_out",
+      [],
+      ir.Let(
+        [],
+        ir.Block(
+          "l_two",
+          [],
+          ir.Let([], ir.Block("l_one", [], dispatch), arm("a")),
+        ),
+        arm("b"),
+      ),
+    ),
+    ir.Values([ir.Var("p0")]),
+  )
+}
+
+pub fn arity0_arms_hand_back_the_bare_record_test() {
+  let m = module("arms0", [fn1("f", arms0())])
+  let assert Ok(cm) = emit_core.emit_module(m, binding())
+  let assert Ok(mod) = build_beam.compile_and_load(cm)
+  let assert Ok(st) = t_instantiate(mod)
+  list.each([1, 2, 3], fn(arg) {
+    let assert Ok(#(v, after)) = t_invoke(mod, atom.create("f"), st, [arg])
+    assert v == arg
+    assert after == st
+  })
+}
