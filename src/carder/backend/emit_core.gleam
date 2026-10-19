@@ -2722,9 +2722,10 @@ fn apply_cont(
             NoState -> arity
             Threading(_) -> arity + 1
           }
-          case n {
-            1 -> Ok(#(call, state))
-            _ -> {
+          // a fun body under Threading is always a tuple, even of the record alone
+          case sc, n {
+            NoState, 1 -> Ok(#(call, state))
+            _, _ -> {
               let #(t, state2) = fresh_var(state, "t")
               let #(outs, state3) = fresh_n_vars(state2, n)
               let clause =
